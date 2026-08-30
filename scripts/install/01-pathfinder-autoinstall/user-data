@@ -1,0 +1,114 @@
+#cloud-config
+#
+# 01 - Pathfinder autoinstall: Ubuntu Server 24.04.4 LTS
+#
+# Builds the throwaway validation machine for step 01. Deliberately SIMPLER than the
+# production host config in 02-host-autoinstall/ - this box is disposable, needs internet,
+# and exists only to answer open questions 11 and 12.
+#
+# Differences from the production config, all intentional:
+#   * DHCP, not static      - it needs to reach contracts.canonical.com for 'pro attach'
+#   * simple LVM layout     - the STIG partitioning is step 02's job, tested in pass 2
+#   * extra packages        - the tools 01-hw-inventory.sh probes with
+#   * fetches the scripts   - no USB shuffle; they come from the same seed server
+#
+# Still does NOT enable Pro, FIPS or the STIG. Step 01 measures before anything is enabled.
+#
+# Fill in every REPLACE-ME. See docs/01-pathfinder.md.
+# Schema verified against Canonical's autoinstall reference 2026-08-27.
+
+autoinstall:
+  version: 1
+
+  # Match production: the enclave has no egress, so the production hosts cannot refresh the
+  # installer. Testing on a refreshed installer would test something you will never run.
+  refresh-installer:
+    update: false
+
+  locale: en_US.UTF-8
+  keyboard:
+    layout: us
+  timezone: Etc/UTC
+
+  identity:
+    realname: Pathfinder Admin
+    username: encadmin
+    hostname: pathfinder
+    # SHA-512 crypt hash:  mkpasswd --method=SHA-512 --rounds=4096
+    #
+    # Set one even here. Pass 3 runs 'usg fix disa_stig', and the DISA profile requires a
+    # password on the admin account - without it you are locked out of your own test box.
+    password: 'REPLACE-ME-password-hash'
+
+  ssh:
+    install-server: true
+    # Keys only. Set allow-pw: true instead if you have no key handy - it is a throwaway,
+    # but the production config in 02-host-autoinstall/ must stay keys-only.
+    allow-pw: false
+    authorized-keys:
+      - 'REPLACE-ME-ssh-public-key'
+
+  # DHCP on purpose. 'pro attach' reaches contracts.canonical.com, and without egress step 01
+  # cannot answer anything. The production hosts get static addressing in step 02.
+  network:
+    version: 2
+    ethernets:
+      any-nic:
+        match:
+          name: "en*"
+        dhcp4: true
+
+  # Simple guided LVM on the smallest disk. The STIG separate-filesystem layout is deliberately
+  # NOT here - that is the production config, exercised in pass 2 against this same hardware.
+  #
+  # 'size: smallest' picks the smallest FIXED disk - which may be an existing OS you care
+  # about, not the one you meant. Run 01-hw-inventory.sh first and pin the serial from its
+  # /dev/disk/by-id table. Leave size:smallest only on a machine with exactly one fixed disk.
+  storage:
+    layout:
+      name: lvm
+      match:
+        serial: "REPLACE-ME-os-disk-serial"
+
+  # Everything 01-hw-inventory.sh probes with, plus gnupg to close out the step 00 signature
+  # check that could not be done on Windows.
+  packages:
+    - mokutil          # Secure Boot state
+    - nvme-cli         # NVMe topology - the disks destined for Ceph OSDs
+    - pciutils         # lspci, for the hardware RAID check
+    - dmidecode        # system identity for the hardware baseline
+    - gnupg            # finish the deferred ISO signature verification
+    - lsscsi
+
+  # NOTE: this config is deliberately ONLINE - the pathfinder needs internet for 'pro attach'.
+  # The production config in 02-host-autoinstall/ carries an airgap 'apt:' block with
+  # geoip: false and fallback: offline-install. Do not copy this file to a disconnected host.
+  updates: security
+  shutdown: reboot
+
+  late-commands:
+    # Pull the step 01 scripts from the same HTTP server that served this file. Removes the
+    # USB shuffle entirely - the machine comes up with the scripts already on it.
+    # Set this to the same host:port used in the ds=nocloud-net kernel parameter.
+    - curtin in-target --target=/target -- sh -c
+        'curl -fsSL REPLACE-ME-seed-url/01-hw-inventory.sh   -o /root/01-hw-inventory.sh   || true'
+    - curtin in-target --target=/target -- sh -c
+        'curl -fsSL REPLACE-ME-seed-url/01-capability-test.sh -o /root/01-capability-test.sh || true'
+    - curtin in-target --target=/target -- sh -c
+        'chmod +x /root/01-*.sh 2>/dev/null || true'
+
+    # Serial console, same as production - a racked machine you can reach over BMC SOL.
+    - |
+      sed -i 's/^GRUB_CMDLINE_LINUX=.*/GRUB_CMDLINE_LINUX="console=tty0 console=ttyS0,115200n8"/' \
+        /target/etc/default/grub
+    - curtin in-target --target=/target -- update-grub
+
+    - |
+      cat > /target/etc/enclave-build-info <<EOF
+      build_config=01-pathfinder-autoinstall
+      built_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+      iso=ubuntu-24.04.4-live-server-amd64.iso
+      role=pathfinder-DISPOSABLE
+      hardened=no
+      pro_attached=no
+      EOF

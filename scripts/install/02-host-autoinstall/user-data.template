@@ -1,0 +1,338 @@
+#cloud-config
+#
+# 02 - Bare-metal host OS autoinstall: Ubuntu Server 24.04 LTS
+#
+# TEMPLATE. Do not edit the placeholder tokens by hand - 02-build-seed.sh / .ps1 substitute
+# them from host-params.env plus the -H and -a arguments, then write the seed stick.
+#
+#     ./scripts/install/02-build-seed.sh  -H h1 -a 10.0.20.11 -d /mnt
+#     .\scripts\install\02-build-seed.ps1 -HostName h1 -Address 10.0.20.11 -DriveLetter F
+#
+# One template, one stick, rewritten per host. Nothing secret lives in this file.
+#
+# Produces a clean, identically-configured, STIG-partitioned host. Does NOT attach Ubuntu
+# Pro, enable FIPS, apply the STIG, or install LXD - see docs/02-host-install.md for why.
+#
+# Schema verified against Canonical's autoinstall reference 2026-08-27.
+
+autoinstall:
+  version: 1
+
+  # No egress. Do not let the installer try to update itself mid-install.
+  refresh-installer:
+    update: false
+
+  locale: en_US.UTF-8
+  keyboard:
+    layout: us
+  timezone: Etc/UTC
+
+  identity:
+    realname: Enclave Local Administrator
+    username: @@USERNAME@@
+    hostname: @@HOSTNAME@@
+    # SHA-512 crypt hash from host-params.env. NOT optional - the DISA profile requires a
+    # password on the admin account and will lock you out of the host without one.
+    password: '@@PASSWORD_HASH@@'
+
+  ssh:
+    install-server: true
+    # ALLOW_PW from host-params.env.
+    #
+    #   true  - BUILD PHASE DEFAULT. Password SSH works as a fallback. You cannot build a host
+    #           you cannot connect to, and being locked out of a half-built machine on a rack
+    #           costs more than a password on a lab network does.
+    #   false - target state. Step 03 hardening sets this; the STIG requires key-only.
+    #
+    # The console password is set either way and is the last-resort way in.
+    allow-pw: @@ALLOW_PW@@
+    authorized-keys:
+      # One line per SSH_KEY_n in host-params.env. RSA or ECDSA only - FIPS mode refuses
+      # Ed25519 outright: "ED25519 keys are not allowed in FIPS mode" (pathfinder 2026-08-28).
+      # Multiple keys means per-workstation revocation: drop a line, not the whole account.
+@@SSH_KEYS@@
+
+  # NIC_MATCH from host-params.env. Interface naming varies with hardware and firmware
+  # (enp1s0, eno1, ens192...), so pinning a literal name breaks on the next machine.
+  #
+  #   'en*'    - any wired NIC. Correct for single-NIC hosts.
+  #   'eno1'   - a specific name, once you know it from 01-hw-inventory.sh
+  #   'enp1s*' - narrower glob for a known slot
+  #
+  # CAVEAT: this applies to EVERY interface it matches. On a multi-NIC host 'en*' would put
+  # the same static address on all of them. Narrow NIC_MATCH there, or replace the name match
+  # with 'macaddress: "aa:bb:cc:.."' - a MAC is per-host, so that also means one file per host.
+  network:
+    version: 2
+    ethernets:
+      primary:
+        match:
+          name: "@@NIC_MATCH@@"
+        dhcp4: false
+        addresses:
+          - @@ADDRESS@@/@@PREFIX@@
+        routes:
+          - to: default
+            via: @@GATEWAY@@
+        nameservers:
+          addresses:
+            - @@DNS@@
+
+  # Disk encryption is controlled by ENCRYPT_DISKS in host-params.env. When true, a LUKS
+  # dm_crypt layer sits between each partition and its volume group, so BOTH volume groups
+  # and everything in them are encrypted at rest. Required at IL5.
+  #
+  # !! The LUKS passphrase is written in PLAINTEXT into user-data on the seed stick. Treat
+  # !! that stick as a credential: control it, and wipe it when the build is done.
+  # !!
+  # !! UNATTENDED REBOOT: a passphrase-only LUKS host stops at the console on every boot.
+  # !! After install, enrol TPM 2.0 (systemd-cryptenroll) so it unlocks unattended - see
+  # !! open question 20. Until that is done these hosts need a human to reboot.
+  #
+  # GRUB password (UBTU-24-102000) is NOT set here - that is step 05's job via
+  # 'usg fix stig-v1r1'. Open question 21 tests whether USG sets it with --unrestricted.
+  storage:
+    swap:
+      size: 0                # no swap; confirm against your STIG baseline  [VERIFY]
+
+    config:
+      # ================= OS DISK - matched by BUS, not size or serial ========================
+      # Matched on id_path, which encodes the physical bus. Serials differ per machine, so
+      # pinning them means inventorying every host before you can install it - and 'size'
+      # is unsafe (see below).
+      #
+      #   pci-0000:05:00.1-ata-2                       -> sda      SATA
+      #   pci-0000:03:00.0-nvme-1                      -> nvme0n1  NVMe
+      #   pci-0000:04:00.4-usb-0:4.3:1.0-scsi-0:0:0:0  -> sdc      USB
+      #
+      # '*-ata-*' therefore cannot match a USB device. Confirm the pattern on new hardware:
+      #     ls -l /dev/disk/by-path/ | grep -v part
+      #
+      # !! DO NOT USE 'size: smallest' HERE. Confirmed on the pathfinder 2026-08-28:
+      # !! subiquity does NOT exclude removable media from size matching. It selected the
+      # !! 120 MB CIDATA seed stick as the OS disk, wiped it, then failed creating a 1 GB
+      # !! ESP on a 120 MB device. The seed was destroyed and the install died.
+      - id: disk-os
+        type: disk
+        ptable: gpt
+        match:
+          id_path: "*-ata-*"
+        wipe: superblock-recursive
+        preserve: false
+        grub_device: false
+
+      - id: p-esp
+        type: partition
+        device: disk-os
+        size: 1G
+        flag: boot
+        grub_device: true
+      - id: f-esp
+        type: format
+        volume: p-esp
+        fstype: fat32
+      - id: m-esp
+        type: mount
+        device: f-esp
+        path: /boot/efi
+
+      - id: p-boot
+        type: partition
+        device: disk-os
+        size: 2G
+      - id: f-boot
+        type: format
+        volume: p-boot
+        fstype: ext4
+      - id: m-boot
+        type: mount
+        device: f-boot
+        path: /boot
+
+      - id: p-pv
+        type: partition
+        device: disk-os
+        size: -1
+@@CRYPT_OS@@
+      - id: vg0
+        type: lvm_volgroup
+        name: vg0
+        devices:
+          - @@VG0_DEV@@
+
+      # ---- STIG separate filesystems, all on the OS disk ----------------------------------
+      # DISA requires separate filesystems for /tmp /home /var /var/log /var/log/audit.
+      # [VERIFY] reconcile against the real Canonical Ubuntu 24.04 STIG before production.
+      # Sizes are placeholders - set them from the BOM. Nothing uses -1: the remainder of vg0
+      # stays free for growth.
+      - id: lv-root
+        type: lvm_partition
+        name: root
+        volgroup: vg0
+        size: @@LV_ROOT@@
+      - id: f-root
+        type: format
+        volume: lv-root
+        fstype: ext4
+      - id: m-root
+        type: mount
+        device: f-root
+        path: /
+
+      - id: lv-home
+        type: lvm_partition
+        name: home
+        volgroup: vg0
+        size: @@LV_HOME@@
+      - id: f-home
+        type: format
+        volume: lv-home
+        fstype: ext4
+      - id: m-home
+        type: mount
+        device: f-home
+        path: /home
+
+      - id: lv-var
+        type: lvm_partition
+        name: var
+        volgroup: vg0
+        size: @@LV_VAR@@
+      - id: f-var
+        type: format
+        volume: lv-var
+        fstype: ext4
+      - id: m-var
+        type: mount
+        device: f-var
+        path: /var
+
+      # Mount order matters: /var before /var/log before /var/log/audit.
+      - id: lv-varlog
+        type: lvm_partition
+        name: varlog
+        volgroup: vg0
+        size: @@LV_VARLOG@@
+      - id: f-varlog
+        type: format
+        volume: lv-varlog
+        fstype: ext4
+      - id: m-varlog
+        type: mount
+        device: f-varlog
+        path: /var/log
+
+      - id: lv-varlogaudit
+        type: lvm_partition
+        name: varlogaudit
+        volgroup: vg0
+        size: @@LV_VARLOGAUDIT@@
+      - id: f-varlogaudit
+        type: format
+        volume: lv-varlogaudit
+        fstype: ext4
+      - id: m-varlogaudit
+        type: mount
+        device: f-varlogaudit
+        path: /var/log/audit
+
+      - id: lv-tmp
+        type: lvm_partition
+        name: tmp
+        volgroup: vg0
+        size: @@LV_TMP@@
+      - id: f-tmp
+        type: format
+        volume: lv-tmp
+        fstype: ext4
+      - id: m-tmp
+        type: mount
+        device: f-tmp
+        path: /tmp
+
+      # ============ DATA DISK - matched by BUS, the NVMe ====================================
+      # Becomes the LXD storage pool, and on a worker the Ceph OSD device. Left as an EMPTY
+      # volume group on purpose: LXD carves its own logical volumes from a VG.
+      #
+      # Same reasoning as the OS disk: '*-nvme-*' cannot match a USB device or the SATA disk.
+      # If a host has more than one NVMe, narrow this or pin the serial.
+      #
+      # [VERIFY] An empty VG with no LVs and no mounts is the thing most likely to trip
+      # subiquity. If the install fails here, drop this whole block, let the installer finish,
+      # and create the VG by hand:
+      #     sudo pvcreate /dev/nvme0n1 && sudo vgcreate vg-data /dev/nvme0n1
+      - id: disk-data
+        type: disk
+        ptable: gpt
+        match:
+          id_path: "*-nvme-*"
+        wipe: superblock-recursive
+        preserve: false
+        grub_device: false
+
+      - id: p-data
+        type: partition
+        device: disk-data
+        size: -1
+@@CRYPT_DATA@@
+      - id: vg-data
+        type: lvm_volgroup
+        name: vg-data
+        devices:
+          - @@VGDATA_DEV@@
+
+  # ---- AIR-GAP: this block is what makes an offline install work -------------------------
+  #   geoip: false        - the DEFAULT IS TRUE, and it calls https://geoip.ubuntu.com/lookup
+  #                         during install to pick a mirror. In an enclave that is an outbound
+  #                         request that will hang or time out.
+  #   fallback            - abort | offline-install | continue-anyway. 'offline-install'
+  #                         completes from the ISO pool alone, which is the host-1 case.
+  #   primary             - for hosts 2 and 3, point at the Landscape mirror on svc-01 once it
+  #                         exists. Host-1 is built before that, so it relies on the fallback.
+  apt:
+    geoip: false
+    preserve_sources_list: false
+    fallback: offline-install
+    # mirror-selection:
+    #   primary:
+    #     - uri: "http://svc-01.enclave.local/ubuntu"
+
+  # Packages come from the ISO pool in an offline install. Anything not on the ISO silently
+  # fails to install - keep this minimal.
+  packages:
+    - lvm2
+
+  # Accepts only 'security' or 'all'; there is no 'none'. With no reachable archive and the
+  # offline-install fallback above, there is nothing to fetch.
+  updates: security
+
+  shutdown: reboot
+
+  late-commands:
+    # Serial console on the INSTALLED system. These are racked, headless machines: serial over
+    # BMC SOL still works when networking is broken, which is exactly when you need it.
+    - |
+      sed -i 's/^GRUB_CMDLINE_LINUX=.*/GRUB_CMDLINE_LINUX="console=tty0 console=ttyS0,115200n8"/' \
+        /target/etc/default/grub
+    - |
+      grep -q '^GRUB_TERMINAL=' /target/etc/default/grub \
+        && sed -i 's/^GRUB_TERMINAL=.*/GRUB_TERMINAL="console serial"/' /target/etc/default/grub \
+        || echo 'GRUB_TERMINAL="console serial"' >> /target/etc/default/grub
+    - |
+      grep -q '^GRUB_SERIAL_COMMAND=' /target/etc/default/grub \
+        || echo 'GRUB_SERIAL_COMMAND="serial --speed=115200 --unit=0 --word=8 --parity=no --stop=1"' \
+             >> /target/etc/default/grub
+    - curtin in-target --target=/target -- update-grub
+
+    # Per-host provenance for the ATO package: which config and which parameters built this box.
+    - |
+      cat > /target/etc/enclave-build-info <<EOF
+      build_config=02-host-autoinstall/user-data.template
+      hostname=@@HOSTNAME@@
+      address=@@ADDRESS@@/@@PREFIX@@
+      gateway=@@GATEWAY@@
+      built_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+      iso=ubuntu-24.04-live-server-amd64.iso
+      hardened=no
+      pro_attached=no
+      EOF

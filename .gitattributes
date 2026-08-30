@@ -1,0 +1,15 @@
+* text=auto eol=lf
+
+# Windows PowerShell 5.1 reads .ps1 as ANSI unless the file has a UTF-8 BOM, and it wants
+# CRLF. Keep these files exactly as committed - do not let git normalise them to LF.
+*.ps1 text eol=crlf working-tree-encoding=UTF-8
+
+# Shell scripts and cloud-init/autoinstall payloads must stay LF; CRLF breaks the shebang
+# and breaks cloud-init parsing.
+*.sh text eol=lf
+user-data text eol=lf
+meta-data text eol=lf
+
+*.zip binary
+*.iso binary
+*.img binary

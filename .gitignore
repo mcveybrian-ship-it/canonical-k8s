@@ -1,0 +1,68 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Scratch
+*.tmp
+*.bak
+scratch/
+
+# --- Never commit: credentials and run artefacts -------------------------------------------
+# Ubuntu Pro tokens, SSH keys and password hashes are credentials. Console logs from the
+# install steps routinely contain them. Keep them out of the repo entirely.
+*token*
+*TOKEN*
+*.token
+*notes*.txt
+*-report.txt
+capability-test-*.txt
+hw-inventory-*.txt
+*.key
+*.pem
+id_ed25519*
+id_rsa*
+
+# Downloaded media - large, and reproducible from docs/00-downloads.md
+media/
+*.iso
+*.img
+MANIFEST.sha256
+
+# Filled-in autoinstall seeds contain the password hash and SSH keys
+seed-*.iso
+scripts/install/02-host-autoinstall/user-data.h*
+host-params.env
+*/host-params.env
+scripts/install/*/host-params.env
+
+# Downloaded tooling - fetch it from the vendor, do not vendor binaries into the repo
+dependencies/
+*.exe
+*.msi
+
+# Rendered STAGE-01 user-data holds the password hash - keep the template, never the render
+airgapped-setup-machine/*.local.yaml
+airgapped-setup-machine/stage-01-userdata-*.yaml
+
+# Generated docs - regenerate from the markdown, do not track
+*.pdf
+
+# =============================================================================================
+# CLIENT-PRIVATE ENGAGEMENT MATERIAL - local only, never pushed to origin.
+#
+# These are the deliverable and the decision record for a specific client engagement. The rest
+# of this repo is reusable tooling and is safe to share. Untracked here means NO git history
+# for these files - back them up separately.
+# =============================================================================================
+HANDOFF.md
+docs/open-questions.md
+docs/runbook.md
+artifact/
+archive/

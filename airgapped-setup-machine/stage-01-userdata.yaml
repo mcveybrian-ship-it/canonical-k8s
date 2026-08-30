@@ -1,0 +1,110 @@
+#cloud-config
+#
+# STAGE-01 cloud-init user-data.
+#
+# Passed to schtritoff/hyperv-vm-provisioning via -CustomUserDataYamlFile. Build-Stage01.ps1
+# substitutes @@SSH_KEY@@ from a public key file and writes a temporary copy - this file is a
+# template and is never used directly.
+#
+# STAGE-01 is ONLINE and outside the air gap. It is not a hardened enclave host: no FIPS, no
+# STIG, no LUKS. Its jobs are building the Ubuntu Pro mirror and being the development
+# workstation for this project. Do not copy this config to anything inside the boundary.
+
+hostname: stage-01
+fqdn: stage-01.lab.local
+prefer_fqdn_over_hostname: false
+
+timezone: Etc/UTC
+locale: en_US.UTF-8
+
+users:
+  - name: encadmin
+    gecos: Enclave Build Admin
+    groups: [adm, sudo]
+    shell: /bin/bash
+    lock_passwd: false
+    # Same SHA-512 crypt hash convention as the enclave hosts. Console fallback only.
+    passwd: '@@PASSWORD_HASH@@'
+    sudo: ALL=(ALL) ALL
+    ssh_authorized_keys:
+      # RSA or ECDSA. Kept consistent with the enclave hosts, where FIPS refuses Ed25519.
+      - '@@SSH_KEY@@'
+
+ssh_pwauth: true          # ONLINE dev box on a lab network - convenience over lockout risk
+
+# Fill the whole VHD. The script provisions a 1 TB disk; without this the root filesystem
+# stays at the cloud image's ~3.5 GB.
+growpart:
+  mode: auto
+  devices: ['/']
+  ignore_growroot_disabled: false
+resize_rootfs: true
+
+package_update: true
+package_upgrade: true
+
+packages:
+  # --- development toolchain: what this repo's scripts actually need -----------------------
+  - git
+  - python3
+  - python3-yaml          # autoinstall config validation
+  - shellcheck            # lint the .sh scripts
+  - gnupg                 # closes the deferred ISO signature check from step 00
+  - whois                 # provides mkpasswd for the password hash
+  - dosfstools            # mkfs.vfat for CIDATA seed sticks
+  - rsync
+  - curl
+  - wget
+  - jq
+  - vim
+  - tmux
+  - tree
+
+  # --- staging and media --------------------------------------------------------------------
+  - qemu-utils            # qemu-img, for cloud image conversion
+  - nginx                 # serve and test the mirror locally before it crosses the gap
+  - unzip
+
+  # --- diagnostics --------------------------------------------------------------------------
+  - pciutils
+  - nvme-cli
+  - dmidecode
+  - net-tools
+
+# NOT installed here, deliberately:
+#   apt-mirror, contracts-airgapped, get-resource-tokens - these come from
+#   ppa:yellow/ua-airgapped and need the PAID Pro token attached first. See
+#   airgap-update-lab.md section 5. Adding the PPA before the token exists just fails.
+#
+#   Any desktop environment - STAGE-01 is headless. VS Code connects with Remote-SSH,
+#   which runs its server component on this machine and renders on Windows.
+
+write_files:
+  - path: /etc/enclave-build-info
+    permissions: '0644'
+    content: |
+      build_config=airgapped-setup-machine/stage-01-userdata.yaml
+      role=STAGE-01 online mirror builder + development workstation
+      inside_airgap=no
+      hardened=no
+      pro_attached=no
+      encrypted=no
+
+  # Mirror tree, ready for apt-mirror once the Pro token lands.
+  - path: /srv/apt-mirror/.keep
+    content: ''
+
+runcmd:
+  - [ mkdir, -p, /srv/apt-mirror/keys ]
+  - [ chown, -R, 'encadmin:encadmin', /srv/apt-mirror ]
+  # Prove the disk actually grew - the most common cloud-image surprise.
+  - [ sh, -c, 'df -h / > /var/log/stage-01-rootfs.log' ]
+
+final_message: |
+  STAGE-01 is up after $UPTIME seconds.
+
+  Next:
+    1. ssh encadmin@<address>
+    2. df -h /            confirm the root filesystem filled the 1 TB disk
+    3. git clone <this repo>
+    4. Attach the PAID Ubuntu Pro token, then follow airgap-update-lab.md section 5

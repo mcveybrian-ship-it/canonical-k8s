@@ -1,0 +1,74 @@
+#!/bin/sh
+#
+# pre-push - refuse to push client-private engagement material to a public remote.
+#
+# origin is public: github.com/mcveybrian-ship-it/canonical-k8s
+#
+# Two things this stops:
+#   1. Pushing the local "prehistory" branch, whose trees contain all six private files.
+#   2. Pushing ANY ref where a commit being sent carries one of those paths - which covers
+#      cases nobody thought of, including a future branch cut from prehistory.
+#
+# Enable it (per clone - git does not track .git/hooks):
+#   git config core.hooksPath .githooks
+#
+# Override for a genuine false positive, deliberately awkward to type:
+#   ALLOW_PRIVATE_PUSH=i-have-checked git push ...
+#
+set -u
+
+# File entries are anchored with $; directory entries are deliberately left as prefixes.
+# Without the $ this matches host-params.env.example, which is tracked and public.
+PRIVATE_RE='^(HANDOFF\.md$|docs/open-questions\.md$|docs/runbook\.md$|artifact/|archive/|scripts/install/02-host-autoinstall/host-params\.env$)'
+PROTECTED_BRANCH='refs/heads/prehistory'
+
+ZERO='0000000000000000000000000000000000000000'
+fail=0
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+
+    # Deleting a remote ref sends a zero local sha - nothing to inspect.
+    [ "$local_sha" = "$ZERO" ] && continue
+
+    if [ "$local_ref" = "$PROTECTED_BRANCH" ]; then
+        echo "pre-push: REFUSING to push $local_ref" >&2
+        echo "  It holds the pre-squash history, whose trees contain the client-private" >&2
+        echo "  engagement record. origin is public. Keep it local; the durable copy is" >&2
+        echo "  the .bundle outside the repo." >&2
+        fail=1
+        continue
+    fi
+
+    # Which commits are actually being sent?
+    if [ "$remote_sha" = "$ZERO" ]; then
+        # New ref on the remote: everything reachable that the remote does not have.
+        range=$(git rev-list "$local_sha" --not --remotes 2>/dev/null)
+    else
+        range=$(git rev-list "$remote_sha..$local_sha" 2>/dev/null)
+    fi
+
+    for commit in $range; do
+        hits=$(git ls-tree -r --name-only "$commit" | grep -E "$PRIVATE_RE" || true)
+        if [ -n "$hits" ]; then
+            echo "pre-push: REFUSING to push $local_ref" >&2
+            echo "  commit $(git log -1 --format='%h %s' "$commit")" >&2
+            echo "  carries client-private paths:" >&2
+            echo "$hits" | sed 's/^/    /' >&2
+            fail=1
+            break
+        fi
+    done
+done
+
+if [ "$fail" -ne 0 ]; then
+    if [ "${ALLOW_PRIVATE_PUSH:-}" = "i-have-checked" ]; then
+        echo "pre-push: ALLOW_PRIVATE_PUSH set - proceeding anyway." >&2
+        exit 0
+    fi
+    echo >&2
+    echo "  Nothing was pushed. If this is genuinely a false positive:" >&2
+    echo "    ALLOW_PRIVATE_PUSH=i-have-checked git push ..." >&2
+    exit 1
+fi
+
+exit 0

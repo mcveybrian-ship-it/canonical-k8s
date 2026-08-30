@@ -36,6 +36,55 @@ nodes cannot self-heal. Keep that posture.
 not. When a question gets answered, move the finding into `HANDOFF.md` §3 with its source
 and close the row — do not leave a copy behind in both files.
 
+## How to work here
+
+Corrections earned the hard way across the 2026-08-27/30 sessions. All of them were given
+after getting it wrong first. Read them as constraints, not suggestions.
+
+**Do not add files — fix the ones that exist.** A second document for step 01 produced two
+`01-*.md` and two `02-*.md`. His words: *"are we just adding files"*. One document per step,
+updated in place. A new file only when there is genuinely a new step or a new mechanism.
+
+**Never give a single-platform answer.** He works from Windows/PowerShell and builds Ubuntu.
+Either cover both, or state plainly why only one applies — `01-*.sh` runs on the Ubuntu
+target, so bash-only is correct there and saying so is the answer. Audit the scripts rather
+than trusting memory about which exist.
+
+**Nothing hardcoded when it could be a parameter.** *"I hate things hard coded when there
+are options."* Disk serials, addresses, LV sizes, usernames, NIC names all belong in
+`host-params.env`.
+
+**Stop narrating.** Full analyses after every step drown the work: *"You went down a god
+damn rabbit hole."* Give the next command and a one-line reason. Save the analysis for when
+something is actually broken.
+
+**Verify on his machine, do not assert.** Several "this works" claims were wrong until
+actually run against his hardware. He calls it out fast: *"half ass paragraph does not tell
+me shit."* Run it, paste the real output, and say plainly which parts you could not verify.
+
+**Why this matters:** he is a consultant producing an auditable build procedure. A wrong doc
+or a command that only works on one OS costs a trip to the rack, and the deliverable is
+supposed to be repeatable by someone else.
+
+## Two machines, and what git will not carry
+
+**STAGE-01 (`10.0.20.160`) owns this repo as of 2026-08-30.** The Windows working copy is a
+backup and the seed-stick writer. Work on STAGE-01 over VS Code Remote-SSH.
+
+**Five paths are gitignored and git cannot sync them** — `HANDOFF.md`,
+`docs/open-questions.md`, `docs/runbook.md`, `artifact/`, `archive/`. Two copies diverge
+silently. Move them with `scripts/private-sync.sh pack|unpack`, never git, and re-pack
+whenever one changes on the authoritative machine.
+
+**`origin` is public.** Enable the guard in every clone — git does not track `.git/hooks`:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+That refuses any push carrying the private paths, including the local `prehistory` branch
+under any name. See the top of `docs/open-questions.md`.
+
 ## Scripts
 
 Build scripts live in `scripts/install/`, numbered to match the steps in `START-HERE.md`.

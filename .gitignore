@@ -54,6 +54,19 @@ airgapped-setup-machine/stage-01-userdata-*.yaml
 # Generated docs - regenerate from the markdown, do not track
 *.pdf
 
+# Backup and transfer archives. These contain the client-private material below, and may
+# contain the filled-in host-params.env with its password hash and SSH keys. Never commit
+# one. Do not treat one stored inside this directory as a backup either - keep it off the
+# repo tree. Ignored here as a backstop for when it lands inside anyway.
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.bundle
+
+# Backups written by private-sync.sh unpack
+*.bak-*
+
 # =============================================================================================
 # CLIENT-PRIVATE ENGAGEMENT MATERIAL - local only, never pushed to origin.
 #

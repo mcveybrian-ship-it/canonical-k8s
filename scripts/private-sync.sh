@@ -186,6 +186,20 @@ case "$MODE" in
 
     tar -xzf "$IN" -C "$ROOT"
     echo "extracted into $ROOT"
+
+    # tar preserves the modes from wherever this was packed. Packed on Windows that means
+    # 644 - world-readable client-private material. Tighten to owner-only on the way in.
+    echo "tightening permissions to owner-only:"
+    for p in $PRIVATE_PATHS; do
+      [ -e "$p" ] || continue
+      if [ -d "$p" ]; then
+        chmod -R go-rwx "$p"
+        find "$p" -type d -exec chmod u+rwx {} +
+      else
+        chmod 600 "$p"
+      fi
+      note "$(ls -ld "$p" | awk '{print $1, $3, $9}')"
+    done
     echo
 
     # The whole reason this script exists: prove the restored files are still ignored,

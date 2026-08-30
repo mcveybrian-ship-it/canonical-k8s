@@ -1,18 +1,21 @@
 # STAGE-01 — build plan
 
-**Status as of 2026-08-30: VM BUILT, NOT FINISHED.**
+**Status as of 2026-08-30: BUILT AND USABLE. Everything not gated on Q9 is done.**
 
 | | |
 |---|---|
-| VM provisioned | **Done** 2026-08-29 — `10.0.20.160`, reachable, sshd accepting `publickey,password` |
-| Dev toolchain (§4.4) | **Not verified** — run the audit in §6 |
-| This repo cloned on it | **No** |
-| VS Code Remote-SSH | **Not set up** |
-| SSH key auth from Windows | **BROKEN** — see §4.5 |
-| Pro token / mirror (§6 steps 7-9) | **Blocked on Q9** |
+| VM provisioned | **Done** 2026-08-29 — `10.0.20.160`, 8 vCPU / 16 GB, 989 G free |
+| SSH key auth from Windows | **Done** 2026-08-30 — was broken, see §4.5 |
+| Dev toolchain (§4.4) | **Done** — all ten present |
+| Mirror + Stage-B tooling | **Done** — `nginx`, `snapd`, `qemu-utils`, `apt-mirror`, `regctl`, `regsync`, `store-admin` |
+| This repo cloned on it | **Done** 2026-08-30 |
+| Client-private material | **Done** — transferred with `scripts/private-sync.sh`, verified gitignored |
+| **Repo ownership** | **STAGE-01 is authoritative from 2026-08-30.** See §7 decision 7 |
+| Retire the Windows-only scripts and doc blocks | **Not started** — §6 step 6 |
+| Pro token, mirror run, nginx proof | **Blocked on Q9** — §6 steps 7-9 |
 
-The build sequence and what remains is §6. Do not trust any "nothing has been built" reading -
-§9 records four gotchas found while building it, and the machine answers on the network.
+§6 carries per-step status and the audit command that produced this table. §8 records the four
+gotchas found building it - do not re-derive them.
 
 STAGE-01 is the online staging machine from
 [`airgap-update-lab.md`](airgap-update-lab.md). This plan gives it a second job:
@@ -178,7 +181,26 @@ git  python3  python3-yaml  shellcheck  gnupg  whois  dosfstools  rsync  curl  j
 snapd  store-admin(snap)  regclient (regctl/regsync)  qemu-utils
 ```
 
-**Not installed:** any desktop environment. See §3.
+`store-admin` and `regclient` are not `apt` packages. Both installed 2026-08-30; commands
+verified against the vendor docs cited in §9 that day, not from memory:
+
+```bash
+# Enterprise Store admin tooling - Canonical snap
+sudo snap install store-admin
+
+# regclient - static binaries. Do NOT use the "go install" line in runbook 4.3:
+# it needs a Go toolchain, which is deliberately not on this machine.
+sudo curl -L -o /usr/local/bin/regctl  https://github.com/regclient/regclient/releases/latest/download/regctl-linux-amd64
+sudo curl -L -o /usr/local/bin/regsync https://github.com/regclient/regclient/releases/latest/download/regsync-linux-amd64
+sudo chmod 755 /usr/local/bin/regctl /usr/local/bin/regsync
+```
+
+**Naming:** the product formerly called *Snap Store Proxy* is now the **Enterprise Store**.
+The snap is still `store-admin`. `runbook.md` §4.4 uses the current name;
+`airgap-update-lab.md` still says Snap Store Proxy in one place and needs updating.
+
+**Not installed:** any desktop environment. See §3. No Go toolchain either - the two binaries
+above are fetched, not built.
 
 ### 4.5 Credentials and access
 
@@ -220,10 +242,10 @@ same guards as the enclave seed builder, for the same reason.
 2. ~~Clone `schtritoff/hyperv-vm-provisioning` on the host~~ — **done**
 3. ~~Write a `userdata.yaml` for STAGE-01~~ — **done**, own user and keys, no default `admin`/`Passw0rd`
 4. ~~Provision the VM~~ — **done 2026-08-29.** `10.0.20.160`, single 1 TB VHDX, 989 G free
-5. **Install the dev toolchain (§4.4), clone this repo, verify the scripts run** — **mostly done
-   2026-08-30.** All ten dev packages present; `nginx`, `snapd`, `qemu-utils`, `apt-mirror`
-   installed; repo cloned; private material restored via `scripts/private-sync.sh`.
-   **Remaining: `regctl` and `store-admin`.**
+5. ~~Install the dev toolchain (§4.4), clone this repo, verify the scripts run~~ — **done
+   2026-08-30.** All ten dev packages; `nginx`, `snapd`, `qemu-utils`, `apt-mirror`, `regctl`,
+   `regsync`, `store-admin`; repo cloned; private material restored via
+   `scripts/private-sync.sh`
 6. **Switch development to STAGE-01** — **DECIDED 2026-08-30, in progress.** See §7 decision 7.
    Retire `00-fetch-verify-media.ps1` and the Windows-only blocks in the step docs;
    `02-build-seed.ps1` stays (§7 decision 4)

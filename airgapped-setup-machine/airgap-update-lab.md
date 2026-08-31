@@ -42,6 +42,12 @@ personal-tier tokens for the rest.
 
 STAGE-01 can be any laptop/VM: internet access, ~250 GB disk, Ubuntu 24.04.
 
+> **Naming, reconciled 2026-08-31.** `MIRROR-01` is this lab runbook's generic name for the
+> in-gap repository server. In the enclave design it is **`svc-repo-01`**, a VM on host-4 —
+> see `docs/runbook.md` §1.1. Same role, two names; the runbook's is authoritative for the
+> build, this one for the four-machine lab pattern.
+
+
 ## 3. Architecture
 
 ```

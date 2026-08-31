@@ -6,16 +6,39 @@
 *how* things were built and why; they have gone stale more than once. If they disagree with
 this section, this section wins and the other one gets fixed.
 
-Last updated **2026-08-31 02:45**.
+Last updated **2026-08-31 17:45**.
 
-**Two items left. Everything else on this machine is done.**
+**STAGE-01's work is DONE. The bundle is staged and waiting on hardware.**
 
 | # | What | State |
 |---|---|---|
-| 1 | **nginx vhost + prove the mirror resolves** | **DONE 2026-08-31.** All 9 suites, all 5 archives, `apt-get update` GPG-verified exit 0, one marker package pulled from each archive. `airgap-update-lab.md` §6.5 |
-| 2 | **Generate `airgapped-contracts.yaml`** | **NOT STARTED — now the blocker.** `pro-airgapped` must emit it with `aptURL`s rewritten to MIRROR-01. Without it the enclave can pull packages but has nothing to `pro attach` against |
-| 3 | **Build the three transfer scripts** | **PLANNED, not written.** `docs/airgap-media.md` §6. ext4 chosen; `build-01` being built 2026-08-31 |
-| 4 | **Decision 6 — writing physical media from a VM** | **RESOLVED IN PRINCIPLE 2026-08-31.** STAGE-01 never writes media; it produces a bundle and a physical box writes the SSD. Seed sticks stay a Windows job (§7 decision 4). Full plan in `docs/airgap-media.md` §6 |
+| 1 | nginx vhost + prove the mirror resolves | **DONE.** All 9 suites, all 5 archives, `apt-get update` GPG-verified exit 0, a marker package pulled from each archive. `airgap-update-lab.md` §6.5 |
+| 2 | Generate `airgapped-contracts.yaml` | **DONE.** `pro-airgapped` run on `stage-01`; **4 of 4 `aptURL`s rewritten** to `svc-repo-01`. Lives at `/srv/apt-mirror/airgapped-contracts.yaml`, `640 root:encadmin` — it is a credential |
+| 3 | The three transfer scripts | **DONE.** `scripts/transfer/`, all lint-clean, parameterised into `transfer-params.env` |
+| 4 | **`build-transfer-bundle.sh` executed** | **DONE.** 15 items, **3.5 GB** of extras, manifest verified. With the 316 GB mirror that is **320 GB for the SSD** |
+| 5 | Decision 6 — writing physical media from a VM | **RESOLVED.** STAGE-01 never writes media; `build-01` does. Seed sticks stay a Windows job (§7 decision 4) |
+| — | **Write the SSD** | **BLOCKED ON HARDWARE — SSD arrives Tue 2026-09-01.** Run `write-transfer-media.sh` on `build-01` |
+
+**What is staged, in `/srv/bundle-staging`:**
+
+| | |
+|---|---|
+| `config/airgapped-contracts.yaml` | `0600`, 4 rewritten `aptURL`s |
+| `config/nginx-apt-mirror.conf` | the proven vhost |
+| `debs/` | `contracts-airgapped`, `pro-airgapped`, `get-resource-tokens` — the three the mirror can never serve |
+| `keys/` | `ubuntu-pro-{cis,esm-apps,esm-infra,fips}.gpg` |
+| `media/` | the server ISO, the Minimal cloud image, `SHA256SUMS` + `.gpg` |
+| `scripts/` | `restore-mirror.sh` + its params, so `svc-repo-01` needs nothing it cannot read off the disk |
+
+**Machine roster**, because there are now five names in play:
+
+| Machine | Address | Side | Role |
+|---|---|---|---|
+| `stage-01` | `10.0.20.160` | online | Hyper-V VM. Pro token, the mirror, the repo |
+| `build-01` | `10.0.20.124` | online | Physical. Writes the transfer SSD |
+| Hyper-V host (R7515) | — | online | Windows Server 2022. Runs `stage-01`; seed-stick writer |
+| `host-1..4` | — | **air-gapped** | Not built |
+| `svc-repo-01` | — | **air-gapped** | A VM on `host-4`. Where `restore-mirror.sh` runs |
 
 **THE MIRROR IS COMPLETE — 2026-08-31 02:25. 317 GB, 90,681 packages.**
 

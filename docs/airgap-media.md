@@ -175,10 +175,94 @@ anything else you hand-copy.
 Last item is the one that ends trips: a wrong SSH key or an unfilled `REPLACE-ME` means
 another media cycle.
 
-## 6. Not yet answered
+## 6. Stage B — moving the 320 GB mirror (planned 2026-08-31, not yet built)
 
-- **Stage B size and cadence** — open question 6. Decides whether the platform bundle fits on a
-  thumb drive, needs an SSD, and how often the transfer procedure runs.
+**Decision 6 is resolved in principle: STAGE-01 never writes physical media.** It is a Hyper-V
+guest and Hyper-V has no casual USB passthrough. Instead it *produces a bundle*; a separate
+physical machine writes the disk. That also splits the problem in two, which is the part that
+makes it tractable — the two media have nothing in common:
+
+| | Mirror SSD | Seed sticks |
+|---|---|---|
+| Size | **320 GB** (measured 2026-08-31) | ~120 MB each |
+| Filesystem | ext4 (see below) | FAT32 / vfat, volume label `CIDATA` |
+| Written by | a physical Ubuntu box | Windows `02-build-seed.ps1` on the Hyper-V host |
+| Cadence | first trip, then deltas | once per host build |
+
+Seed sticks are unchanged and stay a Windows job — that is §7 decision 4 in
+`airgapped-setup-machine/README.md`, and nothing here alters it.
+
+### The path
+
+```
+   ONLINE SIDE                    ║ GAP ║        INSIDE THE ENCLAVE
+
+ [ STAGE-01, VM ]  --(1)-->  [ BUILD-BOX, physical Ubuntu, SSD attached ]
+   320 GB mirror              rsync over SSH, ~60-90 min first trip
+                                        |
+                                       (2) write-transfer-media.sh
+                                        v
+                                 [ 500 GB SSD ] ═════╬═════╬══>  [ MIRROR-01 ]
+                                   carried by hand    ║     ║     nginx :80
+                                                      ║     ║     contracts :8484
+                                                                    (3) restore-mirror.sh
+```
+
+| Step | Runs on | Does | Time |
+|---|---|---|---|
+| 1 | STAGE-01 | `build-transfer-bundle.sh` — gather mirror + 4 keyrings + 3 `.deb`s + ISOs + `airgapped-contracts.yaml` + MIRROR-01 configs into one staging tree; manifest the non-repo items | minutes |
+| 2 | BUILD-BOX | `write-transfer-media.sh` — rsync that tree onto the SSD, verify | **60–90 min first trip**, minutes after |
+| 3 | MIRROR-01 | `restore-mirror.sh` — rsync in, install the 3 `.deb`s, place the 4 keyrings, drop the nginx vhost, start the contracts server, run the three-level proof from `airgap-update-lab.md` §6.5 | ~20 min |
+
+Step 3 is the one that matters: it turns files on a disk into a working enclave service, and it
+is the part nobody can improvise at the rack.
+
+### Decisions baked in, so they are not re-argued
+
+- **rsync, never tar.** Later trips carry only the delta because rsync compares against what is
+  already on the drive. Tarring 320 GB of already-compressed `.deb`s costs hours and buys
+  nothing.
+- **No 90,000-file checksum manifest.** An apt repository is already a signed hash chain —
+  GPG-signed `Release` → hashes of `Packages` → hashes of every `.deb`. **`apt-get update` on
+  MIRROR-01 *is* the integrity check.** Manifest only what the repo does not cover: the
+  keyrings, the three `.deb`s, the ISOs and the scripts — which are the supply-chain-sensitive
+  items anyway.
+- **Windows stays out of the mirror path.** Routing it through Windows means two copies and
+  640 GB of I/O for no gain.
+- **The bottleneck is the vNIC, not the disk.** STAGE-01 has a 1000 Mb/s link: 320 GB is ~43
+  min at line rate, realistically 60–90 with **90,893 files across 38,128 directories** —
+  per-file overhead dominates.
+
+### Filesystem — ext4 recommended, NTFS viable
+
+Measured on the real tree, 2026-08-31, because the usual objections turned out not to apply:
+
+| Concern | Measured | Verdict |
+|---|---|---|
+| Case-insensitive collisions | **0 true collisions** | Not a blocker |
+| Path length vs NTFS 260 | longest **207** chars, 1 file over 200 | Fits, tight |
+| Largest file vs FAT32 4 GB | **2.76 GB** (`qgis-api-doc`) | Fits, but avoid FAT32 |
+| Symlinks | **0** | Not a blocker |
+
+**ext4** is still the recommendation — faster across 38,128 directories and it preserves
+ownership. NTFS costs only a `chown -R` on arrival; choose it only if the drive must be
+readable from Windows.
+
+> **An earlier draft of this section claimed 76 case collisions. That was wrong** — the test
+> compared basenames across *different* directories, so it was really just packages appearing
+> in both the archive and an ESM pool. The correct test is per-directory and returns zero.
+
+### Blocker before any of this runs
+
+**`airgapped-contracts.yaml` does not exist yet.** `pro-airgapped` must consume the resource
+tokens and emit it with every `aptURL` rewritten to MIRROR-01. Without it the enclave has a
+repository it can pull from and **nothing to `pro attach` against** — the ESM and FIPS packages
+sit on the disk unusable. It has to be in the bundle, so it comes before step 1.
+
+## 7. Not yet answered
+
+- **Stage B size and cadence** — open question 6. The apt half is now measured at 320 GB; what
+  is still unknown is the container-image and snap half.
 - **Whether one stick can carry both ISO and `cidata`.** Would halve the drive count. Test it on
   the pathfinder if you want it; do not assume it.
 - **Diagnostic toolset contents** — still undecided, and it must be fixed before the Stage A

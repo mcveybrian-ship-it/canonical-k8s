@@ -379,6 +379,96 @@ cp /usr/share/keyrings/ubuntu-pro-esm-apps.gpg   /srv/apt-mirror/keys/
 pro-airgapped < tokens.yaml > airgapped-contracts.yaml
 ```
 
+### 6.5 Serve it and prove it — done on STAGE-01 2026-08-31
+
+**Prove the mirror before media crosses.** Until a client resolves a package through nginx,
+all that is known is that files are on disk — not that the tree is served in a layout `apt`
+can consume. A layout error found inside the gap costs a media round trip.
+
+The vhost roots the mirror tree itself, so served paths mirror the upstream hostnames and the
+client `sources` written for MIRROR-01 are near-identical to the real ones. Keys and the
+carried `.deb`s sit outside that tree and get explicit aliases. Full config lives in
+`/etc/nginx/sites-available/apt-mirror`; the shape is:
+
+```nginx
+server {
+    listen 80 default_server;
+    root /srv/apt-mirror/mirror;
+    autoindex on;
+
+    # ^~ IS REQUIRED ON BOTH. See the trap below.
+    location ^~ /keys/ { alias /srv/apt-mirror/keys/; autoindex on; }
+    location ^~ /debs/ { alias /srv/apt-mirror/debs/; autoindex on;
+                         default_type application/vnd.debian.binary-package; }
+
+    location ~* \.(deb|udeb|ddeb|tar\.(gz|xz|zst))$ {
+        default_type application/vnd.debian.binary-package;
+    }
+    location / { try_files $uri $uri/ =404; }
+}
+```
+
+Remove `sites-enabled/default` — it is also `default_server` on :80 and nginx will not start
+with two.
+
+> **nginx trap: regex locations are matched BEFORE prefix locations.** Written as
+> `location /debs/`, the `\.deb$` regex block captures `/debs/*.deb` and resolves it against
+> the *server root* instead of the alias. The symptom is precise and misleading: `/debs/`
+> returns **200** (the directory index matches the prefix location) while every `.deb` inside
+> it returns **404**. `^~` tells nginx not to consider regex locations for that prefix.
+> This silently hid exactly the three packages MIRROR-01 cannot obtain any other way.
+
+**No auth on this vhost, and that is correct.** Inside the gap, entitlement is enforced by the
+contracts server on `:8484`, not by the repo. The bearer tokens never leave STAGE-01's
+`mirror.list`.
+
+#### The proof — run it, do not assume it
+
+Metadata resolving is not proof; that is the same trap as §6.3. Verify at three levels:
+
+1. **`Release` for all nine suites** → 200.
+2. **A real `pool/` file from each of the five archives**, taken from that archive's own
+   `Packages` index → 200 with a non-zero size.
+3. **A genuine `apt` resolution with GPG verification on.** Point apt at `localhost` using
+   overridden `Dir::` paths so STAGE-01's own configuration is never touched:
+
+```bash
+T=/tmp/aptproof; rm -rf $T
+mkdir -p $T/{lists/partial,cache/archives/partial,etc/preferences.d,etc/apt.conf.d}
+# one "deb [arch=amd64 signed-by=<keyring>] http://localhost/<archive> <suite> <components>"
+# line per source; keyrings are /usr/share/keyrings/ubuntu-archive-keyring.gpg for the
+# archive and /srv/apt-mirror/keys/*.gpg for infra / apps / fips / cis.
+O="-o Dir::Etc::sourcelist=$T/etc/sources.list -o Dir::Etc::sourceparts=/dev/null \
+   -o Dir::State::lists=$T/lists -o Dir::Cache=$T/cache \
+   -o Dir::Etc::preferencesparts=$T/etc/preferences.d -o Dir::Etc::parts=$T/etc/apt.conf.d \
+   -o Acquire::Languages=none"
+apt-get $O update
+apt-cache $O policy usg openssl-fips-module-3        # confirm the source URL per package
+cd $T && apt-get $O download accountsservice iperf3 7zip openssl-fips-module-3 usg
+dpkg-deb -I $T/usg_*.deb                             # a real, intact package
+```
+
+**Result 2026-08-31 — all nine sources fetched, GPG verified, exit 0.** One marker package
+pulled from every archive, each resolving to the expected source:
+
+| Package | Version | Resolved from |
+|---|---|---|
+| `accountsservice` | 23.13.9-2ubuntu6.1 | `archive.ubuntu.com/ubuntu` |
+| `iperf3` | 3.16-1ubuntu0.1~esm1 | `esm.ubuntu.com/infra/ubuntu` |
+| `7zip` | 23.01+dfsg-11ubuntu0.1~esm1 | `esm.ubuntu.com/apps/ubuntu` |
+| `openssl-fips-module-3` | 3.0.13-0ubuntu3.15+Fips1 | `esm.ubuntu.com/fips-updates/ubuntu` |
+| `usg` | 24.04.8 | `esm.ubuntu.com/usg/ubuntu` |
+
+That the ESM/FIPS/USG `Release` signatures verify against the four carried keyrings is the
+other half of the proof — it confirms `/srv/apt-mirror/keys/` holds the right keys before
+they cross.
+
+**One thing the proof does not cover:** the mirrored `Release` files advertise
+`main restricted universe multiverse` and seven architectures, because they are Canonical's
+files copied verbatim, while only amd64 `main`+`universe` is held. A client asking for
+`restricted` resolves the index and then 404s on packages. **Client `sources` must match what
+is actually held**, not what `Release` claims.
+
 ## 7. Carry it across
 
 1. `rsync -a /srv/apt-mirror/ /media/usb/apt-mirror/` — first trip needs a disk

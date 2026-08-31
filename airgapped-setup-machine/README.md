@@ -6,13 +6,16 @@
 *how* things were built and why; they have gone stale more than once. If they disagree with
 this section, this section wins and the other one gets fixed.
 
-Last updated **2026-08-31 02:30**.
+Last updated **2026-08-31 02:45**.
+
+**Two items left. Everything else on this machine is done.**
 
 | # | What | State |
 |---|---|---|
-| 1 | `apt download` the three air-gap `.deb`s for MIRROR-01 | **NOT DONE.** `/srv/apt-mirror/debs/` exists but is empty. **Next — see §0.3** |
-| 2 | nginx vhost + prove the mirror with a client | **NOT STARTED.** §6 step 9. nginx runs but has only the stock default site |
-| 3 | Decision 6 — how seed sticks get written now dev lives on a VM | **OPEN.** §7. Doesn't block today; bites at step 02 |
+| 1 | **nginx vhost + prove the mirror resolves** | **DONE 2026-08-31.** All 9 suites, all 5 archives, `apt-get update` GPG-verified exit 0, one marker package pulled from each archive. `airgap-update-lab.md` §6.5 |
+| 2 | **Generate `airgapped-contracts.yaml`** | **NOT STARTED — now the blocker.** `pro-airgapped` must emit it with `aptURL`s rewritten to MIRROR-01. Without it the enclave can pull packages but has nothing to `pro attach` against |
+| 3 | **Build the three transfer scripts** | **PLANNED, not written.** `docs/airgap-media.md` §6. Awaiting two answers: ext4 vs NTFS, and whether a physical BUILD-BOX exists |
+| 4 | **Decision 6 — writing physical media from a VM** | **RESOLVED IN PRINCIPLE 2026-08-31.** STAGE-01 never writes media; it produces a bundle and a physical box writes the SSD. Seed sticks stay a Windows job (§7 decision 4). Full plan in `docs/airgap-media.md` §6 |
 
 **THE MIRROR IS COMPLETE — 2026-08-31 02:25. 317 GB, 90,681 packages.**
 
@@ -540,9 +543,14 @@ printf '\n=== keys that can log in ===\n'; ssh-keygen -lf ~/.ssh/authorized_keys
 
 **Still open:**
 
-6. **How does media get written once development moves to STAGE-01?** Options: keep the
-   PowerShell seed writer on the Hyper-V host (recommended), Hyper-V physical-disk passthrough
-   (works, tedious, untested), or a small physical Ubuntu box for media only.
+6. ~~**How does media get written once development moves to STAGE-01?**~~ **RESOLVED IN
+   PRINCIPLE 2026-08-31.** Neither of the two awkward options was needed. **STAGE-01 never
+   writes physical media** — it produces a transfer bundle, and a separate physical box writes
+   the disk. That removes the Hyper-V USB-passthrough problem entirely instead of working
+   around it, and it splits the question into two unrelated ones: a 320 GB ext4 SSD for the
+   mirror (written from Ubuntu) and ~120 MB FAT32 seed sticks (still Windows, per decision 4).
+   Full plan, measured numbers and the three scripts: `docs/airgap-media.md` §6.
+   **Still to answer:** ext4 vs NTFS on the SSD, and whether a physical BUILD-BOX exists.
 
 **Answered 2026-08-30:**
 

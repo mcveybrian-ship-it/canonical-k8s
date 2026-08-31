@@ -82,6 +82,7 @@ the Pro pockets.
 | esm.ubuntu.com/apps   | noble-apps-security, noble-apps-updates     | Pro token   | Security fixes for ~36k Universe packages — the "full Pro" content. |
 | **esm.ubuntu.com/fips-updates** | **noble-updates** (component `main`) | Pro token | **FIPS crypto packages. Added 2026-08-30 — it was missing, and without it the enclave cannot enable FIPS at all.** |
 | **esm.ubuntu.com/usg** | **noble** (component `main`) | Pro token | **USG — the DISA-STIG / CIS tooling. Added 2026-08-31.** Its own archive, `Origin: UbuntuCIS`, key `ubuntu-pro-cis.gpg`. Not part of ESM |
+| **ppa.launchpadcontent.net/maas/3.7** | **noble** (component `main`) | none (public PPA) | **MAAS as debs, added 2026-08-31.** The snap declares `base: core24`, which has no FIPS stable channel, so a snap-installed MAAS runs non-FIPS crypto on a FIPS host. 53 packages; `maas 1:3.7.3-18030-g.9122eee68-0ubuntu1~24.04.1`, the same version as the snap |
 
 > **`usg` is an alias of the `cis` entitlement, and that is why it is easy to miss.** In the
 > Pro client it is `CISEntitlement` — `name = "cis"`, `origin = "UbuntuCIS"`,
@@ -244,20 +245,30 @@ clean http://archive.ubuntu.com/ubuntu
 > archive lines above already carry. All nine components, the same version as the squid snap,
 > zero extra transfer. See `docs/runbook.md` §2.5.
 
-> **Carry the PPA's signing key too.** A PPA is signed by its own key, not Canonical's archive
-> key, so the enclave cannot verify this repository without it:
+> **Carry the PPA's signing key too — VERIFIED 2026-08-31.** A PPA is signed by its own key,
+> not Canonical's archive key, so the enclave cannot verify this repository without it.
+>
+> **Fingerprint: `3AB6DCF1F234E78DAA9C104204E7FDC5684D4A1C`** — "Launchpad PPA for MAAS".
+>
+> That was established three ways, not looked up: Launchpad's own API reports it as the
+> archive's `signing_key_fingerprint`, the PPA's `InRelease` is signed by that exact key, and
+> the fetched key produces `Good signature` against it.
 >
 > ```bash
 > ### MACHINE: stage-01 ###
-> sudo apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 684D4A47A61B7DBA 2>/dev/null || true
-> # Preferred on 24.04 - export to a keyring file that travels in the bundle:
-> gpg --keyserver keyserver.ubuntu.com --recv-keys 684D4A47A61B7DBA
-> gpg --export 684D4A47A61B7DBA | sudo tee /srv/apt-mirror/keys/maas-ppa.gpg >/dev/null
+> K=3AB6DCF1F234E78DAA9C104204E7FDC5684D4A1C
+> # Confirm Launchpad still names this fingerprint before trusting it:
+> curl -sL 'https://api.launchpad.net/devel/~maas/+archive/ubuntu/3.7' \
+>   | python3 -c 'import json,sys; print(json.load(sys.stdin)["signing_key_fingerprint"])'
+> # Fetch over HTTPS and convert to a keyring the bundle can carry:
+> curl -sL "https://keyserver.ubuntu.com/pks/lookup?op=get&options=mr&search=0x$K" \
+>   | gpg --dearmor | sudo tee /srv/apt-mirror/keys/maas-ppa.gpg >/dev/null
 > ```
 >
-> **[VERIFY] that key ID against Launchpad before trusting it** — the fingerprint shown on
-> <https://launchpad.net/~maas/+archive/ubuntu/3.7> is authoritative, not this file. Importing
-> whatever a keyserver returns for an ID proves nothing, which is the same trap recorded for the
+> **An earlier draft of this section printed the wrong key ID** (`684D4A47A61B7DBA`), taken
+> from a page rather than from the signature. It was marked `[VERIFY]`, and the check caught
+> it. Never import whatever a keyserver returns for a short ID — resolve the full fingerprint
+> from the archive's own signature and from Launchpad, then compare. Same trap recorded for the
 > cloud-image key in `docs/00-downloads.md`.
 
 ### What else has to cross that `apt-mirror` will never fetch

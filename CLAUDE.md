@@ -54,6 +54,19 @@ than trusting memory about which exist.
 are options."* Disk serials, addresses, LV sizes, usernames, NIC names all belong in
 `host-params.env`.
 
+**Every command block names the machine it runs on. No exceptions.** There are now six
+machines in play — `stage-01`, `build-01`, the Hyper-V host, `host-1..4`, and the in-gap VMs
+including `svc-repo-01`. A command without a machine is a command that gets run on the wrong
+one. Label it on the line above the block:
+
+```bash
+### MACHINE: stage-01 ###
+./scripts/private-sync.sh backup
+```
+
+This applies to quoted vendor documentation too — Canonical's docs do not know which of your
+boxes they are talking about. The roster lives in `airgapped-setup-machine/README.md` §0.
+
 **Stop narrating.** Full analyses after every step drown the work: *"You went down a god
 damn rabbit hole."* Give the next command and a one-line reason. Save the analysis for when
 something is actually broken.

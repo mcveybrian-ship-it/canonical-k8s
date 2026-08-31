@@ -104,17 +104,28 @@ fi
 if [ "$DRY" -eq 1 ]; then
   note "DRY RUN - nothing will be written"
 else
-  mkdir -p "$STAGING_DIR"/{keys,debs,media,config,scripts}
+  mkdir -p "$STAGING_DIR"/{keys,debs,media,config,scripts,snaps}
 fi
 
+# Counts what ARRIVED, not what was found in the source. The earlier version reported
+# the source count and swallowed every cp failure inside -exec, so on 2026-08-31 it
+# printed "snaps: 6 file(s)" while all twelve copies failed against a directory that did
+# not exist. A bundle script that reports success on a failed copy is worse than no
+# script: the failure surfaces inside the gap.
 copy_in() {  # copy_in <label> <src dir> <dest subdir> <glob>
-  local label="$1" src="$2" dest="$3" glob="$4" n=0
+  local label="$1" src="$2" dest="$3" glob="$4" want=0 got=0
   if [ ! -d "$src" ]; then note "SKIP $label - no $src"; return 0; fi
-  # shellcheck disable=SC2086
-  n=$(find "$src" -maxdepth 1 -name "$glob" -type f 2>/dev/null | wc -l)
-  if [ "$n" -eq 0 ]; then note "SKIP $label - nothing matching $glob"; return 0; fi
-  [ "$DRY" -eq 0 ] && find "$src" -maxdepth 1 -name "$glob" -type f -exec cp -a {} "$STAGING_DIR/$dest/" \;
-  note "$label: $n file(s)"
+  want=$(find "$src" -maxdepth 1 -name "$glob" -type f 2>/dev/null | wc -l)
+  if [ "$want" -eq 0 ]; then note "SKIP $label - nothing matching $glob"; return 0; fi
+
+  if [ "$DRY" -eq 1 ]; then note "$label: $want file(s) (dry run)"; return 0; fi
+
+  [ -d "$STAGING_DIR/$dest" ] || die "staging subdir missing: $STAGING_DIR/$dest"
+  find "$src" -maxdepth 1 -name "$glob" -type f -exec cp -a -t "$STAGING_DIR/$dest/" {} +
+
+  got=$(find "$STAGING_DIR/$dest" -maxdepth 1 -name "$glob" -type f 2>/dev/null | wc -l)
+  [ "$got" -eq "$want" ] || die "$label: copied $got of $want file(s) into $STAGING_DIR/$dest"
+  note "$label: $got file(s)"
 }
 
 copy_in "signing keys" "$MIRROR_BASE/keys" keys '*.gpg'

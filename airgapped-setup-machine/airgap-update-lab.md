@@ -376,14 +376,97 @@ Searching the mirror for `openssl_*+Fips*.deb` finds nothing and looks alarming.
 ```bash
 sudo -u apt-mirror apt-mirror        # first run: the big one (hours)
 
-# Grab the ESM signing keys to carry across
-cp /usr/share/keyrings/ubuntu-pro-esm-infra.gpg  /srv/apt-mirror/keys/
-cp /usr/share/keyrings/ubuntu-pro-esm-apps.gpg   /srv/apt-mirror/keys/
+# Grab the signing keys to carry across. FOUR, not two - the enclave cannot verify
+# the FIPS or USG repos without the last two, and there is no apt install in there
+# to recover with. fips-updates is signed by the plain ubuntu-pro-fips.gpg; there is
+# no "-updates" key. usg is signed by ubuntu-pro-cis.gpg - the cis alias again.
+sudo cp /usr/share/keyrings/ubuntu-pro-esm-infra.gpg \
+        /usr/share/keyrings/ubuntu-pro-esm-apps.gpg \
+        /usr/share/keyrings/ubuntu-pro-fips.gpg \
+        /usr/share/keyrings/ubuntu-pro-cis.gpg      /srv/apt-mirror/keys/
 
-# Generate the airgapped contracts-server config (maps token -> entitlements),
-# then edit its aptURL entries to point at MIRROR-01
-pro-airgapped < tokens.yaml > airgapped-contracts.yaml
+# And the three .debs the mirror can never serve to the in-gap box - see section 6.
+sudo install -d -o apt-mirror -g apt-mirror /srv/apt-mirror/debs
+cd /srv/apt-mirror/debs && sudo -u apt-mirror apt download \
+    contracts-airgapped pro-airgapped get-resource-tokens
+
 ```
+
+### 6.4a Generate `airgapped-contracts.yaml` — done 2026-08-31
+
+**This is the file that makes the ESM and FIPS packages usable.** Without it the enclave has a
+repository it can pull from and nothing to `pro attach` against, so every FIPS and ESM package
+on the disk is inert. It is generated on STAGE-01 **while it is still online** — `pro-airgapped`
+calls `contracts.canonical.com` to fetch the account contract info.
+
+**The input is NOT a token list, and the earlier `pro-airgapped < tokens.yaml` line in this
+document was wrong.** Confirmed from `pro-airgapped --help` on 1.8.1: the input is a JSON (or
+YAML) object whose **keys are contract tokens** — the paid Pro token itself, not the per-service
+resource tokens — mapping to optional per-entitlement overrides of `affordances`, `directives`
+or `obligations`:
+
+```json
+{
+  "<PAID_PRO_CONTRACT_TOKEN>": {
+    "esm-infra":    { "directives": { "aptURL": "http://svc-repo-01.enclave.local/esm.ubuntu.com/infra/ubuntu" } },
+    "esm-apps":     { "directives": { "aptURL": "http://svc-repo-01.enclave.local/esm.ubuntu.com/apps/ubuntu" } },
+    "fips-updates": { "directives": { "aptURL": "http://svc-repo-01.enclave.local/esm.ubuntu.com/fips-updates/ubuntu" } },
+    "cis":          { "directives": { "aptURL": "http://svc-repo-01.enclave.local/esm.ubuntu.com/usg/ubuntu" } }
+  }
+}
+```
+
+**`cis`, not `usg`** — the same alias trap as the resource tokens. Use the entitlement name.
+
+**Those `aptURL`s match the nginx layout in §6.5 exactly.** The vhost roots at the mirror tree
+and served paths mirror the upstream hostnames, so no path translation is needed. Leave
+`aptKey` alone; `pro-airgapped` fills in Canonical's defaults and the matching keyrings already
+travel in the bundle.
+
+```bash
+read -rsp 'paid Pro contract token: ' T; echo
+sed -i "s|PRO_TOKEN_HERE|$T|" contracts-input.json      # from the template above
+unset T
+
+pro-airgapped --input contracts-input.json > /tmp/airgapped-contracts.yaml
+sudo install -m 600 -o root -g root /tmp/airgapped-contracts.yaml \
+     /srv/apt-mirror/airgapped-contracts.yaml
+shred -u /tmp/airgapped-contracts.yaml contracts-input.json
+```
+
+**Then make it readable by the account that assembles the bundle.** It maps contract tokens to
+entitlements, so it is a credential — group-read it to one account rather than loosening it:
+
+```bash
+sudo chown root:encadmin /srv/apt-mirror/airgapped-contracts.yaml
+sudo chmod 640 /srv/apt-mirror/airgapped-contracts.yaml
+```
+
+**Verify the rewrite, because it is the entire point of the file:**
+
+```bash
+sudo grep -oE 'aptURL: *\S+' /srv/apt-mirror/airgapped-contracts.yaml | sort -u
+```
+
+**Expect exactly four** pointing at the in-gap address. Measured 2026-08-31:
+
+```
+aptURL: http://svc-repo-01.enclave.local/esm.ubuntu.com/apps/ubuntu
+aptURL: http://svc-repo-01.enclave.local/esm.ubuntu.com/fips-updates/ubuntu
+aptURL: http://svc-repo-01.enclave.local/esm.ubuntu.com/infra/ubuntu
+aptURL: http://svc-repo-01.enclave.local/esm.ubuntu.com/usg/ubuntu
+```
+
+> **Nine other `aptURL`s still point at `esm.ubuntu.com`, and that is deliberate.** They belong
+> to entitlements this enclave does not mirror — `anbox-cloud`, `cc-eal`, `fips` (plain),
+> `fips-preview`, `realtime`, `ros`, `ros-updates`. Inside the gap those URLs are simply
+> unreachable, so an attempt to enable one fails immediately and obviously. Repointing them at
+> the local mirror would instead produce a confusing 404 from your own nginx. **A clean failure
+> beats a misleading one.** They cost nothing at attach time either — `pro attach` talks to the
+> contracts server on :8484, and apt sources are written only for services actually enabled.
+
+`build-transfer-bundle.sh` counts these and warns below four, so a missed override is caught
+on the connected side rather than at the rack.
 
 ### 6.5 Serve it and prove it — done on STAGE-01 2026-08-31
 

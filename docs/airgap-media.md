@@ -222,6 +222,27 @@ drive**, and remember many boards also mux M.2 slots against SATA ports. The 256
 back in and the 2 TB NVMe became the data disk, which is the better layout anyway — the bundle
 belongs on the fast, large device.
 
+#### Installer choices, and why each one
+
+The guided installer auto-selects the **largest** disk, which is the 2 TB — the wrong one. Use
+the custom layout and pick the OS disk explicitly.
+
+| Screen | Choice | Why |
+|---|---|---|
+| Guided storage | **Custom storage layout** | Guided defaults to the largest disk |
+| The OS disk, first action | **Reformat** | It shipped with Windows. "Use As Boot Device" alone reuses the existing ESP and leaves the NTFS partitions in place, so no `free space` row appears and there is nothing to add a partition to |
+| The OS disk, second action | **Use As Boot Device** | Creates the ~1 GB ESP |
+| The `free space` row beneath it | **Add GPT Partition** → blank size, `ext4`, mount `/` | Blank size means "all remaining". The add action lives on the `free space` row, not on the disk row |
+| The 2 TB | **touch nothing** | Set it up after first boot — see below |
+| Profile | hostname `build-01`, user `encadmin` | Matching STAGE-01's username keeps the transfer scripts free of per-host paths |
+| OpenSSH server | **Install: yes** · **Import SSH identity: NO** | The import pulls whatever public keys sit on a GitHub or Launchpad *account*. You do not control what is there, it may be Ed25519, and the repo deploy key is not on the account anyway. Push the key deliberately afterwards |
+| Featured server snaps | **none** | `microk8s` in particular would be actively confusing — this project uses the `k8s` snap. Nothing on that screen is wanted, and `build-01` handles everything that crosses into the enclave, so it stays minimal by choice |
+
+> **Do not press Reset after reformatting.** Reset reverts *every* planned change, including
+> the reformat, and you land back at the NTFS partitions wondering why there is no free space.
+> Nothing is written until the final red confirmation dialog, which names each device it will
+> destroy — that dialog is the real checkpoint.
+
 **Set the data disk up after first boot, not in the installer.** Keeping it out of the
 installer entirely is the simplest guarantee against wiping the wrong device:
 

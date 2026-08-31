@@ -59,6 +59,48 @@ Everything from earlier still stands: VM provisioned, dev toolchain 10/10, Stage
 repo cloned, private material transferred, push access + ssh-agent (§4.6), pre-push guard
 fired against the live remote, Windows-only material retired, step 00 media downloaded.
 
+### 0.5 REBUILD FROM ZERO — the ordered sequence
+
+**If both machines were lost tomorrow, this is the order to rebuild them in.** Every step
+points at the section that holds the detail; nothing is duplicated here. Follow it top to
+bottom. Roughly a day, most of it waiting on the mirror.
+
+**Prerequisites you cannot rebuild from this repo:** the paid Ubuntu Pro token (Infra tier or
+above — §0.1), a GitHub account with write access to the repo, and the client-private tarball,
+which git cannot carry (see the top of `docs/open-questions.md`).
+
+| # | Machine | Do | Where it is written |
+|---|---|---|---|
+| 1 | Hyper-V host | Provision the `stage-01` VM | §2, §4.2 · `Build-Stage01.ps1` |
+| 2 | `stage-01` | Dev toolchain, mirror + Stage-B tooling | §4.4 |
+| 3 | `stage-01` | systemd user ssh-agent, GitHub deploy key, clone the repo | §4.6 |
+| 4 | `stage-01` | Enable the pre-push guard — `git config core.hooksPath .githooks` | top of `docs/open-questions.md` |
+| 5 | `stage-01` | Restore private material — `scripts/private-sync.sh unpack` | `CLAUDE.md` |
+| 6 | `stage-01` | Step 00: download and GPG-verify the install media | `docs/00-downloads.md` |
+| 7 | `stage-01` | `pro attach`, add `ppa:yellow/ua-airgapped`, install the three tools | `airgap-update-lab.md` §5 |
+| 8 | `stage-01` | `get-resource-tokens` — **mind the four naming traps** | §5.1 |
+| 9 | `stage-01` | Write `mirror.list` (6 stanzas), `chmod 640 root:apt-mirror`, substitute tokens | §6, §6.1, §6.2 |
+| 10 | `stage-01` | **Verify tokens against `pool/`, not `Release`** | §6.3 |
+| 11 | `stage-01` | Run `apt-mirror` — **~4 h, 320 GB** | §6, §6.4 |
+| 12 | `stage-01` | `apt download` the three air-gap `.deb`s; copy the four keyrings | §0.3, §6 |
+| 13 | `stage-01` | nginx vhost, then **prove it at three levels** | §6.5 |
+| 14 | `stage-01` | Generate `airgapped-contracts.yaml`, verify 4 rewritten `aptURL`s | **§6.4a** |
+| 15 | `build-01` | Install Ubuntu 24.04 — **installer choices matter** | `docs/airgap-media.md` §6.1 |
+| 16 | `build-01` | Data disk → `/srv/bundle`, packages, key from `stage-01` | §6.1 |
+| 17 | `stage-01` | `build-transfer-bundle.sh` | `scripts/transfer/` |
+| 18 | `build-01` | `write-transfer-media.sh` → the SSD | `scripts/transfer/` |
+| 19 | `svc-repo-01` | `restore-mirror.sh` — restores **and proves** | `scripts/transfer/` |
+
+**Steps 7–14 are the ones with teeth.** Every trap in them cost real time the first
+time — the stock 2022 `kinetic` `mirror.list`, the `chmod 600` that silently kills the run, the
+token that returns 200 on `Release` and 401 on every package, FIPS and USG living in archives
+that are not part of ESM, `usg`'s token printing under `cis`, and the `pro-airgapped` input
+schema. They are written down at the step that hits them, not collected here, so they are read
+in context.
+
+**What this sequence does NOT get you:** the Kubernetes half — snaps, container images, Harbor,
+MAAS boot images. That is Stage B, blocked on Q8, and nothing of it is staged yet.
+
 ### 0.3 Three `.deb`s the mirror can never serve — carry them separately
 
 `contracts-airgapped` and `pro-airgapped` must be **installed on MIRROR-01, inside the gap**,

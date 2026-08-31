@@ -67,6 +67,27 @@ one. Label it on the line above the block:
 This applies to quoted vendor documentation too — Canonical's docs do not know which of your
 boxes they are talking about. The roster lives in `airgapped-setup-machine/README.md` §0.
 
+**Show every command that changes anything — do not just run it.** Reads are free: `grep`,
+`find`, `curl -o /dev/null`, `snap info`, `bash -n`, `shellcheck`, checksums. Run those
+directly. But anything that **writes, deletes, moves, installs or pushes** goes to him as a
+command block *before* it executes, even when it is obviously part of what he asked for.
+
+**The reason is not permission, it is transfer.** He is a consultant producing a build
+procedure someone else has to repeat, and he is the one who will be at the rack without help.
+*"if you run things without telling how do I learn the structure"*. A command he did not see
+is a step he cannot repeat, cannot debug, and cannot hand to anyone else. Running it silently
+is faster today and costs him the engagement.
+
+The rule was set after `rm -rf /srv/bundle-staging/*` was run unannounced on 2026-08-31. It
+was recoverable, which was luck rather than judgment.
+
+**Where a destructive step is genuinely needed every run, put it in the script with guards
+rather than typing it at a prompt** — and place the guard so it fires *first*. The clean step
+in `build-transfer-bundle.sh` is the worked example: an early version checked the path only
+after a writability test, so `/etc` was rejected merely because the caller was unprivileged,
+and it would have proceeded as root. **A safety check that depends on the caller being
+unprivileged is not a safety check.**
+
 **Stop narrating.** Full analyses after every step drown the work: *"You went down a god
 damn rabbit hole."* Give the next command and a one-line reason. Save the analysis for when
 something is actually broken.

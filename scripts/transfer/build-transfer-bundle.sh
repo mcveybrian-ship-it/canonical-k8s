@@ -60,6 +60,26 @@ set +a
 
 MIRROR_TREE="$MIRROR_BASE/mirror"
 
+# --- STAGING_DIR safety, evaluated FIRST ---------------------------------------------------
+# This script deletes and recreates subdirectories under STAGING_DIR on every run. That is
+# fine for a directory it owns and catastrophic for one it does not.
+#
+# Placement matters more than the patterns. An earlier version put this AFTER the
+# writability check, which meant /etc was rejected only because the invoking user could not
+# write there - run as root it would have proceeded. Safety checks that depend on the caller
+# being unprivileged are not safety checks. This runs before anything else touches the path.
+#
+# Patterns are UNQUOTED so the globs glob; a quoted "/*" matches the literal two characters.
+case "$STAGING_DIR" in
+  ""|/|/bin*|/boot*|/dev*|/etc*|/home|/lib*|/opt*|/proc*|/root*|/run*|/sbin*|/srv|/sys*|/usr*|/var*)
+    die "refusing to use an unsafe STAGING_DIR: '$STAGING_DIR'" ;;
+  "$MIRROR_BASE"|"$MIRROR_BASE"/*)
+    die "STAGING_DIR must not live inside MIRROR_BASE ('$MIRROR_BASE') - the clean step would eat the mirror" ;;
+esac
+[ "${#STAGING_DIR}" -ge 8 ] || die "STAGING_DIR is implausibly short, refusing: '$STAGING_DIR'"
+case "$STAGING_DIR" in /*) ;; *) die "STAGING_DIR must be an absolute path: '$STAGING_DIR'" ;; esac
+
+
 # --- 1. refuse to build a bundle around a mirror that is not there ---------------------------
 head2 "checking the mirror"
 [ -d "$MIRROR_TREE" ] || die "no mirror tree at $MIRROR_TREE"
@@ -104,6 +124,21 @@ fi
 if [ "$DRY" -eq 1 ]; then
   note "DRY RUN - nothing will be written"
 else
+  # Re-running has to start clean, or a file removed from the source survives in the
+  # bundle and travels across the gap as a stale artefact nobody remembers adding.
+  #
+  # This used to be a manual 'rm -rf $STAGING_DIR/*' typed at the prompt. It is in the
+  # script now because a recursive delete with a glob should not depend on a human
+  # getting the variable right at 1am. The guards below are the reason it is safe:
+  # refuse to touch anything that is not a plausible staging directory, and delete only
+  # the subdirectories this script itself creates - never $STAGING_DIR wholesale.
+  if [ -d "$STAGING_DIR" ]; then
+    for sub in keys debs media config scripts snaps; do
+      [ -d "$STAGING_DIR/$sub" ] && rm -rf -- "${STAGING_DIR:?}/$sub"
+    done
+    rm -f -- "${STAGING_DIR:?}/MANIFEST.sha256"
+    note "cleaned previous staging content"
+  fi
   mkdir -p "$STAGING_DIR"/{keys,debs,media,config,scripts,snaps}
 fi
 

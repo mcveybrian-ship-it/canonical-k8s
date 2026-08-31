@@ -277,6 +277,70 @@ get reused and every enclave host will refuse Ed25519.
 BOM/CRLF class of failure that §7 decision 7 of `airgapped-setup-machine/README.md` was written
 about. Decision 4 kept `02-build-seed.ps1` because no physical Linux box existed. One now does.
 
+### 6.2 Rebuilding the bundle — what step 1 actually does
+
+`build-transfer-bundle.sh` is safe to re-run at any time and is expected to be run repeatedly
+— every time the mirror changes, a key is added, or a snap is restaged. **It is idempotent by
+construction, not by luck.**
+
+```bash
+### MACHINE: stage-01 ###
+cd ~/canonical-k8s
+./scripts/transfer/build-transfer-bundle.sh          # -n for a dry run
+```
+
+In order, it:
+
+1. **Refuses to proceed unless `STAGING_DIR` is a plausible directory.** This is the first
+   thing it does, before touching anything — see the box below.
+2. **Verifies the mirror**, counting `.deb` files in the `pool/` of every suite named by
+   `EXPECTED_SUITES`, not just checking that a `Release` file exists. A `Release` without a
+   pool is what a bad bearer token looks like.
+3. **Cleans its own subdirectories** (`keys debs media config scripts snaps` and the manifest)
+   so a file removed from the source cannot survive in the bundle and cross the gap as a stale
+   artefact nobody remembers adding.
+4. **Copies the extras and verifies each arrived**, comparing the destination count against
+   the source count and dying on a mismatch.
+5. **Checks every `.snap` has its `.assert`.** Installing without one requires `--dangerous`,
+   which discards signature verification, and inside the gap there is no second chance.
+6. **Counts the rewritten `aptURL`s** in `airgapped-contracts.yaml`, expecting four.
+7. **Writes `MANIFEST.sha256`** over the extras only — the mirror is a signed hash chain
+   already.
+
+Expected output on a healthy run:
+
+```
+  cleaned previous staging content
+  signing keys: 5 file(s)
+  airgap debs: 3 file(s)
+  snaps: 6 file(s)
+  snap asserts: 6 file(s)
+  ...
+  snap/assert pairs verified: 6
+  28 item(s) hashed -> /srv/bundle-staging/MANIFEST.sha256
+  extras size: 4.3G
+```
+
+> **Two bugs found here on 2026-08-31, both worth knowing because both are recurring shapes.**
+>
+> **It reported success on a failed copy.** `copy_in` counted files in the *source* and
+> swallowed every `cp` failure inside `find -exec`, so it printed `snaps: 6 file(s)` while all
+> twelve copies failed against a subdirectory the `mkdir` list had omitted — then wrote a
+> manifest and announced "ready to transfer" with no snaps in the bundle. **A bundle script
+> that claims success while dropping content is worse than no script**, because it moves the
+> discovery inside the gap. It now counts what *arrived*.
+>
+> **A safety guard that only worked because the caller was unprivileged.** The clean step's
+> path check originally ran *after* a writability test, so `STAGING_DIR=/etc` was refused only
+> because `encadmin` cannot write to `/etc` — **run as root it would have proceeded and deleted
+> subdirectories under `/etc`.** The guard now runs first, before anything else touches the
+> path, and rejects `/`, `/etc*`, `/usr*`, `/var*`, `/srv`, anything inside `MIRROR_BASE`,
+> relative paths, and anything implausibly short. Verified by running it against each.
+> **A safety check that depends on the caller being unprivileged is not a safety check.**
+>
+> Note also that `case` patterns must be **unquoted** to glob — a quoted `"/*"` matches the
+> literal two characters and silently protects nothing.
+
 ### The path
 
 ```

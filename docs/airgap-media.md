@@ -352,3 +352,44 @@ sit on the disk unusable. It has to be in the bundle, so it comes before step 1.
   the pathfinder if you want it; do not assume it.
 - **Diagnostic toolset contents** — still undecided, and it must be fixed before the Stage A
   media is built.
+
+## 8. Backing up the client-private material
+
+**git cannot carry it.** `HANDOFF.md`, `docs/open-questions.md`, `docs/runbook.md`, `artifact/`
+and `archive/` are gitignored because `origin` is public. That means the bake-off decision, the
+entire Q-list, the runbook and the published artifact source exist **only** as files on whatever
+machines you have put them on — and for two days that was one VM.
+
+```bash
+### MACHINE: stage-01 ###
+./scripts/private-sync.sh backup
+```
+
+Packs, copies to `build-01`, and **proves it arrived**: compares the SHA-256 of the file that
+actually landed, then opens the archive on the far end to confirm it is a readable tarball and
+not just the right number of bytes. Rotates to the last 10 by default.
+
+Everything is a parameter — `-t user@host`, `-d remote dir`, `-k ssh key`, `-r keep`, or the
+`BACKUP_TARGET` / `BACKUP_DIR` / `BACKUP_KEY` / `BACKUP_KEEP` environment variables. Defaults
+point at `build-01`.
+
+The remote directory is `0700` and the archive `0600`, because `build-01` is outside the ATO
+boundary and this is client-private engagement material.
+
+**Restore anywhere:**
+
+```bash
+scp encadmin@10.0.20.124:private-backups/canonical-k8s-private-<date>.tar.gz .
+./scripts/private-sync.sh unpack -i canonical-k8s-private-<date>.tar.gz
+```
+
+`unpack` re-verifies that every restored path is still gitignored on the machine it lands on —
+that check is the point of the script, not the tar.
+
+**Run it after any change to the runbook, HANDOFF or the open questions.** Those files never
+appear in `git status`, so nothing will remind you.
+
+> **This is a second copy, not an offsite one.** `stage-01` and `build-01` sit on the same
+> network in the same room. It removes the single-machine risk; it does not survive the room.
+> The Windows working copy is the third leg — see §7 decision 7 in
+> `airgapped-setup-machine/README.md`.

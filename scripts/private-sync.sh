@@ -42,9 +42,14 @@ usage() {
 usage:
   private-sync.sh pack   [-o <tarball>] [--with-secrets]
   private-sync.sh unpack -i <tarball>  [-f]
+  private-sync.sh backup [-t <user@host>] [-d <remote dir>] [-k <ssh key>]
+                         [-r <keep>] [--with-secrets]
 
   pack     collect the private paths into a tarball outside the repo
   unpack   restore them into this repo, then verify git still ignores them
+  backup   pack, then copy the archive to another machine and verify it arrived
+           intact. git CANNOT carry these files, so a single copy on a single
+           machine is the real risk to this engagement record.
 
 options:
   -o <tarball>     output path for pack. Default ../canonical-k8s-private-<date>.tar.gz
@@ -53,6 +58,12 @@ options:
                    backed up to <name>.bak-<timestamp> first
   --with-secrets   also include host-params.env, which holds the password hash, the LUKS
                    passphrase and SSH keys. Off by default and never silent
+
+backup options:
+  -t <user@host>   destination. Default from BACKUP_TARGET, else encadmin@10.0.20.124
+  -d <remote dir>  remote directory. Default from BACKUP_DIR, else ~/private-backups
+  -k <ssh key>     ssh key. Default from BACKUP_KEY, else ~/.ssh/build01
+  -r <keep>        how many archives to keep on the far end. Default 10, 0 = keep all
 USAGE
 }
 
@@ -73,10 +84,21 @@ IN=""
 FORCE=0
 WITH_SECRETS=0
 
+# Backup defaults. Environment first, then these - nothing hardcoded that could be
+# a parameter.
+BACKUP_TARGET="${BACKUP_TARGET:-encadmin@10.0.20.124}"
+BACKUP_DIR="${BACKUP_DIR:-private-backups}"
+BACKUP_KEY="${BACKUP_KEY:-$HOME/.ssh/build01}"
+BACKUP_KEEP="${BACKUP_KEEP:-10}"
+
 while [ $# -gt 0 ]; do
   case "$1" in
     -o) OUT="${2:-}"; shift 2 ;;
     -i) IN="${2:-}"; shift 2 ;;
+    -t) BACKUP_TARGET="${2:-}"; shift 2 ;;
+    -d) BACKUP_DIR="${2:-}"; shift 2 ;;
+    -k) BACKUP_KEY="${2:-}"; shift 2 ;;
+    -r) BACKUP_KEEP="${2:-}"; shift 2 ;;
     -f) FORCE=1; shift ;;
     --with-secrets) WITH_SECRETS=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -223,6 +245,91 @@ case "$MODE" in
     echo
     echo "all restored paths are ignored. git status should be unchanged:"
     git status --short || true
+    ;;
+
+  backup)
+    # Pack, push, and PROVE it arrived intact. The value here is not the copy - scp
+    # does that - it is the verification and the rotation. A backup nobody has checked
+    # is a rumour.
+    #
+    # These files are gitignored by design, so git will never carry them. One copy on
+    # one machine is the single largest risk to the engagement record: the bake-off
+    # decision, every open question, the runbook and the published artifact source.
+    [ -r "$BACKUP_KEY" ] || die "no ssh key at $BACKUP_KEY (use -k, or set BACKUP_KEY)"
+    case "$BACKUP_KEEP" in ''|*[!0-9]*) die "-r must be a number, got: $BACKUP_KEEP" ;; esac
+
+    SSH_OPTS="-i $BACKUP_KEY -o BatchMode=yes -o StrictHostKeyChecking=accept-new"
+
+    echo "checking the destination:"
+    # shellcheck disable=SC2086
+    ssh $SSH_OPTS "$BACKUP_TARGET" true 2>/dev/null \
+      || die "cannot ssh to $BACKUP_TARGET with $BACKUP_KEY.
+       If the key is not installed yet:  ssh-copy-id -i $BACKUP_KEY.pub $BACKUP_TARGET"
+    note "reachable: $BACKUP_TARGET"
+
+    # Re-run ourselves to pack, so there is exactly ONE definition of what is private.
+    echo
+    echo "packing:"
+    PACK_ARGS="pack"
+    [ "$WITH_SECRETS" -eq 1 ] && PACK_ARGS="$PACK_ARGS --with-secrets"
+    [ -n "$OUT" ] && PACK_ARGS="$PACK_ARGS -o $OUT"
+    # shellcheck disable=SC2086
+    "$0" $PACK_ARGS >/dev/null || die "pack failed - nothing was sent"
+
+    ARCHIVE="${OUT:-../canonical-k8s-private-$(date +%F).tar.gz}"
+    ARCHIVE="$( cd "$(dirname "$ARCHIVE")" && pwd -P )/$(basename "$ARCHIVE")"
+    [ -f "$ARCHIVE" ] || die "expected archive not found: $ARCHIVE"
+
+    LOCAL_SHA="$(sha256sum "$ARCHIVE" | cut -d' ' -f1)"
+    note "$(basename "$ARCHIVE")  $(du -h "$ARCHIVE" | cut -f1)"
+    note "sha256 $LOCAL_SHA"
+
+    echo
+    echo "sending:"
+    # 0700 on the directory and 0600 on the file: this is client-private material
+    # sitting on a machine that is not in the ATO boundary.
+    # shellcheck disable=SC2086
+    ssh $SSH_OPTS "$BACKUP_TARGET" "mkdir -p '$BACKUP_DIR' && chmod 700 '$BACKUP_DIR'" \
+      || die "cannot create $BACKUP_DIR on $BACKUP_TARGET"
+    # shellcheck disable=SC2086
+    scp $SSH_OPTS -q "$ARCHIVE" "$BACKUP_TARGET:$BACKUP_DIR/" \
+      || die "copy failed"
+    # shellcheck disable=SC2086
+    ssh $SSH_OPTS "$BACKUP_TARGET" "chmod 600 '$BACKUP_DIR/$(basename "$ARCHIVE")'"
+    note "copied to $BACKUP_TARGET:$BACKUP_DIR/"
+
+    echo
+    echo "verifying the copy that actually landed:"
+    # shellcheck disable=SC2086
+    REMOTE_SHA="$(ssh $SSH_OPTS "$BACKUP_TARGET" \
+                  "sha256sum '$BACKUP_DIR/$(basename "$ARCHIVE")' | cut -d' ' -f1")"
+    note "remote sha256 $REMOTE_SHA"
+    [ "$LOCAL_SHA" = "$REMOTE_SHA" ] \
+      || die "CHECKSUM MISMATCH - the remote copy is corrupt. Do not trust it."
+    note "match - the remote copy is byte-identical"
+
+    # Prove it is a readable archive on the far end, not just the right bytes.
+    # shellcheck disable=SC2086
+    n="$(ssh $SSH_OPTS "$BACKUP_TARGET" \
+         "tar -tzf '$BACKUP_DIR/$(basename "$ARCHIVE")' 2>/dev/null | grep -cv '/$'")" \
+      || die "the remote archive does not open as a tarball"
+    note "opens cleanly on the far end: $n file(s)"
+
+    if [ "$BACKUP_KEEP" -gt 0 ]; then
+      echo
+      echo "rotating (keeping $BACKUP_KEEP):"
+      # shellcheck disable=SC2086
+      ssh $SSH_OPTS "$BACKUP_TARGET" "
+        cd '$BACKUP_DIR' 2>/dev/null || exit 0
+        ls -1t canonical-k8s-private-*.tar.gz 2>/dev/null | tail -n +\$(( $BACKUP_KEEP + 1 )) \
+          | while read -r f; do rm -f -- \"\$f\" && echo \"  removed \$f\"; done
+        echo \"  kept \$(ls -1 canonical-k8s-private-*.tar.gz 2>/dev/null | wc -l) archive(s)\""
+    fi
+
+    echo
+    echo "done. Restore on any machine with:"
+    echo "  scp $BACKUP_TARGET:$BACKUP_DIR/$(basename "$ARCHIVE") ."
+    echo "  ./scripts/private-sync.sh unpack -i $(basename "$ARCHIVE")"
     ;;
 
   *)

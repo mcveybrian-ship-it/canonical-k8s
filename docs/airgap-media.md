@@ -192,12 +192,76 @@ makes it tractable — the two media have nothing in common:
 Seed sticks are unchanged and stay a Windows job — that is §7 decision 4 in
 `airgapped-setup-machine/README.md`, and nothing here alters it.
 
+### 6.1 `build-01` — the machine that writes the media
+
+Built **2026-08-31**. A dedicated physical Ubuntu box on the online side. Named to match the
+existing convention (`stage-01`, `svc-repo-01`, `k8s-cp-01`); earlier drafts called it
+"BUILD-BOX", which was a role placeholder, not a name.
+
+| | |
+|---|---|
+| OS | Ubuntu 24.04 LTS Server, **manual install** — it is not an enclave host |
+| RAM | 32 GB |
+| OS disk | **256 GB** — ESP + ext4 `/`, no LVM, no LUKS |
+| Data disk | **2 TB M.2 NVMe** → `/srv/bundle`, ext4, `LABEL=bundle` |
+| User | `encadmin`, matching STAGE-01 so the transfer scripts need no per-host paths |
+| Ubuntu Pro | **Not attached — deliberate** |
+
+**Why no Pro attachment.** `build-01` sits outside the ATO boundary and needs nothing Pro
+provides: ESM is empty on a young LTS (that is why the `esm-infra` mirror holds four packages),
+Livepatch is pointless on a box you can reboot at will, and FIPS/USG are actively unwanted —
+enabling FIPS would move it to the FIPS kernel and impose the Ed25519 SSH ban on a machine
+whose only job is moving files. Same reasoning as STAGE-01 §0.2. *(If good-faith licence
+coverage is wanted for the lab, the free personal tier costs nothing — see
+`airgap-update-lab.md` §1. That is a licensing choice, not a capability one.)*
+
+**Hardware note that cost time.** A 1 TB **M.2 SATA** drive was invisible to the installer in
+slot 1 — that slot is PCIe/NVMe-only, and the SATA pins simply are not connected. No BIOS
+setting fixes it. **Check the board's storage table before assuming an M.2 slot takes a SATA
+drive**, and remember many boards also mux M.2 slots against SATA ports. The 256 GB drive went
+back in and the 2 TB NVMe became the data disk, which is the better layout anyway — the bundle
+belongs on the fast, large device.
+
+**Set the data disk up after first boot, not in the installer.** Keeping it out of the
+installer entirely is the simplest guarantee against wiping the wrong device:
+
+```bash
+sudo parted /dev/nvme0n1 mklabel gpt
+sudo parted -a opt /dev/nvme0n1 mkpart primary ext4 0% 100%
+sudo mkfs.ext4 -L bundle /dev/nvme0n1p1
+sudo mkdir -p /srv/bundle
+echo 'LABEL=bundle /srv/bundle ext4 defaults 0 2' | sudo tee -a /etc/fstab
+sudo mount -a
+```
+
+`LABEL=` rather than a device name, so it survives the drive changing slots — the same instinct
+as pinning by `id_path` in the autoinstall template.
+
+**Packages:**
+
+```bash
+sudo apt install -y rsync gnupg dosfstools whois python3-yaml shellcheck \
+  git curl jq pv nvme-cli smartmontools gdisk parted e2fsprogs xorriso openssh-server
+```
+
+`dosfstools` and `xorriso` are what let `build-01` write seed sticks natively; `pv` gives
+progress on long writes; `nvme-cli`/`smartmontools` matter because consumer M.2 is about to
+take 320 GB.
+
+**SSH key: RSA 3072+ or ECDSA, never Ed25519.** `build-01` does not run FIPS itself, but keys
+get reused and every enclave host will refuse Ed25519.
+
+**Consequence worth revisiting: `build-01` can retire the Windows seed-writer.**
+`02-build-seed.sh` runs natively here, which removes the PowerShell dependency and the whole
+BOM/CRLF class of failure that §7 decision 7 of `airgapped-setup-machine/README.md` was written
+about. Decision 4 kept `02-build-seed.ps1` because no physical Linux box existed. One now does.
+
 ### The path
 
 ```
    ONLINE SIDE                    ║ GAP ║        INSIDE THE ENCLAVE
 
- [ STAGE-01, VM ]  --(1)-->  [ BUILD-BOX, physical Ubuntu, SSD attached ]
+ [ STAGE-01, VM ]  --(1)-->  [ build-01, physical Ubuntu, SSD attached ]
    320 GB mirror              rsync over SSH, ~60-90 min first trip
                                         |
                                        (2) write-transfer-media.sh
@@ -211,7 +275,7 @@ Seed sticks are unchanged and stay a Windows job — that is §7 decision 4 in
 | Step | Runs on | Does | Time |
 |---|---|---|---|
 | 1 | STAGE-01 | `build-transfer-bundle.sh` — gather mirror + 4 keyrings + 3 `.deb`s + ISOs + `airgapped-contracts.yaml` + MIRROR-01 configs into one staging tree; manifest the non-repo items | minutes |
-| 2 | BUILD-BOX | `write-transfer-media.sh` — rsync that tree onto the SSD, verify | **60–90 min first trip**, minutes after |
+| 2 | `build-01` | `write-transfer-media.sh` — rsync that tree onto the SSD, verify | **60–90 min first trip**, minutes after |
 | 3 | MIRROR-01 | `restore-mirror.sh` — rsync in, install the 3 `.deb`s, place the 4 keyrings, drop the nginx vhost, start the contracts server, run the three-level proof from `airgap-update-lab.md` §6.5 | ~20 min |
 
 Step 3 is the one that matters: it turns files on a disk into a working enclave service, and it

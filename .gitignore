@@ -84,3 +84,6 @@ archive/
 *.deb
 *.snap
 *.tar.zst
+
+# Transfer params - names hosts and paths, and is read by root on svc-repo-01
+scripts/transfer/transfer-params.env

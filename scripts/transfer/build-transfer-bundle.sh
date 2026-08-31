@@ -119,6 +119,11 @@ copy_in() {  # copy_in <label> <src dir> <dest subdir> <glob>
 
 copy_in "signing keys" "$MIRROR_BASE/keys" keys '*.gpg'
 copy_in "airgap debs"  "$MIRROR_BASE/debs" debs '*.deb'
+# Snaps side-load as a .snap + .assert PAIR. A .snap without its assertion cannot be
+# installed offline without --dangerous, which discards signature verification - not a
+# trade this build can make. Both globs are copied and the pairing is checked below.
+copy_in "snaps"        "$MIRROR_BASE/snaps" snaps '*.snap'
+copy_in "snap asserts" "$MIRROR_BASE/snaps" snaps '*.assert'
 copy_in "install ISOs" "$MEDIA_DIR"        media '*.iso'
 copy_in "cloud images" "$MEDIA_DIR/minimal" media '*.img'
 copy_in "checksums"    "$MEDIA_DIR"        media 'SHA256SUMS*'
@@ -159,6 +164,22 @@ if [ "$DRY" -eq 0 ]; then
   cp -a "$SCRIPT_DIR/restore-mirror.sh" "$STAGING_DIR/scripts/" 2>/dev/null || true
   cp -a "$PARAMS" "$STAGING_DIR/scripts/transfer-params.env" 2>/dev/null || true
   note "restore script + params: copied"
+fi
+
+# Every .snap must have its matching .assert. Installing without one needs --dangerous,
+# which skips signature verification entirely - and inside the gap there is no second
+# chance to fetch the assertion.
+if [ "$DRY" -eq 0 ] && [ -d "$STAGING_DIR/snaps" ]; then
+  unpaired=0
+  for s in "$STAGING_DIR"/snaps/*.snap; do
+    [ -e "$s" ] || continue
+    [ -f "${s%.snap}.assert" ] || { echo "  MISSING ASSERTION for $(basename "$s")" >&2; unpaired=$((unpaired+1)); }
+  done
+  if [ "$unpaired" -gt 0 ]; then
+    die "$unpaired snap(s) have no assertion. Re-download with 'snap download', which writes both."
+  fi
+  n=$(find "$STAGING_DIR/snaps" -name '*.snap' | wc -l)
+  [ "$n" -gt 0 ] && note "snap/assert pairs verified: $n"
 fi
 
 # --- 3. manifest the extras (NOT the mirror - see header) --------------------------------------

@@ -126,9 +126,25 @@ copy_in "checksums"    "$MEDIA_DIR"        media 'SHA256SUMS*'
 # The contracts-server config. Its absence is a hard stop: without it the enclave can
 # pull packages but has nothing to `pro attach` against, and every FIPS and ESM package
 # on the disk is inert.
-if [ -f "$MIRROR_BASE/airgapped-contracts.yaml" ]; then
-  [ "$DRY" -eq 0 ] && cp -a "$MIRROR_BASE/airgapped-contracts.yaml" "$STAGING_DIR/config/"
+#
+# It is a credential file - it maps contract tokens to entitlements - so pro-airgapped's
+# output should be mode 0600 root:root. That makes it unreadable to the account running
+# this script. Group-read it to that account rather than loosening it for everyone, and
+# check here so we fail before half-building a bundle.
+CONTRACTS="$MIRROR_BASE/airgapped-contracts.yaml"
+if [ -f "$CONTRACTS" ] && [ ! -r "$CONTRACTS" ]; then
+  die "$CONTRACTS exists but is not readable by $(id -un). Run:
+       sudo chown root:$(id -un) $CONTRACTS && sudo chmod 640 $CONTRACTS"
+fi
+if [ -f "$CONTRACTS" ]; then
+  [ "$DRY" -eq 0 ] && install -m 0600 "$CONTRACTS" "$STAGING_DIR/config/"
   note "contracts config: present"
+  # Rewritten aptURLs are the whole point of the file. If an entitlement we mirror still
+  # points at Canonical, clients inside the gap will try to reach it and fail at enable
+  # time - so surface the count rather than trusting the generation step.
+  local_urls=$(grep -c "aptURL: *http://$REPO_ADDRESS" "$CONTRACTS" 2>/dev/null || echo 0)
+  note "aptURLs pointing at $REPO_ADDRESS: $local_urls  (expect 4: esm-infra, esm-apps, fips-updates, cis)"
+  [ "$local_urls" -ge 4 ] || note "  WARNING: fewer than 4 - check the overrides in the pro-airgapped input"
 else
   note "contracts config: *** MISSING *** - see the warning at the end"
 fi

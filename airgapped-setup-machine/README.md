@@ -1,5 +1,170 @@
 # STAGE-01 — build plan
 
+## 0. WHAT IS LEFT — read this first, do not reconstruct it
+
+**This section is the single home for STAGE-01's remaining work.** The tables in §4–§7 record
+*how* things were built and why; they have gone stale more than once. If they disagree with
+this section, this section wins and the other one gets fixed.
+
+Last updated **2026-08-31 02:30**.
+
+| # | What | State |
+|---|---|---|
+| 1 | `apt download` the three air-gap `.deb`s for MIRROR-01 | **NOT DONE.** `/srv/apt-mirror/debs/` exists but is empty. **Next — see §0.3** |
+| 2 | nginx vhost + prove the mirror with a client | **NOT STARTED.** §6 step 9. nginx runs but has only the stock default site |
+| 3 | Decision 6 — how seed sticks get written now dev lives on a VM | **OPEN.** §7. Doesn't block today; bites at step 02 |
+
+**THE MIRROR IS COMPLETE — 2026-08-31 02:25. 317 GB, 90,681 packages.**
+
+| Archive | Size | Packages | Note |
+|---|---|---|---|
+| `archive.ubuntu.com` | 247 G | 85,779 | noble, -updates, -security; main+universe, amd64 |
+| `esm/fips-updates` | 68 G | 3,836 | incl. **353 FIPS kernel images** |
+| `esm/apps` | 2.4 G | 1,059 | |
+| `esm/usg` | 3.3 M | 3 | `usg`, `usg-benchmarks`, `usg-benchmarks-1` |
+| `esm/infra` | 408 K | 4 | Thin by design on a young LTS — see §0.4 |
+
+Also done: Pro attached (Infra weekday tier); all three air-gap tools installed
+(`contracts-airgapped`, `get-resource-tokens`, `pro-airgapped`); four signing keys staged in
+`/srv/apt-mirror/keys/` — `ubuntu-pro-esm-infra.gpg`, `ubuntu-pro-esm-apps.gpg`,
+`ubuntu-pro-fips.gpg`, `ubuntu-pro-cis.gpg`.
+
+Everything from earlier still stands: VM provisioned, dev toolchain 10/10, Stage-B tooling,
+repo cloned, private material transferred, push access + ssh-agent (§4.6), pre-push guard
+fired against the live remote, Windows-only material retired, step 00 media downloaded.
+
+### 0.3 Three `.deb`s the mirror can never serve — carry them separately
+
+`contracts-airgapped` and `pro-airgapped` must be **installed on MIRROR-01, inside the gap**,
+but they live in `ppa:yellow/ua-airgapped`, which is not in `mirror.list` and cannot be —
+MIRROR-01 has no route to Launchpad. **The contracts server cannot be installed from the
+mirror it exists to authenticate.**
+
+```bash
+sudo install -d -o apt-mirror -g apt-mirror /srv/apt-mirror/debs
+cd /srv/apt-mirror/debs
+sudo -u apt-mirror apt download contracts-airgapped pro-airgapped get-resource-tokens
+```
+
+### 0.4 Two verification traps found on 2026-08-31 — do not repeat them
+
+**1. Checking `dists/.../Release` does not prove a token works.** Release metadata is served
+more permissively than package content. The `esm-infra` token authenticated against Release
+(200) and was then **rejected on every pool file** (401). The whole archive looked healthy
+and downloaded zero packages. **Always verify against a real `pool/` file taken from that
+archive's own `Packages` index**, not against Release.
+
+**2. wget's first 401 is normal — read the second one.** The success and failure paths start
+identically:
+
+```
+apps :  401 -> Authentication selected: Basic realm="APT mirror" -> 200 OK          OK
+infra:  401 -> Authentication selected: Basic realm="APT mirror" -> 401 Unauthorized
+        Username/Password Authentication Failed.                                    FAILED
+```
+
+Grepping for `401` finds both. Grep for **`Authentication Failed`** instead.
+
+**Cause:** the contract exposes twelve resource names (`cc-eal`, `esm-apps`, `esm-infra`,
+`fips`, `fips-preview`, `fips-updates`, `landscape`, `livepatch`, `realtime-kernel`, `ros`,
+`ros-updates`, `usg`) and the wrong one was pasted onto the infra lines. Fixed by
+re-substituting the value printed under `esm-infra:`; all four packages then downloaded.
+
+**Also note the naming traps:** the token for `usg` is printed under **`cis`** — `usg` is an
+alias of the `cis` entitlement. And the STIG package is **`usg`**, not `ubuntu-security-guide`
+(that is the 20.04-era name, which is why `apt-cache madison ubuntu-security-guide` kept
+returning nothing).
+
+**Done and verified**, so nobody re-opens them:
+
+- VM provisioned; dev toolchain 10/10; Stage-B tooling (`regctl`, `regsync`, `store-admin`,
+  `snapd`, `qemu-utils`); repo cloned; private material transferred
+- Push access to `origin` + ssh-agent (§4.6); **pre-push guard fired against the live remote**,
+  4 tests — see `docs/open-questions.md`
+- Windows-only material retired (§6 step 6); step 00 media downloaded
+- **Ubuntu Pro attached 2026-08-31** — *Ubuntu Pro + Infra Support (weekday)*, account
+  "Mcvey Consulting", valid to 2027-08-30. `esm-apps`, `esm-infra`, `livepatch` enabled;
+  `fips-updates`, `usg`, `landscape` entitled and deliberately left disabled (§0.2)
+- **Archive mirror COMPLETE 2026-08-31 00:19** — 21:25:45 → 00:19:18, 2 h 53 m. **247 GB,
+  85,779 `.deb` files — exactly the count apt-mirror predicted.** Zero-byte files: 0. No wget
+  failures. Suites `noble`, `noble-security`, `noble-updates`. 738 GB free
+
+### 0.2 Do not enable `fips-updates` or `usg` on STAGE-01
+
+Both are entitled and both must stay **disabled here**. STAGE-01 is the staging box, not an
+enclave host. Enabling `fips-updates` moves it onto the FIPS kernel (the pathfinder went
+`7.0.0-30-generic` HWE → `6.8.0-138-fips`) for no benefit, and would put a FIPS-mode SSH
+restriction on the machine that holds the git deploy key.
+
+**The packages still reach the enclave** — they are *mirrored*, not installed. Mirroring
+requires only the bearer token in `mirror.list`, never enabling the service locally.
+
+### 0.1 What the paid Pro token actually unblocks
+
+Worth being precise, because "blocked on Q9" was previously applied far too broadly and cost
+a day on the mirror.
+
+| Needs the paid token | Does **not** need it |
+|---|---|
+| `pro attach` on STAGE-01 | The 245 GiB archive mirror — anonymous |
+| `get-resource-tokens` → the esm-infra / esm-apps bearer tokens | nginx serving that mirror |
+| The four ESM lines in `mirror.list` (single-digit GB) | Everything in items 2 and 3 above |
+| `pro-airgapped` → the airgapped contracts-server config | |
+| The Support Portal KB article describing the air-gapped Pro procedure | |
+
+**What to buy for the mirror: ONE paid Ubuntu Pro subscription, on STAGE-01, at the Infra
+tier or above.** One machine — not three.
+
+`airgap-update-lab.md` §2 is the authority on which machine holds what, and it has been
+settled since the lab was designed:
+
+| Machine | Where | Role | Subscription |
+|---|---|---|---|
+| **STAGE-01** | Online, **outside** the gap | Builds and syncs the mirror; holds the token | **PAID full Pro** |
+| MIRROR-01 | **Inside** the gap | nginx :80 (repo) + `contracts-airgapped` :8484 | Free tier |
+| CLIENT-01/02 | Inside the gap | Patch from MIRROR-01 | Free tier |
+
+**STAGE-01 is not the mirror.** It is the staging box that *fetches the packages the mirror is
+made of*, then hands them across the gap on removable media. The serving mirror is MIRROR-01,
+inside the enclave, and it needs no paid token — clients attach to its local contracts server,
+which serves entitlements derived from STAGE-01's paid token.
+
+**Which tier — established 2026-08-30 from Canonical's own pages.**
+
+| Tier | List | Buys the air-gapped procedure? |
+|---|---|---|
+| Ubuntu Pro, self-support | $500/yr | **No.** Entitlement only. *"No enterprise support included"*, no Knowledge Base |
+| **Pro + 24/7 Infra** | **$1,775/yr** | **Yes — the minimum that works** |
+| Pro + 24/7 Full | $3,400/yr | Yes, plus break-fix on ~36,000 Universe packages |
+| Weekday variants | 50% of the 24/7 rate | Infra weekday ≈ **$887.50/yr** |
+
+The tier matters for a reason unrelated to the token — every paid tier carries the
+entitlement. It is that the procedure is **KB-only**: Canonical's airgapped page says
+*"Customers with a paid subscription to Ubuntu Pro can set up the included services in
+environments with limited or no network connectivity"*, then points at a Knowledge Base
+article, *Get Started with Ubuntu Pro in an Airgapped Environment*, and states Support Portal
+/ Knowledge Base access is required to follow it. At $500 you own the entitlement and cannot
+read the instructions for using it.
+
+**So the mirror costs $887.50–$1,775/yr, one subscription.**
+
+> **Do not confuse this with the production cluster's licensing.** The three enclave hosts
+> need their own Pro coverage — that is a BOM/TCO line item, driven by
+> `HANDOFF.md` §3, and it is **not** what makes the mirror work. `airgap-update-lab.md` §1
+> also warns that one paid sub feeding otherwise-unlicensed production servers through a
+> mirror violates Canonical's service description: the free-tier rows above are lab and
+> evaluation only.
+
+Sources: <https://ubuntu.com/pro/docs/airgapped-setup/> · <https://ubuntu.com/pricing/pro>
+(both re-fetched 2026-08-30; pricing unchanged from 2026-08-27) · `airgap-update-lab.md` §1–3.
+
+**The consequence if Q9 never lands:** the enclave gets `noble`, `-updates` and `-security`
+from the mirror above, which on a young LTS is where nearly all patches come from today. What
+it does **not** get is ESM/Pro content, FIPS packages or USG STIG tooling — and those are the
+OS decision. So Q9 is not optional; it just is not blocking the work in flight.
+
+---
+
 **Status as of 2026-08-30: BUILT AND USABLE. Everything not gated on Q9 is done.**
 
 | | |
@@ -9,10 +174,14 @@
 | Dev toolchain (§4.4) | **Done** — all ten present |
 | Mirror + Stage-B tooling | **Done** — `nginx`, `snapd`, `qemu-utils`, `apt-mirror`, `regctl`, `regsync`, `store-admin` |
 | This repo cloned on it | **Done** 2026-08-30 |
+| Push access to `origin` | **Done** 2026-08-30 — deploy key registered, agent set up (§4.6) |
+| Pre-push guard fired against the live remote | **Done** 2026-08-30 — four tests, `docs/open-questions.md` |
 | Client-private material | **Done** — transferred with `scripts/private-sync.sh`, verified gitignored |
 | **Repo ownership** | **STAGE-01 is authoritative from 2026-08-30.** See §7 decision 7 |
 | Retire the Windows-only scripts and doc blocks | **Not started** — §6 step 6 |
-| Pro token, mirror run, nginx proof | **Blocked on Q9** — §6 steps 7-9 |
+| **Archive mirror (200-250 GB, no token needed)** | **NOT STARTED** — §6 step 8a. `mirror.list` was still the stock 2022 `kinetic` default until 2026-08-30. **This is the long pole and nothing blocks it** |
+| Pro token, ESM pockets, contracts server | **Blocked on Q9** — §6 steps 7, 8b |
+| nginx mirror vhost | **NOT STARTED** — §6 step 9. nginx runs, but serves only the stock default site |
 
 §6 carries per-step status and the audit command that produced this table. §8 records the four
 gotchas found building it - do not re-derive them.
@@ -207,10 +376,63 @@ above are fetched, not built.
 | | Status |
 |---|---|
 | **Paid Ubuntu Pro token** | **BLOCKING.** This is open question 9 — it unlocks the air-gapped tooling entitlement and the Support Portal KB article. Without it STAGE-01 cannot do its main job |
-| **SSH key auth from Windows** | **BROKEN as of 2026-08-30.** Two different keys both named `enclave_admin` exist - Windows `%USERPROFILE%\.ssh` holds `SHA256:4Z7+69CE5dAX6YZIs4G5ivEzLDm3dAwB51rGAxum/Rc`, WSL `~/.ssh` holds `SHA256:g3mQlJ+Gjv41DiIXaoXOccc5/332fbN3tLRWYsz5rPQ`, and STAGE-01 accepts **neither** as `encadmin`. §3 commits this project to VS Code Remote-SSH from Windows, so this is on the critical path, not a nicety. Fix: get in by console or password, then append the Windows public key to `~/.ssh/authorized_keys` |
+| **SSH key auth from Windows** | **FIXED 2026-08-30.** Two different keys both named `enclave_admin` had existed - Windows `%USERPROFILE%\.ssh` and WSL `~/.ssh` held different keys and STAGE-01 accepted neither. `~/.ssh/authorized_keys` now holds `SHA256:4Z7+69CE5dAX6YZIs4G5ivEzLDm3dAwB51rGAxum/Rc` (`enclave-admin`, RSA 4096) - the Windows one. Remote-SSH works |
 | SSH keypair | Generate on STAGE-01 for reaching the enclave hosts; add the pathfinder's key to it |
-| Git access to this repo | STAGE-01 is online, so a normal clone. **Not cloned as of 2026-08-30** |
+| **Git push access to origin** | **WORKING 2026-08-30.** Deploy key `~/.ssh/github_stage01` (`SHA256:yiOpB1BJ2AbWd49ckl7UdbQwUzfbOjcHJ8x+Sr9cGWE`, RSA 4096, read/write) registered on the repo. The key is **passphrase-protected**, so it needs an agent - see §4.6. Repo cloned 2026-08-30 |
 | ESM resource tokens | Derived from the paid token via `get-resource-tokens` |
+
+### 4.6 SSH agent for the git deploy key - set up 2026-08-30
+
+The deploy key is passphrase-protected (`aes256-ctr`/`bcrypt`), so `git` cannot sign with it
+unless an agent holds it unlocked. Headless, there is no desktop session to start one.
+
+**The failure mode is misleading.** With no agent, `ssh -T git@github.com` reports
+`Permission denied (publickey)` - which reads as "the key is not registered". It is not that.
+`ssh -vv` shows the truth:
+
+```
+debug1: Server accepts key: ... RSA SHA256:yiOpB1BJ2AbWd49ckl7UdbQwUzfbOjcHJ8x+Sr9cGWE
+git@github.com: Permission denied (publickey).
+```
+
+GitHub **accepted** the public key and asked for a signature; ssh could not produce one
+because the private key was locked and nothing could prompt. Check `ssh-add -l` before
+re-issuing a key.
+
+Ubuntu ships `/usr/lib/systemd/user/ssh-agent.service` but it carries
+`ConditionPathExists=/etc/X11/Xsession.options` and orders itself before
+`graphical-session-pre.target` - it will not start on a headless box. A local unit replaces it:
+
+```ini
+# ~/.config/systemd/user/ssh-agent.service
+[Unit]
+Description=SSH agent for STAGE-01 development (git deploy key)
+
+[Service]
+Type=simple
+Environment=SSH_AUTH_SOCK=%t/ssh-agent.socket
+ExecStart=/usr/bin/ssh-agent -D -a %t/ssh-agent.socket
+
+[Install]
+WantedBy=default.target
+```
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now ssh-agent.service
+# and in ~/.bashrc:
+export SSH_AUTH_SOCK="${XDG_RUNTIME_DIR}/ssh-agent.socket"
+```
+
+**Lingering is deliberately off** (`loginctl show-user encadmin -p Linger` -> `Linger=no`), so
+the agent dies at logout and the key must be re-added after a reboot:
+
+```bash
+ssh-add ~/.ssh/github_stage01
+```
+
+That is the intended trade: this box will hold the paid Pro token, and an unlocked
+write-capable key surviving logout indefinitely is not the posture we want on it.
 
 ## 5. Files in this folder
 
@@ -246,14 +468,25 @@ same guards as the enclave seed builder, for the same reason.
    2026-08-30.** All ten dev packages; `nginx`, `snapd`, `qemu-utils`, `apt-mirror`, `regctl`,
    `regsync`, `store-admin`; repo cloned; private material restored via
    `scripts/private-sync.sh`
-6. **Switch development to STAGE-01** — **DECIDED 2026-08-30, in progress.** See §7 decision 7.
-   Retire `00-fetch-verify-media.ps1` and the Windows-only blocks in the step docs;
-   `02-build-seed.ps1` stays (§7 decision 4)
-7. Attach the paid Pro token, install the air-gapped tooling — **blocked, Q9**
-8. First `apt-mirror` run — hours; leave it overnight — **blocked, Q9**
-9. Prove the mirror locally with nginx before anything crosses the gap — **blocked, Q9**
+6. ~~**Switch development to STAGE-01**~~ — **done 2026-08-30.** See §7 decision 7.
+   `00-fetch-verify-media.ps1` deleted; `docs/00-downloads.md` now routes step 00 to STAGE-01
+   and keeps the Windows procedure as a clearly-marked manual fallback with no script behind
+   it. `02-build-seed.ps1` stays, and its PowerShell blocks in `01-pathfinder.md` /
+   `02-host-install.md` stay with it (§7 decision 4)
+7. Attach the paid Pro token, install `contracts-airgapped` / `get-resource-tokens` from
+   `ppa:yellow/ua-airgapped` — **blocked, Q9.** The PPA is not added and neither package is
+   installed
+8. First `apt-mirror` run. **Splits in two — see `airgap-update-lab.md` §6:**
+   - **8a. archive.ubuntu.com, 200-250 GB — NOT blocked.** Anonymous and free, no token.
+     Hours; leave it overnight. **This is the long pole of the whole build**
+   - **8b. ESM pockets, single-digit GB — blocked, Q9.** Needs resource tokens. Appended to
+     the same `mirror.list` later; the archive content already on disk is not re-fetched
+9. Prove the mirror locally with nginx before anything crosses the gap — **not blocked for
+   8a.** nginx is running but has only the stock default site; the mirror vhost is unwritten
 
-**Steps 7–9 are gated on Q9** — the paid Pro token and Support Portal access. Nothing else is.
+**Corrected 2026-08-30.** Steps 8 and 9 were previously marked "blocked, Q9" wholesale. That
+was wrong and it cost time — the free archive half is the multi-hour item and could have been
+running all along. **Only step 7 and step 8b are gated on Q9.**
 
 ### Audit STAGE-01's state
 

@@ -9,9 +9,16 @@ the bottom but deliberately not staged yet.
 Verified 2026-08-27. Filenames and point releases change; re-check the index pages rather
 than pasting these URLs from memory in six months.
 
-Automated by [`scripts/install/00-fetch-verify-media.sh`](../scripts/install/00-fetch-verify-media.sh)
-(Linux) or [`00-fetch-verify-media.ps1`](../scripts/install/00-fetch-verify-media.ps1)
-(Windows — checksums only, see its header).
+Automated by [`scripts/install/00-fetch-verify-media.sh`](../scripts/install/00-fetch-verify-media.sh),
+**run on STAGE-01**.
+
+> **Bash only, and that is the whole answer here.** Step 00 runs on STAGE-01, which is the
+> connected staging machine and holds the media anyway. It has native `gpg`, `sha256sum` and
+> `curl`, so there is nothing left for a PowerShell equivalent to do.
+> `00-fetch-verify-media.ps1` was **retired 2026-08-30** — it could only ever do checksums, not
+> signatures, because it could not assume Gpg4win. The Windows sections below are kept as a
+> manual fallback for the case where you are verifying on the Windows box before the media
+> moves; they need no script.
 
 ---
 
@@ -100,22 +107,23 @@ different lists covering different files. Every `gpg` and checksum command below
 **relative to the directory you are standing in**, so running one in the wrong place verifies
 the wrong list.
 
-Layout produced by the fetch scripts (sizes from a real run, 2026-08-27):
+Layout produced by the fetch script (sizes from a real run, 2026-08-27):
 
 ```
-E:\media\                                             <- run the SERVER ISO checks here
+<media-dir>/                                          <- run the SERVER ISO checks here
     ubuntu-24.04.4-live-server-amd64.iso     3,247 MB
     SHA256SUMS                                  594 bytes   6 entries
     SHA256SUMS.gpg                              833 bytes
     MANIFEST.sha256                             628 bytes   (written by the fetch script)
-    minimal\                                          <- run the CLOUD IMAGE checks here
+    minimal/                                          <- run the CLOUD IMAGE checks here
         ubuntu-24.04-minimal-cloudimg-amd64.img     253 MB
         ubuntu-24.04-minimal-cloudimg-amd64.manifest
         SHA256SUMS                            2,174 bytes  18 entries
         SHA256SUMS.gpg                          833 bytes
 ```
 
-Substitute your own path if you did not download to `E:\media`.
+`<media-dir>` is wherever you pointed the fetch script — on STAGE-01 that is a local path; on
+the Windows fallback path it was `E:\media`, and the Windows sections below still use that.
 
 > **Both `SHA256SUMS` files list far more than you downloaded.** The server list has **6
 > entries** (24.04.3 and 24.04.4, desktop/server/WSL) and you downloaded 1. The minimal list
@@ -128,15 +136,17 @@ Substitute your own path if you did not download to `E:\media`.
 
 | Your machine | Signature check | Checksum check |
 |---|---|---|
-| **Linux / macOS** | `gpg` — built in or one package away | `sha256sum -c` |
-| **Windows + Gpg4win** | `gpg` — see install below | `Get-FileHash`, or `00-fetch-verify-media.ps1` |
-| **Windows, no Gpg4win** | **Defer** — do it on the pathfinder in step 01 | `00-fetch-verify-media.ps1` |
+| **STAGE-01 — do it here** | `gpg`, installed 2026-08-30 | `00-fetch-verify-media.sh` |
+| Windows + Gpg4win | `gpg` — see install below | `Get-FileHash`, manual |
+| Windows, no Gpg4win | **Defer** — do it on STAGE-01 | `Get-FileHash`, manual |
 
-Deferring is the normal bootstrap case: you need the ISO in order to have a Linux machine at
-all. But prefer verifying on Windows if you can — **your Windows box is the connected side**,
-and checking before the media crosses is the correct supply-chain posture. Deferring means
-the ISO travels one hop unverified. **Do not skip it permanently** — the ATO evidence package
-wants the signature, not just the checksum.
+**The bootstrap problem this table used to describe is gone.** It assumed the Windows box was
+the connected side and that you had no Linux machine until the ISO was written — so signatures
+got deferred to the pathfinder and the ISO travelled one hop unverified. STAGE-01 is now the
+connected side and has native `gpg`, so signature and checksum both happen before the media
+moves, which is the correct supply-chain posture and what the ATO evidence package wants.
+
+Deferring is now only a fallback, and there is no longer a reason to reach for it.
 
 ### Linux / macOS
 
@@ -203,7 +213,13 @@ Automated by [`00-fetch-verify-media.sh`](../scripts/install/00-fetch-verify-med
 checks the imported fingerprints against those values rather than trusting whatever the
 keyserver returns, and which stops rather than auto-importing the cloud-image key.
 
-### Windows — install Gpg4win
+### Windows — manual fallback
+
+Everything from here to "Next" is the **fallback path**, kept because the Windows box remains
+the seed-stick writer and you may want to verify media there before it moves. It is entirely
+manual — no script backs it any more. Prefer STAGE-01 above.
+
+#### Install Gpg4win
 
 Confirmed available via winget as `GnuPG.Gpg4win`, version 5.1.0 as of 2026-08-27:
 
@@ -214,7 +230,7 @@ winget install --id GnuPG.Gpg4win --exact
 **Open a new PowerShell window afterwards.** The installer adds `gpg.exe` to PATH and your
 current session will not see it. Confirm with `gpg --version`.
 
-### Windows — verify the server ISO
+#### Verify the server ISO
 
 ```powershell
 cd E:\media                            # the directory with the ISO and its SHA256SUMS
@@ -248,7 +264,7 @@ hex digits do. For reference, `ubuntu-24.04.4-live-server-amd64.iso` should be
 > in step 2 is what establishes trust here. A **BAD signature** is a failure; this warning is
 > not.
 
-### Windows — the cloud image
+#### The cloud image
 
 Different folder, different `SHA256SUMS`, **different signing key**. The fetch script puts it
 in a `minimal` subfolder of your download directory:

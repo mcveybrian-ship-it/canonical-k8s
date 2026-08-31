@@ -79,3 +79,8 @@ docs/open-questions.md
 docs/runbook.md
 artifact/
 archive/
+
+# Vendor binaries staged for transfer - never belong in a public repo
+*.deb
+*.snap
+*.tar.zst

@@ -74,6 +74,7 @@ Do not reopen without updating [`docs/open-questions.md`](docs/open-questions.md
 
 | File | Job |
 |---|---|
+| [`airgapped-setup-machine/README.md`](airgapped-setup-machine/README.md) | **STAGE-01** — the online staging machine and sole dev workstation. **§0 is the single home for what is left to do on it.** Not a numbered step; it underpins 04 and 10 |
 | [`docs/airgap-media.md`](docs/airgap-media.md) | What goes on the USB drives, and what makes an offline install work |
 | [`docs/open-questions.md`](docs/open-questions.md) | What is unanswered, grouped by who answers it |
 | [`docs/runbook.md`](docs/runbook.md) | Reference architecture — *why* the design is what it is, with sources. **Not a step list.** Cited by §-number |

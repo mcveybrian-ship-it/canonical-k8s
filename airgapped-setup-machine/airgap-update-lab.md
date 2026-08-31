@@ -230,8 +230,35 @@ deb [arch=amd64] https://bearer:<FIPS_TOKEN>@esm.ubuntu.com/fips-updates/ubuntu 
 # Not part of ESM. Without this there is no `usg fix stig-v1r1` inside the gap.
 deb [arch=amd64] https://bearer:<USG_TOKEN>@esm.ubuntu.com/usg/ubuntu noble main
 
+# MAAS as DEBS, not the snap — added 2026-08-31. No auth; it is a public PPA.
+# The snap declares base:core24, which has no FIPS stable channel, so a snap-installed
+# MAAS runs non-FIPS crypto on a FIPS host. Debs link the host's OpenSSL. Same version
+# either way: 1:3.7.3-18030-g.9122eee68-0ubuntu1~24.04.1.
+deb [arch=amd64] https://ppa.launchpadcontent.net/maas/3.7/ubuntu noble main
+
 clean http://archive.ubuntu.com/ubuntu
 ```
+
+> **Ceph needs no stanza — it is already mirrored.** The same FIPS reasoning moved storage off
+> the MicroCeph snap, but `ceph 19.2.3-0ubuntu0.24.04.3` is in `noble-updates/main`, which the
+> archive lines above already carry. All nine components, the same version as the squid snap,
+> zero extra transfer. See `docs/runbook.md` §2.5.
+
+> **Carry the PPA's signing key too.** A PPA is signed by its own key, not Canonical's archive
+> key, so the enclave cannot verify this repository without it:
+>
+> ```bash
+> ### MACHINE: stage-01 ###
+> sudo apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 684D4A47A61B7DBA 2>/dev/null || true
+> # Preferred on 24.04 - export to a keyring file that travels in the bundle:
+> gpg --keyserver keyserver.ubuntu.com --recv-keys 684D4A47A61B7DBA
+> gpg --export 684D4A47A61B7DBA | sudo tee /srv/apt-mirror/keys/maas-ppa.gpg >/dev/null
+> ```
+>
+> **[VERIFY] that key ID against Launchpad before trusting it** — the fingerprint shown on
+> <https://launchpad.net/~maas/+archive/ubuntu/3.7> is authoritative, not this file. Importing
+> whatever a keyserver returns for an ID proves nothing, which is the same trap recorded for the
+> cloud-image key in `docs/00-downloads.md`.
 
 ### What else has to cross that `apt-mirror` will never fetch
 

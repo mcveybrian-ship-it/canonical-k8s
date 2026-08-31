@@ -90,6 +90,12 @@ which git cannot carry (see the top of `docs/open-questions.md`).
 | 17 | `stage-01` | `build-transfer-bundle.sh` | `scripts/transfer/` |
 | 18 | `build-01` | `write-transfer-media.sh` → the SSD | `scripts/transfer/` |
 | 19 | `svc-repo-01` | `restore-mirror.sh` — restores **and proves** | `scripts/transfer/` |
+| ↻ | `stage-01` | **`private-sync.sh backup`** — after *any* edit to the five private paths | `docs/airgap-media.md` §8 |
+
+**Step ↻ is not a one-off.** `HANDOFF.md`, `open-questions.md` and `runbook.md` never show up
+in `git status`, so no commit and no push will ever remind you they changed. It packs, copies
+to `build-01`, verifies the checksum of the file that landed, opens the archive on the far end,
+and rotates. Without it the entire engagement record is one copy on one machine.
 
 **Steps 7–14 are the ones with teeth.** Every trap in them cost real time the first
 time — the stock 2022 `kinetic` `mirror.list`, the `chmod 600` that silently kills the run, the

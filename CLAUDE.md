@@ -76,6 +76,19 @@ backup and the seed-stick writer. Work on STAGE-01 over VS Code Remote-SSH.
 silently. Move them with `scripts/private-sync.sh pack|unpack`, never git, and re-pack
 whenever one changes on the authoritative machine.
 
+**After editing any of those five, run the backup.** They never appear in `git status`, so
+nothing else will remind you — and a change to `runbook.md` or `open-questions.md` is exactly
+the kind of work that never reaches a commit:
+
+```bash
+./scripts/private-sync.sh backup          # packs, copies to build-01, verifies, rotates
+```
+
+It compares the checksum of the file that actually landed and opens the archive on the far
+end, so a silent corruption is caught rather than assumed away. `docs/airgap-media.md` §8 has
+the parameters and the restore procedure. Note it is a **second copy, not an offsite one** —
+`stage-01` and `build-01` share a network and a room.
+
 **`origin` is public.** Enable the guard in every clone — git does not track `.git/hooks`:
 
 ```bash

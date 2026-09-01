@@ -19,13 +19,13 @@ and `scripts/install/02-*`. No exceptions.
 |---|---|---|---|
 | **00** | Download and verify the Ubuntu media | [`docs/00-downloads.md`](docs/00-downloads.md) | **DONE** 2026-08-27 — GPG signature check still outstanding, carries into step 01 |
 | **01** | Pathfinder: validate FIPS/STIG, then test the autoinstall | [`docs/01-pathfinder.md`](docs/01-pathfinder.md) | Pass 1 **DONE** · Pass 2 **you are here** |
-| **02** | Base OS install, 3 bare-metal hosts | [`docs/02-host-install.md`](docs/02-host-install.md) + [`airgap-media.md`](docs/airgap-media.md) | **READY** — two decisions first, §1 and §10 |
-| 03 | LXD on host-1, compose `svc-01` | not written | **NEXT.** Nothing blocks it once a host is built |
+| **02** | Base OS install, **4** bare-metal hosts — **host-4 first**, it carries MAAS | [`docs/02-host-install.md`](docs/02-host-install.md) + [`airgap-media.md`](docs/airgap-media.md) | **READY** — two decisions first, §1 and §10 |
+| 03 | libvirt on host-4, compose `svc-mgmt-01` by hand | not written | **NEXT.** libvirt, not LXD - runbook §2.6 |
 | 04 | Enclave services — Pro contract server, Landscape mirror, Harbor, MAAS | not written | Blocked: **Q9** — the air-gapped Pro procedure is Knowledge Base material, not public. This is the gate on everything downstream |
 | 05 | Harden hosts — Pro, FIPS, STIG | not written | **Cannot run before 04.** Pro attach in an air gap needs the contract server on `svc-01`. Also needs Q13 (your AO), Q19/Q20/Q21 |
 | 06 | Compose and deploy the 6 cluster VMs | not written | After 05. Each guest needs its own Pro attach, FIPS and STIG pass |
-| 07 | Bootstrap Kubernetes | not written | Blocked: Q8 — the FIPS snap channel |
-| 08 | Storage — MicroCeph and ceph-csi | not written | After 07 |
+| 07 | Bootstrap Kubernetes | not written | **Q8 ANSWERED** — no FIPS channel exists; needs the `core22` FIPS base snap. After 06 |
+| 08 | Storage — **Ceph (debs)** and ceph-csi | not written | After 07. **Not MicroCeph** — runbook §2.5 |
 | 09 | Validation and ATO evidence | not written | Includes the host-failure rehearsal, before go-live |
 | 10 | Day-2 patching | not written | Blocked: Q6 — offline bundle size and cadence |
 
@@ -63,12 +63,14 @@ Do not reopen without updating [`docs/open-questions.md`](docs/open-questions.md
 
 | | |
 |---|---|
-| Platform | Canonical Kubernetes, channel `1.36-classic/stable` |
+| Platform | Canonical Kubernetes **v1.36.4, snap rev 5526** — `1.36-classic/stable` was unpublished; taken from `candidate`, side-loaded by revision |
 | OS | Ubuntu 24.04 LTS, host and guest |
-| Image variant | Minimal on the 6 cluster nodes; standard server on the 3 hosts and `svc-01` |
+| Image variant | Minimal on the **7** cluster nodes; standard server on the **4 hosts** and the **3 service VMs** |
 | Datastore | Embedded etcd — the 1.36 default; `k8s-dqlite` was removed in 1.36 |
-| Storage | MicroCeph on the worker VMs, via ceph-csi |
+| Storage | **Ceph from `noble-updates/main` debs** on the worker VMs, via ceph-csi — **not** MicroCeph (runbook §2.5) |
 | Host provisioning | Autoinstall from media, **not** MAAS — MAAS runs on a VM on a host, so it cannot install that host |
+| Hypervisor | **libvirt/KVM from debs** — **not** LXD, which is snap-only on `base: core24` with no FIPS channel (runbook §2.6) |
+| Hosts | **4** — hosts 1–3 carry a control plane + worker each; host-4 carries 3 service VMs + the 4th worker |
 
 ## Everything else
 

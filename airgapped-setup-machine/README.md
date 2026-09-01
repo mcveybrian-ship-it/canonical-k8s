@@ -6,31 +6,39 @@
 *how* things were built and why; they have gone stale more than once. If they disagree with
 this section, this section wins and the other one gets fixed.
 
-Last updated **2026-08-31 17:45**.
+Last updated **2026-08-31 21:00**.
 
-**STAGE-01's work is DONE. The bundle is staged and waiting on hardware.**
+**STAGE-01's work is DONE. Everything that does not need hardware is finished.**
 
 | # | What | State |
 |---|---|---|
-| 1 | nginx vhost + prove the mirror resolves | **DONE.** All 9 suites, all 5 archives, `apt-get update` GPG-verified exit 0, a marker package pulled from each archive. `airgap-update-lab.md` §6.5 |
-| 2 | Generate `airgapped-contracts.yaml` | **DONE.** `pro-airgapped` run on `stage-01`; **4 of 4 `aptURL`s rewritten** to `svc-repo-01`. Lives at `/srv/apt-mirror/airgapped-contracts.yaml`, `640 root:encadmin` — it is a credential |
-| 3 | The three transfer scripts | **DONE.** `scripts/transfer/`, all lint-clean, parameterised into `transfer-params.env` |
-| 4 | **`build-transfer-bundle.sh` executed** | **DONE.** 15 items, **3.5 GB** of extras, manifest verified. With the 316 GB mirror that is **320 GB for the SSD** |
-| 5 | Decision 6 — writing physical media from a VM | **RESOLVED.** STAGE-01 never writes media; `build-01` does. Seed sticks stay a Windows job (§7 decision 4) |
-| — | **Write the SSD** | **BLOCKED ON HARDWARE — SSD arrives Tue 2026-09-01.** Run `write-transfer-media.sh` on `build-01` |
+| 1 | nginx vhost + prove the mirror resolves | ✅ **DONE** — 9 suites, 5 archives, `apt-get update` GPG-verified exit 0, a marker package pulled from each. §6.5 |
+| 2 | Generate `airgapped-contracts.yaml` | ✅ **DONE** — 4 of 4 `aptURL`s rewritten to `svc-repo-01`. `640 root:encadmin`; it is a credential |
+| 3 | The three transfer scripts | ✅ **DONE** — `scripts/transfer/`, lint-clean, fully parameterised |
+| 4 | `build-transfer-bundle.sh` executed | ✅ **DONE** — **28 items, 4.3 GB extras**, manifest verified |
+| 5 | Decision 6 — writing media from a VM | ✅ **RESOLVED** — `build-01` writes; STAGE-01 never touches USB |
+| 6 | Q8 — FIPS snap channel | ✅ **ANSWERED** — no FIPS channel exists for `k8s`; the requirement is `core22` from `fips-updates/stable` |
+| 7 | Platform snaps staged | ✅ **DONE** — `k8s` ×2, `core22`-FIPS, `core24`, `microceph`, `maas` + all 6 assertions |
+| 8 | Q24 — non-FIPS base snaps | ✅ **DECIDED** — Ceph and MAAS move to **debs**; no exception left to defend |
+| 9 | MAAS PPA mirrored + key verified | ✅ **DONE** — 53 debs, `Good signature from "Launchpad PPA for MAAS"` |
+| 10 | Artifact corrected + republished | ✅ **DONE** — 3 factual errors fixed, dated four-host callout added |
+| 11 | Private material backed up off-box | ✅ **DONE** — `private-sync.sh backup` to `build-01`, checksum-verified |
+| — | **Write the SSD** | ⏳ **BLOCKED ON HARDWARE** — arrives Tue 2026-09-01. `write-transfer-media.sh` on `build-01` |
+| 12 | **Q23 — which `k8s` version** | ✅ **DECIDED** — **v1.36.4, snap revision 5526**. LTS line; the build is `grade: stable`; and side-loading pins the revision, so the channel stops mattering once it crosses |
+| — | `ceph-csi` against deb-deployed Ceph | ⚠️ **UNTESTED** — load-bearing on the storage design. A lab test, not a paper question |
 
-**What is staged, in `/srv/bundle-staging`:**
+**What is staged, in `/srv/bundle-staging` — 28 items, 4.3 GB:**
 
 | | |
 |---|---|
-| `config/airgapped-contracts.yaml` | `0600`, 4 rewritten `aptURL`s |
-| `config/nginx-apt-mirror.conf` | the proven vhost |
+| `config/` | `airgapped-contracts.yaml` (`0600`, 4 rewritten `aptURL`s) · the proven nginx vhost |
 | `debs/` | `contracts-airgapped`, `pro-airgapped`, `get-resource-tokens` — the three the mirror can never serve |
-| `keys/` | `ubuntu-pro-{cis,esm-apps,esm-infra,fips}.gpg` |
+| `keys/` | `ubuntu-pro-{cis,esm-apps,esm-infra,fips}.gpg` · **`maas-ppa.gpg`** — 5 keyrings |
 | `media/` | the server ISO, the Minimal cloud image, `SHA256SUMS` + `.gpg` |
+| `snaps/` | `k8s` 1.35.7 + 1.36.4, `core22`-FIPS, `core24`, `microceph`, `maas` — **6 snaps + 6 assertions, pairing verified** |
 | `scripts/` | `restore-mirror.sh` + its params, so `svc-repo-01` needs nothing it cannot read off the disk |
 
-**Machine roster**, because there are now five names in play:
+**Machine roster**, because there are now six names in play:
 
 | Machine | Address | Side | Role |
 |---|---|---|---|
@@ -40,20 +48,24 @@ Last updated **2026-08-31 17:45**.
 | `host-1..4` | — | **air-gapped** | Not built |
 | `svc-repo-01` | — | **air-gapped** | A VM on `host-4`. Where `restore-mirror.sh` runs |
 
-**THE MIRROR IS COMPLETE — 2026-08-31 02:25. 317 GB, 90,681 packages.**
+**THE MIRROR IS COMPLETE — 318 GB, 90,853 packages, six archives.**
 
 | Archive | Size | Packages | Note |
 |---|---|---|---|
-| `archive.ubuntu.com` | 247 G | 85,779 | noble, -updates, -security; main+universe, amd64 |
+| `archive.ubuntu.com` | 248 G | 85,898 | noble, -updates, -security; main+universe, amd64 |
 | `esm/fips-updates` | 68 G | 3,836 | incl. **353 FIPS kernel images** |
 | `esm/apps` | 2.4 G | 1,059 | |
+| **`ppa maas/3.7`** | **239 M** | **53** | **Added 2026-08-31** — MAAS as debs, because the snap needs a non-FIPS `core24` base |
 | `esm/usg` | 3.3 M | 3 | `usg`, `usg-benchmarks`, `usg-benchmarks-1` |
-| `esm/infra` | 408 K | 4 | Thin by design on a young LTS — see §0.4 |
+| `esm/infra` | 404 K | 4 | Thin by design on a young LTS — see §0.4 |
+
+**Ceph needs no archive of its own** — `ceph 19.2.3-0ubuntu0.24.04.3` is already in
+`noble-updates/main`, which is why moving storage off the MicroCeph snap cost zero extra
+transfer. See `docs/runbook.md` §2.5.
 
 Also done: Pro attached (Infra weekday tier); all three air-gap tools installed
-(`contracts-airgapped`, `get-resource-tokens`, `pro-airgapped`); four signing keys staged in
-`/srv/apt-mirror/keys/` — `ubuntu-pro-esm-infra.gpg`, `ubuntu-pro-esm-apps.gpg`,
-`ubuntu-pro-fips.gpg`, `ubuntu-pro-cis.gpg`.
+(`contracts-airgapped`, `get-resource-tokens`, `pro-airgapped`); **five** signing keys staged
+in `/srv/apt-mirror/keys/`; six snaps + assertions in `/srv/apt-mirror/snaps/`.
 
 Everything from earlier still stands: VM provisioned, dev toolchain 10/10, Stage-B tooling,
 repo cloned, private material transferred, push access + ssh-agent (§4.6), pre-push guard

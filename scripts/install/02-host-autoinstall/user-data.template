@@ -52,6 +52,14 @@ autoinstall:
       # Multiple keys means per-workstation revocation: drop a line, not the whole account.
 @@SSH_KEYS@@
 
+  # AIR-GAPPED HOSTS: leave GATEWAY empty in host-params.env and NO default route is written.
+  # The host can then reach everything on its own subnet - your workstation, stage-01, the
+  # other enclave hosts - and has no path off it. That is not a firewall rule somebody can
+  # undo later; there is simply no route. Leave DNS empty too and no resolver is configured,
+  # which is correct when nothing outside is resolvable anyway - use addresses, not names.
+  #
+  # Set GATEWAY only for a host that genuinely must route off-subnet.
+  #
   # NIC_MATCH from host-params.env. Interface naming varies with hardware and firmware
   # (enp1s0, eno1, ens192...), so pinning a literal name breaks on the next machine.
   #
@@ -71,12 +79,7 @@ autoinstall:
         dhcp4: false
         addresses:
           - @@ADDRESS@@/@@PREFIX@@
-        routes:
-          - to: default
-            via: @@GATEWAY@@
-        nameservers:
-          addresses:
-            - @@DNS@@
+@@ROUTES@@@@NAMESERVERS@@
 
   # Disk encryption is controlled by ENCRYPT_DISKS in host-params.env. When true, a LUKS
   # dm_crypt layer sits between each partition and its volume group, so BOTH volume groups
@@ -105,7 +108,12 @@ autoinstall:
       #   pci-0000:03:00.0-nvme-1                      -> nvme0n1  NVMe
       #   pci-0000:04:00.4-usb-0:4.3:1.0-scsi-0:0:0:0  -> sdc      USB
       #
-      # '*-ata-*' therefore cannot match a USB device. Confirm the pattern on new hardware:
+      # The pattern comes from host-params.env (OS_DISK_MATCH / DATA_DISK_MATCH) because it
+      # is NOT universal. The defaults assume a SATA OS disk and an NVMe data disk, which is
+      # what the pathfinder happened to be. On an ALL-NVMe host - increasingly normal, and
+      # true of host-4 - '*-ata-*' matches NOTHING and '*-nvme-*' matches EVERY disk, so the
+      # install either fails or wipes the wrong device. Always confirm against the real
+      # hardware first:
       #     ls -l /dev/disk/by-path/ | grep -v part
       #
       # !! DO NOT USE 'size: smallest' HERE. Confirmed on the pathfinder 2026-08-28:
@@ -116,7 +124,7 @@ autoinstall:
         type: disk
         ptable: gpt
         match:
-          id_path: "*-ata-*"
+          id_path: "@@OS_DISK_MATCH@@"
         wipe: superblock-recursive
         preserve: false
         grub_device: false
@@ -265,7 +273,7 @@ autoinstall:
         type: disk
         ptable: gpt
         match:
-          id_path: "*-nvme-*"
+          id_path: "@@DATA_DISK_MATCH@@"
         wipe: superblock-recursive
         preserve: false
         grub_device: false
@@ -330,7 +338,7 @@ autoinstall:
       build_config=02-host-autoinstall/user-data.template
       hostname=@@HOSTNAME@@
       address=@@ADDRESS@@/@@PREFIX@@
-      gateway=@@GATEWAY@@
+      gateway=@@GATEWAY_RECORD@@
       built_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
       iso=ubuntu-24.04-live-server-amd64.iso
       hardened=no

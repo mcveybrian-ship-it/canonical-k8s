@@ -394,3 +394,105 @@ Fetched 2026-08-27.
 4. [Providing autoinstall configuration](https://canonical-subiquity.readthedocs-hosted.com/en/latest/tutorial/providing-autoinstall.html) · [Operating the server installer](https://canonical-subiquity.readthedocs-hosted.com/en/latest/tutorial/operate-server-installer.html) — `autoinstall.yaml` at medium root, `subiquity.autoinstallpath`, serial console, SSH into the installer
 5. [Ubuntu DISA-STIG compliance](https://ubuntu.com/security/disa-stig) — fresh-install requirement, administrative password requirement
 6. [Canonical Ubuntu 24.04 LTS STIG](https://www.stigviewer.com/stigs/canonical_ubuntu_2404_lts) — index only; pull the authoritative benchmark from DISA
+
+---
+
+## host-4 — first real execution of this procedure, 2026-09-01
+
+**This is the first time the step-02 autoinstall has been run on real hardware.** Everything
+below is measured from that build, not drafted. host-4 is built first because it carries MAAS,
+which composes every other VM (runbook §1.6).
+
+### Hardware as probed
+
+```
+sda      28.9G  usb   USB Flash Disk           <- installer stick, must never match
+nvme0n1  931.5G nvme  WDS100T3X0C-00SJG0       <- 1 TB WD, onboard M.2
+nvme1n1  1.9T   nvme  XF-2TB 2280              <- 2 TB, PCIe card
+nvme2n1  1.9T   nvme  XF-2TB 2280              <- 2 TB, PCIe card
+
+pci-0000:01:00.0-nvme-1  -> nvme0n1
+pci-0000:0c:00.0-nvme-1  -> nvme1n1
+pci-0000:0f:00.0-nvme-1  -> nvme2n1
+pci-0000:2d:00.3-usb-... -> sda
+```
+
+**All three drives are NVMe**, so `TRAN` cannot distinguish them and the shipped defaults
+(`*-ata-*` / `*-nvme-*`) are useless here — `*-ata-*` matches nothing, `*-nvme-*` matches all
+three. This is exactly why the patterns moved into `host-params.env` on 2026-09-01. Matched by
+PCI address instead:
+
+| Param | Value | Resolves to |
+|---|---|---|
+| `OS_DISK_MATCH` | `pci-0000:01:00.0-nvme-*` | `nvme0n1`, 1 TB — OS + `vg0` |
+| `DATA_DISK_MATCH` | `pci-0000:0c:00.0-nvme-*` | `nvme1n1`, 2 TB — `vg-data` |
+| *(unmatched)* | `pci-0000:0f:00.0` | `nvme2n1`, 2 TB — left **raw** for `k8s-wk-04`'s Ceph OSD |
+
+Leaving the third disk unmatched is deliberate: Ceph wants its own device, and an OSD on a
+separate spindle keeps recovery I/O off the mirror and Harbor.
+
+### Network — air-gapped from the first boot
+
+```
+ADDRESS   10.0.20.158    PREFIX 24
+GATEWAY   <empty>        no default route is written at all
+DNS       <empty>        nothing outside resolves
+NIC_MATCH 'en*'          resolves to enp42s0
+```
+
+**It was never connected to the internet, at any point.** "This host has never had egress" is a
+clean statement for the SSP; "we built it connected then disconnected it" is not, and cannot be
+walked back. The host reaches everything on `10.0.20.0/24` — so SSH administration works
+normally — and has no path off it. Not a firewall rule; an absent route.
+
+### Findings from this build
+
+**A wireless adapter is present** — `wlo1` / `wlp41s0`, `ec:91:61:db:47:c1`. **On an
+air-gapped IL5 host that is a finding**, and "we didn't configure it" is not an answer since
+anyone with root can bring it up. Disable it in firmware, remove the card if it is an M.2
+module, or at minimum blacklist the module and mask the interface. **Spec production hosts
+without wireless.**
+
+**The two 2 TB drives are DRAM-less** (Realtek RTS5772DL controllers, `XF-2TB 2280`). Fine for
+a lab, but one of them carries the Ceph OSD, and DRAM-less NVMe has poor sustained-write and
+`fsync` behaviour. When Ceph recovery is slow, that is why — lab artefact, not design fault.
+Same category as the consumer-M.2 note in runbook §1.5.
+
+**The old install on `nvme0n1` (partitions p1–p5) is wiped** by `wipe: superblock-recursive`.
+
+### The trap that cost the most time — `PASSWORD_HASH` quoting
+
+`mkpasswd -m sha-512` output **must** be wrapped in single quotes:
+
+```
+PASSWORD_HASH='$6$....'      # correct
+PASSWORD_HASH=$6$....        # WRONG - the shell expands $6 to nothing
+```
+
+Unquoted, the shell expands `$6` and the hash is silently mangled — the account is created with
+a garbage password and **nothing errors**. You discover it at the console of a host that also
+wants a LUKS passphrase. This is the same failure already recorded in
+`airgapped-setup-machine/README.md` §8 for the Hyper-V provisioning script; it recurs because
+the trigger is generic — `$` in a value, in a file that gets sourced.
+
+Worse, the symptom pointed nowhere: an unbalanced quote swallowed the next three lines,
+including a comment containing `PowerShell's ssh.exe`, and the script died with
+**`ssh.exe: command not found`**. `02-build-seed.sh` now validates quote balance and rejects an
+unquoted `PASSWORD_HASH` **before sourcing**, naming the line and the fix.
+
+### Building the seed without USB
+
+`stage-01` is a Hyper-V guest with no practical USB passthrough, so the seed is generated to a
+directory and the two files copied to media elsewhere:
+
+```bash
+### MACHINE: stage-01 ###
+./scripts/install/02-build-seed.sh -H host-4 -a 10.0.20.158 -o ~/seed-host-4
+```
+
+Then, anywhere with USB: `sudo mkfs.vfat -F 32 -n CIDATA /dev/sdX1` and copy both files to its
+root. **Verify line endings after copying** — `file user-data` must not say CRLF. Routing via
+Windows is how that happens.
+
+`user-data` contains the LUKS passphrase in plaintext. The stick is a credential; wipe it when
+the build is done.

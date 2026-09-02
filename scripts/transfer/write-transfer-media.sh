@@ -70,7 +70,9 @@ mountpoint -q "$MEDIA_MOUNT" \
   || die "$MEDIA_MOUNT is NOT a mount point. Mount the transfer SSD there first, by label:
          sudo mkdir -p $MEDIA_MOUNT && sudo mount LABEL=${MEDIA_LABEL:-enclave-xfer} $MEDIA_MOUNT"
 
-avail=$(df -PBG --output=avail "$MEDIA_MOUNT" | tail -1 | tr -dc '0-9')
+# -P and --output are mutually exclusive in GNU coreutils; --output already gives one
+# clean column, so -P has nothing to add.
+avail=$(df -BG --output=avail "$MEDIA_MOUNT" | tail -1 | tr -dc '0-9')
 note "target : $MEDIA_MOUNT"
 note "free   : ${avail} GB"
 note "fstype : $(findmnt -no FSTYPE "$MEDIA_MOUNT")"
@@ -100,11 +102,13 @@ RSYNC_OPTS=(-a --delete --human-readable "--info=progress2,stats1")
 
 head2 "pulling the mirror  (this is the long one)"
 note "expect roughly an hour on a 1 Gb link - 90,000 files, so per-file overhead dominates"
-mkdir -p "$MEDIA_MOUNT/mirror"
+# A dry run must not touch the target at all - the point of -n is to answer "would this
+# work" without leaving anything behind to explain later.
+[ "$DRY" -eq 0 ] && mkdir -p "$MEDIA_MOUNT/mirror"
 rsync "${RSYNC_OPTS[@]}" -e "$SSH_CMD" "$REMOTE:$MIRROR_BASE/mirror/" "$MEDIA_MOUNT/mirror/"
 
 head2 "pulling the extras"
-mkdir -p "$MEDIA_MOUNT/bundle"
+[ "$DRY" -eq 0 ] && mkdir -p "$MEDIA_MOUNT/bundle"
 rsync "${RSYNC_OPTS[@]}" -e "$SSH_CMD" "$REMOTE:$STAGING_DIR/" "$MEDIA_MOUNT/bundle/"
 
 # --- 4. verify the extras against their manifest ------------------------------------------------

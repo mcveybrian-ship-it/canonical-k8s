@@ -192,9 +192,6 @@ network:
       dhcp4: false
       dhcp6: false
       addresses: [10.0.20.158/24]
-      parameters:
-        stp: false
-        forward-delay: 0
 YAML
 sudo chmod 600 /etc/netplan/70-bridge.yaml
 ```
@@ -208,8 +205,40 @@ Line by line:
 | `addresses: [10.0.20.158/24]` | the host's address moves to `br0`, unchanged, so nothing else on your LAN notices |
 | **no `routes:`** | deliberate. host-4 is air-gapped and has **no default route** — adding a gateway here would silently undo that |
 | **no `nameservers:`** | same reason: there is no DNS to reach |
-| `stp: false` | Spanning Tree costs ~30s of blocked forwarding on every link change. One NIC, no loop possible |
-| `forward-delay: 0` | with STP off there is nothing to wait for; without this a VM can boot before its link forwards and fail DHCP |
+| **no `parameters:`** | see below — a bridge with custom parameters makes `netplan try` refuse to run |
+
+**Why there is no `parameters:` block, and it is not an oversight.**
+
+The obvious thing to write is `stp: false` and `forward-delay: 0`. Do that and `netplan try`
+**refuses to run at all**:
+
+```
+br0: reverting custom parameters for bridges and bonds is not supported
+
+Please carefully review the configuration and use 'netplan apply' directly.
+```
+
+It exits *before applying anything* — so the config never lands, and the safety net you thought
+you had does not exist. From `try_command.py`:
+
+```python
+for itf in multi_iface.values():
+    if not itf._is_trivial_compound_itf:
+        reason = "reverting custom parameters for bridges and bonds is not supported"
+```
+
+Setting either parameter is exactly what makes `_is_trivial_compound_itf` false. Confirmed
+against the netplan bindings:
+
+| Config | `_is_trivial_compound_itf` | `netplan try` |
+|---|---|---|
+| with `parameters:` | `False` | **refuses** |
+| without | `True` | works, auto-reverts |
+
+And the two settings only restate the kernel's own defaults — a Linux bridge has STP off unless
+you turn it on. So omitting them costs nothing and buys back a config that can roll itself
+back. **If you ever do need custom bridge parameters, apply them with `netplan apply` at the
+console** — there is no safety net on that path.
 
 **Step 3 — check the syntax, then check the result.** `generate` parses the config and writes
 the systemd units without touching the running network.

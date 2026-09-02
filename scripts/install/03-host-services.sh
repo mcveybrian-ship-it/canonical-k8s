@@ -292,9 +292,22 @@ cmd_bridge() {
       nameservers:
         addresses: [$BRIDGE_DNS]"
 
+  # NO 'parameters:' BLOCK, and that is deliberate. Found on host-4 2026-09-02:
+  # netplan try REFUSES to run at all on a bridge carrying custom parameters -
+  #     br0: reverting custom parameters for bridges and bonds is not supported
+  # - and exits before applying anything, so the auto-revert safety net does not exist for
+  # such a config. Confirmed in try_command.py is_revertable(): any bridge whose
+  # _is_trivial_compound_itf is False is rejected, and setting stp/forward-delay is exactly
+  # what makes it False.
+  #
+  # stp: false and forward-delay: 0 only restate the kernel's own defaults for a bridge, so
+  # omitting them costs nothing and buys back a config that can auto-revert. If you ever DO
+  # need custom bridge parameters, add them and apply with 'netplan apply' AT THE CONSOLE -
+  # there is no safety net for that path.
   cat > "$np" <<YAML
 # Bridge for enclave service VMs. Written by 03-host-services.sh on $(date -Is).
 # No gateway by design: this host is air-gapped and reaches its own subnet only.
+# No parameters: block - it would make netplan try refuse. See the script."
 network:
   version: 2
   ethernets:
@@ -307,9 +320,6 @@ network:
       dhcp4: false
       dhcp6: false
       addresses: [$BRIDGE_ADDRESS]$routes$dns
-      parameters:
-        stp: false
-        forward-delay: 0
 YAML
   chmod 600 "$np"
   ok "wrote $np"

@@ -350,6 +350,51 @@ Mount it by hand each trip; the script checks `mountpoint -q` and dies if you fo
 The `chown` is required: the script tests `[ -w "$MEDIA_MOUNT" ]` as the invoking user, and a
 freshly-made ext4 filesystem is owned by root.
 
+### 6.1b The SSH key build-01 needs — a prerequisite the scripts assume
+
+`write-transfer-media.sh` **pulls** from stage-01, so build-01 needs a key **to** stage-01.
+This is the opposite direction from `~/.ssh/build01`, which is stage-01's private key for
+reaching build-01 — build-01 had never been anything but an SSH *destination* and held no
+private key at all. The first run failed on exactly this:
+
+```
+error: cannot ssh to encadmin@10.0.20.160 with /home/encadmin/.ssh/build01
+```
+
+**`ssh-copy-id` cannot bootstrap it**, because stage-01 sets `PasswordAuthentication no`. The
+public key has to be installed from stage-01, which already trusts you.
+
+```bash
+### MACHINE: build-01 (10.0.20.124) ###
+ssh-keygen -t ed25519 -f ~/.ssh/stage01 -N '' -C 'build-01 -> stage-01 transfer'
+```
+
+**No passphrase, deliberately.** The transfer runs unattended for an hour; a passphrase means
+an ssh-agent, and an agent that dies mid-rsync is a worse failure than the bare key.
+
+stage-01 can already reach build-01, so pull the public key across rather than pasting it:
+
+```bash
+### MACHINE: stage-01 ###
+ssh -i ~/.ssh/build01 encadmin@10.0.20.124 'cat ~/.ssh/stage01.pub' \
+  | sed 's|^|from="10.0.20.124",no-agent-forwarding,no-X11-forwarding |' \
+  >> ~/.ssh/authorized_keys
+```
+
+**The `from=` restriction is not decoration.** This key grants access to the machine holding
+the paid Pro token and the 319 GB mirror. Bound to build-01's address, a leaked copy is useless
+anywhere else. `no-agent-forwarding` and `no-X11-forwarding` cost nothing and remove two things
+an unattended transfer never needs.
+
+```bash
+### MACHINE: build-01 (10.0.20.124) ###
+cd ~/canonical-k8s/scripts/transfer
+sed -i 's|^SSH_KEY=.*|SSH_KEY=/home/encadmin/.ssh/stage01|' transfer-params.env
+ssh -i ~/.ssh/stage01 -o BatchMode=yes encadmin@10.0.20.160 'hostname'
+```
+
+That must print `stage-01` before the transfer will run.
+
 ### 6.2 Rebuilding the bundle — what step 1 actually does
 
 `build-transfer-bundle.sh` is safe to re-run at any time and is expected to be run repeatedly

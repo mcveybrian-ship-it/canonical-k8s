@@ -6,7 +6,7 @@
 *how* things were built and why; they have gone stale more than once. If they disagree with
 this section, this section wins and the other one gets fixed.
 
-Last updated **2026-09-02 17:45**.
+Last updated **2026-09-02 18:15**.
 
 **STAGE-01's work is DONE. Everything that does not need hardware is finished.**
 
@@ -29,7 +29,7 @@ real client over the network. See `docs/03-host-services.md`.
 | 9 | MAAS PPA mirrored + key verified | ✅ **DONE** — 53 debs, `Good signature from "Launchpad PPA for MAAS"` |
 | 10 | Artifact corrected + republished | ✅ **DONE** — 3 factual errors fixed, dated four-host callout added |
 | 11 | Private material backed up off-box | ✅ **DONE** — `private-sync.sh backup` to `build-01`, checksum-verified |
-| — | **Write the SSD** | ⏳ **STILL BLOCKED 2026-09-02** — `lsblk` on `build-01` shows only its 238 G boot SATA and the 1.8 T `/srv/bundle` NVMe. No transfer SSD attached. `write-transfer-media.sh` on `build-01` |
+| — | **Write the SSD** | ⏳ **UNBLOCKED 2026-09-02** — drive attached and prepared: 931.5 G WD SN550 in a USB enclosure, wiped, GPT, ext4 `LABEL=enclave-xfer`, `-m 0`, mounted at `/mnt/transfer`. Payload is 322.6 G. `write-transfer-media.sh` on `build-01` has not been run yet. Procedure in `docs/airgap-media.md` §6.1a |
 | 12 | **Q23 — which `k8s` version** | ✅ **DECIDED** — **v1.36.4, snap revision 5526**. LTS line; the build is `grade: stable`; and side-loading pins the revision, so the channel stops mattering once it crosses |
 | — | `ceph-csi` against deb-deployed Ceph | ⚠️ **UNTESTED** — load-bearing on the storage design. A lab test, not a paper question |
 

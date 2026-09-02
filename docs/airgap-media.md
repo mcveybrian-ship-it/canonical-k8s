@@ -277,6 +277,79 @@ get reused and every enclave host will refuse Ed25519.
 BOM/CRLF class of failure that §7 decision 7 of `airgapped-setup-machine/README.md` was written
 about. Decision 4 kept `02-build-seed.ps1` because no physical Linux box existed. One now does.
 
+### 6.1a Preparing the transfer SSD — done 2026-09-02
+
+**The drive as it arrived:** a 1 TB WD Blue SN550 (`WDS100T3X0C-00SJG0`, serial
+`204188801050`) in a USB enclosure, so it presents as `/dev/sdb` with `TRAN=usb`, not as an
+NVMe device. It shipped with a Windows layout — a 16 MB Microsoft Reserved partition and a
+931.5 GB exFAT partition.
+
+931.5 GB against a **322.6 GB** payload (319 G mirror + 4.3 G extras), so there is room for
+several patch cycles before size becomes a question. The §6 table says 320 GB because that was
+the measured payload, not a requirement.
+
+**Look before destroying.** The drive was not blank, and a formatted-over drive is not
+recoverable:
+
+```bash
+### MACHINE: build-01 (10.0.20.124) ###
+sudo mkdir -p /mnt/inspect
+sudo mount -o ro /dev/sdb2 /mnt/inspect
+ls -la /mnt/inspect | head -30
+sudo du -sh /mnt/inspect
+sudo umount /mnt/inspect
+```
+
+**Confirm the device by serial, not by name.** `/dev/sdb` is assigned in discovery order and
+moves between boots, especially for USB. Wiping by device name is how the wrong disk dies:
+
+```bash
+### MACHINE: build-01 (10.0.20.124) ###
+lsblk -dno NAME,SIZE,TRAN,MODEL,SERIAL /dev/sdb
+```
+
+It must read `sdb 931.5G usb WDS100T3X0C-00SJG0 204188801050`. A different serial means stop.
+
+**Wipe and format:**
+
+```bash
+### MACHINE: build-01 (10.0.20.124) ###
+### DESTROYS ALL DATA ON /dev/sdb - serial must be 204188801050
+sudo wipefs -a /dev/sdb
+sudo sgdisk --zap-all /dev/sdb
+sudo sgdisk -n1:0:0 -t1:8300 -c1:"enclave-xfer" /dev/sdb
+sudo partprobe /dev/sdb
+sudo mkfs.ext4 -L enclave-xfer -m 0 /dev/sdb1
+```
+
+`-m 0` matters here. ext4 reserves 5% of the filesystem for root by default — a sensible
+guard against a full root filesystem, and pure waste on a courier disk. On 931.5 GB that is
+**~46 GB** given back.
+
+`wipefs` before `sgdisk` because a stale exFAT superblock signature can survive a partition
+table rewrite and confuse `blkid` afterwards.
+
+**Mount it where `write-transfer-media.sh` expects, and no further:**
+
+```bash
+### MACHINE: build-01 (10.0.20.124) ###
+sudo mkdir -p /mnt/transfer
+sudo mount LABEL=enclave-xfer /mnt/transfer
+sudo chown encadmin:encadmin /mnt/transfer
+df -h /mnt/transfer && findmnt -no SOURCE,TARGET,FSTYPE,LABEL /mnt/transfer
+```
+
+Mounted by `LABEL=`, for the same reason the device was verified by serial.
+
+**Deliberately NOT in `/etc/fstab`.** This disk lives in a bag between trips. An entry for a
+disk that is not present fails the boot, and `build-01` is not a machine anyone wants to
+rescue at a console — `nofail` would fix the boot but leaves `/mnt/transfer` as an ordinary
+empty directory, which is exactly the case `write-transfer-media.sh` refuses to write into.
+Mount it by hand each trip; the script checks `mountpoint -q` and dies if you forget.
+
+The `chown` is required: the script tests `[ -w "$MEDIA_MOUNT" ]` as the invoking user, and a
+freshly-made ext4 filesystem is owned by root.
+
 ### 6.2 Rebuilding the bundle — what step 1 actually does
 
 `build-transfer-bundle.sh` is safe to re-run at any time and is expected to be run repeatedly
@@ -401,12 +474,14 @@ readable from Windows.
 > compared basenames across *different* directories, so it was really just packages appearing
 > in both the archive and an ESM pool. The correct test is per-directory and returns zero.
 
-### Blocker before any of this runs
+### Blocker before any of this runs — CLEARED 2026-08-31
 
-**`airgapped-contracts.yaml` does not exist yet.** `pro-airgapped` must consume the resource
-tokens and emit it with every `aptURL` rewritten to MIRROR-01. Without it the enclave has a
-repository it can pull from and **nothing to `pro attach` against** — the ESM and FIPS packages
-sit on the disk unusable. It has to be in the bundle, so it comes before step 1.
+**`airgapped-contracts.yaml` exists.** `pro-airgapped` consumed the resource tokens and emitted
+it with **4 of 4** `aptURL`s rewritten to `svc-repo-01`. It is in the bundle at mode `0600`; it
+is a credential, not a config file.
+
+Why it gated everything: without it the enclave has a repository it can pull from and
+**nothing to `pro attach` against**, so the ESM and FIPS packages sit on the disk unusable.
 
 ## 7. Not yet answered
 

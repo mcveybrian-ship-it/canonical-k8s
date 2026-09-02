@@ -384,6 +384,75 @@ not named in the config and is left untouched.
 > rules for partition requirements, and reconcile before the first real install. Add any
 > filesystem it names that is missing from the template. This is install-time-irreversible.
 
+## 10a. The second LUKS passphrase, and why the seed removes it
+
+Two encrypted disks means two LUKS headers, so an unmodified install asks for **two**
+passphrases at boot and blocks on the second. What that looks like at the rack is worse than
+it sounds: the host answers ping, so it appears to be up, but `sshd` has not started and will
+not until someone types at the console. Measured on host-4, 2026-09-02:
+
+```
+systemd-cryptsetup@crypt\x2ddata.service   374s   (waiting at a prompt)
+```
+
+Four hosts, two prompts each, is eight console entries per full-cluster reboot on machines
+that already require a person present because there is no TPM.
+
+**The seed now fixes this at install time.** When `ENCRYPT_DISKS=true`, `02-build-seed.sh`
+emits a `late-command` that:
+
+1. creates `/etc/luks/` and writes a random keyfile, `0400 root:root`, **on the encrypted
+   root** — not on an unencrypted `/boot` and not on the data volume it unlocks;
+2. `luksAddKey`s it as an **additional** keyslot, feeding the existing passphrase
+   non-interactively (it is already in `user-data` at install time, which is the only reason
+   this automates cleanly). The passphrase slot is never removed, so manual unlock still works
+   if the keyfile is ever lost;
+3. rewrites the `crypt-data` line in `crypttab` to use the keyfile with `luks,discard,nofail`;
+4. rebuilds the initramfs.
+
+After, on host-4:
+
+```
+4.742s systemd-cryptsetup@crypt\x2ddata.service
+```
+
+**374s to 4.7s, and the second prompt is gone.**
+
+**Root still asks for its passphrase, and that is deliberate.** It is the secret protecting
+everything else. The keyfile only exists once root is already open, so an attacker holding the
+physical disks has an encrypted root and a key they cannot reach. Automating root's unlock
+without a TPM would mean storing its key somewhere readable, which defeats the encryption.
+
+**`nofail` is not cosmetic.** With it, a keyfile problem degrades to "data volume not mounted"
+— the host boots, `sshd` starts, and you can log in and fix it. Without it, the failure is the
+six-minute stall above, with no way in.
+
+The block is emitted only when `ENCRYPT_DISKS=true`, and even then it acts only if a separate
+data volume exists. host-4 was the only host that ever needed the manual version; hosts 1-3
+have never booted the slow way.
+
+### A bash trap this uncovered — worth more than the feature
+
+While render-testing the above, the placeholder check rejected the output:
+
+```
+368:  if cryptsetup status crypt-data >/dev/null 2>@@KEYFILE_LATECMD@@1; then
+```
+
+In bash, `${var//pattern/replacement}` treats an `&` in the **replacement** as "the text that
+was matched", the same rule `sed` uses. So substituting a block containing `2>&1` reinserted
+the placeholder in the middle of it.
+
+Here the check caught it, but **that was luck**. The same rule applies to every free-text value
+the seed substitutes: a LUKS passphrase or an SSH key comment containing `&` would have
+produced a corrupted seed with **no error at all**, and the first sign of trouble would be an
+unbootable host at the rack.
+
+`02-build-seed.sh` now defines `esc()` and applies it to every free-text substitution —
+`PASSWORD_HASH`, `SSH_KEYS`, `CRYPT_OS`, `CRYPT_DATA`, the keyfile block, both disk matches and
+`NIC_MATCH`. Verified by rendering a seed with `&` deliberately in the passphrase: it lands in
+the storage config intact, and `2>&1` stays `2>&1`.
+
 ## 11. Sources
 
 Fetched 2026-08-27.

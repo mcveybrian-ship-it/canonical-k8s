@@ -339,6 +339,20 @@ autoinstall:
              >> /target/etc/default/grub
     - curtin in-target --target=/target -- update-grub
 
+    # ---- LUKS keyfile for the DATA volume ------------------------------------------------
+    # Substituted by 02-build-seed.sh. Empty when ENCRYPT_DISKS=false, or when there is no
+    # separate data disk.
+    #
+    # WHY: each LUKS container has its own header, so a host with two encrypted disks asks
+    # for TWO passphrases at every boot, and boot BLOCKS on the second one. Measured on
+    # host-4 2026-09-02: systemd-cryptsetup@crypt-data took 6m14s waiting at a prompt,
+    # during which the machine answered ping but never started sshd. Four hosts would mean
+    # eight console entries per full-cluster reboot.
+    #
+    # The root volume still asks for its passphrase - that is the secret protecting
+    # everything. Once root is open, the keyfile on it unlocks the data volume. An attacker
+    # holding the disks has an encrypted root and a keyfile they cannot reach.
+@@KEYFILE_LATECMD@@
     # Per-host provenance for the ATO package: which config and which parameters built this box.
     - |
       cat > /target/etc/enclave-build-info <<EOF

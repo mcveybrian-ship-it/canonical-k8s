@@ -47,6 +47,13 @@ while getopts ":H:a:d:o:p:t:nh" opt; do
   esac
 done
 
+# BASH GOTCHA, found 2026-09-02: in ${var//pattern/replacement}, an '&' in the REPLACEMENT
+# means "the text that was matched" - the same rule sed uses. So substituting a value
+# containing '2>&1' silently produced '2>@@PLACEHOLDER@@1'. Any free-text value can hit this:
+# a LUKS passphrase or an SSH key comment containing '&' would corrupt the seed with no error.
+# Escape every replacement that is not a fixed literal.
+esc() { printf '%s' "${1//&/\\&}"; }
+
 die() { echo "[x] $*" >&2; exit 1; }
 
 [[ -n "$HOST" ]] || die "-H <hostname> is required"
@@ -127,12 +134,40 @@ done
   VG0_DEV="crypt-os"
   VGDATA_DEV="crypt-data"
   ENC_SUMMARY="LUKS on both volume groups"
+  KEYFILE_LATECMD=$(cat <<'KFEOF'
+    - |
+      set -e
+      # Only act if a separate data volume actually exists on this host.
+      if cryptsetup status crypt-data >/dev/null 2>&1; then
+        DEV=$(cryptsetup status crypt-data | awk '/device:/{print $2}')
+        UUID=$(blkid -s UUID -o value "$DEV")
+
+        install -d -m 0700 /target/etc/luks
+        dd if=/dev/urandom of=/target/etc/luks/crypt-data.key bs=512 count=8 status=none
+        chmod 0400 /target/etc/luks/crypt-data.key
+
+        # Add the keyfile as an ADDITIONAL keyslot. The passphrase slot is never removed,
+        # so a keyfile problem still leaves you able to unlock by hand.
+        printf '%s' "__LUKS_PASSPHRASE__" | \
+          cryptsetup luksAddKey "$DEV" /target/etc/luks/crypt-data.key --key-file=-
+
+        # nofail: a keyfile problem then degrades to "data volume not mounted" instead of
+        # blocking boot for six minutes with no sshd.
+        sed -i '/^crypt-data/d' /target/etc/crypttab 2>/dev/null || true
+        echo "crypt-data UUID=$UUID /etc/luks/crypt-data.key luks,discard,nofail" \
+          >> /target/etc/crypttab
+      fi
+    - curtin in-target --target=/target -- update-initramfs -u -k all
+KFEOF
+)
+  KEYFILE_LATECMD="${KEYFILE_LATECMD//__LUKS_PASSPHRASE__/$LUKS_PASSPHRASE}"
 else
   CRYPT_OS=""
   CRYPT_DATA=""
   VG0_DEV="p-pv"
   VGDATA_DEV="p-data"
   ENC_SUMMARY="NONE - plaintext disks"
+  KEYFILE_LATECMD=""
 fi
 [[ "$PASSWORD_HASH" == \$6\$* ]] || die "PASSWORD_HASH does not look like a SHA-512 crypt hash"
 
@@ -163,7 +198,7 @@ SSH_KEYS_YAML="${SSH_KEYS_YAML%$'\n'}"
 content="$(cat "$TEMPLATE")"
 content="${content//@@HOSTNAME@@/$HOST}"
 content="${content//@@ADDRESS@@/$ADDR}"
-content="${content//@@NIC_MATCH@@/$NIC_MATCH}"
+content="${content//@@NIC_MATCH@@/$(esc "$NIC_MATCH")}"
 # SERIAL_CONSOLE=true puts ttyS0 last, so prompts go to serial - correct for a racked
 # host reached over BMC serial-over-LAN. false puts tty0 last so prompts appear on an
 # attached monitor. Getting this backwards makes a LUKS host look hung at boot.
@@ -173,8 +208,9 @@ else
   CONSOLE_CMDLINE="console=ttyS0,115200n8 console=tty0"
 fi
 content="${content//@@CONSOLE_CMDLINE@@/$CONSOLE_CMDLINE}"
-content="${content//@@OS_DISK_MATCH@@/$OS_DISK_MATCH}"
-content="${content//@@DATA_DISK_MATCH@@/$DATA_DISK_MATCH}"
+content="${content//@@KEYFILE_LATECMD@@/$(esc "$KEYFILE_LATECMD")}"
+content="${content//@@OS_DISK_MATCH@@/$(esc "$OS_DISK_MATCH")}"
+content="${content//@@DATA_DISK_MATCH@@/$(esc "$DATA_DISK_MATCH")}"
 content="${content//@@PREFIX@@/$PREFIX}"
 # An air-gapped host declares no default route at all. Empty GATEWAY means the routes block
 # is omitted entirely, so the host reaches its own subnet and has no path off it - not a
@@ -195,9 +231,9 @@ fi
 content="${content//@@GATEWAY_RECORD@@/${GATEWAY:-none-airgapped-no-default-route}}"
 content="${content//@@ROUTES@@/$ROUTES_BLOCK}"
 content="${content//@@NAMESERVERS@@/$NS_BLOCK}"
-content="${content//@@PASSWORD_HASH@@/$PASSWORD_HASH}"
+content="${content//@@PASSWORD_HASH@@/$(esc "$PASSWORD_HASH")}"
 content="${content//@@ALLOW_PW@@/$ALLOW_PW}"
-content="${content//@@SSH_KEYS@@/$SSH_KEYS_YAML}"
+content="${content//@@SSH_KEYS@@/$(esc "$SSH_KEYS_YAML")}"
 content="${content//@@USERNAME@@/$USERNAME}"
 content="${content//@@LV_ROOT@@/$LV_ROOT}"
 content="${content//@@LV_HOME@@/$LV_HOME}"
@@ -205,8 +241,8 @@ content="${content//@@LV_VAR@@/$LV_VAR}"
 content="${content//@@LV_VARLOG@@/$LV_VARLOG}"
 content="${content//@@LV_VARLOGAUDIT@@/$LV_VARLOGAUDIT}"
 content="${content//@@LV_TMP@@/$LV_TMP}"
-content="${content//@@CRYPT_OS@@/$CRYPT_OS}"
-content="${content//@@CRYPT_DATA@@/$CRYPT_DATA}"
+content="${content//@@CRYPT_OS@@/$(esc "$CRYPT_OS")}"
+content="${content//@@CRYPT_DATA@@/$(esc "$CRYPT_DATA")}"
 content="${content//@@VG0_DEV@@/$VG0_DEV}"
 content="${content//@@VGDATA_DEV@@/$VGDATA_DEV}"
 

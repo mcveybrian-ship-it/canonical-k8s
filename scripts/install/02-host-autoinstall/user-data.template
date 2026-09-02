@@ -320,7 +320,14 @@ autoinstall:
     # Serial console on the INSTALLED system. These are racked, headless machines: serial over
     # BMC SOL still works when networking is broken, which is exactly when you need it.
     - |
-      sed -i 's/^GRUB_CMDLINE_LINUX=.*/GRUB_CMDLINE_LINUX="console=tty0 console=ttyS0,115200n8"/' \
+      # CONSOLE ORDER MATTERS AND IT IS EASY TO GET BACKWARDS.
+      # Kernel messages go to EVERY console listed, but /dev/console - where interactive
+      # prompts are written - is the LAST one. With ttyS0 last, the LUKS passphrase prompt
+      # goes to the serial port and the monitor shows boot messages then nothing at all.
+      # That cost an afternoon on host-4 on 2026-09-01: the machine looked hung and was
+      # simply waiting for a passphrase on a port nobody was attached to.
+      # tty0 LAST => prompt on the monitor, serial still receives all kernel output.
+      sed -i 's/^GRUB_CMDLINE_LINUX=.*/GRUB_CMDLINE_LINUX="@@CONSOLE_CMDLINE@@"/' \
         /target/etc/default/grub
     - |
       grep -q '^GRUB_TERMINAL=' /target/etc/default/grub \

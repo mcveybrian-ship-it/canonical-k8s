@@ -164,6 +164,15 @@ content="$(cat "$TEMPLATE")"
 content="${content//@@HOSTNAME@@/$HOST}"
 content="${content//@@ADDRESS@@/$ADDR}"
 content="${content//@@NIC_MATCH@@/$NIC_MATCH}"
+# SERIAL_CONSOLE=true puts ttyS0 last, so prompts go to serial - correct for a racked
+# host reached over BMC serial-over-LAN. false puts tty0 last so prompts appear on an
+# attached monitor. Getting this backwards makes a LUKS host look hung at boot.
+if [[ "${SERIAL_CONSOLE:-false}" == "true" ]]; then
+  CONSOLE_CMDLINE="console=tty0 console=ttyS0,115200n8"
+else
+  CONSOLE_CMDLINE="console=ttyS0,115200n8 console=tty0"
+fi
+content="${content//@@CONSOLE_CMDLINE@@/$CONSOLE_CMDLINE}"
 content="${content//@@OS_DISK_MATCH@@/$OS_DISK_MATCH}"
 content="${content//@@DATA_DISK_MATCH@@/$DATA_DISK_MATCH}"
 content="${content//@@PREFIX@@/$PREFIX}"

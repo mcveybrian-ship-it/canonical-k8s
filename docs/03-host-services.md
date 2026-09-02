@@ -464,4 +464,16 @@ systemd-networkd enabled
 `forward_delay` reads 1500 (centiseconds) but is only consulted when STP is enabled, so it is
 inert here.
 
-Outstanding on host-4: the libvirt storage pool, then `svc-mgmt-01` itself.
+**After a cold boot and `libvirt`, verified from `stage-01`:**
+
+```
+default net : Active=no  Autostart=no
+pool        : images  active  autostart yes
+free space  : 1.8T on /var/lib/libvirt/images
+bridge      : 10.0.20.158/24, members: enp42s0
+```
+
+`./03-host-services.sh verify` returns `[ok] step 03 complete`.
+
+**Host preparation is done. `svc-mgmt-01` is not yet composed** — that is the remainder of
+step 03, and the first thing that will actually use any of this.

@@ -94,30 +94,171 @@ still enabled you would also need `/etc/cloud/cloud.cfg.d/99-disable-network-con
 
 ---
 
-## 4. The data volumes
+### 3.1 What the bridge actually does — run it by hand once
+
+**Run this sequence yourself the first time.** The script does exactly the same thing; doing
+it by hand once is what makes the script debuggable at 2am on a host you cannot ssh into.
+
+**The idea in one line:** today `enp42s0` holds the IP address. After this, `enp42s0` holds
+*nothing* and becomes a plain switch port, and a new virtual device `br0` holds the address
+and passes frames between the NIC and every VM attached to it.
+
+```
+BEFORE                          AFTER
+enp42s0  10.0.20.158            enp42s0  (no address, enslaved)
+                                   |
+                                br0     10.0.20.158
+                                   |
+                                vnet0 -> svc-repo-01  10.0.20.161
+```
+
+**Step 1 — write down what you are changing from.** If anything goes wrong this is what you
+restore to, and on an air-gapped host you cannot look it up later.
+
+```bash
+### MACHINE: host-4 (10.0.20.158) ###
+ip -br addr show enp42s0
+ip route
+sudo cp -a /etc/netplan /root/netplan.bak-$(date +%F)
+```
+
+**Step 2 — write the bridge config.** Netplan reads every `*.yaml` in `/etc/netplan` in
+filename order, so `70-bridge.yaml` is applied after `50-cloud-init.yaml` and wins. Mode
+`600`, because netplan warns loudly about world-readable configs.
+
+```bash
+### MACHINE: host-4 (10.0.20.158) ###
+sudo tee /etc/netplan/70-bridge.yaml >/dev/null <<'YAML'
+network:
+  version: 2
+  ethernets:
+    enp42s0:
+      dhcp4: false
+      dhcp6: false
+  bridges:
+    br0:
+      interfaces: [enp42s0]
+      dhcp4: false
+      dhcp6: false
+      addresses: [10.0.20.158/24]
+      parameters:
+        stp: false
+        forward-delay: 0
+YAML
+sudo chmod 600 /etc/netplan/70-bridge.yaml
+```
+
+Line by line:
+
+| Line | Why |
+|---|---|
+| `enp42s0: dhcp4: false` | the NIC must stop claiming an address of its own — it is now just a port |
+| `interfaces: [enp42s0]` | this is the enslaving. The NIC becomes a member of the bridge |
+| `addresses: [10.0.20.158/24]` | the host's address moves to `br0`, unchanged, so nothing else on your LAN notices |
+| **no `routes:`** | deliberate. host-4 is air-gapped and has **no default route** — adding a gateway here would silently undo that |
+| **no `nameservers:`** | same reason: there is no DNS to reach |
+| `stp: false` | Spanning Tree costs ~30s of blocked forwarding on every link change. One NIC, no loop possible |
+| `forward-delay: 0` | with STP off there is nothing to wait for; without this a VM can boot before its link forwards and fail DHCP |
+
+**Step 3 — check the syntax before applying it.** This parses the config and reports errors
+without touching the running network.
+
+```bash
+### MACHINE: host-4 (10.0.20.158) ###
+sudo netplan generate
+```
+
+Silence is success. An error here costs you nothing — an error in step 4 costs a walk.
+
+**Step 4 — apply it with the safety net.** `netplan try` applies the config, then waits. If
+you do not press ENTER within the timeout, **it puts everything back automatically**.
+
+```bash
+### MACHINE: host-4 (10.0.20.158) ###
+sudo netplan try --timeout 120
+```
+
+What you will see: your ssh session may freeze for a few seconds as the address moves. That is
+normal — the address is the same, so the session usually survives. **Do not press ENTER until
+you have proved it works in a second window.**
+
+**Step 5 — prove it from somewhere else, then confirm.** Open a *second* terminal:
+
+```bash
+### MACHINE: stage-01 ###
+ssh encadmin@10.0.20.158 'ip -br addr show br0; ip -br link show enp42s0'
+```
+
+You want `br0` holding `10.0.20.158/24`, and `enp42s0` UP with no address. **Only then** go
+back to the first window and press ENTER.
+
+**If you pressed nothing and the session died:** wait two full minutes. `netplan try` reverts
+on its own and the host comes back on the same address. That is the entire point of using it.
+
+**If you confirmed a broken config:** that is the walk to the rack. At the console:
+
+```bash
+### MACHINE: host-4 — physical console ###
+sudo rm /etc/netplan/70-bridge.yaml
+sudo netplan apply
+```
+
+**Step 6 — stop libvirt's NAT network**, so nothing accidentally lands on 192.168.122.0/24:
+
+```bash
+### MACHINE: host-4 (10.0.20.158) ###
+sudo virsh net-destroy default
+sudo virsh net-autostart default --disable
+sudo virsh net-list --all
+```
+
+`default` should read `inactive` / `no`. It is disabled rather than deleted — an inactive
+network costs nothing and leaves the option open.
+
+From here a VM joins the LAN with `--network bridge=br0` instead of `--network default`.
+
+## 4. The data volumes — one, not one per service
 
 The step-02 autoinstall creates `vg-data` on top of `crypt-data` **with no logical volumes**,
 because the sizes depend on what services land here — which is this step's decision, not the
 installer's.
 
-Default split of the 1.9 T `crypt-data`, all parameters:
+**It is one volume, and the reasoning matters more than the number.** `svc-repo-01` and
+`svc-harbor-01` are **VMs** (runbook §1.1), so their storage lives inside their virtual disks.
+A `/srv/repo` mounted on the host would be a second copy of storage that belongs in the guest.
 
-| LV | Size | Mount | Why |
-|---|---|---|---|
-| `libvirt` | 700 G | `/var/lib/libvirt/images` | VM disks. Cannot take `nodev`. |
-| `repo` | 500 G | `/srv/repo` | The 318 GB mirror, plus room to grow |
-| `harbor` | 200 G | `/srv/harbor` | Container images |
+Everything host-4 must carry on `vg-data`:
 
-That is ~1.4 T of 1.9 T, **deliberately under-allocated**: an LV extends online, shrinking one
-does not. Leave the slack.
+| VM | Disk (runbook §1.5) |
+|---|---|
+| `svc-repo-01` | 1 TB — 320 GB today, grows every patch cycle |
+| `svc-harbor-01` | 500 GB |
+| `svc-mgmt-01` | 100 GB |
+| `k8s-wk-04` OS | 100 GB |
+| | **1.7 T of a 1.9 T `vg-data`** |
 
-`repo` and `harbor` mount `nodev,nosuid` — STIG-relevant and free. `/var/lib/libvirt/images`
-cannot take `nodev` without breaking device nodes in guests.
+`k8s-wk-04`'s Ceph OSD is **not** in that total — it gets the raw third NVMe (`nvme2n1`),
+deliberately left unmatched by the step-02 disk patterns.
+
+1.7 T of 1.9 T leaves no room to snapshot a VM before changing it. So the VM disks are
+**sparse qcow2 in a single pool** rather than fixed LVs: `svc-repo-01` is created with a 1 TB
+virtual disk but consumes only what it actually holds, ~325 GB today. qcow2 costs a little
+performance against a raw LV; for a package repo, a registry and MAAS that is not measurable,
+and the flexibility is worth far more than the loss.
+
+```
+DATA_LVS='libvirt:100%FREE:/var/lib/libvirt/images'
+```
+
+A size ending in `%` is passed to `lvcreate -l`; anything else to `-L`. If you later decide a
+service really does want its own LV, add it to `DATA_LVS` and re-run `datavg` — it is
+idempotent and will only create what is missing.
+
+`/var/lib/libvirt/images` mounts plain `defaults`. It **cannot** take `nodev`: guests need
+device nodes inside their images.
 
 The script runs `mount -a` at the end. A broken `fstab` on a host with no default route is the
 same trip to the rack as a broken bridge, so it is proven before you reboot into it.
-
----
 
 ## 5. Run it
 

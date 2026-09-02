@@ -174,8 +174,14 @@ cmd_datavg() {
     if lvs "$DATA_VG/$name" >/dev/null 2>&1; then
       skip "LV $DATA_VG/$name exists"
     else
-      say "lvcreate -n $name -L $size $DATA_VG"
-      lvcreate -n "$name" -L "$size" "$DATA_VG" >/dev/null
+      # A size ending in % is an extent count (lvcreate -l), anything else is bytes (-L).
+      # 100%FREE is the normal case here: one pool volume taking whatever vg-data has.
+      case "$size" in
+        *%*) say "lvcreate -n $name -l $size $DATA_VG"
+             lvcreate -n "$name" -l "$size" "$DATA_VG" >/dev/null ;;
+        *)   say "lvcreate -n $name -L $size $DATA_VG"
+             lvcreate -n "$name" -L "$size" "$DATA_VG" >/dev/null ;;
+      esac
       ok "created $DATA_VG/$name ($size)"
     fi
 

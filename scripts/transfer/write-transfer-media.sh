@@ -116,20 +116,48 @@ if [ "$avail" -lt "$total" ]; then
 fi
 
 # --- 3. pull ---------------------------------------------------------------------------------
-RSYNC_OPTS=(-a --delete --human-readable "--info=progress2,stats1")
+# progress2 emits a carriage-return progress frame many times a second. On a terminal that is
+# one line updating in place; through a pipe - 'tee transfer.log', the sensible way to run an
+# hour-long job - every frame lands on its own. The first run produced a 10 MB log that was
+# unreadable and buried the two rsync errors that actually mattered. Ask for progress only
+# when stdout is a terminal.
+if [ -t 1 ]; then
+  RSYNC_OPTS=(-a --delete --human-readable "--info=progress2,stats1")
+else
+  RSYNC_OPTS=(-a --delete --human-readable "--info=stats1")
+fi
 [ "$RSYNC_BWLIMIT" -gt 0 ] && RSYNC_OPTS+=(--bwlimit="$RSYNC_BWLIMIT")
 [ "$DRY" -eq 1 ] && RSYNC_OPTS+=(--dry-run)
+
+# rsync's exit code is information, not just pass/fail, and losing it cost a run. On
+# 2026-09-02 two concurrent rsyncs raced, rsync exited non-zero, and 'set -e' killed the script
+# WITHOUT PRINTING ANYTHING - so the mirror looked complete, the extras were silently never
+# copied, and the operator saw a finished prompt with no error.
+#
+#   23  partial transfer due to error  - real, stop
+#   24  source files vanished mid-run  - benign on a live mirror, note and continue
+do_rsync() {
+  local what="$1" src="$2" dst="$3" rc=0
+  rsync "${RSYNC_OPTS[@]}" -e "$SSH_CMD" "$src" "$dst" || rc=$?
+  case "$rc" in
+    0)  note "$what: complete" ;;
+    24) note "$what: complete (rsync 24 - source files vanished mid-run, expected on a live mirror)" ;;
+    23) die  "$what: rsync exited 23 - some files could not be transferred. The disk is INCOMPLETE.
+       Re-run this script; it deltas and will finish what is missing." ;;
+    *)  die  "$what: rsync exited $rc. The disk is INCOMPLETE - re-run this script." ;;
+  esac
+}
 
 head2 "pulling the mirror  (this is the long one)"
 note "expect roughly an hour on a 1 Gb link - 90,000 files, so per-file overhead dominates"
 # A dry run must not touch the target at all - the point of -n is to answer "would this
 # work" without leaving anything behind to explain later.
 [ "$DRY" -eq 0 ] && mkdir -p "$MEDIA_MOUNT/mirror"
-rsync "${RSYNC_OPTS[@]}" -e "$SSH_CMD" "$REMOTE:$MIRROR_BASE/mirror/" "$MEDIA_MOUNT/mirror/"
+do_rsync "mirror" "$REMOTE:$MIRROR_BASE/mirror/" "$MEDIA_MOUNT/mirror/"
 
 head2 "pulling the extras"
 [ "$DRY" -eq 0 ] && mkdir -p "$MEDIA_MOUNT/bundle"
-rsync "${RSYNC_OPTS[@]}" -e "$SSH_CMD" "$REMOTE:$STAGING_DIR/" "$MEDIA_MOUNT/bundle/"
+do_rsync "extras" "$REMOTE:$STAGING_DIR/" "$MEDIA_MOUNT/bundle/"
 
 # --- 4. verify the extras against their manifest ------------------------------------------------
 head2 "verifying extras"

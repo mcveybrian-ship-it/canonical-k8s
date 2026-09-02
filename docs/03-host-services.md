@@ -396,7 +396,9 @@ No Pro attach, no FIPS, no STIG, no MAAS.
 
 ## 7. State as built
 
-Recorded 2026-09-02 on host-4, after `apt` and `libvirt`:
+host-4, 2026-09-02, verified from `stage-01` rather than asserted.
+
+**After `apt` and `libvirt`:**
 
 ```
 virsh    : 10.0.0
@@ -408,4 +410,28 @@ apt      : all three InRelease files fetched from 10.0.20.160, signatures verifi
            libvirt-daemon-system 10.0.0-2ubuntu8.16 <- noble-updates/main on the mirror
 ```
 
-Still outstanding on host-4 at that point: the bridge, the data LVs, and the storage pool.
+**After `datavg`** — note the whole chain, which is the point:
+
+```
+nvme1n1 -> crypt-data (LUKS) -> vg-data -> vg--data-libvirt -> /var/lib/libvirt/images
+1.9T, ext4, defaults, UUID in fstab, mount -a clean
+```
+
+Every VM disk therefore lands on encrypted storage by construction. There is nothing extra to
+remember when composing a guest.
+
+**After the bridge:**
+
+```
+br0       UP    10.0.20.158/24
+enp42s0   UP    (no address), member of br0
+routes    10.0.20.0/24 dev br0        <- no default route
+stp_state 0                           <- kernel default, as predicted when dropping parameters
+/etc/netplan/  70-bridge.yaml only    <- 50-cloud-init.yaml moved to /root/netplan.pre-bridge/
+systemd-networkd enabled
+```
+
+`forward_delay` reads 1500 (centiseconds) but is only consulted when STP is enabled, so it is
+inert here.
+
+Outstanding on host-4: the libvirt storage pool, then `svc-mgmt-01` itself.

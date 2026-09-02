@@ -6,7 +6,7 @@
 *how* things were built and why; they have gone stale more than once. If they disagree with
 this section, this section wins and the other one gets fixed.
 
-Last updated **2026-09-02 18:15**.
+Last updated **2026-09-02 23:00**.
 
 **STAGE-01's work is DONE. Everything that does not need hardware is finished.**
 
@@ -29,7 +29,8 @@ real client over the network. See `docs/03-host-services.md`.
 | 9 | MAAS PPA mirrored + key verified | ✅ **DONE** — 53 debs, `Good signature from "Launchpad PPA for MAAS"` |
 | 10 | Artifact corrected + republished | ✅ **DONE** — 3 factual errors fixed, dated four-host callout added |
 | 11 | Private material backed up off-box | ✅ **DONE** — `private-sync.sh backup` to `build-01`, checksum-verified |
-| — | **Write the SSD** | ⏳ **UNBLOCKED 2026-09-02** — drive attached and prepared: 931.5 G WD SN550 in a USB enclosure, wiped, GPT, ext4 `LABEL=enclave-xfer`, `-m 0`, mounted at `/mnt/transfer`. Payload is 322.6 G. `write-transfer-media.sh` on `build-01` has not been run yet. Procedure in `docs/airgap-media.md` §6.1a |
+| 13 | **Write the SSD** | ✅ **DONE 2026-09-02** — 318 G mirror (91,073 files, byte-identical to source) + 4.3 G extras (29 files), `MANIFEST.sha256` verified. 931.5 G WD SN550, ext4 `LABEL=enclave-xfer`. Procedure §6.1a, ssh key §6.1b |
+| — | **`restore-mirror.sh` in the gap** | ⏳ **NEXT, and it needs `svc-repo-01` to exist.** Audited before first run — four defects fixed, one a blocker. §6.1c |
 | 12 | **Q23 — which `k8s` version** | ✅ **DECIDED** — **v1.36.4, snap revision 5526**. LTS line; the build is `grade: stable`; and side-loading pins the revision, so the channel stops mattering once it crosses |
 | — | `ceph-csi` against deb-deployed Ceph | ⚠️ **UNTESTED** — load-bearing on the storage design. A lab test, not a paper question |
 

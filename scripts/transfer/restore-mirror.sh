@@ -81,6 +81,17 @@ fi
 # --- 2. copy the tree in --------------------------------------------------------------------
 head2 "installing the repository tree"
 run mkdir -p "$REPO_ROOT"
+
+# Check the space FIRST. Copying 317 GiB and running out at 90% wastes hours and leaves a
+# half-populated tree that looks plausible. write-transfer-media.sh checks before writing the
+# SSD; there is no reason this side should be less careful, and far less excuse - a failure
+# here is inside the gap.
+need_gb=$(du -sBG "$SRC/mirror" 2>/dev/null | cut -f1 | tr -dc '0-9')
+have_gb=$(df -BG --output=avail "$REPO_ROOT" | tail -1 | tr -dc '0-9')
+note "need   : ${need_gb} GB"
+note "have   : ${have_gb} GB on $REPO_ROOT"
+[ "${have_gb:-0}" -ge "${need_gb:-0}" ] \
+  || die "not enough space on $REPO_ROOT: need ${need_gb} GB, have ${have_gb} GB"
 run rsync -a --delete --info=progress2 "$SRC/mirror/" "$REPO_ROOT/mirror/"
 note "tree   : $REPO_ROOT/mirror"
 
@@ -120,6 +131,44 @@ else
   note "Packages will serve, but no client can 'pro attach' - ESM and FIPS stay inert."
 fi
 
+# --- 5a. nginx itself, from the tree we just copied ---------------------------------------------
+# The chicken-and-egg nobody notices until they are at the rack: this script configures nginx,
+# but a freshly-built air-gapped VM does not HAVE nginx, and it cannot install it from the
+# mirror because serving the mirror is what this script is for. nginx is not among the three
+# carried .debs either - those are the PPA tools the mirror can never serve.
+#
+# The tree is already on local disk by now, so apt can read it directly over file://. No
+# network, no nginx, no ordering problem. The archive keyring ships with Ubuntu.
+#
+# The update pockets are in the bootstrap source deliberately. With 'noble' alone apt resolves
+# nginx 1.24.0-2ubuntu7 - the UNPATCHED release-pocket build - because that is the only version
+# that suite indexes. Measured against the real tree: with all three suites it resolves
+# 1.24.0-2ubuntu7.17 and pulls 7 packages, every one present in the pool. Installing a
+# knowingly unpatched web server as the enclave's first service is not a defensible start.
+head2 "nginx"
+if command -v nginx >/dev/null 2>&1; then
+  note "already installed: $(nginx -v 2>&1)"
+else
+  note "not installed - bootstrapping from the local tree over file://"
+  BOOTSTRAP_LIST=/etc/apt/sources.list.d/zz-restore-bootstrap.sources
+  run tee "$BOOTSTRAP_LIST" >/dev/null <<EOF
+# Temporary, written by restore-mirror.sh. Reads the copied tree directly off local disk.
+Types: deb
+URIs: file://$REPO_ROOT/mirror/archive.ubuntu.com/ubuntu/
+Suites: ${BOOTSTRAP_SUITES:-noble noble-updates noble-security}
+Components: ${BOOTSTRAP_COMPONENTS:-main}
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+EOF
+  run apt-get update -qq \
+    || die "apt-get update failed against file://$REPO_ROOT/mirror - is the tree complete?"
+  run apt-get install -y --no-install-recommends nginx-core \
+    || die "could not install nginx from the carried tree"
+  note "installed: $(nginx -v 2>&1)"
+  # Leave the file:// source in place: it is how this machine patches itself before the
+  # HTTP vhost exists, and removing it would strand the box if nginx ever needed reinstalling.
+  note "left $BOOTSTRAP_LIST in place - it is this machine's own package source"
+fi
+
 # --- 6. nginx ------------------------------------------------------------------------------------
 head2 "serving the tree"
 if [ -f "$SRC/bundle/config/nginx-apt-mirror.conf" ]; then
@@ -143,9 +192,19 @@ fi
 head2 "proving the mirror"
 if [ "$DRY" -eq 1 ]; then note "DRY RUN - skipped"; exit 0; fi
 
+# A proof that can pass having checked nothing is not a proof. Both of these silently
+# returned success before: an unset EXPECTED_SUITES ran the loop once on an empty line and
+# reported no failures, and a suite with no Packages file scored "----" which was treated as
+# a pass. That is the same shape as the bad token that produced a healthy-looking empty
+# archive on 2026-08-31.
+[ -n "${EXPECTED_SUITES:-}" ] \
+  || die "EXPECTED_SUITES is empty - there is nothing to verify. Set it in $PARAMS."
+
 fail=0
+checked=0
 while IFS= read -r line; do
   [ -z "$line" ] && continue
+  checked=$((checked+1))
   archive="${line%%:*}"; suite="${line##*:}"
 
   rc=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 \
@@ -161,9 +220,13 @@ while IFS= read -r line; do
 
   printf '  Release %s   pool %s   %-38s %s\n' "$rc" "$pc" "$archive" "$suite"
   [ "$rc" = "200" ] || fail=$((fail+1))
-  [ "$pc" = "200" ] || [ "$pc" = "----" ] || fail=$((fail+1))
-done <<< "${EXPECTED_SUITES:-}"
+  # "----" means no Packages file was found for this suite. That is a mirroring failure,
+  # not an exemption - count it.
+  [ "$pc" = "200" ] || fail=$((fail+1))
+done <<< "$EXPECTED_SUITES"
 
+[ "$checked" -gt 0 ] || die "verified 0 suites - EXPECTED_SUITES parsed to nothing"
+note "checked: $checked suite(s)"
 [ "$fail" -eq 0 ] || die "$fail check(s) failed - the tree is not correctly served"
 
 note ""

@@ -395,6 +395,52 @@ ssh -i ~/.ssh/stage01 -o BatchMode=yes encadmin@10.0.20.160 'hostname'
 
 That must print `stage-01` before the transfer will run.
 
+### 6.1c Four defects found auditing `restore-mirror.sh` before it ever ran
+
+`write-transfer-media.sh` had never been executed before 2026-09-02 and failed on its first
+line. `restore-mirror.sh` was in the same state — written 2026-08-31, never run — except that
+it runs on `svc-repo-01` **inside the gap**, where a failure costs a trip rather than a re-run.
+Audited rather than discovered:
+
+**1. nginx cannot be installed, and the script assumes it exists.** It writes
+`/etc/nginx/sites-available/apt-mirror`, runs `nginx -t` and reloads — on a freshly built
+air-gapped VM that has no nginx. It cannot come from the mirror, because *serving the mirror is
+what this script does*, and it is not among the three carried `.debs` (those are the PPA tools
+the mirror can never serve). A genuine chicken-and-egg that only surfaces at the rack.
+
+The fix: by that point the tree is on local disk, so apt can read it over `file://` — no
+network, no nginx, no ordering problem, and the archive keyring ships with Ubuntu. Verified
+against the real tree: `apt-get update` succeeds and is GPG-verified, and `nginx-core` resolves
+to 7 packages, all present in the pool.
+
+**2. That bootstrap must include the update pockets.** With `Suites: noble` alone, apt resolves
+nginx `1.24.0-2ubuntu7` — the **unpatched** release-pocket build, because that is the only
+version the release suite indexes:
+
+| Suite | `nginx` |
+|---|---|
+| `noble` | 1.24.0-2ubuntu7 |
+| `noble-updates` | 1.24.0-2ubuntu7.17 |
+| `noble-security` | 1.24.0-2ubuntu7.17 |
+
+Installing a knowingly unpatched web server as the enclave's first service is not a defensible
+start. The bootstrap source now carries all three.
+
+**3. No free-space check before a 317 GiB copy.** `write-transfer-media.sh` checks before
+writing the SSD; this side did not, so running out at 90% would waste hours and leave a
+half-populated tree that looks plausible. Now checked first.
+
+**4. The proof could pass having verified nothing.** Two paths:
+
+- an unset `EXPECTED_SUITES` ran the loop once on an empty line, matched `continue`, and
+  reported zero failures — success with zero checks;
+- a suite with no `Packages` file scored `"----"`, which was explicitly treated as a pass.
+
+Both are the same shape as the bad Pro token that produced a healthy-looking empty archive on
+2026-08-31, which is the exact failure this section exists to catch. The script now refuses an
+empty `EXPECTED_SUITES`, counts what it checked, dies if that count is zero, and treats `----`
+as the mirroring failure it is.
+
 ### 6.2 Rebuilding the bundle — what step 1 actually does
 
 `build-transfer-bundle.sh` is safe to re-run at any time and is expected to be run repeatedly

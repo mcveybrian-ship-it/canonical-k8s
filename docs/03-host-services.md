@@ -127,6 +127,52 @@ ip route
 sudo cp -a /etc/netplan /root/netplan.bak-$(date +%F)
 ```
 
+**Step 1a — the collision you will hit, and why the old file has to go.**
+
+The step-02 autoinstall writes `50-cloud-init.yaml` defining the NIC as **`primary`** with
+`match: name: "en*"` — *not* as `enp42s0`. Netplan merges configuration by that id, so simply
+adding a bridge file produces **two units matching the same physical NIC**:
+
+```
+10-netplan-enp42s0.network   Match Name=enp42s0   Bridge=br0
+10-netplan-primary.network   Match Name=en*       Address=10.0.20.158/24
+```
+
+One bridges the NIC, the other still assigns the address to it. Which wins depends on the
+lexical order of generated filenames. That is not a configuration to put on a host you cannot
+reach.
+
+**And `addresses: []` in the later file does not fix it.** Netplan *merges* keys, it does not
+replace them, so the address from the earlier file survives. Verified with
+`netplan generate --root-dir` before trusting it:
+
+| Approach | `primary` unit | |
+|---|---|---|
+| Add a bridge file, keep `50-cloud-init.yaml` | `Address=...` **and** `Bridge=br0` | broken |
+| Override with `addresses: []` | `Address=...` **and** `Bridge=br0` | **still broken** |
+| One file, `50-cloud-init.yaml` moved away | `Bridge=br0` | correct |
+
+So move it out of `/etc/netplan` first:
+
+```bash
+### MACHINE: host-4 (10.0.20.158) ###
+sudo mkdir -p /root/netplan.pre-bridge
+sudo mv /etc/netplan/50-cloud-init.yaml /root/netplan.pre-bridge/
+ls /etc/netplan/
+```
+
+**Know what the safety net does and does not cover.** `netplan try`'s revert restores
+`/run/systemd/network` — your *connectivity* — but it does **not** restore `/etc/netplan`. From
+`configmanager.py`, `revert()` only unlinks files netplan itself added. A file you moved stays
+moved. To undo by hand:
+
+```bash
+### MACHINE: host-4 — console or ssh ###
+sudo cp /root/netplan.pre-bridge/* /etc/netplan/
+sudo rm -f /etc/netplan/70-bridge.yaml
+sudo netplan apply
+```
+
 **Step 2 — write the bridge config.** Netplan reads every `*.yaml` in `/etc/netplan` in
 filename order, so `70-bridge.yaml` is applied after `50-cloud-init.yaml` and wins. Mode
 `600`, because netplan warns loudly about world-readable configs.
@@ -165,15 +211,19 @@ Line by line:
 | `stp: false` | Spanning Tree costs ~30s of blocked forwarding on every link change. One NIC, no loop possible |
 | `forward-delay: 0` | with STP off there is nothing to wait for; without this a VM can boot before its link forwards and fail DHCP |
 
-**Step 3 — check the syntax before applying it.** This parses the config and reports errors
-without touching the running network.
+**Step 3 — check the syntax, then check the result.** `generate` parses the config and writes
+the systemd units without touching the running network.
 
 ```bash
 ### MACHINE: host-4 (10.0.20.158) ###
 sudo netplan generate
+grep -l 'Address=10.0.20.158/24' /run/systemd/network/*
 ```
 
-Silence is success. An error here costs you nothing — an error in step 4 costs a walk.
+Silence from `generate` means it parsed. The `grep` must return **exactly one file**, and it
+must be `10-netplan-br0.network`. Two files means the NIC is being bridged *and* addressed —
+stop and go back to step 1a. An error here costs you nothing; the same error in step 4 costs a
+walk.
 
 **Step 4 — apply it with the safety net.** `netplan try` applies the config, then waits. If
 you do not press ENTER within the timeout, **it puts everything back automatically**.

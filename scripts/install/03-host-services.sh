@@ -255,6 +255,34 @@ cmd_bridge() {
     || die "BRIDGE_ADDRESS is $BRIDGE_ADDRESS but $BRIDGE_NIC currently has ${have:-nothing}.
        Refusing: these params do not describe this machine."
 
+  # ---------------------------------------------------------------------------------------
+  # Move aside any netplan file that already assigns this address.
+  #
+  # Found on host-4 2026-09-02. The step-02 autoinstall writes 50-cloud-init.yaml defining the
+  # NIC as 'primary' with match name:"en*" - NOT as enp42s0. Netplan merges by that id, so
+  # simply adding a bridge file produced TWO units matching the same NIC: one bridging it and
+  # one still assigning the address to it. Which won depended on generated-filename order.
+  #
+  # 'addresses: []' in a later file does NOT clear it - netplan merges keys, it does not
+  # replace them. Verified with netplan generate --root-dir. The old file has to go.
+  # ---------------------------------------------------------------------------------------
+  local bdir moved=0 f
+  bdir="/root/netplan.pre-bridge-$(date +%Y%m%d%H%M%S)"
+  for f in /etc/netplan/*.yaml; do
+    [ -e "$f" ] || continue
+    [ "$f" = "$np" ] && continue
+    if grep -q "${BRIDGE_ADDRESS%%/*}" "$f" 2>/dev/null; then
+      [ "$moved" -eq 0 ] && mkdir -p "$bdir"
+      mv "$f" "$bdir/"
+      warn "moved $f -> $bdir/ (it also assigns ${BRIDGE_ADDRESS%%/*})"
+      moved=1
+    fi
+  done
+  if [ "$moved" -eq 1 ]; then
+    say "    netplan try reverts the RUNNING network but NOT /etc/netplan - a file you"
+    say "    remove stays removed. To undo by hand:  sudo cp $bdir/* /etc/netplan/"
+  fi
+
   local routes="" dns=""
   [ -n "${BRIDGE_GATEWAY:-}" ] && routes="
       routes:
@@ -285,6 +313,15 @@ network:
 YAML
   chmod 600 "$np"
   ok "wrote $np"
+
+  netplan generate || { rm -f "$np"; die "netplan generate failed - $np removed, nothing applied"; }
+  ok "netplan generate clean"
+
+  # Exactly one unit may carry the address. Two means the NIC is bridged AND addressed.
+  local n; n=$(grep -l "Address=$BRIDGE_ADDRESS" /run/systemd/network/* 2>/dev/null | wc -l)
+  [ "$n" -eq 1 ] || die "generated $n units carrying $BRIDGE_ADDRESS, expected exactly 1.
+       Applying this would strand the host. Nothing was applied."
+  ok "exactly one interface carries $BRIDGE_ADDRESS"
 
   # netplan try reverts by itself if nobody confirms. On the only NIC of an air-gapped host
   # that auto-revert is the difference between a retry and a drive to the rack.

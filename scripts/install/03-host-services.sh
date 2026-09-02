@@ -224,11 +224,13 @@ cmd_datavg() {
       cp /etc/fstab "/etc/fstab.bak-$(date +%Y%m%d%H%M%S)"
       printf 'UUID=%s  %s  %s  %s  0 2\n' "$uuid" "$mnt" "$DATA_FSTYPE" "$opts" >> /etc/fstab
       ok "fstab += $mnt ($opts)"
+      # Reload BEFORE mounting. systemd caches fstab, and mounting against the stale copy
+      # prints a "your fstab has been modified" hint that makes a clean run look broken.
+      systemctl daemon-reload
     fi
     mountpoint -q "$mnt" || mount "$mnt"
   done
 
-  systemctl daemon-reload
   # Prove fstab is not booby-trapped. A bad fstab on a host with no default route and no
   # console is a trip to the rack.
   mount -a && ok "mount -a clean - fstab will not break the next boot"

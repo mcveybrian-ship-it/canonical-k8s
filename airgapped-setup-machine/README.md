@@ -6,9 +6,15 @@
 *how* things were built and why; they have gone stale more than once. If they disagree with
 this section, this section wins and the other one gets fixed.
 
-Last updated **2026-08-31 21:00**.
+Last updated **2026-09-02 16:30**.
 
 **STAGE-01's work is DONE. Everything that does not need hardware is finished.**
+
+**host-4 does not need the SSD to make progress.** It has no default route, but it reaches
+`stage-01`'s nginx on its own subnet (`HTTP 200`), and `stage-01` has `ip_forward=0`, so that
+is a package source without being a route to the internet. host-4's apt was repointed at the
+mirror on 2026-09-02 and libvirt installed from it — the first time the mirror has served a
+real client over the network. See `docs/03-host-services.md`.
 
 | # | What | State |
 |---|---|---|
@@ -23,7 +29,7 @@ Last updated **2026-08-31 21:00**.
 | 9 | MAAS PPA mirrored + key verified | ✅ **DONE** — 53 debs, `Good signature from "Launchpad PPA for MAAS"` |
 | 10 | Artifact corrected + republished | ✅ **DONE** — 3 factual errors fixed, dated four-host callout added |
 | 11 | Private material backed up off-box | ✅ **DONE** — `private-sync.sh backup` to `build-01`, checksum-verified |
-| — | **Write the SSD** | ⏳ **BLOCKED ON HARDWARE** — arrives Tue 2026-09-01. `write-transfer-media.sh` on `build-01` |
+| — | **Write the SSD** | ⏳ **STILL BLOCKED 2026-09-02** — `lsblk` on `build-01` shows only its 238 G boot SATA and the 1.8 T `/srv/bundle` NVMe. No transfer SSD attached. `write-transfer-media.sh` on `build-01` |
 | 12 | **Q23 — which `k8s` version** | ✅ **DECIDED** — **v1.36.4, snap revision 5526**. LTS line; the build is `grade: stable`; and side-loading pins the revision, so the channel stops mattering once it crosses |
 | — | `ceph-csi` against deb-deployed Ceph | ⚠️ **UNTESTED** — load-bearing on the storage design. A lab test, not a paper question |
 
@@ -43,9 +49,10 @@ Last updated **2026-08-31 21:00**.
 | Machine | Address | Side | Role |
 |---|---|---|---|
 | `stage-01` | `10.0.20.160` | online | Hyper-V VM. Pro token, the mirror, the repo |
-| `build-01` | `10.0.20.124` | online | Physical. Writes the transfer SSD |
+| `build-01` | `10.0.20.124` | online | Physical, 32 GB. Writes the transfer SSD; holds the `private-sync.sh` backup |
 | Hyper-V host (R7515) | — | online | Windows Server 2022. Runs `stage-01`; seed-stick writer |
-| `host-1..4` | — | **air-gapped** | Not built |
+| `host-4` | `10.0.20.158` | **air-gapped** | **BUILT 2026-09-01/02.** Services host. LUKS on 2 of 3 NVMe, 125 GB RAM. Step 03 in progress |
+| `host-1..3` | `.155` `.156` `.157` | **air-gapped** | Not built |
 | `svc-repo-01` | — | **air-gapped** | A VM on `host-4`. Where `restore-mirror.sh` runs |
 
 **THE MIRROR IS COMPLETE — 318 GB, 90,853 packages, six archives.**

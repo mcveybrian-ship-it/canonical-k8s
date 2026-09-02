@@ -1,0 +1,353 @@
+#!/usr/bin/env bash
+# =========================================================================================
+# 03-host-services.sh - prepare a bare-metal host to run enclave service VMs.
+#
+#     MACHINE: runs ON the host being prepared (host-4 first). Never on stage-01.
+#
+# Everything here is idempotent: run a subcommand twice and the second run reports
+# "already done" rather than failing or duplicating. That matters because this procedure
+# has to be repeatable by someone who is not the person who wrote it.
+#
+#     ./03-host-services.sh apt        point apt at the mirror
+#     ./03-host-services.sh libvirt    install the virtualisation stack
+#     ./03-host-services.sh datavg     create LVs on vg-data and mount them
+#     ./03-host-services.sh bridge     replace the NIC with a bridge   <-- can cut you off
+#     ./03-host-services.sh pool       define the libvirt storage pool
+#     ./03-host-services.sh verify     prove all of the above, change nothing
+#     ./03-host-services.sh all        apt, libvirt, datavg, pool, verify (NOT bridge)
+#
+# "all" deliberately excludes "bridge". Every other step is reversible from an ssh session;
+# the bridge step is the one that can leave an air-gapped host needing a physical console.
+# =========================================================================================
+set -euo pipefail
+
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PARAMS="${PARAMS:-$SELF/03-host-services/services-params.env}"
+
+say()  { printf '  %s\n' "$*"; }
+ok()   { printf '  [ok] %s\n' "$*"; }
+skip() { printf '  [--] %s\n' "$*"; }
+warn() { printf '  [!!] %s\n' "$*" >&2; }
+die()  { printf '\n  [x] %s\n\n' "$*" >&2; exit 1; }
+
+need_root() { [ "$(id -u)" -eq 0 ] || die "run this with sudo: sudo $0 $*"; }
+
+# -----------------------------------------------------------------------------------------
+# Params. Validate quoting BEFORE sourcing - an unbalanced quote in a params file swallows
+# the rest of it and produces an error that points at the wrong line. This cost an hour in
+# step 02; see docs/02-host-install.md.
+# -----------------------------------------------------------------------------------------
+# Same guard as step 02, for the same reason: an unbalanced quote swallows the rest of the
+# file and the error points at the wrong line. Extended here to ignore a trailing comment,
+# because "libvirt's NAT" in a comment is not an unbalanced value.
+_paramcheck() {
+  local f="$1" n=0 bad=0 l body q i c inq
+  while IFS= read -r l; do
+    n=$((n+1))
+    case "$l" in \#*|"") continue ;; esac
+    body=""; inq=0
+    for (( i=0; i<${#l}; i++ )); do
+      c="${l:i:1}"
+      [ "$c" = "'" ] && inq=$((1-inq))
+      [ "$c" = "#" ] && [ "$inq" -eq 0 ] && break
+      body+="$c"
+    done
+    q="${body//[^\']/}"
+    if (( ${#q} % 2 )); then
+      echo "  line $n: unbalanced single quote -> ${l%%=*}=..." >&2
+      bad=1
+    fi
+  done < "$f"
+  return $bad
+}
+
+load_params() {
+  [ -r "$PARAMS" ] || die "no params file at $PARAMS
+       cp $SELF/03-host-services/services-params.env.example $PARAMS"
+  _paramcheck "$PARAMS" || die "$PARAMS has quoting errors - see above. Nothing was done."
+  # shellcheck disable=SC1090
+  . "$PARAMS"
+  : "${MIRROR_URL:?}" "${MIRROR_SUITES:?}" "${MIRROR_COMPONENTS:?}" "${MIRROR_KEYRING:?}"
+  : "${BRIDGE_NAME:?}" "${BRIDGE_NIC:?}" "${BRIDGE_ADDRESS:?}"
+  : "${DATA_VG:?}" "${DATA_LVS:?}" "${DATA_FSTYPE:?}"
+  : "${POOL_NAME:?}" "${POOL_PATH:?}"
+
+  case "$MIRROR_COMPONENTS" in
+    *restricted*|*multiverse*)
+      die "MIRROR_COMPONENTS names restricted/multiverse, which were not mirrored.
+       apt-get update WILL fail. Mirrored components: main universe" ;;
+  esac
+}
+
+# =========================================================================================
+cmd_apt() {
+  need_root apt; load_params
+  local f=/etc/apt/sources.list.d/ubuntu.sources
+  local new; new=$(mktemp)
+  {
+    echo "# Enclave apt mirror. Written by 03-host-services.sh on $(date -Is)."
+    echo "# The host has no default route; this URL is reachable on the local subnet only."
+    echo "Types: deb"
+    echo "URIs: $MIRROR_URL"
+    echo "Suites: $MIRROR_SUITES"
+    echo "Components: $MIRROR_COMPONENTS"
+    echo "Signed-By: $MIRROR_KEYRING"
+  } > "$new"
+
+  if [ -f "$f" ] && diff -q <(grep -v '^#' "$f") <(grep -v '^#' "$new") >/dev/null 2>&1; then
+    rm -f "$new"; skip "apt already points at $MIRROR_URL"
+  else
+    [ -f "$f" ] && [ ! -f "$f.pre-mirror" ] && cp "$f" "$f.pre-mirror" && say "saved $f.pre-mirror"
+    install -m 0644 "$new" "$f"; rm -f "$new"
+    ok "wrote $f"
+  fi
+
+  # apt only reads *.list and *.sources. Anything else in that directory is inert - but a
+  # file named *.sources.orig becomes LIVE the moment someone renames it, so say so.
+  local stray
+  stray=$(find /etc/apt/sources.list.d -maxdepth 1 -type f \
+            ! -name '*.list' ! -name '*.sources' -printf '%f ' 2>/dev/null || true)
+  [ -n "$stray" ] && say "inert backups present (apt ignores these): $stray"
+
+  say "apt-get update ..."
+  apt-get update -qq || die "apt-get update failed against $MIRROR_URL"
+  ok "apt-get update succeeded, signatures verified"
+}
+
+# =========================================================================================
+cmd_libvirt() {
+  need_root libvirt; load_params
+  local pkgs="qemu-system-x86 libvirt-daemon-system libvirt-clients virtinst ovmf"
+  local missing=""
+  for p in $pkgs; do
+    dpkg -s "$p" >/dev/null 2>&1 || missing="$missing $p"
+  done
+  if [ -z "$missing" ]; then
+    skip "libvirt stack already installed"
+  else
+    say "installing:$missing"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $missing
+    ok "installed"
+  fi
+
+  systemctl enable --now libvirtd >/dev/null 2>&1 || true
+  [ -c /dev/kvm ] || die "/dev/kvm missing - check virtualisation is enabled in firmware"
+
+  # Group membership does not apply to sessions that already exist.
+  local u="${SUDO_USER:-}"
+  if [ -n "$u" ]; then
+    if id -nG "$u" | grep -qw libvirt && id -nG "$u" | grep -qw kvm; then
+      skip "$u already in libvirt and kvm"
+    else
+      usermod -aG libvirt,kvm "$u"
+      warn "$u added to libvirt,kvm - LOG OUT AND BACK IN before virsh works without sudo"
+    fi
+  fi
+
+  if [ "${DISABLE_DEFAULT_NAT:-true}" = "true" ]; then
+    if virsh -c qemu:///system net-info default >/dev/null 2>&1; then
+      virsh -c qemu:///system net-destroy default >/dev/null 2>&1 || true
+      virsh -c qemu:///system net-autostart default --disable >/dev/null 2>&1 || true
+      ok "libvirt 'default' NAT network stopped and autostart disabled"
+      say "    VMs go on $BRIDGE_NAME instead - 192.168.122.0/24 is unreachable from"
+      say "    host-1..3, and svc-repo-01 has to serve apt to all of them"
+    fi
+  fi
+  ok "libvirt $(virsh --version 2>/dev/null) ready"
+}
+
+# =========================================================================================
+cmd_datavg() {
+  need_root datavg; load_params
+  vgs "$DATA_VG" >/dev/null 2>&1 || die "volume group '$DATA_VG' does not exist.
+       The step-02 autoinstall creates it on crypt-data. Check: sudo vgs"
+
+  local free; free=$(vgs --noheadings -o vg_free --units g "$DATA_VG" | tr -d ' g')
+  say "$DATA_VG has ${free}G free"
+
+  local spec name size mnt opts
+  for spec in $DATA_LVS; do
+    IFS=: read -r name size mnt <<< "$spec"
+    [ -n "$name" ] && [ -n "$size" ] && [ -n "$mnt" ] \
+      || die "malformed DATA_LVS entry '$spec' - want name:size:mountpoint"
+
+    if lvs "$DATA_VG/$name" >/dev/null 2>&1; then
+      skip "LV $DATA_VG/$name exists"
+    else
+      say "lvcreate -n $name -L $size $DATA_VG"
+      lvcreate -n "$name" -L "$size" "$DATA_VG" >/dev/null
+      ok "created $DATA_VG/$name ($size)"
+    fi
+
+    local dev="/dev/$DATA_VG/$name"
+    if blkid "$dev" >/dev/null 2>&1; then
+      skip "$dev already has a filesystem"
+    else
+      "mkfs.$DATA_FSTYPE" -q "$dev"
+      ok "mkfs.$DATA_FSTYPE $dev"
+    fi
+
+    case "$mnt" in
+      /var/lib/libvirt/*) opts="${DATA_MOUNTOPTS_LIBVIRT:-defaults}" ;;
+      *)                  opts="${DATA_MOUNTOPTS_DEFAULT:-defaults}" ;;
+    esac
+
+    mkdir -p "$mnt"
+    local uuid; uuid=$(blkid -s UUID -o value "$dev")
+    if grep -q "UUID=$uuid" /etc/fstab; then
+      skip "fstab entry for $mnt exists"
+    else
+      cp /etc/fstab "/etc/fstab.bak-$(date +%Y%m%d%H%M%S)"
+      printf 'UUID=%s  %s  %s  %s  0 2\n' "$uuid" "$mnt" "$DATA_FSTYPE" "$opts" >> /etc/fstab
+      ok "fstab += $mnt ($opts)"
+    fi
+    mountpoint -q "$mnt" || mount "$mnt"
+  done
+
+  systemctl daemon-reload
+  # Prove fstab is not booby-trapped. A bad fstab on a host with no default route and no
+  # console is a trip to the rack.
+  mount -a && ok "mount -a clean - fstab will not break the next boot"
+}
+
+# =========================================================================================
+cmd_bridge() {
+  need_root bridge; load_params
+  local np=/etc/netplan/70-bridge.yaml
+
+  ip -br link show "$BRIDGE_NIC" >/dev/null 2>&1 \
+    || die "NIC '$BRIDGE_NIC' not found. Present: $(ip -br link | awk '{print $1}' | tr '\n' ' ')"
+
+  if ip -br addr show "$BRIDGE_NAME" >/dev/null 2>&1; then
+    skip "$BRIDGE_NAME already exists"; return 0
+  fi
+
+  # The address must currently be ON the NIC we are about to enslave. If it is not, the
+  # params are describing a different machine and applying them would strand this one.
+  local have; have=$(ip -br addr show "$BRIDGE_NIC" | awk '{print $3}')
+  [ "$have" = "$BRIDGE_ADDRESS" ] \
+    || die "BRIDGE_ADDRESS is $BRIDGE_ADDRESS but $BRIDGE_NIC currently has ${have:-nothing}.
+       Refusing: these params do not describe this machine."
+
+  local routes="" dns=""
+  [ -n "${BRIDGE_GATEWAY:-}" ] && routes="
+      routes:
+        - to: default
+          via: $BRIDGE_GATEWAY"
+  [ -n "${BRIDGE_DNS:-}" ] && dns="
+      nameservers:
+        addresses: [$BRIDGE_DNS]"
+
+  cat > "$np" <<YAML
+# Bridge for enclave service VMs. Written by 03-host-services.sh on $(date -Is).
+# No gateway by design: this host is air-gapped and reaches its own subnet only.
+network:
+  version: 2
+  ethernets:
+    $BRIDGE_NIC:
+      dhcp4: false
+      dhcp6: false
+  bridges:
+    $BRIDGE_NAME:
+      interfaces: [$BRIDGE_NIC]
+      dhcp4: false
+      dhcp6: false
+      addresses: [$BRIDGE_ADDRESS]$routes$dns
+      parameters:
+        stp: false
+        forward-delay: 0
+YAML
+  chmod 600 "$np"
+  ok "wrote $np"
+
+  # netplan try reverts by itself if nobody confirms. On the only NIC of an air-gapped host
+  # that auto-revert is the difference between a retry and a drive to the rack.
+  if [ -t 0 ] && [ -t 1 ]; then
+    warn "applying with 'netplan try' - it AUTO-REVERTS in 120s unless you press ENTER."
+    warn "if your ssh session dies, wait 2 minutes and reconnect on $BRIDGE_ADDRESS."
+    netplan try --timeout 120 || { rm -f "$np"; die "reverted - $np removed"; }
+    ok "bridge applied and confirmed"
+  else
+    rm -f "$np"
+    die "no TTY. This step can strand the host, so it refuses to run unattended.
+       Re-run it from an interactive session (or the physical console)."
+  fi
+}
+
+# =========================================================================================
+cmd_pool() {
+  need_root pool; load_params
+  mkdir -p "$POOL_PATH"
+  if virsh -c qemu:///system pool-info "$POOL_NAME" >/dev/null 2>&1; then
+    skip "storage pool '$POOL_NAME' exists"
+  else
+    virsh -c qemu:///system pool-define-as "$POOL_NAME" dir --target "$POOL_PATH" >/dev/null
+    virsh -c qemu:///system pool-build "$POOL_NAME" >/dev/null 2>&1 || true
+    virsh -c qemu:///system pool-start "$POOL_NAME" >/dev/null
+    virsh -c qemu:///system pool-autostart "$POOL_NAME" >/dev/null
+    ok "storage pool '$POOL_NAME' -> $POOL_PATH"
+  fi
+  mountpoint -q "$POOL_PATH" \
+    && ok "$POOL_PATH is its own volume" \
+    || warn "$POOL_PATH is on the root filesystem - run 'datavg' first or VM images fill /"
+}
+
+# =========================================================================================
+cmd_verify() {
+  load_params
+  local fail=0
+  echo; echo "  ---- step 03 verification on $(hostname) ----"
+
+  grep -q "$MIRROR_URL" /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null \
+    && ok "apt -> $MIRROR_URL" || { warn "apt does not point at the mirror"; fail=1; }
+
+  ip route | grep -q '^default' \
+    && { warn "host HAS a default route - it is not air-gapped"; fail=1; } \
+    || ok "no default route"
+
+  command -v virsh >/dev/null \
+    && ok "virsh $(virsh --version)" || { warn "virsh missing"; fail=1; }
+  systemctl is-active --quiet libvirtd \
+    && ok "libvirtd active" || { warn "libvirtd not active"; fail=1; }
+  [ -c /dev/kvm ] && ok "/dev/kvm present" || { warn "/dev/kvm missing"; fail=1; }
+
+  if virsh -c qemu:///system net-info default >/dev/null 2>&1; then
+    virsh -c qemu:///system net-info default 2>/dev/null | grep -qi 'Active:.*no' \
+      && ok "default NAT network inactive" \
+      || { warn "default NAT network is ACTIVE - VMs may land on 192.168.122.0/24"; fail=1; }
+  fi
+
+  ip -br addr show "$BRIDGE_NAME" >/dev/null 2>&1 \
+    && ok "$BRIDGE_NAME up: $(ip -br addr show "$BRIDGE_NAME" | awk '{print $3}')" \
+    || warn "$BRIDGE_NAME not present - run 'bridge' from an interactive session"
+
+  local spec name size mnt
+  for spec in $DATA_LVS; do
+    IFS=: read -r name size mnt <<< "$spec"
+    if mountpoint -q "$mnt" 2>/dev/null; then
+      ok "$mnt mounted ($(findmnt -no SIZE "$mnt"), $(findmnt -no OPTIONS "$mnt" | cut -d, -f1-3))"
+    else
+      warn "$mnt NOT mounted"; fail=1
+    fi
+  done
+
+  grep -q '^crypt-data.*nofail' /etc/crypttab 2>/dev/null \
+    && ok "crypt-data unlocks by keyfile with nofail" \
+    || warn "crypt-data is not on the keyfile - boot will prompt twice"
+
+  echo
+  [ "$fail" -eq 0 ] && ok "step 03 complete" || warn "step 03 INCOMPLETE - see above"
+  return "$fail"
+}
+
+# =========================================================================================
+case "${1:-}" in
+  apt)     cmd_apt ;;
+  libvirt) cmd_libvirt ;;
+  datavg)  cmd_datavg ;;
+  bridge)  cmd_bridge ;;
+  pool)    cmd_pool ;;
+  verify)  cmd_verify ;;
+  all)     cmd_apt; cmd_libvirt; cmd_datavg; cmd_pool; cmd_verify ;;
+  *)       sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac

@@ -42,6 +42,12 @@ host-params.env
 */host-params.env
 scripts/install/*/host-params.env
 
+# Live step-03 params. No secret in the shipped example, but it names live addresses and is
+# the obvious place someone adds a token. Only the .example is tracked.
+services-params.env
+*/services-params.env
+scripts/install/*/services-params.env
+
 # Downloaded tooling - fetch it from the vendor, do not vendor binaries into the repo
 dependencies/
 *.exe

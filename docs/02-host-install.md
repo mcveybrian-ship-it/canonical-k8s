@@ -329,7 +329,7 @@ That is a sequencing decision, not an omission:
   separate, deliberate, evidence-producing step where the pre- and post-audit reports are
   captured — not buried in `late-commands` where nothing is recorded.
 
-Hardening lands in `03-host-harden.sh` once the capability test returns.
+Hardening lands in **step 05** once the capability test returns and the contract server exists. It is not step 03 — step 03 is libvirt and the service-VM volumes, see `docs/03-host-services.md`.
 
 ## 9. Step 5 — Verify before moving on
 

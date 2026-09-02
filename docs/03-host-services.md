@@ -7,6 +7,11 @@ Step 02 left host-4 with an encrypted OS, an unlocked-by-keyfile `crypt-data`, a
 `vg-data`. This step turns it into a virtualisation host that can compose `svc-mgmt-01`,
 `svc-repo-01` and Harbor. It is the last step before the enclave services in step 04.
 
+**Every subcommand refuses to run on a machine the params do not describe.** `BRIDGE_ADDRESS`
+is the host's own address, so it identifies the box without hardcoding a hostname, and it is
+checked across every interface — after the bridge step the address lives on `br0`, not the NIC.
+Paste a step into the wrong window and you get `Wrong machine. Nothing was done.`
+
 Everything is driven by [`scripts/install/03-host-services.sh`](../scripts/install/03-host-services.sh)
 and parameterised in `scripts/install/03-host-services/services-params.env`. Every subcommand
 is idempotent — running it twice reports `[--]` rather than failing.

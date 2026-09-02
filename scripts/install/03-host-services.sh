@@ -72,6 +72,24 @@ load_params() {
   : "${DATA_VG:?}" "${DATA_LVS:?}" "${DATA_FSTYPE:?}"
   : "${POOL_NAME:?}" "${POOL_PATH:?}"
 
+  # ---------------------------------------------------------------------------------------
+  # Refuse to run on a machine these params do not describe.
+  #
+  # Added 2026-09-02 after step B was pasted into a stage-01 window by mistake. That one was
+  # harmless - it copies a file - but it left a params file behind, and a params file is the
+  # only thing standing between "wrong window" and "sudo ./03-host-services.sh apt", which
+  # would repoint the machine that BUILDS the mirror at the mirror it builds.
+  #
+  # BRIDGE_ADDRESS is the host's own address, so it identifies the machine without hardcoding
+  # a hostname. Checked across every interface, because after the bridge step the address
+  # lives on br0 rather than on the NIC.
+  # ---------------------------------------------------------------------------------------
+  if ! ip -br addr | grep -qw "${BRIDGE_ADDRESS%%/*}"; then
+    die "these params describe $BRIDGE_ADDRESS, but $(hostname) has:
+       $(ip -br addr | grep -v '^lo' | awk '{printf "%s %s  ", $1, $3}')
+       Wrong machine. Nothing was done."
+  fi
+
   case "$MIRROR_COMPONENTS" in
     *restricted*|*multiverse*)
       die "MIRROR_COMPONENTS names restricted/multiverse, which were not mirrored.

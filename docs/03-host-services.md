@@ -18,6 +18,43 @@ is idempotent — running it twice reports `[--]` rather than failing.
 
 ---
 
+## 0. Prerequisite — getting this repository onto the host
+
+**The host cannot clone it.** It has no default route, so `github.com` is unreachable. The
+repo is pushed to it from `stage-01`:
+
+```bash
+### MACHINE: stage-01 ###
+cd ~/canonical-k8s
+./scripts/install/push-repo-to-host.sh 10.0.20.158
+```
+
+**Do not `rsync` the working tree instead.** It would carry `host-params.env` — which holds
+the LUKS passphrase and the password hash — onto every host in the enclave, along with
+`HANDOFF.md`, `docs/open-questions.md`, `docs/runbook.md`, `artifact/` and `archive/`.
+
+The script uses `git archive HEAD`, which emits **only files tracked at HEAD**. Anything
+gitignored is by definition not tracked, so the private paths cannot ride along even by
+mistake. That is a property of the mechanism rather than of remembering an `--exclude` flag —
+but the script proves it on every run anyway, and refuses to send if a private path ever
+appears:
+
+```
+  checking the archive carries nothing private ...
+  [ok] tracked files only - no private paths, no live params
+  sending 34 tracked file(s) at 4e96160 to encadmin@10.0.20.158:~/canonical-k8s
+  [ok] 35 file(s) on 10.0.20.158
+  [ok] scripts are executable on the target
+```
+
+It counts what **arrived**, not what was sent — `build-transfer-bundle.sh` once reported
+success having copied nothing, and that is not a mistake worth making twice.
+
+Re-run it after any change on `stage-01`; the target is not a git clone and will not update
+itself.
+
+---
+
 ## 1. Why this step exists at all
 
 host-4 came out of step 02 unable to install a single package. It has **no default route** by

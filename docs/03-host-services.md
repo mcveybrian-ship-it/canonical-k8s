@@ -217,8 +217,12 @@ the systemd units without touching the running network.
 ```bash
 ### MACHINE: host-4 (10.0.20.158) ###
 sudo netplan generate
-grep -l 'Address=10.0.20.158/24' /run/systemd/network/*
+sudo grep -l 'Address=10.0.20.158/24' /run/systemd/network/*
+sudo grep -E 'Name=|Address=|Bridge=' /run/systemd/network/*.network
 ```
+
+`sudo` on the greps is not optional - netplan writes those units root-only, and without it
+you get three "Permission denied" lines and no answer.
 
 Silence from `generate` means it parsed. The `grep` must return **exactly one file**, and it
 must be `10-netplan-br0.network`. Two files means the NIC is being bridged *and* addressed —

@@ -79,6 +79,26 @@ note "fstype : $(findmnt -no FSTYPE "$MEDIA_MOUNT")"
 
 [ -w "$MEDIA_MOUNT" ] || die "$MEDIA_MOUNT is not writable by $(id -un)"
 
+# --- 1a. one at a time -------------------------------------------------------------------------
+# Two concurrent runs against the same target is not a theoretical problem: it happened on
+# 2026-09-02. The script was started in a tmux window, tmux was detached, and it was started
+# again in the plain ssh shell - two rsyncs writing /mnt/transfer/mirror/ with --delete, each
+# able to remove files the other was mid-write on, pulling the same 317 GB twice over one link.
+#
+# flock on the target, not on /var/lock, so the guard follows the DISK. Two different mount
+# points can run at once, which is legitimate; two runs at the same one cannot.
+#
+# This runs AFTER the mountpoint and writability checks, deliberately. Locking first would
+# create the lock file on the ROOT filesystem whenever the SSD was not mounted - writing to
+# the very place the mountpoint check exists to protect.
+exec 9>"${MEDIA_MOUNT%/}/.write-transfer.lock" 2>/dev/null || true
+if ! flock -n 9; then
+  die "another write-transfer-media.sh is already writing to $MEDIA_MOUNT.
+       Check it:   ps -eo pid,etime,cmd | grep [w]rite-transfer
+       If you started one in tmux, reattach instead:   tmux attach -t xfer"
+fi
+
+
 # --- 2. reachability and size -------------------------------------------------------------------
 head2 "checking STAGE-01"
 $SSH_CMD "$REMOTE" true 2>/dev/null || die "cannot ssh to $REMOTE with $SSH_KEY"

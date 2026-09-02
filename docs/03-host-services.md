@@ -383,6 +383,36 @@ And prove it:
 
 ---
 
+## 5a. Two traps found on the first cold boot
+
+**`systemctl is-active libvirtd` is not a health check on 24.04.** libvirt is socket-activated:
+`libvirtd.socket` listens, and `libvirtd.service` only starts when something connects. Straight
+after a reboot the service reads `inactive` on a perfectly healthy host. The first version of
+`verify` tested exactly that and reported:
+
+```
+  [!!] libvirtd not active
+  [!!] default NAT network is ACTIVE - VMs may land on 192.168.122.0/24
+```
+
+Both were wrong, and the second was caused by the first — `virsh net-info` failed against a
+daemon that had not started yet, so the check could not find `Active: no` and assumed the worst.
+`verify` now asks `virsh -c qemu:///system version`, which is both the thing we actually depend
+on and the thing that triggers the activation.
+
+**`inactive` is not the same as disabled.** The real state after that boot was:
+
+```
+default   inactive   Autostart: yes
+```
+
+Inactive *today*, but set to start on boot. `virbr0` and `192.168.122.1` come back the next
+time something starts it. `verify` now checks **both** fields and only passes when active and
+autostart are each `no`.
+
+That is what `03-host-services.sh libvirt` does. If you installed libvirt by hand, run that
+subcommand anyway — the packages are only half of it.
+
 ## 6. What this step deliberately does NOT do
 
 No Pro attach, no FIPS, no STIG, no MAAS.

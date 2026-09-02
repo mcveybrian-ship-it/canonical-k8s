@@ -380,14 +380,32 @@ cmd_verify() {
 
   command -v virsh >/dev/null \
     && ok "virsh $(virsh --version)" || { warn "virsh missing"; fail=1; }
-  systemctl is-active --quiet libvirtd \
-    && ok "libvirtd active" || { warn "libvirtd not active"; fail=1; }
+
+  # Do NOT test 'systemctl is-active libvirtd'. libvirt is socket-activated on 24.04:
+  # libvirtd.service stays inactive until something connects, so straight after a reboot that
+  # check reports a healthy host as broken - and then every later virsh check fails too,
+  # because the daemon it was about to start had not started yet. Ask virsh instead; it is
+  # the thing we actually depend on, and connecting is what triggers the activation.
+  if virsh -c qemu:///system version >/dev/null 2>&1; then
+    ok "libvirt reachable (socket-activated; libvirtd.service may read inactive until used)"
+  else
+    warn "cannot connect to qemu:///system"; fail=1
+  fi
   [ -c /dev/kvm ] && ok "/dev/kvm present" || { warn "/dev/kvm missing"; fail=1; }
 
+  # Both halves matter. 'inactive' today with 'autostart yes' is not fixed - it is a virbr0 on
+  # 192.168.122.1 waiting for the next boot that happens to start it.
   if virsh -c qemu:///system net-info default >/dev/null 2>&1; then
-    virsh -c qemu:///system net-info default 2>/dev/null | grep -qi 'Active:.*no' \
-      && ok "default NAT network inactive" \
-      || { warn "default NAT network is ACTIVE - VMs may land on 192.168.122.0/24"; fail=1; }
+    local nstate nauto
+    nstate=$(virsh -c qemu:///system net-info default 2>/dev/null | awk '/^Active:/{print $2}')
+    nauto=$(virsh -c qemu:///system net-info default 2>/dev/null | awk '/^Autostart:/{print $2}')
+    if [ "$nstate" = "no" ] && [ "$nauto" = "no" ]; then
+      ok "default NAT network inactive and autostart off"
+    else
+      warn "default NAT network: active=$nstate autostart=$nauto - run 'libvirt' to disable it"
+      warn "    autostart=yes means virbr0/192.168.122.1 returns on a later boot"
+      fail=1
+    fi
   fi
 
   ip -br addr show "$BRIDGE_NAME" >/dev/null 2>&1 \

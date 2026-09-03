@@ -345,14 +345,25 @@ else
      -o "Dir::State::lists=$T/lists" -o "Dir::Cache=$T/cache"
      -o "Dir::Etc::preferencesparts=/dev/null" -o "APT::Get::AllowUnauthenticated=false")
 
-  if ! apt-get "${O[@]}" update 2>&1 | tee "$T/update.log" | grep -qE '^(Get|Hit)'; then
-    sed 's/^/       /' "$T/update.log" >&2
-    die "apt-get update failed against the ESM suites - see above"
+  # Do NOT pipe apt-get into `grep -q`. grep -q exits at the first match, closing the pipe and
+  # sending SIGPIPE to apt-get; under `set -o pipefail` the pipeline then reports failure
+  # BECAUSE the check succeeded quickly. Redirect to a file and inspect it separately.
+  #
+  # The log is kept on failure. An earlier version deleted it in an EXIT trap before anyone
+  # could read it, which turned a one-line diagnosis into a reproduction exercise.
+  ESM_LOG="${REPO_ROOT}/esm-proof.log"
+  if ! apt-get "${O[@]}" update > "$ESM_LOG" 2>&1; then
+    sed 's/^/       /' "$ESM_LOG" >&2
+    die "apt-get update failed against the ESM suites. Log kept at $ESM_LOG"
   fi
-  if grep -qiE 'NO_PUBKEY|not signed|BADSIG|EXPKEYSIG' "$T/update.log"; then
-    sed 's/^/       /' "$T/update.log" >&2
-    die "GPG verification FAILED on an ESM suite - the carried keyrings do not match the tree"
+  grep -qE '^(Get|Hit)' "$ESM_LOG" \
+    || die "apt fetched nothing from the ESM suites - an empty success. Log: $ESM_LOG"
+  if grep -qiE 'NO_PUBKEY|not signed|BADSIG|EXPKEYSIG' "$ESM_LOG"; then
+    sed 's/^/       /' "$ESM_LOG" >&2
+    die "GPG verification FAILED on an ESM suite - the carried keyrings do not match the tree.
+       Log kept at $ESM_LOG"
   fi
+  note "fetched $(grep -cE '^Get:' "$ESM_LOG") index file(s), signatures verified"
   note "apt-get update: signatures verified against the carried keyrings"
 
   ( cd "$T" && apt-get "${O[@]}" download $ESM_PROOF_PACKAGES ) >/dev/null 2>&1 \

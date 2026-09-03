@@ -241,9 +241,17 @@ fi
 
 # See vm-specs.env for why UEFI is the default - SeaBIOS failures are invisible with
 # --graphics none, because SeaBIOS only writes to VGA.
+# '--boot uefi' is NOT plain UEFI - it selects the Microsoft-keys-enrolled Secure Boot
+# firmware, under which Ubuntu's GRUB stopped with "prohibited by secure boot policy" and
+# cloud-init never ran. Ask for the features explicitly instead of taking the default.
 FIRMWARE_ARGS=()
 case "${VM_FIRMWARE:-uefi}" in
-  uefi) FIRMWARE_ARGS=(--boot uefi) ;;
+  uefi)
+    if [ "${VM_SECURE_BOOT:-false}" = "true" ]; then
+      FIRMWARE_ARGS=(--boot uefi)
+    else
+      FIRMWARE_ARGS=(--boot "firmware=efi,firmware.feature0.name=secure-boot,firmware.feature0.enabled=no,firmware.feature1.name=enrolled-keys,firmware.feature1.enabled=no")
+    fi ;;
   bios) FIRMWARE_ARGS=() ;;
   *)    die "VM_FIRMWARE must be 'uefi' or 'bios', not '${VM_FIRMWARE}'" ;;
 esac

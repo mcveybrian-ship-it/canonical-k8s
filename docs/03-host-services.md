@@ -552,6 +552,76 @@ copy costs ~600 MB each (measured: 607 MiB), 6 GB across the fleet against 1.9 T
 `ens3` on others. Guessing wrong yields a VM with no address *and* no default route —
 unreachable, recoverable only from a console.
 
+## 5e. Key-only SSH, and the `sshd` rule that hid it
+
+Run **last**, after everything else works and after every key that needs access is installed:
+
+```bash
+### MACHINE: each host in turn - the jump host LAST ###
+cd ~/canonical-k8s/scripts/install
+sudo ./03-host-services.sh keyonly
+```
+
+**State on 2026-09-03 before this step:**
+
+```
+stage-01      publickey,password      <- accepted passwords
+build-01      publickey,password      <- accepted passwords
+host-4        publickey,password      <- accepted passwords
+svc-mgmt-01   publickey               <- correct
+svc-repo-01   publickey               <- correct
+```
+
+Only the composer-built VMs were clean. The three autoinstalled machines were not, and
+`host-4` is inside the boundary.
+
+**This was not a bug — it was a deliberate default nobody reversed.** `ALLOW_PW=true` is
+correct during a build: you cannot build a host you cannot connect to, and being locked out of
+a half-built machine on a rack costs more than a password on a lab network. The template even
+said so. What it also said was *"step 03 hardening sets this"* — and no such step existed,
+because hardening is step 05. It would have sat at `true` until an assessor found it.
+`ALLOW_PW` now defaults to **`false`**, so `host-1..3` never get it.
+
+### `sshd` is first-match-wins, and that is why nobody noticed
+
+```
+/etc/ssh/sshd_config.d/50-cloud-init.conf        PasswordAuthentication yes   <- WINS
+/etc/ssh/sshd_config.d/60-cloudimg-settings.conf PasswordAuthentication no
+```
+
+Unlike almost every other config format, **`sshd` takes the FIRST occurrence of a keyword and
+ignores the rest.** cloud-init's `50-` file is read before the `60-` file that says `no`, so
+the machine does the opposite of what reading the files in order suggests. The `50-` file is
+also mode `0600`, so an unprivileged `grep` across the directory finds only the `no` and
+concludes the machine is locked down.
+
+That is why the fix writes into `50-cloud-init.conf` itself. **A `99-*.conf` would be read
+after it and silently lose.**
+
+**It also cost an hour of debugging the wrong thing.** SecureCRT connected to `stage-01` and
+failed against every VM. Because `stage-01` accepted the password, the difference looked like a
+client problem — and the trace that finally settled it showed SecureCRT disconnecting the
+instant the VM said `continuations [publickey]`, having never been given a key at all. The
+server was the variable, not the client. **When one machine works and another does not, probe
+what each server offers before touching the client:**
+
+```bash
+ssh -o PreferredAuthentications=none -o BatchMode=yes user@host true
+# -> Permission denied (publickey,password)   or   (publickey)
+```
+
+### The guard, and the one it does not cover
+
+`keyonly` refuses unless the invoking user has at least one key in `authorized_keys` — on an
+air-gapped host with no default route, getting that wrong is recoverable only from the physical
+console.
+
+**That guard is necessary and not sufficient.** `build-01` passed it holding exactly one key —
+which belonged to `stage-01`, not to the operator — and locking it down cut the operator off
+from a machine that was, by every check, healthy. The subcommand now **lists** the keys it is
+about to make exclusive, with the reminder that anyone missing must be added first. A count
+proves the runner can get back in; only the list shows who else can.
+
 ## 6. What this step deliberately does NOT do
 
 No Pro attach, no FIPS, no STIG, no MAAS.

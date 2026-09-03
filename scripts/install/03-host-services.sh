@@ -385,6 +385,17 @@ cmd_keyonly() {
   [ "${n:-0}" -ge 1 ] || die "$ak contains no public keys - refusing."
   ok "$u has $n key(s) in authorized_keys"
 
+  # LIST them, do not just count them. The count guard only proves the person running this
+  # can still get in - it says nothing about anyone else. build-01 passed that check with a
+  # single key and locked the operator out anyway, because the key it had was another
+  # machine's. After this runs, these are the ONLY ways into the host.
+  say ""
+  say "    After this, the ONLY ways into $(hostname) are:"
+  awk '{ printf "      %s  %s\n", $1, $NF }' "$ak" | while read -r l; do say "$l"; done
+  say ""
+  say "    If anyone who needs access is not on that list, add their key FIRST."
+  say ""
+
   # WHY THIS FILE AND NOT A HIGHER-NUMBERED ONE: sshd is FIRST-MATCH-WINS, not last. A
   # 99-*.conf would be read AFTER 50-cloud-init.conf and lose. cloud-init's file is where
   # the 'yes' lives, so that is where the 'no' has to go - anything else leaves two files

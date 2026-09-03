@@ -112,6 +112,12 @@ say "bridge  : $BRIDGE"
 
 # ---- disk --------------------------------------------------------------------------------
 run install -d -m 0711 "$POOL/seed"
+# Log the serial console to a file as well as the pty. A VM with no default route that fails
+# to bring up networking is invisible: no ssh, and 'virsh console' needs an interactive root
+# session on the host. Without this the only evidence of what went wrong is gone the moment
+# nobody was watching. Costs nothing; answers the question every time.
+LOGDIR="$POOL/console"
+run install -d -m 0755 "$LOGDIR"
 # A full copy, NOT a backing-file overlay. An overlay would save a few hundred MB per VM and
 # tie all ten to one file: delete or corrupt the base and every VM dies at once, and the base
 # can never be retired. A converted copy costs ~600 MB each - 6 GB across the fleet, against
@@ -241,7 +247,9 @@ virt-install \
   --disk "path=$DISK,format=qcow2,bus=virtio" \
   --disk "path=$SEED,device=cdrom" \
   --network "bridge=$BRIDGE,model=virtio" \
-  --graphics none --console pty,target_type=serial \
+  --graphics none \
+  --console pty,target_type=serial \
+  --serial "file,path=$LOGDIR/$VM-console.log" \
   --import --noautoconsole
 ok "defined and started"
 
@@ -251,5 +259,7 @@ ok "autostart enabled"
 say ""
 say "cloud-init takes a minute or two. Watch it:"
 say "    sudo virsh console $VM        (escape is Ctrl-])"
+say "Or read the console log, which needs no interactive session:"
+say "    sudo tail -f $LOGDIR/$VM-console.log"
 say "Then, from anywhere on the subnet:"
 say "    ssh ${VM_USER:-encadmin}@$ADDRESS 'cat /etc/enclave-build-info'"

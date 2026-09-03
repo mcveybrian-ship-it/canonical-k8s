@@ -259,6 +259,18 @@ cloud-localds -N "$TMP/network-config" "$SEED" "$TMP/user-data" "$TMP/meta-data"
 ok "seed    : $SEED"
 
 # ---- define and start --------------------------------------------------------------------
+# THE SEED GOES ON VIRTIO, NOT AS A SATA CDROM. Found on svc-mgmt-01 2026-09-03:
+# virt-install's default for device=cdrom is the SATA bus, and an Ubuntu cloud image ships a
+# TRIMMED INITRAMFS carrying only virtio drivers - no AHCI. The guest therefore enumerated
+# only vda and never saw the seed at all:
+#
+#     virtio_blk virtio2: [vda] 209715200 512-byte logical blocks
+#     vda: vda1 vda14 vda15 vda16          <- no sr0, no sda, no ata
+#
+# ds-identify then found no datasource and systemd SKIPPED every cloud-init unit, which
+# produces no error and no output - the VM boots to a stock 'ubuntu' login with no address,
+# looking alive and being useless. NoCloud matches on the filesystem label, not on the device
+# being a cdrom, so a read-only virtio disk works and is visible to the trimmed initramfs.
 virt-install \
   --name "$VM" \
   --memory "$RAM_MB" --vcpus "$VCPUS" \
@@ -266,7 +278,7 @@ virt-install \
   --os-variant "${VM_OSVARIANT:-ubuntu24.04}" \
   "${FIRMWARE_ARGS[@]}" \
   --disk "path=$DISK,format=qcow2,bus=virtio" \
-  --disk "path=$SEED,device=cdrom" \
+  --disk "path=$SEED,device=disk,bus=virtio,format=raw,readonly=on" \
   --network "bridge=$BRIDGE,model=virtio" \
   --graphics none \
   --console pty,target_type=serial \

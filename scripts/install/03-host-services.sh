@@ -368,7 +368,10 @@ cmd_pool() {
 
 # =========================================================================================
 cmd_keyonly() {
-  need_root keyonly; load_params
+  # No load_params: this step needs nothing from the params file, and requiring one would
+  # stop it running on stage-01 and build-01, which have no services-params.env and are
+  # exactly the machines that turned out to need it. Its own guard below is the safety.
+  need_root keyonly
   local u="${SUDO_USER:-$(id -un)}" home ak
   home=$(getent passwd "$u" | cut -d: -f6)
   ak="$home/.ssh/authorized_keys"

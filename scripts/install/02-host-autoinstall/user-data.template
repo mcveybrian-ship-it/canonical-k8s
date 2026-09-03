@@ -303,7 +303,7 @@ autoinstall:
     fallback: offline-install
     # mirror-selection:
     #   primary:
-    #     - uri: "http://svc-01.enclave.local/ubuntu"
+    #     - uri: "http://svc-01.enclave.internal/ubuntu"
 
   # Packages come from the ISO pool in an offline install. Anything not on the ISO silently
   # fails to install - keep this minimal.

@@ -119,7 +119,7 @@ apt:
   fallback: offline-install
   mirror-selection:
     primary:
-      - uri: "http://svc-01.enclave.local/ubuntu"
+      - uri: "http://svc-01.enclave.internal/ubuntu"
 ```
 
 Host-1 is built before that mirror exists, so it relies on the fallback alone.

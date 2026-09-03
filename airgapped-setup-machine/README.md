@@ -6,7 +6,7 @@
 *how* things were built and why; they have gone stale more than once. If they disagree with
 this section, this section wins and the other one gets fixed.
 
-Last updated **2026-09-03 20:10**.
+Last updated **2026-09-03 20:30**.
 
 **STAGE-01's work is DONE. Everything that does not need hardware is finished.**
 
@@ -55,7 +55,7 @@ real client over the network. See `docs/03-host-services.md`.
 | `host-4` | `10.0.20.158` | **air-gapped** | **BUILT 2026-09-01/02.** Services host. LUKS on 2 of 3 NVMe, 125 GB RAM. **Step 03 host prep DONE** - mirror apt, br0, 1.8T LUKS-backed image pool, verified after a cold boot. `svc-mgmt-01` next |
 | `host-1..3` | `.155` `.156` `.157` | **air-gapped** | Not built |
 | `svc-mgmt-01` | `10.2.20.161` | **air-gapped** | **BUILT 2026-09-03.** First enclave VM. MAAS + Pro contract server go here |
-| `svc-repo-01` | `10.2.20.162` | **air-gapped** | A VM on `host-4`. Where `restore-mirror.sh` runs. **NEXT** |
+| `svc-repo-01` | `10.2.20.162` | **air-gapped** | **BUILT 2026-09-03**, cloud-init clean in 5s. 991 GB disk. `restore-mirror.sh` runs here **NEXT** |
 
 **THE MIRROR IS COMPLETE — 318 GB, 90,853 packages, six archives.**
 

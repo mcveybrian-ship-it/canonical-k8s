@@ -5,6 +5,10 @@
 #   ./apply-addresses.sh render          print the block, change nothing
 #   ./apply-addresses.sh apply           write it into THIS machine's /etc/hosts  (sudo)
 #   ./apply-addresses.sh push            apply it on every reachable enclave node
+#
+# NOTE: 'push' needs PASSWORDLESS sudo on the targets. The enclave hosts deliberately do not
+# have it, so on those run 'apply' locally instead - same result, one step per machine. VMs
+# built by 03-compose-vm.sh get this block from cloud-init and need neither.
 #   ./apply-addresses.sh verify          check every node resolves every name
 #
 # Renumbering is: edit enclave-addresses.env, run 'push', done. That is the whole point -

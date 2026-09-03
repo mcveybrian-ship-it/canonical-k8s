@@ -441,6 +441,35 @@ Both are the same shape as the bad Pro token that produced a healthy-looking emp
 empty `EXPECTED_SUITES`, counts what it checked, dies if that count is zero, and treats `----`
 as the mirroring failure it is.
 
+### 6.1d The path proven end to end — 2026-09-03
+
+**The enclave feeds itself.** The full chain, each link verified rather than assumed:
+
+```
+Ubuntu archive + ESM  ->  stage-01 (the only Pro token)
+                      ->  318 GB SSD, ext4, carried by hand
+                      ->  svc-repo-01, nginx, 9/9 suites
+                      ->  host-4, apt-get install, GPG-verified
+```
+
+The final check is the one that counts:
+
+```
+Get:1 http://10.2.20.162/archive.ubuntu.com/ubuntu noble-updates/main amd64 tcpdump [479 kB]
+dpkg-deb -I  ->  Package: tcpdump  Version: 4.99.4-3ubuntu4.24.04.1
+downloaded:  6333724c69b1078759fa3c5914d7d0369fdfb6aab21694b038d1685c4c09772e
+advertised:  6333724c69b1078759fa3c5914d7d0369fdfb6aab21694b038d1685c4c09772e
+```
+
+A client inside the enclave resolved a package through nginx, apt verified the `Release`
+signature against the archive keyring, and the delivered bytes match the hash the repository
+advertises. Until that happened, all that was known was that files were on a disk.
+
+**Still owed at this point:** the ESM/FIPS/USG suites are served and return `200`, but have not
+been proven through a GPG-verified `apt` resolution — they are signed by the carried Ubuntu Pro
+keyrings, not the archive keyring, so the test above does not cover them. That needs a sources
+list using `signed-by=` against `/keys/`, downloading `usg` and `openssl-fips-module-3`.
+
 ### 6.2 Rebuilding the bundle — what step 1 actually does
 
 `build-transfer-bundle.sh` is safe to re-run at any time and is expected to be run repeatedly

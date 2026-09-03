@@ -6,7 +6,7 @@
 *how* things were built and why; they have gone stale more than once. If they disagree with
 this section, this section wins and the other one gets fixed.
 
-Last updated **2026-09-03 20:30**.
+Last updated **2026-09-03 23:15**.
 
 **STAGE-01's work is DONE. Everything that does not need hardware is finished.**
 
@@ -30,7 +30,7 @@ real client over the network. See `docs/03-host-services.md`.
 | 10 | Artifact corrected + republished | ✅ **DONE** — 3 factual errors fixed, dated four-host callout added |
 | 11 | Private material backed up off-box | ✅ **DONE** — `private-sync.sh backup` to `build-01`, checksum-verified |
 | 13 | **Write the SSD** | ✅ **DONE 2026-09-02** — 318 G mirror (91,073 files, byte-identical to source) + 4.3 G extras (29 files), `MANIFEST.sha256` verified. 931.5 G WD SN550, ext4 `LABEL=enclave-xfer`. Procedure §6.1a, ssh key §6.1b |
-| — | **`restore-mirror.sh` in the gap** | ⏳ **NEXT, and it needs `svc-repo-01` to exist.** Audited before first run — four defects fixed, one a blocker. §6.1c |
+| 14 | **`restore-mirror.sh` in the gap** | ✅ **DONE 2026-09-03.** All 9 suites `Release 200 / pool 200`. **Proven end to end:** host-4 downloaded tcpdump from `svc-repo-01`, GPG-verified, SHA-256 matching the advertised value. The enclave now feeds itself |
 | 12 | **Q23 — which `k8s` version** | ✅ **DECIDED** — **v1.36.4, snap revision 5526**. LTS line; the build is `grade: stable`; and side-loading pins the revision, so the channel stops mattering once it crosses |
 | — | `ceph-csi` against deb-deployed Ceph | ⚠️ **UNTESTED** — load-bearing on the storage design. A lab test, not a paper question |
 
@@ -55,7 +55,7 @@ real client over the network. See `docs/03-host-services.md`.
 | `host-4` | `10.0.20.158` | **air-gapped** | **BUILT 2026-09-01/02.** Services host. LUKS on 2 of 3 NVMe, 125 GB RAM. **Step 03 host prep DONE** - mirror apt, br0, 1.8T LUKS-backed image pool, verified after a cold boot. `svc-mgmt-01` next |
 | `host-1..3` | `.155` `.156` `.157` | **air-gapped** | Not built |
 | `svc-mgmt-01` | `10.2.20.161` | **air-gapped** | **BUILT 2026-09-03.** First enclave VM. MAAS + Pro contract server go here |
-| `svc-repo-01` | `10.2.20.162` | **air-gapped** | **BUILT 2026-09-03**, cloud-init clean in 5s. 991 GB disk. `restore-mirror.sh` runs here **NEXT** |
+| `svc-repo-01` | `10.2.20.162` | **air-gapped** | **SERVING 2026-09-03.** 318 GB mirror over nginx, 9/9 suites verified, keys at `/keys/`, the 3 PPA debs at `/debs/`. host-4 installs from it |
 
 **THE MIRROR IS COMPLETE — 318 GB, 90,853 packages, six archives.**
 

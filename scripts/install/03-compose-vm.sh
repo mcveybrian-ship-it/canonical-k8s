@@ -124,15 +124,30 @@ ok "disk    : $DISK (independent copy, sparse, grown to ${DISK_GB}G)"
 # The hosts block comes from apply-addresses.sh so there is exactly one renderer. A VM that
 # writes its own copy is a second source of truth waiting to disagree.
 HOSTS_BLOCK="$("$ENCLAVE_DIR/apply-addresses.sh" render | sed 's/^/      /')"
+# Find the keys under sudo, which is how this always runs. $HOME is /root there, so the
+# operator's own authorized_keys is invisible unless SUDO_USER is resolved back to a home
+# directory - and the failure looks like "you have no keys" rather than "I looked in the
+# wrong place".
+SSH_KEY_SEARCH="${VM_SSH_KEYS:-}"
+if [ -z "$SSH_KEY_SEARCH" ]; then
+  if [ -n "${SUDO_USER:-}" ]; then
+    SUDO_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+    [ -n "$SUDO_HOME" ] && SSH_KEY_SEARCH="$SUDO_HOME/.ssh/authorized_keys"
+  fi
+  SSH_KEY_SEARCH="$SSH_KEY_SEARCH $HOME/.ssh/authorized_keys /root/.ssh/authorized_keys"
+fi
+
 SSH_KEYS_YAML=""
-for k in ${VM_SSH_KEYS:-$HOME/.ssh/authorized_keys /root/.ssh/authorized_keys}; do
+for k in $SSH_KEY_SEARCH; do
   [ -r "$k" ] || continue
   while IFS= read -r line; do
     case "$line" in ssh-*|ecdsa-*) SSH_KEYS_YAML="$SSH_KEYS_YAML      - \"$line\""$'\n' ;; esac
   done < "$k"
 done
-[ -n "$SSH_KEYS_YAML" ] || die "no ssh public keys found - set VM_SSH_KEYS to a file of them.
-       Without one the VM has no default route AND no way in."
+[ -n "$SSH_KEYS_YAML" ] || die "no ssh public keys found. Looked in:
+$(for k in $SSH_KEY_SEARCH; do printf '         %s%s\n' "$k" "$([ -r "$k" ] && echo ' (readable, but no ssh-* lines)' || echo ' (not readable)')"; done)
+       Set VM_SSH_KEYS to a file containing them. Without a key the VM has no default
+       route AND no way in - it would boot and be unreachable."
 
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 cat > "$TMP/meta-data" <<EOF

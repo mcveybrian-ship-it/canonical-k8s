@@ -42,7 +42,17 @@ autoinstall:
     #   true  - BUILD PHASE DEFAULT. Password SSH works as a fallback. You cannot build a host
     #           you cannot connect to, and being locked out of a half-built machine on a rack
     #           costs more than a password on a lab network does.
-    #   false - target state. Step 03 hardening sets this; the STIG requires key-only.
+    #   false - TARGET STATE, and now the default. The STIG requires key-only.
+    #
+    # CHANGED 2026-09-03. This sat at true on stage-01, build-01 and host-4 because the
+    # thing that was supposed to flip it - "step 03 hardening" - does not exist; hardening
+    # is step 05. Three machines therefore accepted password logins, and the config files
+    # said otherwise, because sshd is FIRST-MATCH-WINS and cloud-init's 50-cloud-init.conf
+    # is read before 60-cloudimg-settings.conf. Reading the files in the obvious order gives
+    # you the opposite of the truth.
+    #
+    # Set it true only if you genuinely cannot get a key onto the host first, and run
+    # `03-host-services.sh keyonly` the moment you can.
     #
     # The console password is set either way and is the last-resort way in.
     allow-pw: @@ALLOW_PW@@

@@ -13,6 +13,7 @@
 #     ./03-host-services.sh datavg     create LVs on vg-data and mount them
 #     ./03-host-services.sh bridge     replace the NIC with a bridge   <-- can cut you off
 #     ./03-host-services.sh pool       define the libvirt storage pool
+#     ./03-host-services.sh keyonly    disable password SSH  <-- do this LAST
 #     ./03-host-services.sh verify     prove all of the above, change nothing
 #     ./03-host-services.sh all        apt, libvirt, datavg, pool, verify (NOT bridge)
 #
@@ -366,6 +367,60 @@ cmd_pool() {
 }
 
 # =========================================================================================
+cmd_keyonly() {
+  need_root keyonly; load_params
+  local u="${SUDO_USER:-$(id -un)}" home ak
+  home=$(getent passwd "$u" | cut -d: -f6)
+  ak="$home/.ssh/authorized_keys"
+
+  # NEVER disable password auth on a machine nobody can key into. This check is the whole
+  # safety of this subcommand: get it wrong on an air-gapped host with no default route and
+  # the only way back is the physical console.
+  [ -r "$ak" ] || die "$u has no $ak - refusing to disable password auth.
+       You would lock yourself out of a machine with no default route."
+  local n; n=$(grep -cE '^(ssh|ecdsa)-' "$ak" 2>/dev/null || true)
+  [ "${n:-0}" -ge 1 ] || die "$ak contains no public keys - refusing."
+  ok "$u has $n key(s) in authorized_keys"
+
+  # WHY THIS FILE AND NOT A HIGHER-NUMBERED ONE: sshd is FIRST-MATCH-WINS, not last. A
+  # 99-*.conf would be read AFTER 50-cloud-init.conf and lose. cloud-init's file is where
+  # the 'yes' lives, so that is where the 'no' has to go - anything else leaves two files
+  # disagreeing and the wrong one winning silently.
+  local f=/etc/ssh/sshd_config.d/50-cloud-init.conf
+  if [ -f "$f" ] && ! grep -q '^PasswordAuthentication yes' "$f"; then
+    skip "password auth already disabled"
+  else
+    [ -f "$f" ] && cp "$f" "$f.bak-$(date +%Y%m%d%H%M%S)"
+    cat > "$f" <<'CONF'
+# Key-only SSH. Overwrites cloud-init's PasswordAuthentication yes.
+#
+# sshd is FIRST-MATCH-WINS: this file (50-) is read before 60-cloudimg-settings.conf, so
+# whatever it says here decides, and a higher-numbered file cannot override it. That is why
+# the setting lives here rather than in a 99-*.conf.
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+CONF
+    chmod 0644 "$f"
+    ok "wrote $f"
+  fi
+
+  sshd -t || die "sshd config is invalid - NOT reloading. Fix it before disconnecting."
+  ok "sshd -t passed"
+  systemctl reload ssh 2>/dev/null || systemctl reload sshd
+  ok "sshd reloaded (existing sessions survive a reload)"
+
+  local offered
+  offered=$(ssh -o PreferredAuthentications=none -o StrictHostKeyChecking=no \
+                -o BatchMode=yes -o ConnectTimeout=5 "$u@127.0.0.1" true 2>&1 \
+            | grep -o '(.*)' | tr -d '()')
+  case "$offered" in
+    publickey) ok "verified: this host now offers publickey only" ;;
+    *password*) warn "still offering: $offered - check for another PasswordAuthentication line" ;;
+    *) say "offered methods: ${offered:-could not probe}" ;;
+  esac
+}
+
+# =========================================================================================
 cmd_verify() {
   load_params
   local fail=0
@@ -438,6 +493,7 @@ case "${1:-}" in
   datavg)  cmd_datavg ;;
   bridge)  cmd_bridge ;;
   pool)    cmd_pool ;;
+  keyonly) cmd_keyonly ;;
   verify)  cmd_verify ;;
   all)     cmd_apt; cmd_libvirt; cmd_datavg; cmd_pool; cmd_verify ;;
   *)       sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;

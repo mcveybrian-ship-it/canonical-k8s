@@ -194,14 +194,18 @@ users:
     sudo: ALL=(ALL) NOPASSWD:ALL
     ssh_authorized_keys:
 $SSH_KEYS_YAML
+# preserve_sources_list: true is LOAD-BEARING. With the 'primary'/'security' form, cloud-init
+# generates ubuntu.sources from ITS OWN template - default suites and components - and does so
+# AFTER write_files, silently overwriting the file below. On svc-mgmt-01 (2026-09-03) that
+# produced:
+#     Suites: noble noble-updates noble-backports
+#     Components: main universe restricted multiverse
+# against a mirror carrying only main+universe and no backports, so apt-get update 404'd on
+# every one of them. cloud-init then fell back to trying 'snap install' for each package -
+# 30 seconds apiece against a store it cannot reach - and sat in 'running' for minutes.
+# Preserving the list and writing the file ourselves is the only way to control components.
 apt:
-  preserve_sources_list: false
-  primary:
-    - arches: [default]
-      uri: $VM_MIRROR_URL
-  security:
-    - arches: [default]
-      uri: $VM_MIRROR_URL
+  preserve_sources_list: true
 
 write_files:
   - path: /etc/apt/sources.list.d/ubuntu.sources

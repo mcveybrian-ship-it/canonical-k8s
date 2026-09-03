@@ -211,6 +211,33 @@ else
   note "no vhost carried - configure nginx by hand, root $REPO_ROOT/mirror"
 fi
 
+# --- 6a. wait for the reload to actually take effect ---------------------------------------------
+# `systemctl reload nginx` signals the master and RETURNS IMMEDIATELY. For a second or two the
+# previous config is still answering - and on this run nginx had only just been installed in
+# section 2a, so the previous config was the stock default site.
+#
+# Measured on svc-repo-01 2026-09-03: the proof ran 5s after the reload, six requests hit the
+# new workers and passed, three hit the old ones and 404'd against /var/www/html. They landed
+# in the DEFAULT access log rather than apt-mirror's, which is the only reason it was findable.
+# The tree was complete and byte-identical the whole time; the proof simply asked too early and
+# could not tell that from a real failure.
+if [ "$DRY" -eq 0 ]; then
+  head2 "waiting for nginx to serve the new config"
+  _probe="${EXPECTED_SUITES%%$'\n'*}"
+  _pa="${_probe%%:*}"; _ps="${_probe##*:}"
+  _url="http://localhost/$_pa/dists/$_ps/Release"
+  _ok=0
+  for _i in $(seq 1 30); do
+    if [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$_url")" = "200" ]; then
+      _ok=1; note "serving after ${_i}s"; break
+    fi
+    sleep 1
+  done
+  [ "$_ok" -eq 1 ] || die "nginx is not serving $_url after 30s.
+       This is a real failure, not a race - check: sudo nginx -T, and whether
+       /etc/nginx/sites-enabled/default is still present."
+fi
+
 # --- 7. PROVE IT ---------------------------------------------------------------------------------
 # Three levels. Release alone proves nothing: metadata is served more permissively than
 # content, which is exactly how a bad token produced a healthy-looking empty archive on

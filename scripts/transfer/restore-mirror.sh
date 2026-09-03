@@ -313,11 +313,66 @@ done <<< "$EXPECTED_SUITES"
 note "checked: $checked suite(s)"
 [ "$fail" -eq 0 ] || die "$fail check(s) failed - the tree is not correctly served"
 
+# --- 8. LEVEL 3: a real GPG-verified apt resolution against the ESM suites ----------------------
+# Levels 1 and 2 above prove files are served. They do NOT prove the ESM/FIPS/USG suites are
+# consumable, because those are signed by the CARRIED Ubuntu Pro keyrings rather than the
+# archive keyring - the reason the Pro subscription exists at all. A test that downloads from
+# archive.ubuntu.com says nothing about them.
+#
+# apt runs with every Dir:: overridden, so this machine's own apt configuration is never
+# touched and the test leaves nothing behind.
+#
+# The suite -> keyring mapping below was VERIFIED WITH gpgv on 2026-09-03, not inferred from
+# the filenames. To re-verify:
+#     gpgv --keyring /srv/repo/keys/<key>.gpg <tree>/dists/<suite>/InRelease
+head2 "proving a GPG-verified apt resolution (ESM/FIPS/USG)"
+if [ -z "${ESM_PROOF_PACKAGES:-}" ]; then
+  note "ESM_PROOF_PACKAGES unset - skipping. Set it in $PARAMS to enable."
+else
+  T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
+  mkdir -p "$T"/lists/partial "$T"/cache/archives/partial "$T"/etc
+  K="${REPO_ROOT}/keys"
+  {
+    printf 'deb [arch=amd64 signed-by=%s/ubuntu-pro-esm-infra.gpg] http://localhost/esm.ubuntu.com/infra/ubuntu noble-infra-security main\n' "$K"
+    printf 'deb [arch=amd64 signed-by=%s/ubuntu-pro-esm-infra.gpg] http://localhost/esm.ubuntu.com/infra/ubuntu noble-infra-updates main\n'  "$K"
+    printf 'deb [arch=amd64 signed-by=%s/ubuntu-pro-esm-apps.gpg]  http://localhost/esm.ubuntu.com/apps/ubuntu noble-apps-security main\n'   "$K"
+    printf 'deb [arch=amd64 signed-by=%s/ubuntu-pro-esm-apps.gpg]  http://localhost/esm.ubuntu.com/apps/ubuntu noble-apps-updates main\n'    "$K"
+    printf 'deb [arch=amd64 signed-by=%s/ubuntu-pro-fips.gpg]      http://localhost/esm.ubuntu.com/fips-updates/ubuntu noble-updates main\n' "$K"
+    printf 'deb [arch=amd64 signed-by=%s/ubuntu-pro-cis.gpg]       http://localhost/esm.ubuntu.com/usg/ubuntu noble main\n'                  "$K"
+  } > "$T/etc/sources.list"
+
+  O=(-o "Dir::Etc::sourcelist=$T/etc/sources.list" -o "Dir::Etc::sourceparts=/dev/null"
+     -o "Dir::State::lists=$T/lists" -o "Dir::Cache=$T/cache"
+     -o "Dir::Etc::preferencesparts=/dev/null" -o "APT::Get::AllowUnauthenticated=false")
+
+  if ! apt-get "${O[@]}" update 2>&1 | tee "$T/update.log" | grep -qE '^(Get|Hit)'; then
+    sed 's/^/       /' "$T/update.log" >&2
+    die "apt-get update failed against the ESM suites - see above"
+  fi
+  if grep -qiE 'NO_PUBKEY|not signed|BADSIG|EXPKEYSIG' "$T/update.log"; then
+    sed 's/^/       /' "$T/update.log" >&2
+    die "GPG verification FAILED on an ESM suite - the carried keyrings do not match the tree"
+  fi
+  note "apt-get update: signatures verified against the carried keyrings"
+
+  ( cd "$T" && apt-get "${O[@]}" download $ESM_PROOF_PACKAGES ) >/dev/null 2>&1 \
+    || die "could not download: $ESM_PROOF_PACKAGES
+       The suites resolve but a package did not. Check it exists in the mirrored components."
+  for _p in $ESM_PROOF_PACKAGES; do
+    _f=$(ls "$T"/${_p}_*.deb 2>/dev/null | head -1)
+    [ -n "$_f" ] || die "$_p did not download"
+    dpkg-deb -I "$_f" >/dev/null 2>&1 || die "$_p downloaded but dpkg-deb cannot read it"
+    note "$(printf '%-28s %s' "$_p" "$(dpkg-deb -f "$_f" Version) - dpkg-deb OK")"
+  done
+  ok "ESM/FIPS/USG proven: signed, downloadable, and readable by dpkg"
+  rm -rf "$T"; trap - EXIT
+fi
+
 note ""
-note "HTTP checks passed. Now prove a real GPG-verified apt resolution:"
-note "  see airgap-update-lab.md section 6.5 - build a sources list pointing at"
-note "  http://$REPO_ADDRESS with signed-by= each carried keyring, then:"
-note "    apt-get \$OPTS update && apt-get \$OPTS download usg openssl-fips-module-3"
+ok "all three verification levels passed"
+note "  1. Release for every expected suite"
+note "  2. a real pool file from each archive"
+note "  3. a GPG-verified apt resolution against the ESM suites, with dpkg-deb reading the result"
 note ""
-note "Until a package downloads and dpkg-deb -I reads it, you have proven only that"
-note "files are on a disk."
+note "The repo is serving. Remaining before clients can 'pro attach':"
+note "  contracts-airgapped --config /etc/ubuntu-advantage/airgapped-contracts.yaml"

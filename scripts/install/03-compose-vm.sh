@@ -235,6 +235,15 @@ if [ "$DRY" -eq 1 ]; then
   exit 0
 fi
 
+# See vm-specs.env for why UEFI is the default - SeaBIOS failures are invisible with
+# --graphics none, because SeaBIOS only writes to VGA.
+FIRMWARE_ARGS=()
+case "${VM_FIRMWARE:-uefi}" in
+  uefi) FIRMWARE_ARGS=(--boot uefi) ;;
+  bios) FIRMWARE_ARGS=() ;;
+  *)    die "VM_FIRMWARE must be 'uefi' or 'bios', not '${VM_FIRMWARE}'" ;;
+esac
+
 cloud-localds -N "$TMP/network-config" "$SEED" "$TMP/user-data" "$TMP/meta-data"
 ok "seed    : $SEED"
 
@@ -244,6 +253,7 @@ virt-install \
   --memory "$RAM_MB" --vcpus "$VCPUS" \
   --cpu host-passthrough \
   --os-variant "${VM_OSVARIANT:-ubuntu24.04}" \
+  "${FIRMWARE_ARGS[@]}" \
   --disk "path=$DISK,format=qcow2,bus=virtio" \
   --disk "path=$SEED,device=cdrom" \
   --network "bridge=$BRIDGE,model=virtio" \

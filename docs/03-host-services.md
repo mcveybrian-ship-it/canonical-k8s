@@ -450,6 +450,108 @@ autostart are each `no`.
 That is what `03-host-services.sh libvirt` does. If you installed libvirt by hand, run that
 subcommand anyway — the packages are only half of it.
 
+## 5b. Composing the service VMs
+
+[`scripts/install/03-compose-vm.sh`](../scripts/install/03-compose-vm.sh) builds one VM from
+the Ubuntu Minimal cloud image. Everything comes from two files —
+`scripts/enclave/enclave-addresses.env` and `scripts/enclave/vm-specs.env` — so nothing is
+typed twice and renumbering stays a one-file change.
+
+```bash
+### MACHINE: stage-01 ###
+cd ~/canonical-k8s
+./scripts/install/push-repo-to-host.sh 10.2.20.158
+scp -i ~/.ssh/build01 /srv/bundle-staging/media/ubuntu-24.04-minimal-cloudimg-amd64.img \
+    encadmin@10.2.20.158:/tmp/
+```
+
+```bash
+### MACHINE: host-4 (10.2.20.158) ###
+sudo install -d -m 0711 /var/lib/libvirt/images/base
+sudo mv /tmp/ubuntu-24.04-minimal-cloudimg-amd64.img /var/lib/libvirt/images/base/
+cd ~/canonical-k8s/scripts/install
+sudo ./03-compose-vm.sh svc-mgmt-01 -n     # review, changes nothing
+sudo ./03-compose-vm.sh svc-mgmt-01
+```
+
+**`svc-mgmt-01` as built, 2026-09-03** — verified from `stage-01`, not asserted:
+
+```
+hostname   : svc-mgmt-01              cloud-init : done, 54.3s
+address    : enp1s0 10.2.20.161/24    packages   : 9 of 9 diagnostics
+default rt : 0                        apt update : 0 errors
+sources    : noble noble-updates noble-security / main universe
+resolves   : svc-repo-01 -> 10.2.20.162
+disk       : 96G, grown from the 3.5G image
+build-info : gateway=none-airgapped-no-default-route
+```
+
+### 5c. Six traps this cost, five of them silent
+
+The first VM took six fixes. **Five failed without producing an error** — the machine booted,
+reached a login prompt, and was useless. That pattern is the thing to remember: on an
+air-gapped guest with no default route, "looks alive" and "worked" are very different claims.
+
+**1. SSH keys are invisible under `sudo`.** The script always runs as root, where `$HOME` is
+`/root`, so the operator's own `authorized_keys` was never read and it reported "no ssh public
+keys found" on a machine that plainly had them. `SUDO_USER` is now resolved via `getent`.
+*This is the one that failed loudly, and it was the only one.*
+
+**2. There was no way to see a VM fail.** No route, so no ssh; and `virsh console` needs an
+interactive root session on the host. The domain now writes its serial console to
+`/var/lib/libvirt/images/console/<vm>-console.log`, chmod'd **after** `virt-install` — qemu
+recreates the file under its own umask, so pre-creating it `0644` does not survive.
+**Everything below was found with that log. Without it we were guessing.**
+
+**3. SeaBIOS fails invisibly with `--graphics none`.** virt-install defaulted to legacy BIOS.
+SeaBIOS writes only to VGA, and there is no VGA, so a firmware-level failure produced two
+seconds of CPU and total silence on the serial console. `VM_FIRMWARE='uefi'` — OVMF writes to
+serial, so the same class of failure becomes readable.
+
+**4. `--boot uefi` does not mean UEFI.** It selects the Microsoft-keys-enrolled Secure Boot
+firmware (`OVMF_CODE_4M.ms.fd`, `secure='yes'`, `enrolled-keys='yes'`). GRUB stopped with
+`error: prohibited by secure boot policy` — yet the VM still reached a login prompt with
+cloud-init never having run. `VM_SECURE_BOOT='false'` asks for the firmware features
+explicitly. **This is a deferral, not a decision** — see `docs/open-questions.md`.
+
+**5. The seed must be on virtio, not a SATA cdrom.** virt-install's default bus for
+`device=cdrom` is SATA, and **Ubuntu cloud images ship a trimmed initramfs carrying only
+virtio drivers**. The guest enumerated only `vda`:
+
+```
+virtio_blk virtio2: [vda] 209715200 512-byte logical blocks
+vda: vda1 vda14 vda15 vda16          <- no sr0, no sda, no ata
+```
+
+`ds-identify` found no datasource and systemd **skipped every cloud-init unit** — no error, no
+output. NoCloud matches on the filesystem label rather than the device being a cdrom, so the
+seed is now a read-only virtio disk.
+
+**6. cloud-init's `apt:` module overwrites `write_files`.** With the `primary`/`security` form
+it generates `ubuntu.sources` from its own template, *after* `write_files`, producing:
+
+```
+Suites: noble noble-updates noble-backports
+Components: main universe restricted multiverse
+```
+
+against a mirror carrying **main+universe only and no backports**. Every one 404'd. The
+second-order effect is the one to remember: **when apt cannot find a package, cloud-init falls
+back to `snap install`** — 30 seconds apiece against a store an air-gapped machine can never
+reach. Eight packages is minutes of apparent hang whose only symptom is `cloud-init status:
+running`. `preserve_sources_list: true` is the fix and is the only way to control components,
+which matters because an enclave mirror deliberately carrying two of the four is normal.
+
+### 5d. Two design choices worth knowing
+
+**Independent disks, not backing-file overlays.** An overlay saves a few hundred MB per VM and
+ties all ten to one file — delete or corrupt the base and every VM dies together. A converted
+copy costs ~600 MB each (measured: 607 MiB), 6 GB across the fleet against 1.9 TB.
+
+**The NIC is matched as `en*`, not named.** A virtio NIC is `enp1s0` on some machine types and
+`ens3` on others. Guessing wrong yields a VM with no address *and* no default route —
+unreachable, recoverable only from a console.
+
 ## 6. What this step deliberately does NOT do
 
 No Pro attach, no FIPS, no STIG, no MAAS.

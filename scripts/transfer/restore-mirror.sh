@@ -87,9 +87,16 @@ run mkdir -p "$REPO_ROOT"
 # SSD; there is no reason this side should be less careful, and far less excuse - a failure
 # here is inside the gap.
 need_gb=$(du -sBG "$SRC/mirror" 2>/dev/null | cut -f1 | tr -dc '0-9')
-have_gb=$(df -BG --output=avail "$REPO_ROOT" | tail -1 | tr -dc '0-9')
+# df the nearest EXISTING ancestor. In a dry run the mkdir above did not happen, so
+# df "$REPO_ROOT" fails with "No such file or directory" and the check that exists to
+# prevent a half-copied tree becomes the thing that stops the run.
+_df_target="$REPO_ROOT"
+while [ ! -d "$_df_target" ] && [ "$_df_target" != "/" ]; do
+  _df_target=$(dirname "$_df_target")
+done
+have_gb=$(df -BG --output=avail "$_df_target" | tail -1 | tr -dc '0-9')
 note "need   : ${need_gb} GB"
-note "have   : ${have_gb} GB on $REPO_ROOT"
+note "have   : ${have_gb} GB on $_df_target"
 [ "${have_gb:-0}" -ge "${need_gb:-0}" ] \
   || die "not enough space on $REPO_ROOT: need ${need_gb} GB, have ${have_gb} GB"
 run rsync -a --delete --info=progress2 "$SRC/mirror/" "$REPO_ROOT/mirror/"

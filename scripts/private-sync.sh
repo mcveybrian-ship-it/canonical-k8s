@@ -60,7 +60,7 @@ options:
                    passphrase and SSH keys. Off by default and never silent
 
 backup options:
-  -t <user@host>   destination. Default from BACKUP_TARGET, else encadmin@10.0.20.124
+  -t <user@host>   destination. Default from BACKUP_TARGET, else encadmin@10.2.10.124
   -d <remote dir>  remote directory. Default from BACKUP_DIR, else ~/private-backups
   -k <ssh key>     ssh key. Default from BACKUP_KEY, else ~/.ssh/build01
   -r <keep>        how many archives to keep on the far end. Default 10, 0 = keep all
@@ -86,7 +86,7 @@ WITH_SECRETS=0
 
 # Backup defaults. Environment first, then these - nothing hardcoded that could be
 # a parameter.
-BACKUP_TARGET="${BACKUP_TARGET:-encadmin@10.0.20.124}"
+BACKUP_TARGET="${BACKUP_TARGET:-encadmin@10.2.10.124}"
 BACKUP_DIR="${BACKUP_DIR:-private-backups}"
 BACKUP_KEY="${BACKUP_KEY:-$HOME/.ssh/build01}"
 BACKUP_KEEP="${BACKUP_KEEP:-10}"

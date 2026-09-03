@@ -102,7 +102,12 @@ note "need   : ${need_gb} GB"
 note "have   : ${have_gb} GB on $_df_target"
 [ "${have_gb:-0}" -ge "${need_gb:-0}" ] \
   || die "not enough space on $REPO_ROOT: need ${need_gb} GB, have ${have_gb} GB"
-run rsync -a --delete --info=progress2 "$SRC/mirror/" "$REPO_ROOT/mirror/"
+# Same trap as write-transfer-media.sh: progress2 emits a carriage-return frame many times a
+# second. On a terminal that is one line updating in place; redirected to a log - which is how
+# anyone sensibly runs a 318 GB copy - every frame lands on its own line and buries any real
+# error in tens of MB of noise. Ask for it only when stdout is a terminal.
+if [ -t 1 ]; then RS_INFO="--info=progress2,stats1"; else RS_INFO="--info=stats1"; fi
+run rsync -a --delete "$RS_INFO" "$SRC/mirror/" "$REPO_ROOT/mirror/"
 note "tree   : $REPO_ROOT/mirror"
 
 # --- 2a. make apt work from the copied tree, BEFORE anything needs it ---------------------------

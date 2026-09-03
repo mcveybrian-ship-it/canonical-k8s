@@ -118,10 +118,9 @@ run install -d -m 0711 "$POOL/seed"
 # nobody was watching. Costs nothing; answers the question every time.
 LOGDIR="$POOL/console"
 run install -d -m 0755 "$LOGDIR"
-# The log is written by qemu as root. Pre-create it world-readable so it can be read over ssh
-# without sudo - a diagnostic nobody can reach is only half a fix, and the whole point is to
-# see why a VM with no network did not come up.
-run install -m 0644 /dev/null "$LOGDIR/$VM-console.log"
+# The log is written by qemu, which recreates it under its own umask - so pre-creating it
+# 0644 does NOT survive. It has to be chmod'd again AFTER virt-install has started the
+# domain. A diagnostic nobody can read without an interactive sudo is only half a fix.
 # A full copy, NOT a backing-file overlay. An overlay would save a few hundred MB per VM and
 # tie all ten to one file: delete or corrupt the base and every VM dies at once, and the base
 # can never be retired. A converted copy costs ~600 MB each - 6 GB across the fleet, against
@@ -277,6 +276,11 @@ ok "defined and started"
 
 virsh autostart "$VM" >/dev/null
 ok "autostart enabled"
+
+# Now that qemu has created it, make the console log readable over ssh.
+chmod 0644 "$LOGDIR/$VM-console.log" 2>/dev/null \
+  && ok "console log readable: $LOGDIR/$VM-console.log" \
+  || warn "could not chmod the console log - it will need sudo to read"
 
 say ""
 say "cloud-init takes a minute or two. Watch it:"

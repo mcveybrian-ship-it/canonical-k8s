@@ -49,7 +49,10 @@ done
 die()  { echo "error: $*" >&2; exit 1; }
 note() { printf '  %s\n' "$*"; }
 head2() { printf '\n== %s ==\n' "$*"; }
-run()  { if [ "$DRY" -eq 1 ]; then echo "  DRY: $*"; else "$@"; fi; }
+# DRY messages go to STDERR. Several call sites redirect stdout - `run tee "$f" >/dev/null`
+# is the obvious one - and on stdout the DRY line vanishes with it, so a dry run silently
+# fails to show the very file it would write.
+run()  { if [ "$DRY" -eq 1 ]; then echo "  DRY: $*" >&2; else "$@"; fi; }
 
 [ -r "$PARAMS" ] || die "no params file: $PARAMS"
 set -a
@@ -102,11 +105,60 @@ note "have   : ${have_gb} GB on $_df_target"
 run rsync -a --delete --info=progress2 "$SRC/mirror/" "$REPO_ROOT/mirror/"
 note "tree   : $REPO_ROOT/mirror"
 
+# --- 2a. make apt work from the copied tree, BEFORE anything needs it ---------------------------
+# ORDER MATTERS AND THIS USED TO BE LAST. The carried .debs are installed in the next section,
+# and inside the real gap there are NO working apt sources at that point - so dependency
+# resolution fails and the dpkg -i fallback installs them without their dependencies. Setting
+# up file:// here, immediately after the tree lands, gives every later step a working apt.
+#
+# The chicken-and-egg nobody notices until they are at the rack: this script configures nginx,
+# but a freshly-built air-gapped VM does not HAVE nginx, and it cannot install it from the
+# mirror because serving the mirror is what this script is for. nginx is not among the three
+# carried .debs either - those are the PPA tools the mirror can never serve.
+#
+# The tree is already on local disk by now, so apt can read it directly over file://. No
+# network, no nginx, no ordering problem. The archive keyring ships with Ubuntu.
+#
+# The update pockets are in the bootstrap source deliberately. With 'noble' alone apt resolves
+# nginx 1.24.0-2ubuntu7 - the UNPATCHED release-pocket build - because that is the only version
+# that suite indexes. Measured against the real tree: with all three suites it resolves
+# 1.24.0-2ubuntu7.17 and pulls 7 packages, every one present in the pool. Installing a
+# knowingly unpatched web server as the enclave's first service is not a defensible start.
+head2 "local apt source, and nginx"
+if command -v nginx >/dev/null 2>&1; then
+  note "already installed: $(nginx -v 2>&1)"
+else
+  note "not installed - bootstrapping from the local tree over file://"
+  BOOTSTRAP_LIST=/etc/apt/sources.list.d/zz-restore-bootstrap.sources
+  run tee "$BOOTSTRAP_LIST" >/dev/null <<EOF
+# Temporary, written by restore-mirror.sh. Reads the copied tree directly off local disk.
+Types: deb
+URIs: file://$REPO_ROOT/mirror/archive.ubuntu.com/ubuntu/
+Suites: ${BOOTSTRAP_SUITES:-noble noble-updates noble-security}
+Components: ${BOOTSTRAP_COMPONENTS:-main}
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+EOF
+  run apt-get update -qq \
+    || die "apt-get update failed against file://$REPO_ROOT/mirror - is the tree complete?"
+  run apt-get install -y --no-install-recommends nginx-core \
+    || die "could not install nginx from the carried tree"
+  [ "$DRY" -eq 1 ] && note "installed: (dry run - nginx not actually installed)" \
+                   || note "installed: $(nginx -v 2>&1)"
+  # Leave the file:// source in place: it is how this machine patches itself before the
+  # HTTP vhost exists, and removing it would strand the box if nginx ever needed reinstalling.
+  note "left $BOOTSTRAP_LIST in place - it is this machine's own package source"
+fi
+
 # --- 3. the three .debs the mirror can never serve ---------------------------------------------
 head2 "installing the air-gap tooling from carried .debs"
 if compgen -G "$SRC/bundle/debs/*.deb" >/dev/null; then
-  run apt-get install -y --no-download "$SRC"/bundle/debs/*.deb 2>/dev/null \
-    || run dpkg -i "$SRC"/bundle/debs/*.deb
+  # NOT --no-download: these three .debs have dependencies, and after 2a they resolve from
+  # the file:// source pointing at the copied tree. --no-download would refuse to use it and
+  # force the dpkg -i fallback, which installs them with their dependencies UNMET - a package
+  # that is present but broken, which is worse than one that failed to install.
+  run apt-get install -y "$SRC"/bundle/debs/*.deb \
+    || die "could not install the carried .debs. Their dependencies come from the file://
+       source set up in section 2a - check that apt-get update succeeded there."
   note "installed: $(ls -1 "$SRC"/bundle/debs/*.deb | wc -l) package(s)"
 else
   note "NO .debs carried - contracts-airgapped cannot be installed. This is fatal for"
@@ -136,44 +188,6 @@ if [ -f "$SRC/bundle/config/airgapped-contracts.yaml" ]; then
 else
   note "*** airgapped-contracts.yaml NOT PRESENT ***"
   note "Packages will serve, but no client can 'pro attach' - ESM and FIPS stay inert."
-fi
-
-# --- 5a. nginx itself, from the tree we just copied ---------------------------------------------
-# The chicken-and-egg nobody notices until they are at the rack: this script configures nginx,
-# but a freshly-built air-gapped VM does not HAVE nginx, and it cannot install it from the
-# mirror because serving the mirror is what this script is for. nginx is not among the three
-# carried .debs either - those are the PPA tools the mirror can never serve.
-#
-# The tree is already on local disk by now, so apt can read it directly over file://. No
-# network, no nginx, no ordering problem. The archive keyring ships with Ubuntu.
-#
-# The update pockets are in the bootstrap source deliberately. With 'noble' alone apt resolves
-# nginx 1.24.0-2ubuntu7 - the UNPATCHED release-pocket build - because that is the only version
-# that suite indexes. Measured against the real tree: with all three suites it resolves
-# 1.24.0-2ubuntu7.17 and pulls 7 packages, every one present in the pool. Installing a
-# knowingly unpatched web server as the enclave's first service is not a defensible start.
-head2 "nginx"
-if command -v nginx >/dev/null 2>&1; then
-  note "already installed: $(nginx -v 2>&1)"
-else
-  note "not installed - bootstrapping from the local tree over file://"
-  BOOTSTRAP_LIST=/etc/apt/sources.list.d/zz-restore-bootstrap.sources
-  run tee "$BOOTSTRAP_LIST" >/dev/null <<EOF
-# Temporary, written by restore-mirror.sh. Reads the copied tree directly off local disk.
-Types: deb
-URIs: file://$REPO_ROOT/mirror/archive.ubuntu.com/ubuntu/
-Suites: ${BOOTSTRAP_SUITES:-noble noble-updates noble-security}
-Components: ${BOOTSTRAP_COMPONENTS:-main}
-Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
-EOF
-  run apt-get update -qq \
-    || die "apt-get update failed against file://$REPO_ROOT/mirror - is the tree complete?"
-  run apt-get install -y --no-install-recommends nginx-core \
-    || die "could not install nginx from the carried tree"
-  note "installed: $(nginx -v 2>&1)"
-  # Leave the file:// source in place: it is how this machine patches itself before the
-  # HTTP vhost exists, and removing it would strand the box if nginx ever needed reinstalling.
-  note "left $BOOTSTRAP_LIST in place - it is this machine's own package source"
 fi
 
 # --- 6. nginx ------------------------------------------------------------------------------------

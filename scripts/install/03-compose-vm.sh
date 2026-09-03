@@ -118,6 +118,10 @@ run install -d -m 0711 "$POOL/seed"
 # nobody was watching. Costs nothing; answers the question every time.
 LOGDIR="$POOL/console"
 run install -d -m 0755 "$LOGDIR"
+# The log is written by qemu as root. Pre-create it world-readable so it can be read over ssh
+# without sudo - a diagnostic nobody can reach is only half a fix, and the whole point is to
+# see why a VM with no network did not come up.
+run install -m 0644 /dev/null "$LOGDIR/$VM-console.log"
 # A full copy, NOT a backing-file overlay. An overlay would save a few hundred MB per VM and
 # tie all ten to one file: delete or corrupt the base and every VM dies at once, and the base
 # can never be retired. A converted copy costs ~600 MB each - 6 GB across the fleet, against

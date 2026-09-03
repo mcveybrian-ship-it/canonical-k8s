@@ -202,9 +202,14 @@ fi
 
 # nginx vhost and the restore script travel with the bundle so svc-repo-01 needs nothing
 # it cannot read off the disk.
-if [ -f /etc/nginx/sites-available/apt-mirror ] && [ "$DRY" -eq 0 ]; then
-  cp -a /etc/nginx/sites-available/apt-mirror "$STAGING_DIR/config/nginx-apt-mirror.conf"
-  note "nginx vhost: copied"
+# Carry the TRACKED vhost, not stage-01's live file. Copying the live file meant the
+# enclave's package-server config had no source of truth: it went a week untracked, and the
+# missing ^~ on the /keys/ and /debs/ locations - which made the three carried .debs
+# unreachable over HTTP - travelled into the bundle unreviewed.
+_VHOST="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/nginx-apt-mirror.conf"
+if [ -f "$_VHOST" ] && [ "$DRY" -eq 0 ]; then
+  cp -a "$_VHOST" "$STAGING_DIR/config/nginx-apt-mirror.conf"
+  note "nginx vhost: copied from git ($_VHOST)"
 fi
 if [ "$DRY" -eq 0 ]; then
   cp -a "$SCRIPT_DIR/restore-mirror.sh" "$STAGING_DIR/scripts/" 2>/dev/null || true

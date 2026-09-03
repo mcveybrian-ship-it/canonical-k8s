@@ -196,12 +196,43 @@ else
 fi
 
 # --- 6. nginx ------------------------------------------------------------------------------------
+# The keyrings and .debs must live under $REPO_ROOT for the vhost aliases to reach them.
+# Installing the keys into /usr/share/keyrings (section 4) serves THIS machine; serving them
+# over HTTP is how host-1..3 and every other guest get them.
+head2 "staging keys and debs for HTTP"
+run install -d -m 0755 "$REPO_ROOT/keys" "$REPO_ROOT/debs"
+if compgen -G "$SRC/bundle/keys/*.gpg" >/dev/null; then
+  run cp -a "$SRC"/bundle/keys/*.gpg "$REPO_ROOT/keys/"
+  note "keys   : $(ls -1 "$SRC"/bundle/keys/*.gpg 2>/dev/null | wc -l) served at /keys/"
+fi
+if compgen -G "$SRC/bundle/debs/*.deb" >/dev/null; then
+  run cp -a "$SRC"/bundle/debs/*.deb "$REPO_ROOT/debs/"
+  note "debs   : $(ls -1 "$SRC"/bundle/debs/*.deb 2>/dev/null | wc -l) served at /debs/"
+fi
+
 head2 "serving the tree"
-if [ -f "$SRC/bundle/config/nginx-apt-mirror.conf" ]; then
-  run install -m 0644 "$SRC/bundle/config/nginx-apt-mirror.conf" \
+# Prefer the vhost sitting NEXT TO this script over the one in the bundle. The two travel
+# together - in git as scripts/transfer/, and on the disk as bundle/scripts + bundle/config -
+# so a script updated after the bundle was staged still installs its own matching config.
+# Without this, re-running a fixed script reinstalls the stale vhost it was fixed to replace.
+VHOST=""
+for _c in "$SCRIPT_DIR/nginx-apt-mirror.conf" \
+          "$SCRIPT_DIR/../config/nginx-apt-mirror.conf" \
+          "$SRC/bundle/config/nginx-apt-mirror.conf"; do
+  [ -f "$_c" ] && { VHOST="$_c"; break; }
+done
+if [ -n "$VHOST" ]; then
+  note "vhost  : $VHOST"
+  run install -m 0644 "$VHOST" /etc/nginx/sites-available/apt-mirror
+  # Rewrite ALL THREE paths, not just the root. The carried vhost is written for stage-01
+  # (/srv/apt-mirror/...); on this machine the tree is under $REPO_ROOT. Rewriting only the
+  # root left /keys/ and /debs/ aliased to directories that do not exist here - and those
+  # serve the five keyrings and the three .debs an in-gap machine cannot get any other way.
+  run sed -i \
+      -e "s#root .*/mirror;#root $REPO_ROOT/mirror;#" \
+      -e "s#alias .*/keys/;#alias $REPO_ROOT/keys/;#" \
+      -e "s#alias .*/debs/;#alias $REPO_ROOT/debs/;#" \
       /etc/nginx/sites-available/apt-mirror
-  # The vhost roots at the mirror tree; rewrite that path for this machine.
-  run sed -i "s#root .*/mirror;#root $REPO_ROOT/mirror;#" /etc/nginx/sites-available/apt-mirror
   run ln -sf /etc/nginx/sites-available/apt-mirror /etc/nginx/sites-enabled/apt-mirror
   run rm -f /etc/nginx/sites-enabled/default   # also default_server; nginx refuses two
   run nginx -t

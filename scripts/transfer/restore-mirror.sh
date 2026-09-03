@@ -48,6 +48,8 @@ done
 
 die()  { echo "error: $*" >&2; exit 1; }
 note() { printf '  %s\n' "$*"; }
+ok()   { printf '  [ok] %s\n' "$*"; }   # used by the proof sections
+warn() { printf '  [!!] %s\n' "$*" >&2; }
 head2() { printf '\n== %s ==\n' "$*"; }
 # DRY messages go to STDERR. Several call sites redirect stdout - `run tee "$f" >/dev/null`
 # is the obvious one - and on stdout the DRY line vanishes with it, so a dry run silently

@@ -70,6 +70,7 @@ real client over the network. See `docs/03-host-services.md`.
 
 | What | Blocked on |
 |---|---|
+| **Verify the root-CA backup on the thumb drive**, then `shred -u /srv/ca-backup/*` | Nothing — deferred 2026-09-04 evening. The `.sha256` from that run holds a BARE hash, so use the one-liner in runbook §2.9b, not `sha256sum -c`. Until the shred, the root key is on a network-attached VM |
 | **Close the gap** | Nothing. `gap-state.sh close` + unplug port 4 when work stops |
 | The single re-issuance event | The FIPS YubiKey arriving. Folds together: hardware root, name constraints, CRL, and issuing the wildcard. §2.9b |
 | AO thread — 5 questions | Sending it. Three decide hardware purchases |

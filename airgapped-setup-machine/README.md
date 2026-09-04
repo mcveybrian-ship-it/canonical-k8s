@@ -613,6 +613,77 @@ printf '\n=== ubuntu pro ===\n'; pro status 2>&1 | head -6
 printf '\n=== keys that can log in ===\n'; ssh-keygen -lf ~/.ssh/authorized_keys 2>/dev/null
 ```
 
+## 6.4a Generate `airgapped-contracts.yaml` — the step this README promised
+
+**This section did not exist until 2026-09-04.** §0.5 lists step 14 as "Generate
+`airgapped-contracts.yaml`, verify 4 rewritten `aptURL`s | **§6.4a**" and the section was never
+written — so the procedure producing the credential the entire entitlement path depends on
+lived only in shell history. It is now
+[`scripts/transfer/make-contracts-config.sh`](../scripts/transfer/make-contracts-config.sh).
+
+```bash
+### MACHINE: stage-01 ONLY - it calls Canonical's API, so it needs internet and the token ###
+read -rs -p "Paste Pro token: " T && printf '%s\n' "$T" > ~/.pro-contract-token \
+  && unset T && chmod 600 ~/.pro-contract-token
+./scripts/transfer/make-contracts-config.sh -n     # preview, writes nothing
+./scripts/transfer/make-contracts-config.sh
+```
+
+**The token goes in a file, never on a command line.** A token as an argument is visible in
+`ps` to every user on the box and lands in shell history — the same mechanism that exposed the
+LUKS passphrase on 2026-09-02. The script refuses a token file that is not mode `0600`, and
+never echoes the token or the output.
+
+### Four things this got wrong the first time, all now guarded
+
+**1. `pro-airgapped --input -` does not mean stdin**, despite its own help saying `"-" defaults
+to STDIN`. It takes the `-` literally:
+
+```
+$ echo '{"X":{}}' | pro-airgapped --input - --output f
+error: open : no such file or directory
+```
+
+Verified against 1.8.1: `--input FILE` works, bare stdin works, `--input -` does not. Bare
+stdin is what the script uses, which also keeps the token off disk.
+
+**2. Two of the four entitlement names do not match their archive.** USG's entitlement is
+**`cis`**, and FIPS updates live under **`fips-updates`** — plain `fips` is a *different*
+archive that is not mirrored. Getting either wrong produces a file that generates cleanly and
+does not work.
+
+**3. "No Canonical URLs remain" is the wrong assertion.** A Pro contract carries far more
+entitlements than the four archives mirrored here. These keep their Canonical URLs correctly,
+because they are not mirrored and are **not available inside the gap**:
+
+```
+anbox-cloud  cc-eal  esm-python  fips  fips-preview  realtime-kernel  ros  ros-updates
+```
+
+The script asserts the four expected URLs by exact match and *reports* the rest. That list is
+worth reading — it is what the enclave cannot offer.
+
+**4. A top-level `aptURL` is not the whole story, and this is the subtle one.** Each entitlement
+may carry `overrides` and `series` blocks with their own `aptURL`, and a matching one **wins**.
+`pro-airgapped` rewrites only the top-level directive. On this contract `esm-infra` carries four
+leftovers pointing at Canonical:
+
+```
+esm-infra  override[4]  selector={series: precise}  -> https://esm.ubuntu.com
+esm-infra  override[6]  selector={series: trusty}   -> https://esm.ubuntu.com
+esm-infra  series[precise]                          -> https://esm.ubuntu.com
+esm-infra  series[trusty]                           -> https://esm.ubuntu.com
+```
+
+`precise` and `trusty` are 12.04 and 14.04, which a noble client never matches — so it is
+harmless here. **That is luck, not design.** An override for the deployed series would send
+in-gap clients to the internet while the file looked correct in every other respect, so the
+script now asserts that no override or series block for `TARGET_SERIES` bypasses the enclave.
+
+**Regenerate whenever an address or the domain changes.** It was regenerated on 2026-09-04
+after the move from `enclave.local` to `enclave.internal` — the old copy named a host that no
+longer resolves, and nothing would have reported it until a client tried to `pro attach`.
+
 ## 7. Decisions
 
 **Answered 2026-08-29:**

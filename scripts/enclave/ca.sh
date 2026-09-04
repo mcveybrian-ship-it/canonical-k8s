@@ -27,6 +27,8 @@
 #       sudo ./ca.sh trust [file|dir]     install trust anchors (default: trust-anchors/)
 #       ./ca.sh show <file>               summarise a cert, without dumping it
 #       ./ca.sh inventory                 every cert here, and how long it has left
+#       sudo ./ca.sh install-wildcard <key> <fullchain>
+#                                         install a SHARED key+cert on this machine
 #
 #     ON stage-01, onto removable media:
 #       sudo ./ca.sh backup-root <dir>    the root CA - THE single point of failure
@@ -159,6 +161,53 @@ cmd_backup_root() {
 }
 
 # =========================================================================================
+# install-wildcard - put a SHARED key and certificate onto this machine, safely.
+#
+# Every other path in this script exists so that only a CSR ever leaves a host. A shared
+# wildcard breaks that on purpose, so the copy has to be handled as the secret it is:
+#
+#   - NEVER through /tmp on an intermediate machine. A key written to /tmp is readable by
+#     root on that box, survives deletion on most filesystems, and is the single most common
+#     way a private key escapes an otherwise careful design.
+#   - NEVER pasted into a terminal. It lands in scrollback, in the ssh client's log, and in
+#     whatever the session was being recorded by.
+#   - Move it as a file, straight to its destination, and check the fingerprint on arrival.
+# =========================================================================================
+cmd_install_wildcard() {
+  [ "$(id -u)" -eq 0 ] || die "run with sudo"
+  local key="${1:-}" chain="${2:-}"
+  [ -r "$key" ] && [ -r "$chain" ] \
+    || die "usage: sudo $0 install-wildcard <key> <fullchain.crt>"
+
+  # Refuse a mismatched pair BEFORE installing. nginx would otherwise fail to reload with an
+  # error about the key, on a machine whose previous certificate has already been replaced.
+  local kmod cmod
+  kmod=$(openssl pkey -in "$key" -pubout 2>/dev/null | openssl sha256 | awk '{print $NF}')
+  cmod=$(openssl x509 -in "$chain" -pubkey -noout 2>/dev/null | openssl sha256 | awk '{print $NF}')
+  [ -n "$kmod" ] && [ "$kmod" = "$cmod" ] \
+    || die "this key does not match this certificate - refusing to install either"
+  ok "key matches certificate"
+
+  local d=/etc/ssl/enclave
+  install -d -m 0755 "$d"
+  local base; base=$(basename "$chain" .fullchain.crt)
+  # 0640 root:root. The services that read it start as root and drop privileges after opening
+  # the file, so no group needs it. Widen only if something demonstrably cannot read it.
+  install -m 0640 -o root -g root "$key"   "$d/$base.key"
+  install -m 0644 -o root -g root "$chain" "$d/$base.fullchain.crt"
+  ok "installed $d/$base.key (0640) and $d/$base.fullchain.crt"
+  say "fingerprint: $(openssl x509 -in "$chain" -noout -fingerprint -sha256 | cut -d= -f2)"
+  say "sans:"
+  openssl x509 -in "$chain" -noout -ext subjectAltName 2>/dev/null | tail -1 | sed 's/^/    /'
+  say ""
+  say "  Then point the service at it:"
+  say "    sudo ./enable-tls.sh $base $d/$base.fullchain.crt --root <docroot>|--proxy <url>"
+  say ""
+  say "  And shred the transfer copy - it is a private key:"
+  say "    shred -u <the file you copied here>"
+}
+
+# =========================================================================================
 # gen-crl / revoke - only meaningful if CA_CRL_URL was set BEFORE the certificates were
 # issued. A CRL nothing points at is a file nobody fetches.
 #
@@ -207,7 +256,7 @@ cmd_revoke() {
 }
 
 case "${1:-}" in
-  trust|show|request|inventory) CA_NEED_PARAMS=0 ;;
+  trust|show|request|inventory|install-wildcard) CA_NEED_PARAMS=0 ;;
   *)                  CA_NEED_PARAMS=1 ;;
 esac
 
@@ -596,7 +645,7 @@ cmd_request() {
   # --profile selects WHAT THE CSR LOOKS LIKE, not who signs it. A site issuing from DoD PKI
   # needs a subject DN its registration authority accepts; that is data, not a script edit,
   # because the alternative is a fork of this function per customer.
-  local profile=internal wildcards=() w
+  local profile=internal wildcards=() w enclave_ips=0
   while [ $# -gt 0 ]; do
     case "${1:-}" in
       --profile)    profile="${2:?--profile needs a name}"; shift 2 ;;
@@ -610,6 +659,11 @@ cmd_request() {
       # so *.enclave.internal does NOT cover *.apps.enclave.internal and both must be named.
       --wildcard)   wildcards+=("${2:?--wildcard needs a label or suffix}"); shift 2 ;;
       --wildcard=*) wildcards+=("${1#--wildcard=}"); shift ;;
+      # A wildcard CANNOT cover an IP - there is no wildcard IP SAN - so anything reaching a
+      # service at https://10.2.20.162/ fails verification with an error naming the address.
+      # This adds every host and service address from enclave-addresses.env. Cluster
+      # addresses are deliberately excluded: Kubernetes signs its own (runbook 2.9c).
+      --enclave-ips) enclave_ips=1; shift ;;
       *) break ;;
     esac
   done
@@ -674,6 +728,17 @@ cmd_request() {
     done
     name="wildcard-${first//./-}"      # the FILENAME. No star ever reaches the filesystem.
     cn="*.$first"
+    if [ "$enclave_ips" -eq 1 ]; then
+      local v ipcount=0
+      # HOST_* and SVC_* only. K8S_* belongs to the cluster's own PKI; STAGE_01 and BUILD_01
+      # live outside the gap and must never appear in an enclave certificate.
+      for v in HOST_1 HOST_2 HOST_3 HOST_4 SVC_MGMT_01 SVC_REPO_01 SVC_HARBOR_01; do
+        [ -n "${!v:-}" ] || continue
+        sans="$sans,IP:${!v}"
+        ipcount=$((ipcount + 1))
+      done
+      say "enclave ips: $ipcount added from enclave-addresses.env"
+    fi
     for extra in "$@"; do
       case "$extra" in
         *[0-9].[0-9]*) sans="$sans,IP:$extra" ;;
@@ -914,6 +979,7 @@ case "${1:-}" in
   trust)          shift; cmd_trust "$@" ;;
   show)           shift; cmd_show "$@" ;;
   inventory)      cmd_inventory ;;
+  install-wildcard) shift; cmd_install_wildcard "$@" ;;
   gen-crl)        cmd_gen_crl ;;
   revoke)         shift; cmd_revoke "$@" ;;
   backup-root)    shift; cmd_backup_root "$@" ;;

@@ -81,7 +81,13 @@ install_chrony() {
 # ---------------------------------------------------------------------------- master
 cmd_master() {
   need_root
-  local virt; virt=$(systemd-detect-virt 2>/dev/null || echo unknown)
+  # systemd-detect-virt EXITS 1 WHEN IT FINDS NO VIRTUALISATION. It is reporting "no", not
+  # failing, but `cmd || echo unknown` therefore fires on bare metal and appends a second
+  # line - so $virt became "none\nunknown" and the guard rejected the one machine that
+  # should have passed. Capture the output and ignore the status; the STRING is the answer.
+  local virt=""
+  virt=$(systemd-detect-virt 2>/dev/null) || true
+  [ -n "$virt" ] || virt=unknown
   [ "$virt" = "none" ] || die "this machine is a $virt guest.
       The time master must be PHYSICAL. A guest takes its clock from its hypervisor, so
       serving time from here would hand the hypervisor its own clock back. Run this on

@@ -6,7 +6,7 @@
 *how* things were built and why; they have gone stale more than once. If they disagree with
 this section, this section wins and the other one gets fixed.
 
-Last updated **2026-09-04 00:10**.
+Last updated **2026-09-04 00:40**.
 
 **STAGE-01's work is DONE. Everything that does not need hardware is finished.**
 
@@ -49,11 +49,11 @@ real client over the network. See `docs/03-host-services.md`.
 
 | Machine | Address | Side | Role |
 |---|---|---|---|
-| `stage-01` | `10.0.20.160` | online | Hyper-V VM. Pro token, the mirror, the repo |
-| `build-01` | `10.0.20.124` | online | Physical, 32 GB. Writes the transfer SSD; holds the `private-sync.sh` backup |
+| `stage-01` | **`10.2.10.160`** | online | Hyper-V VM. Pro token, the mirror, the repo. Also holds a **temporary** `10.2.20.160` in the enclave subnet, removed at cutover |
+| `build-01` | **`10.2.10.124`** | online | Physical, 32 GB. Writes the transfer SSD; holds the `private-sync.sh` backup |
 | Hyper-V host (R7515) | — | online | Windows Server 2022. Runs `stage-01`; seed-stick writer |
-| `host-4` | `10.0.20.158` | **air-gapped** | **BUILT 2026-09-01/02.** Services host. LUKS on 2 of 3 NVMe, 125 GB RAM. **Step 03 host prep DONE** - mirror apt, br0, 1.8T LUKS-backed image pool, verified after a cold boot. `svc-mgmt-01` next |
-| `host-1..3` | `.155` `.156` `.157` | **air-gapped** | Not built |
+| `host-4` | **`10.2.20.158`** | **air-gapped** | **BUILT 2026-09-01/02.** Services host. LUKS on 2 of 3 NVMe, 125 GB RAM. **Step 03 host prep DONE** - mirror apt, br0, 1.8T LUKS-backed image pool, verified after a cold boot. **Step 03 DONE.** Installs from `svc-repo-01` |
+| `host-1..3` | `10.2.20.155-157` | **air-gapped** | Not built |
 | `svc-mgmt-01` | `10.2.20.161` | **air-gapped** | **BUILT 2026-09-03.** First enclave VM. MAAS + Pro contract server go here |
 | `svc-repo-01` | `10.2.20.162` | **air-gapped** | **SERVING 2026-09-03.** 318 GB mirror over nginx, 9/9 suites verified, keys at `/keys/`, the 3 PPA debs at `/debs/`. host-4 installs from it |
 

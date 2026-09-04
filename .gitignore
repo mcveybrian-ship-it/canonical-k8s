@@ -93,3 +93,8 @@ archive/
 
 # Transfer params - names hosts and paths, and is read by root on svc-repo-01
 scripts/transfer/transfer-params.env
+
+# Pro contract token, read by make-contracts-config.sh. A credential; mode 0600.
+.pro-contract-token
+*.pro-contract-token
+airgapped-contracts.yaml

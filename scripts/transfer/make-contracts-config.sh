@@ -106,8 +106,17 @@ fi
 
 install -d -m 0755 "$(dirname "$OUT")"
 TMP=$(mktemp); chmod 600 "$TMP"; trap 'rm -f "$TMP"' EXIT
-printf '%s\n' "$INPUT" | pro-airgapped --input - --output "$TMP" \
-  || die "pro-airgapped failed. Check the token is valid and this machine has internet."
+# STDIN with NO --input flag. Its own help says `--input -` means stdin; it does not - it
+# tries to open a file named "" and fails with `open : no such file or directory`. Verified
+# 2026-09-04 against pro-airgapped 1.8.1: `--input FILE` works, bare stdin works, `--input -`
+# does not.
+#
+# stdin also keeps the token off disk entirely, which `--input FILE` would not.
+printf '%s\n' "$INPUT" | pro-airgapped --output "$TMP" \
+  || die "pro-airgapped failed.
+       'unauthorized' means the token was rejected - check it is the CONTRACT token from
+       ubuntu.com/pro/dashboard, not a machine token or a resource token.
+       A connection error means this machine cannot reach contracts.canonical.com."
 
 # --- verify BEFORE installing --------------------------------------------------------------
 # The whole point is the rewritten URLs. A file that generated cleanly but kept Canonical's

@@ -140,6 +140,35 @@ done
 n=$(grep -cF "aptURL: $BASE" "$TMP" || true)
 ok "all 4 mirrored entitlements point at $BASE"
 
+# A top-level directive is not the whole story. Each entitlement can carry `overrides` and
+# `series` blocks with their OWN aptURL, and a matching one wins over the top-level value.
+# pro-airgapped rewrites only the top-level directive, so an override matching the deployed
+# series would silently send clients to Canonical from inside the gap.
+#
+# On this contract the leftovers are all series: precise and trusty - 12.04 and 14.04 - which
+# a noble client never matches. That is luck, not design, and worth asserting rather than
+# eyeballing.
+python3 - "$TMP" "${TARGET_SERIES:-noble}" "$BASE" <<'PYEOF' || die "an override or series block for the deployed series points at Canonical - clients would bypass the enclave"
+import sys, yaml
+f, series, base = sys.argv[1], sys.argv[2], sys.argv[3]
+d = yaml.safe_load(open(f)); bad = []
+for info in d.values():
+    for e in info.get('contractInfo', {}).get('resourceEntitlements', []):
+        if e.get('type') not in ('esm-infra', 'esm-apps', 'cis', 'fips-updates'):
+            continue
+        for ov in (e.get('overrides') or []):
+            if (ov.get('selector') or {}).get('series') != series:
+                continue
+            u = (ov.get('directives') or {}).get('aptURL')
+            if u and not u.startswith(base): bad.append((e['type'], 'override', u))
+        sv = (e.get('series') or {}).get(series) or {}
+        u = (sv.get('directives') or {}).get('aptURL')
+        if u and not u.startswith(base): bad.append((e['type'], f'series[{series}]', u))
+for t, w, u in bad: print(f"       {t} {w} -> {u}", file=sys.stderr)
+sys.exit(1 if bad else 0)
+PYEOF
+ok "no override or series block for ${TARGET_SERIES:-noble} bypasses the enclave"
+
 # Report - not fail on - the entitlements that stay at Canonical, because knowing which
 # capabilities are NOT available in the gap is worth having in front of you.
 _remote=$(grep -oE 'aptURL: https?://[a-z.]*ubuntu\.com[^ ]*' "$TMP" | sed 's|aptURL: ||' | sort -u || true)

@@ -121,12 +121,35 @@ printf '%s\n' "$INPUT" | pro-airgapped --output "$TMP" \
 # --- verify BEFORE installing --------------------------------------------------------------
 # The whole point is the rewritten URLs. A file that generated cleanly but kept Canonical's
 # URLs is useless in the gap and looks fine on inspection.
-n=$(grep -c "aptURL: $BASE" "$TMP" 2>/dev/null || true)
-[ "${n:-0}" -ge 4 ] || die "only ${n:-0} of 4 aptURLs point at $BASE.
-       The overrides did not take. Check the entitlement names in the input against
-       what your contract actually returns - see the naming traps in README §0.3."
-c=$(grep -cE 'aptURL: https?://(esm|contracts)\.ubuntu\.com' "$TMP" 2>/dev/null || true)
-[ "${c:-0}" -eq 0 ] || die "$c aptURL(s) still point at Canonical. Nothing installed."
+# Check the FOUR we mirror, individually. A Pro contract carries many more entitlements -
+# livepatch, landscape, realtime-kernel, ros, anbox and so on - and those legitimately keep
+# their Canonical URLs: they are not mirrored and are not available in the gap. An earlier
+# version failed on "any Canonical URL remains", which rejected a perfectly good file.
+_missing=""
+for _u in "$BASE/esm.ubuntu.com/infra/ubuntu" \
+          "$BASE/esm.ubuntu.com/apps/ubuntu" \
+          "$BASE/esm.ubuntu.com/fips-updates/ubuntu" \
+          "$BASE/esm.ubuntu.com/usg/ubuntu"; do
+  grep -qF "aptURL: $_u" "$TMP" || _missing="$_missing
+         $_u"
+done
+[ -z "$_missing" ] || die "these aptURLs were NOT rewritten:$_missing
+       The overrides did not take for those entitlements. Check the names against what your
+       contract returns - two do not match their archive: USG's entitlement is 'cis', and
+       FIPS updates live under 'fips-updates'. See README §0.3."
+n=$(grep -cF "aptURL: $BASE" "$TMP" || true)
+ok "all 4 mirrored entitlements point at $BASE"
+
+# Report - not fail on - the entitlements that stay at Canonical, because knowing which
+# capabilities are NOT available in the gap is worth having in front of you.
+_remote=$(grep -oE 'aptURL: https?://[a-z.]*ubuntu\.com[^ ]*' "$TMP" | sed 's|aptURL: ||' | sort -u || true)
+if [ -n "$_remote" ]; then
+  say ""
+  say "  These entitlements keep Canonical URLs - they are NOT mirrored and will not work"
+  say "  inside the gap. That is expected; it is the list of what the enclave cannot offer:"
+  printf '%s\n' "$_remote" | sed 's|^|         |'
+  say ""
+fi
 
 install -m 0600 "$TMP" "$OUT"
 ok "wrote $OUT (0600, $n aptURLs rewritten to $BASE)"

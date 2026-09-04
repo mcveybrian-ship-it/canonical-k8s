@@ -60,8 +60,30 @@ export DOMAIN
 
 subj() { printf '/C=%s/O=%s/OU=%s/CN=%s' "$CA_COUNTRY" "$CA_ORG" "$CA_OU" "$1"; }
 
+# --- keep the two halves of the PKI on their own machines --------------------------------
+# The root and the issuing CA must never live on the same host: the whole point is that a
+# compromise of the enclave does not reach the key every machine trusts. Nothing but these
+# checks was stopping `init-issuing` being run on stage-01 by mistake - which happened.
+_is_root_host()    { [ -e "$CA_ROOT_DIR/private/root.key" ]; }
+_is_issuing_host() { [ -e "$CA_ISSUING_DIR/private/issuing.key" ]; }
+
+require_root_host() {
+  _is_issuing_host && die "this machine holds the ISSUING CA ($CA_ISSUING_DIR).
+       Root operations belong on stage-01, outside the enclave."
+  :
+}
+require_issuing_host() {
+  _is_root_host && die "this machine holds the ROOT CA ($CA_ROOT_DIR).
+       The issuing CA must live on a DIFFERENT machine - svc-mgmt-01 - so that a compromise
+       of the enclave cannot reach the root key. Run this there.
+       If a partial issuing CA was created here by mistake, remove it:
+         sudo rm -rf $CA_ISSUING_DIR"
+  :
+}
+
 # =========================================================================================
 cmd_init_root() {
+  require_root_host
   local d="$CA_ROOT_DIR"
   [ -e "$d/private/root.key" ] && die "a root CA already exists at $d.
        Refusing to overwrite it - every certificate ever issued chains to that key.
@@ -158,6 +180,7 @@ CNF
 
 # =========================================================================================
 cmd_sign_issuing() {
+  require_root_host
   local csr="${1:-}"; [ -r "$csr" ] || die "usage: $0 sign-issuing <issuing.csr>"
   local d="$CA_ROOT_DIR"
   [ -r "$d/private/root.key" ] || die "no root CA at $d - run init-root first"
@@ -188,6 +211,7 @@ cmd_sign_issuing() {
 # =========================================================================================
 cmd_init_issuing() {
   [ "$(id -u)" -eq 0 ] || die "run with sudo"
+  require_issuing_host
   local d="$CA_ISSUING_DIR"
   [ -e "$d/private/issuing.key" ] && die "an issuing CA already exists at $d.
        Refusing to overwrite - every certificate it has issued chains to that key."
@@ -252,6 +276,7 @@ CNF
 # =========================================================================================
 cmd_install_issuing() {
   [ "$(id -u)" -eq 0 ] || die "run with sudo"
+  require_issuing_host
   local crt="${1:-}" root="${2:-}"
   [ -r "$crt" ] && [ -r "$root" ] || die "usage: sudo $0 install-issuing <issuing.crt> <root.crt>"
   local d="$CA_ISSUING_DIR"
@@ -283,6 +308,7 @@ cmd_install_issuing() {
 # =========================================================================================
 cmd_issue() {
   [ "$(id -u)" -eq 0 ] || die "run with sudo"
+  require_issuing_host
   local name="${1:-}"; shift || true
   [ -n "$name" ] || die "usage: sudo $0 issue <hostname> [extra-SAN ...]"
   local d="$CA_ISSUING_DIR"

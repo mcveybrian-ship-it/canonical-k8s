@@ -8,16 +8,18 @@
 # "already done" rather than failing or duplicating. That matters because this procedure
 # has to be repeatable by someone who is not the person who wrote it.
 #
+#     ./03-host-services.sh hosts      /etc/hosts from the address file
+#     ./03-host-services.sh trustca    install the enclave root CA  <-- BEFORE apt
 #     ./03-host-services.sh apt        point apt at the mirror
 #     ./03-host-services.sh libvirt    install the virtualisation stack
 #     ./03-host-services.sh datavg     create LVs on vg-data and mount them
 #     ./03-host-services.sh bridge     replace the NIC with a bridge   <-- can cut you off
 #     ./03-host-services.sh pool       define the libvirt storage pool
 #     ./03-host-services.sh tmux       tmux + the shared /etc/tmux.conf
-#     ./03-host-services.sh trustca    install the enclave root CA
 #     ./03-host-services.sh keyonly    disable password SSH  <-- do this LAST
 #     ./03-host-services.sh verify     prove all of the above, change nothing
-#     ./03-host-services.sh all        apt, libvirt, datavg, pool, verify (NOT bridge)
+#     ./03-host-services.sh all        hosts, trustca, apt, libvirt, datavg, pool, tmux, verify
+#                                      (NOT bridge)
 #
 # "all" deliberately excludes "bridge". Every other step is reversible from an ssh session;
 # the bridge step is the one that can leave an air-gapped host needing a physical console.
@@ -71,6 +73,33 @@ load_params() {
   # shellcheck disable=SC1090
   . "$PARAMS"
   : "${MIRROR_URL:?}" "${MIRROR_SUITES:?}" "${MIRROR_COMPONENTS:?}" "${MIRROR_KEYRING:?}"
+
+  # CA BEFORE APT. An https mirror is unreachable until the enclave root is in the trust
+  # store, and the failure reads as a certificate problem on the SERVER - which is where
+  # people look first, and the server is fine. `all` used to run apt first and trustca
+  # sixth, which worked only for as long as the mirror was plaintext.
+  #
+  # Guarded here rather than only in `all` so that running `./03-host-services.sh apt`
+  # on its own is also correct. cmd_trustca is idempotent and says so when it no-ops.
+  case "$MIRROR_URL" in
+    https://*)
+      say "mirror is https - ensuring the enclave root is trusted first"
+      cmd_trustca
+      ;;
+  esac
+
+  # A mirror named rather than numbered needs /etc/hosts populated. Checking here turns
+  # "apt-get update failed" into a sentence that says which name and how to fix it.
+  MIRROR_HOST="${MIRROR_URL#*://}"; MIRROR_HOST="${MIRROR_HOST%%/*}"; MIRROR_HOST="${MIRROR_HOST%%:*}"
+  case "$MIRROR_HOST" in
+    *[a-zA-Z]*)
+      getent hosts "$MIRROR_HOST" >/dev/null 2>&1 \
+        || die "this machine cannot resolve '$MIRROR_HOST', which MIRROR_URL names.
+      Populate /etc/hosts from the address file first:
+        sudo ./03-host-services.sh hosts"
+      ok "resolves $MIRROR_HOST"
+      ;;
+  esac
   : "${BRIDGE_NAME:?}" "${BRIDGE_NIC:?}" "${BRIDGE_ADDRESS:?}"
   : "${DATA_VG:?}" "${DATA_LVS:?}" "${DATA_FSTYPE:?}"
   : "${POOL_NAME:?}" "${POOL_PATH:?}"
@@ -369,6 +398,17 @@ cmd_pool() {
 }
 
 # =========================================================================================
+# /etc/hosts from the single address file. A bare-metal host had no step that did this -
+# host-4's entry was added by hand, which worked and was not reproducible. It became
+# load-bearing the moment MIRROR_URL named svc-repo-01 instead of an IP: without it, apt
+# points at a host the machine cannot resolve. VMs get the same block from cloud-init.
+cmd_hosts() {
+  need_root hosts
+  local aa="$SELF/../enclave/apply-addresses.sh"
+  [ -x "$aa" ] || die "no apply-addresses.sh at $aa"
+  "$aa" apply
+}
+
 cmd_trustca() {
   need_root trustca
   local src="$SELF/../enclave/root-ca.crt"
@@ -559,9 +599,10 @@ case "${1:-}" in
   bridge)  cmd_bridge ;;
   pool)    cmd_pool ;;
   tmux)    cmd_tmux ;;
+  hosts)   cmd_hosts ;;
   trustca) cmd_trustca ;;
   keyonly) cmd_keyonly ;;
   verify)  cmd_verify ;;
-  all)     cmd_apt; cmd_libvirt; cmd_datavg; cmd_pool; cmd_tmux; cmd_trustca; cmd_verify ;;
+  all)     cmd_hosts; cmd_trustca; cmd_apt; cmd_libvirt; cmd_datavg; cmd_pool; cmd_tmux; cmd_verify ;;
   *)       sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

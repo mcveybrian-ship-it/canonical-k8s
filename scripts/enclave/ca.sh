@@ -9,7 +9,11 @@
 #     ON svc-mgmt-01 (the management plane - issuance lives here):
 #       sudo ./ca.sh init-issuing         create the issuing key and its CSR
 #       sudo ./ca.sh install-issuing <crt>  install the signed certificate
-#       sudo ./ca.sh issue <name> [san...]  issue a server certificate
+#       sudo ./ca.sh issue <name> [san...]  issue a cert for a service ON THIS machine
+#       sudo ./ca.sh sign-server <csr>      sign a CSR from another machine
+#
+#     ON any machine needing a certificate:
+#       sudo ./ca.sh request [name] [san...]  generate a key HERE and a CSR to send
 #
 #     ON any machine:
 #       sudo ./ca.sh trust <root.crt>     install the root into the trust store
@@ -387,6 +391,84 @@ cmd_issue() {
 }
 
 # =========================================================================================
+cmd_request() {
+  [ "$(id -u)" -eq 0 ] || die "run with sudo"
+  local name="${1:-$(hostname -s)}"; shift || true
+  local d=/etc/ssl/enclave
+  install -d -m 0755 "$d"
+
+  # THE KEY IS GENERATED HERE AND NEVER MOVES. `issue` on svc-mgmt-01 is for services running
+  # ON svc-mgmt-01; for anything else, a key generated centrally has to travel - through /tmp
+  # on at least two machines, readable by root on each, recoverable from the filesystem after
+  # deletion. Exactly the reasoning that keeps the issuing key off stage-01, applied one level
+  # down. Only a CSR leaves this host.
+  [ -e "$d/$name.key" ] && die "a key already exists at $d/$name.key.
+       Reusing it is fine - send $d/$name.csr for signing. Delete both only if you mean to
+       invalidate every certificate issued against that key."
+
+  local ip sans var
+  var=$(printf '%s' "$name" | tr 'a-z-' 'A-Z_')
+  ip="${!var:-}"
+  # Fall back to this machine's own address rather than omitting the SAN - the addressing file
+  # may not be present on a host that only needs a certificate.
+  [ -z "$ip" ] && ip=$(ip -4 -br addr | awk '$1!="lo"{split($3,a,"/"); print a[1]; exit}')
+  sans="DNS:$name.$DOMAIN,DNS:$name"
+  [ -n "$ip" ] && sans="$sans,IP:$ip"
+  for extra in "$@"; do
+    case "$extra" in
+      *[0-9].[0-9]*) sans="$sans,IP:$extra" ;;
+      *)             sans="$sans,DNS:$extra" ;;
+    esac
+  done
+
+  openssl genrsa -out "$d/$name.key" "${CA_LEAF_KEY_BITS:-3072}" 2>/dev/null || die "key generation failed"
+  chmod 0640 "$d/$name.key"; chgrp root "$d/$name.key"
+  ok "key: $d/$name.key (never leaves this host)"
+
+  openssl req -new -key "$d/$name.key" -"${CA_DIGEST:-sha256}" \
+    -subj "/C=${CA_COUNTRY:-US}/O=${CA_ORG:-Enclave}/OU=${CA_OU:-Enclave PKI}/CN=$name.$DOMAIN" \
+    -addext "subjectAltName=$sans" -out "$d/$name.csr" || die "CSR creation failed"
+  chmod 0444 "$d/$name.csr"
+  ok "csr: $d/$name.csr"
+  say "sans: $sans"
+  say ""
+  say "  Send the CSR to svc-mgmt-01 and sign it:"
+  say "    sudo ./ca.sh sign-server $name.csr"
+  say "  then bring back $name.fullchain.crt and drop it in $d/"
+}
+
+# =========================================================================================
+cmd_sign_server() {
+  [ "$(id -u)" -eq 0 ] || die "run with sudo"
+  require_issuing_host
+  local csr="${1:-}"; [ -r "$csr" ] || die "usage: sudo $0 sign-server <name.csr>"
+  local d="$CA_ISSUING_DIR"
+  [ -r "$d/certs/issuing.crt" ] || die "issuing CA is not signed yet"
+
+  openssl req -in "$csr" -noout -verify >/dev/null 2>&1 || die "$csr is not a valid CSR"
+  local cn; cn=$(openssl req -in "$csr" -noout -subject | sed 's/.*CN *= *//;s/,.*//')
+  local name="${cn%%.*}"
+  say "signing: $cn"
+  openssl req -in "$csr" -noout -ext subjectAltName 2>/dev/null | sed 's/^/  /'
+
+  # copy_extensions=copy in the issuing config carries the CSR's SANs into the certificate.
+  # Without it a certificate signs cleanly and arrives with NO SANs at all, which modern
+  # clients reject outright - and the error names the hostname, not the missing extension.
+  openssl ca -config "$d/openssl.cnf" -extensions v3_server \
+    -days "${CA_LEAF_DAYS:-365}" -notext -md "${CA_DIGEST:-sha256}" \
+    -in "$csr" -out "$d/certs/$name.crt" -batch || die "signing failed"
+  chmod 0444 "$d/certs/$name.crt"
+  cat "$d/certs/$name.crt" "$d/certs/issuing.crt" > "$d/certs/$name.fullchain.crt"
+  chmod 0444 "$d/certs/$name.fullchain.crt"
+
+  local n; n=$(openssl x509 -in "$d/certs/$name.crt" -noout -ext subjectAltName | grep -c ':')
+  [ "$n" -ge 1 ] || die "the signed certificate has NO subjectAltName - check copy_extensions"
+  ok "signed: $d/certs/$name.fullchain.crt (send THIS back, not the bare cert)"
+  say ""
+  cmd_show "$d/certs/$name.crt"
+}
+
+# =========================================================================================
 cmd_show() {
   local f="${1:-}"; [ -r "$f" ] || die "usage: $0 show <certificate>"
   openssl x509 -in "$f" -noout -subject -issuer -dates -ext basicConstraints,keyUsage,subjectAltName 2>/dev/null \
@@ -412,6 +494,8 @@ case "${1:-}" in
   init-issuing)   cmd_init_issuing ;;
   install-issuing) shift; cmd_install_issuing "$@" ;;
   issue)          shift; cmd_issue "$@" ;;
+  request)        shift; cmd_request "$@" ;;
+  sign-server)    shift; cmd_sign_server "$@" ;;
   trust)          shift; cmd_trust "$@" ;;
   show)           shift; cmd_show "$@" ;;
   *)              sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;

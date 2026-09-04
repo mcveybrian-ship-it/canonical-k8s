@@ -631,10 +631,17 @@ took an hour to write.
 §6.1a says to verify by serial before anything destructive. **That check silently finds nothing
 on host-4**, because the USB enclosure does not pass the drive's serial through:
 
-| Machine | What it reports |
-|---|---|
-| `build-01` | `SERIAL 204188801050` — the real drive serial |
-| `host-4` | `SERIAL 0000000000000000` — the enclosure hides it |
+| Machine | Date | What it reports |
+|---|---|---|
+| `build-01` | 2026-09-02 | `SERIAL 204188801050` — the real drive serial |
+| `host-4` | 2026-09-03 | `SERIAL 0000000000000000` |
+| `build-01` | 2026-09-04 | `SERIAL 0000000000000000` — **the same machine, now hiding it** |
+
+**It is not even consistent on one machine.** `build-01` reported the real serial when the disk
+was first prepared and all zeros two days later. Whether the enclosure passes it through
+depends on the port, the controller and the enumeration — so a serial check is not merely
+unavailable on some hosts, it is **unreliable everywhere**, and an unreliable check on a
+destructive command is worse than no check at all, because it passes.
 
 **And this matters more than it looks: `host-4`'s own OS disk is the same model** —
 `WDS100T3X0C-00SJG0`, serial `203979803263`. A destructive command keyed on the model would hit

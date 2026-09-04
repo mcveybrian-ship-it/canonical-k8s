@@ -18,6 +18,10 @@
 #     ON any machine:
 #       sudo ./ca.sh trust <root.crt>     install the root into the trust store
 #       ./ca.sh show <file>               summarise a cert, without dumping it
+#       ./ca.sh inventory                 every cert here, and how long it has left
+#
+#     ON stage-01, onto removable media:
+#       sudo ./ca.sh backup-root <dir>    the root CA - THE single point of failure
 #
 # WHY AN INTERNAL CA AT ALL
 #   Everything the enclave serves is currently HTTP: the apt mirror, the contracts server,
@@ -49,8 +53,105 @@ die()  { printf '\n  [x] %s\n\n' "$*" >&2; exit 1; }
 # `trust` and `show` need nothing. `request` needs only the identity fields and key size,
 # all of which have defaults - so a machine that merely needs a certificate does not have to
 # carry the CA's configuration. Only the operations that actually run a CA do.
+# =========================================================================================
+# inventory - what certificates does this machine hold, and when do they die?
+#
+# Leaf certificates are 365 days. In a connected estate something renews them automatically;
+# in an air gap there is no ACME, no reminder, and nothing that fails loudly until a service
+# stops answering. The first warning would otherwise be apt refusing to talk to the mirror.
+# Run this on each machine, or read the calendar in runbook 2.9b.
+# =========================================================================================
+cmd_inventory() {
+  local now days f cn end left warn_at="${CA_WARN_DAYS:-90}" found=0 expiring=0
+  now=$(date +%s)
+  printf '  %-46s %-22s %s\n' "CERTIFICATE (file)" "EXPIRES" "DAYS LEFT"
+  printf '  %-46s %-22s %s\n' "----------------------------------------------" "----------------------" "---------"
+  # Every place a cert legitimately lives. Private keys are never read.
+  for f in /etc/ssl/enclave/*.crt /etc/enclave-ca/certs/*.crt \
+           /srv/enclave-ca/certs/*.crt /usr/local/share/ca-certificates/*.crt; do
+    [ -r "$f" ] || continue
+    case "$f" in *fullchain*) continue ;; esac   # the leaf is already listed on its own
+    end=$(openssl x509 -in "$f" -noout -enddate 2>/dev/null | cut -d= -f2) || continue
+    [ -n "$end" ] || continue
+    cn=$(openssl x509 -in "$f" -noout -subject 2>/dev/null | sed 's/.*CN *= *//; s/,.*//')
+    # The same CA legitimately appears under several filenames - issuing.crt and chain.crt
+    # both carry the issuing cert. Naming the file makes that read as two copies rather
+    # than as a duplicate row nobody can explain.
+    cn="$cn  ($(basename "$f"))"
+    days=$(date -d "$end" +%s 2>/dev/null) || continue
+    left=$(( (days - now) / 86400 ))
+    found=$((found + 1))
+    if [ "$left" -lt 0 ]; then
+      printf '  %-46s %-22s %s\n' "$cn" "$end" "EXPIRED"
+      expiring=$((expiring + 1))
+    elif [ "$left" -lt "$warn_at" ]; then
+      printf '  %-46s %-22s %s\n' "$cn" "$end" "$left  <-- RENEW"
+      expiring=$((expiring + 1))
+    else
+      printf '  %-46s %-22s %s\n' "$cn" "$end" "$left"
+    fi
+  done
+  say ""
+  [ "$found" -gt 0 ] || { say "no enclave certificates on this machine"; return 0; }
+  if [ "$expiring" -gt 0 ]; then
+    say "$expiring certificate(s) need attention within $warn_at days."
+    say "Renew a leaf by repeating how it was issued - there is no separate renew path:"
+    say "    sudo ./ca.sh request <name>          # on the machine that needs it"
+    say "    sudo ./ca.sh sign-server <csr>       # on svc-mgmt-01"
+    say "    sudo ./enable-tls.sh <name> <fullchain.crt> --root|--proxy ..."
+  else
+    ok "nothing expiring within $warn_at days"
+  fi
+}
+
+# =========================================================================================
+# backup-root - the root CA onto removable media. stage-01 only.
+#
+# THIS IS THE SINGLE POINT OF FAILURE IN THE WHOLE PKI. The root key exists in exactly one
+# place, /srv/enclave-ca/private/root.key on stage-01, and private-sync.sh does not carry it.
+# If that disk dies, every machine in the enclave trusts an anchor that can never issue
+# again: recovery is a new root, a new issuing CA, and a physical visit to every machine to
+# replace the trust store. That is a rebuild, not an incident.
+#
+# The key is already passphrase-encrypted, so this deliberately does NOT add a second
+# passphrase - one more secret to lose protects nothing the first one does not. What matters
+# is that the tarball goes to media kept OFFLINE and PHYSICALLY SEPARATE from stage-01, and
+# that the passphrase is stored somewhere other than beside it.
+# =========================================================================================
+cmd_backup_root() {
+  local dest="${1:-}"
+  [ -n "$dest" ] || die "usage: sudo ./ca.sh backup-root <destination-directory>"
+  [ -d "$dest" ] || die "not a directory: $dest"
+  [ -d "$CA_ROOT_DIR/private" ] || die "no root CA at $CA_ROOT_DIR - this is not the root host"
+  _is_issuing_host && die "this machine holds the ISSUING CA. The root does not live here."
+
+  local out
+  out="$dest/enclave-ca-root-$(date +%Y-%m-%d).tar.gz"
+  [ -e "$out" ] && die "already exists, refusing to overwrite: $out"
+
+  # -C so the archive holds relative paths: it can be restored anywhere, not only to /srv.
+  tar -czf "$out" -C "$(dirname "$CA_ROOT_DIR")" "$(basename "$CA_ROOT_DIR")" \
+    || die "tar failed - nothing usable was written"
+  chmod 0400 "$out"
+
+  # Prove it reads back HERE, while the original is still present. A backup verified only at
+  # restore time is a backup verified when it is already too late.
+  tar -tzf "$out" >/dev/null 2>&1 || die "the archive does not read back - do not trust it"
+  local n; n=$(tar -tzf "$out" | grep -c . )
+  sha256sum "$out" | awk '{print $1}' > "$out.sha256"
+  ok "wrote $out"
+  ok "$n entries, archive verified readable"
+  ok "sha256 recorded in $out.sha256"
+  say ""
+  say "  This archive contains the root PRIVATE KEY. It is passphrase-encrypted; the"
+  say "  passphrase is NOT in the archive and must be stored separately."
+  say ""
+  say "  Keep it OFFLINE and physically apart from stage-01. Two copies, two locations."
+  say "  Verify a copy on arrival:  sha256sum -c $(basename "$out").sha256"
+}
+
 case "${1:-}" in
-  trust|show|request) CA_NEED_PARAMS=0 ;;
+  trust|show|request|inventory) CA_NEED_PARAMS=0 ;;
   *)                  CA_NEED_PARAMS=1 ;;
 esac
 
@@ -521,5 +622,7 @@ case "${1:-}" in
   sign-server)    shift; cmd_sign_server "$@" ;;
   trust)          shift; cmd_trust "$@" ;;
   show)           shift; cmd_show "$@" ;;
+  inventory)      cmd_inventory ;;
+  backup-root)    shift; cmd_backup_root "$@" ;;
   *)              sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

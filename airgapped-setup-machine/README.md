@@ -6,7 +6,7 @@
 *how* things were built and why; they have gone stale more than once. If they disagree with
 this section, this section wins and the other one gets fixed.
 
-Last updated **2026-09-04 02:00**.
+Last updated **2026-09-04 16:00**.
 
 **STAGE-01's work is DONE, and the enclave is now AIR-GAPPED — 2026-09-04.**
 
@@ -59,7 +59,7 @@ real client over the network. See `docs/03-host-services.md`.
 | Hyper-V host (R7515) | — | online | Windows Server 2022. Runs `stage-01`; seed-stick writer |
 | `host-4` | **`10.2.20.158`** | **air-gapped** | **BUILT 2026-09-01/02.** Services host. LUKS on 2 of 3 NVMe, 125 GB RAM. **Step 03 host prep DONE** - mirror apt, br0, 1.8T LUKS-backed image pool, verified after a cold boot. **Step 03 DONE.** Installs from `svc-repo-01` |
 | `host-1..3` | `10.2.20.155-157` | **air-gapped** | Not built |
-| `svc-mgmt-01` | `10.2.20.161` | **air-gapped** | **BUILT 2026-09-03.** First enclave VM. MAAS + Pro contract server go here |
+| `svc-mgmt-01` | `10.2.20.161` | **air-gapped** | **CONTRACTS SERVER RUNNING 2026-09-04.** Attached to its own contracts server; esm-infra/esm-apps/fips-updates/usg all entitled. MAAS still to come |
 | `svc-repo-01` | `10.2.20.162` | **air-gapped** | **SERVING 2026-09-03.** 318 GB mirror over nginx, 9/9 suites verified, keys at `/keys/`, the 3 PPA debs at `/debs/`. host-4 installs from it |
 
 **THE MIRROR IS COMPLETE — 318 GB, 90,853 packages, six archives.**

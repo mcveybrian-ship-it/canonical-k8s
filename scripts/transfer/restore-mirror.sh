@@ -201,6 +201,37 @@ fi
 # The keyrings and .debs must live under $REPO_ROOT for the vhost aliases to reach them.
 # Installing the keys into /usr/share/keyrings (section 4) serves THIS machine; serving them
 # over HTTP is how host-1..3 and every other guest get them.
+# --- 5b. this machine now uses ITS OWN tree -----------------------------------------------------
+# The VM was composed pointing at whatever mirror existed at the time - stage-01, across a
+# temporary bridge that is removed at cutover. After this script runs, this machine IS the
+# repo, and leaving it pointed elsewhere means the one box that can never lose its package
+# source is the one still depending on a machine outside the boundary.
+#
+# file:// rather than http://localhost, deliberately: it works before nginx is up, during an
+# nginx reload, and if the vhost is ever misconfigured. The repo server should not need its
+# own web server in order to patch itself.
+head2 "pointing this machine at its own tree"
+_us=/etc/apt/sources.list.d/ubuntu.sources
+if [ -f "$_us" ] && grep -q "^URIs: file://$REPO_ROOT/mirror/" "$_us" 2>/dev/null; then
+  note "already self-hosted"
+else
+  [ -f "$_us" ] && run cp "$_us" "$_us.pre-selfhost"
+  run tee "$_us" >/dev/null <<EOF
+# This machine serves the enclave mirror. It installs from its own copy over file://, so it
+# can patch itself with nginx down, mid-reload, or misconfigured. Written by restore-mirror.sh.
+Types: deb
+URIs: file://$REPO_ROOT/mirror/archive.ubuntu.com/ubuntu/
+Suites: ${BOOTSTRAP_SUITES:-noble noble-updates noble-security}
+Components: ${BOOTSTRAP_COMPONENTS:-main universe}
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+EOF
+  # the bootstrap file from 2a is now redundant and would duplicate every entry
+  [ -f /etc/apt/sources.list.d/zz-restore-bootstrap.sources ] \
+    && run rm -f /etc/apt/sources.list.d/zz-restore-bootstrap.sources
+  run apt-get update -qq || die "apt-get update failed against the local tree at $REPO_ROOT"
+  note "self-hosted: file://$REPO_ROOT/mirror/, signatures verified"
+fi
+
 head2 "staging keys and debs for HTTP"
 run install -d -m 0755 "$REPO_ROOT/keys" "$REPO_ROOT/debs"
 if compgen -G "$SRC/bundle/keys/*.gpg" >/dev/null; then

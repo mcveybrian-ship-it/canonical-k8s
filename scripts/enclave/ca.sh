@@ -11,6 +11,8 @@
 #       sudo ./ca.sh install-issuing <crt>  install the signed certificate
 #       sudo ./ca.sh issue <name> [san...]  issue a cert for a service ON THIS machine
 #       sudo ./ca.sh sign-server <csr>      sign a CSR from another machine
+#       sudo ./ca.sh gen-crl                generate the CRL (if CA_CRL_URL is set)
+#       sudo ./ca.sh revoke <cert>          revoke, then regenerate the CRL
 #
 #     ON any machine needing a certificate:
 #       sudo ./ca.sh request [--profile P] [name] [san...]
@@ -151,6 +153,54 @@ cmd_backup_root() {
   say ""
   say "  Keep it OFFLINE and physically apart from stage-01. Two copies, two locations."
   say "  Verify a copy on arrival:  sha256sum -c $(basename "$out").sha256"
+}
+
+# =========================================================================================
+# gen-crl / revoke - only meaningful if CA_CRL_URL was set BEFORE the certificates were
+# issued. A CRL nothing points at is a file nobody fetches.
+#
+# AN EXPIRED CRL FAILS HARDER THAN NO CRL. A CRL carries nextUpdate; a client configured to
+# check revocation and handed a stale list may fail closed. Publishing one is a commitment to
+# regenerate it on a schedule - put it on the same calendar reminder as certificate renewal.
+# =========================================================================================
+cmd_gen_crl() {
+  [ "$(id -u)" -eq 0 ] || die "run with sudo"
+  require_issuing_host
+  local d="$CA_ISSUING_DIR"
+  [ -r "$d/certs/issuing.crt" ] || die "issuing CA is not signed yet"
+  install -d -m 0755 "$d/crl"
+  # openssl needs a crlnumber file for a V2 CRL. A CA created before CRLs were parameterised
+  # will not have one; creating it here is correct and idempotent.
+  [ -f "$d/crlnumber" ] || { echo 1000 > "$d/crlnumber"; chmod 0644 "$d/crlnumber"; }
+
+  local out="$d/crl/enclave-issuing.crl"
+  openssl ca -config "$d/openssl.cnf" -gencrl -crldays "${CA_CRL_DAYS:-90}" -out "$out" \
+    || die "CRL generation failed.
+      If openssl complains about 'crlnumber', the CA config predates CRL support - add
+        crlnumber = \$dir/crlnumber
+      to the [ CA_default ] section of $d/openssl.cnf and run this again."
+  chmod 0644 "$out"
+  ok "wrote $out"
+  openssl crl -in "$out" -noout -lastupdate -nextupdate | sed 's/^/    /'
+  local n; n=$(openssl crl -in "$out" -noout -text | grep -c 'Serial Number:' || true)
+  say "    revoked entries: ${n:-0}"
+  say ""
+  say "  Publish it where CA_CRL_URL points, and serve it over PLAIN HTTP:"
+  say "    ${CA_CRL_URL:-<CA_CRL_URL is not set - this CRL is unreachable>}"
+}
+
+cmd_revoke() {
+  [ "$(id -u)" -eq 0 ] || die "run with sudo"
+  require_issuing_host
+  local cert="${1:-}"; [ -r "$cert" ] || die "usage: sudo $0 revoke <certificate.crt>"
+  local d="$CA_ISSUING_DIR"
+  cmd_show "$cert"
+  say ""
+  openssl ca -config "$d/openssl.cnf" -revoke "$cert" || die "revocation failed"
+  ok "revoked in $d/index.txt"
+  say ""
+  say "Revocation is not effective until the CRL is regenerated AND republished:"
+  cmd_gen_crl
 }
 
 case "${1:-}" in
@@ -323,7 +373,29 @@ cmd_sign_issuing() {
 
   local PASSIN=()
   [ -n "${CA_ROOT_PASS_FILE:-}" ] && PASSIN=(-passin "file:$CA_ROOT_PASS_FILE")
-  openssl ca -config "$d/openssl.cnf" -extensions v3_issuing "${PASSIN[@]}" \
+  # nameConstraints bounds what the issuing CA may sign. pathlen:0 already stops it minting
+  # another CA; this stops it minting a certificate for a name the enclave does not own. A
+  # stolen issuing key is then useless against google.com, which is the difference between a
+  # contained incident and an unbounded one.
+  #
+  # It has to be applied HERE, by the root, when the issuing certificate is signed - so it
+  # cannot be retrofitted without re-signing the issuing CA. Cheap while there are two leaves.
+  local extf; extf=$(mktemp)
+  # shellcheck disable=SC2064
+  trap "rm -f '$extf'" RETURN
+  {
+    echo "[ v3_issuing ]"
+    echo "subjectKeyIdentifier   = hash"
+    echo "authorityKeyIdentifier = keyid:always,issuer"
+    echo "basicConstraints       = critical, CA:true, pathlen:0"
+    echo "keyUsage               = critical, digitalSignature, cRLSign, keyCertSign"
+    if [ -n "${CA_NAME_CONSTRAINTS:-}" ]; then
+      echo "nameConstraints        = $CA_NAME_CONSTRAINTS"
+    fi
+  } > "$extf"
+  [ -n "${CA_NAME_CONSTRAINTS:-}" ] && say "name constraints: $CA_NAME_CONSTRAINTS"
+
+  openssl ca -config "$d/openssl.cnf" -extfile "$extf" -extensions v3_issuing "${PASSIN[@]}" \
     -days "${CA_ISSUING_DAYS:-1826}" -notext -md "$CA_DIGEST" \
     -in "$csr" -out "$d/certs/issuing.crt" -batch \
     || die "signing failed"
@@ -602,7 +674,29 @@ cmd_sign_server() {
   # copy_extensions=copy in the issuing config carries the CSR's SANs into the certificate.
   # Without it a certificate signs cleanly and arrives with NO SANs at all, which modern
   # clients reject outright - and the error names the hostname, not the missing extension.
-  openssl ca -config "$d/openssl.cnf" -extensions v3_server \
+  # Extensions are built HERE rather than read from the config written at init time, so that
+  # turning revocation on is a parameter change rather than a CA rebuild.
+  #
+  # A CRL distribution point CANNOT BE ADDED TO A CERTIFICATE THAT ALREADY EXISTS - it is
+  # inside the signature. Every certificate issued without one is permanently unrevokable by
+  # CRL, so "we can add it later if the AO asks" is not actually available: later means
+  # reissuing everything. Set CA_CRL_URL before issuing certificates you might need to revoke.
+  local extf; extf=$(mktemp)
+  # shellcheck disable=SC2064
+  trap "rm -f '$extf'" RETURN
+  {
+    echo "[ v3_server ]"
+    echo "basicConstraints       = critical, CA:false"
+    echo "keyUsage               = critical, digitalSignature, keyEncipherment"
+    echo "extendedKeyUsage       = serverAuth"
+    echo "subjectKeyIdentifier   = hash"
+    echo "authorityKeyIdentifier = keyid,issuer"
+    [ -n "${CA_CRL_URL:-}" ]  && echo "crlDistributionPoints  = URI:$CA_CRL_URL"
+    [ -n "${CA_OCSP_URL:-}" ] && echo "authorityInfoAccess    = OCSP;URI:$CA_OCSP_URL"
+  } > "$extf"
+  [ -n "${CA_CRL_URL:-}" ] && say "crl dp: $CA_CRL_URL"
+
+  openssl ca -config "$d/openssl.cnf" -extfile "$extf" -extensions v3_server \
     -days "${CA_LEAF_DAYS:-365}" -notext -md "${CA_DIGEST:-sha256}" \
     -in "$csr" -out "$d/certs/$name.crt" -batch || die "signing failed"
   chmod 0444 "$d/certs/$name.crt"
@@ -683,6 +777,8 @@ case "${1:-}" in
   trust)          shift; cmd_trust "$@" ;;
   show)           shift; cmd_show "$@" ;;
   inventory)      cmd_inventory ;;
+  gen-crl)        cmd_gen_crl ;;
+  revoke)         shift; cmd_revoke "$@" ;;
   backup-root)    shift; cmd_backup_root "$@" ;;
   *)              sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

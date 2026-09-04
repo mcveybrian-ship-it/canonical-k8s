@@ -5,7 +5,9 @@
 #     MACHINE: the machine that runs the service.
 #
 #     sudo ./enable-tls.sh <name> <fullchain.crt> [--root <docroot>] [--proxy <url>]
-#     sudo ./enable-tls.sh --redirect-http     serve NOTHING on :80, 301 everything to https
+#     sudo ./enable-tls.sh --redirect-http [--crl <dir>]
+#                                          serve NOTHING on :80 except an optional CRL,
+#                                          301 everything else to https
 #     sudo ./enable-tls.sh --restore-http      put the :80 sites back
 #
 #     sudo ./enable-tls.sh svc-repo-01 /tmp/svc-repo-01.fullchain.crt --root /srv/repo/mirror
@@ -43,6 +45,16 @@ DISABLED_DIR=/etc/nginx/sites-disabled-http
 # The existing :80 server blocks are MOVED, not deleted, and --restore-http puts them back.
 redirect_http() {
   [ "$(id -u)" -eq 0 ] || die "run with sudo"
+  # --crl <dir> keeps /crl/ served over PLAIN HTTP instead of being redirected. That is not a
+  # loophole, it is the standard design: fetching a CRL over HTTPS from the same CA is
+  # circular - the client would need the CRL to validate the certificate it is using to fetch
+  # the CRL. A 301 on /crl/ turns revocation checking into a loop that times out.
+  local crldir=""
+  case "${1:-}" in
+    --crl) crldir="${2:?--crl needs a directory}"; shift 2 ;;
+    --crl=*) crldir="${1#--crl=}"; shift ;;
+  esac
+  [ -z "$crldir" ] || [ -d "$crldir" ] || die "no such directory: $crldir"
   install -d -m 0755 "$DISABLED_DIR"
   local moved=0 f
   for f in /etc/nginx/sites-enabled/*; do
@@ -65,10 +77,28 @@ server {
     listen [::]:80 default_server;
     server_name _;
     access_log /var/log/nginx/http-redirect.access.log;
-    return 301 https://$host$request_uri;
+NGINX
+  if [ -n "$crldir" ]; then
+    cat >> "$REDIR_CONF" <<NGINX
+
+    # Served in the clear on purpose - see enable-tls.sh --crl. A CRL is public data, signed
+    # by the CA, and useless to tamper with: a modified one fails its signature check.
+    location ^~ /crl/ {
+        alias ${crldir%/}/;
+        autoindex off;
+        default_type application/pkix-crl;
+    }
+NGINX
+  fi
+  cat >> "$REDIR_CONF" <<'NGINX'
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
 }
 NGINX
   chmod 0644 "$REDIR_CONF"
+  [ -n "$crldir" ] && ok "/crl/ exempt from the redirect, served from $crldir"
   ok "wrote $REDIR_CONF"
   nginx -t || die "nginx config is invalid - NOT reloading. Undo with: $0 --restore-http"
   systemctl reload nginx
@@ -94,7 +124,7 @@ restore_http() {
 }
 
 case "${1:-}" in
-  --redirect-http) redirect_http ;;
+  --redirect-http) shift; redirect_http "$@" ;;
   --restore-http)  restore_http ;;
 esac
 

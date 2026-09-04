@@ -390,7 +390,13 @@ cmd_sign_issuing() {
     echo "[ v3_issuing ]"
     echo "subjectKeyIdentifier   = hash"
     echo "authorityKeyIdentifier = keyid:always,issuer"
-    echo "basicConstraints       = critical, CA:true, pathlen:0"
+    # pathlen:0 means "may sign end-entity certificates and NOTHING else". That is the right
+    # default and it is also a decision with a consequence: Canonical Kubernetes can be
+    # bootstrapped with external intermediate CAs, and chaining those under this CA would
+    # need pathlen:1. Decision recorded in runbook 2.9c is that Kubernetes self-signs, so 0
+    # stands - but pathlen is fixed when this certificate is signed, so reversing it later
+    # means re-signing the issuing CA. Set it deliberately at the re-issuance event.
+    echo "basicConstraints       = critical, CA:true, pathlen:${CA_ISSUING_PATHLEN:-0}"
     echo "keyUsage               = critical, digitalSignature, cRLSign, keyCertSign"
     if [ -n "${CA_NAME_CONSTRAINTS:-}" ]; then
       echo "nameConstraints        = $CA_NAME_CONSTRAINTS"

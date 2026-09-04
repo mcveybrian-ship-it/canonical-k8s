@@ -148,10 +148,21 @@ else
 fi
 
 if [ "$MIGRATE_PRO" -eq 1 ]; then
-  # `pro refresh` re-reads the contract from the new URL. If it fails the machine is still
-  # attached and apt still works, so this is a warning rather than a rollback trigger.
-  pro refresh >/dev/null 2>&1 && ok "pro refresh succeeded against the https contract URL" \
-    || warn "pro refresh failed - check: sudo pro status"
+  # `pro refresh` re-reads the contract from the new URL - but it only means anything on an
+  # ATTACHED machine. On an unattached one it fails by design, and reporting that as a
+  # warning sends the operator looking for a fault that does not exist. host-4 is exactly
+  # this case: contract_url is set by the image, nothing is attached to it yet.
+  attached=$(pro status --format json 2>/dev/null \
+    | python3 -c 'import sys,json; print(json.load(sys.stdin).get("attached"))' 2>/dev/null || true)
+  if [ "$attached" = "True" ]; then
+    if pro refresh >/dev/null 2>&1; then
+      ok "pro refresh succeeded against the https contract URL"
+    else
+      warn "pro refresh failed - check: sudo pro status"
+    fi
+  else
+    ok "not attached to pro - contract_url is set for whenever it is"
+  fi
 fi
 
 say ""

@@ -5,6 +5,7 @@
 #     MACHINE: runs ON the service VM being configured.
 #
 #     ./04-enclave-services.sh contracts   Ubuntu Pro air-gapped contracts server
+#     ./04-enclave-services.sh pro         point the pro client at it, and attach
 #     ./04-enclave-services.sh verify      prove what is running, change nothing
 #
 # Everything here assumes svc-repo-01 is already serving - it is where the packages and the
@@ -131,6 +132,73 @@ UNIT
 }
 
 # =========================================================================================
+cmd_pro() {
+  need_root pro
+  local url="${CONTRACTS_URL:-http://svc-mgmt-01.enclave.internal:$CONTRACTS_PORT}"
+  local tokfile="${PRO_TOKEN_FILE:-}"
+  if [ -z "$tokfile" ]; then
+    local h; h=$(getent passwd "${SUDO_USER:-root}" | cut -d: -f6)
+    tokfile="${h:-$HOME}/.pro-contract-token"
+  fi
+
+  command -v pro >/dev/null || die "ubuntu-advantage-tools is not installed"
+
+  # Point the client at the enclave's own contracts server. Left at the default the client
+  # talks to contracts.canonical.com, which in here simply times out - and the error says
+  # nothing about the contract server being the thing that should have been configured.
+  local conf=/etc/ubuntu-advantage/uaclient.conf
+  if grep -q "^contract_url: *$url\s*$" "$conf" 2>/dev/null; then
+    skip "contract_url already $url"
+  else
+    cp "$conf" "$conf.bak-$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+    if grep -q '^contract_url:' "$conf" 2>/dev/null; then
+      sed -i "s|^contract_url:.*|contract_url: $url|" "$conf"
+    else
+      printf 'contract_url: %s\n' "$url" >> "$conf"
+    fi
+    ok "contract_url -> $url"
+  fi
+
+  local code
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$url/v1/resources" || true)
+  [ "${code:-000}" = "200" ] \
+    || die "the contracts server did not answer at $url/v1/resources (got ${code:-no response}).
+       Is contracts-airgapped running on svc-mgmt-01, and does this machine resolve
+       svc-mgmt-01.enclave.internal? Check: getent hosts svc-mgmt-01.enclave.internal"
+  ok "contracts server reachable at $url"
+
+  if pro status --format json 2>/dev/null | grep -q '"attached": *true'; then
+    skip "already attached"; return 0
+  fi
+
+  [ -r "$tokfile" ] || die "no token file at $tokfile.
+       The token goes in a FILE, not on the command line - 'pro attach <token>' puts it in
+       ps and in shell history. Create it:
+         install -m 600 /dev/null $tokfile
+         read -rs -p 'token: ' T && printf '%s\n' \"\$T\" > $tokfile && unset T"
+  [ "$(stat -c '%a' "$tokfile")" = "600" ] || die "$tokfile must be mode 600 - it is a credential"
+
+  # --no-auto-enable deliberately. Attaching and ENABLING are separate decisions: enabling
+  # fips-updates replaces the kernel and needs a reboot, and usg pulls in the STIG tooling.
+  # Both belong in step 05 hardening, where the before/after evidence gets captured - not as
+  # a side effect of attaching.
+  local ac; ac=$(mktemp); chmod 600 "$ac"; trap 'rm -f "$ac"' EXIT
+  printf 'token: %s\n' "$(head -1 "$tokfile" | tr -d '[:space:]')" > "$ac"
+  if pro attach --attach-config "$ac" --no-auto-enable >/dev/null 2>&1; then
+    ok "attached (no services auto-enabled - that is step 05)"
+  else
+    rm -f "$ac"; trap - EXIT
+    die "pro attach failed. Run it by hand to see why:
+         sudo pro attach --attach-config <file> --no-auto-enable"
+  fi
+  rm -f "$ac"; trap - EXIT
+
+  say ""
+  say "  entitlements this machine can now enable:"
+  pro status 2>/dev/null | sed -n '/SERVICE/,$p' | head -14 | sed 's/^/    /'
+}
+
+# =========================================================================================
 cmd_verify() {
   local fail=0
   echo; echo "  ---- step 04 verification on $(hostname) ----"
@@ -166,6 +234,7 @@ cmd_verify() {
 
 case "${1:-}" in
   contracts) cmd_contracts ;;
+  pro)       cmd_pro ;;
   verify)    cmd_verify ;;
   *)         sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

@@ -252,7 +252,10 @@ _is_issuing_host() { [ -e "$CA_ISSUING_DIR/private/issuing.key" ]; }
 
 require_root_host() {
   _is_issuing_host && die "this machine holds the ISSUING CA ($CA_ISSUING_DIR).
-       Root operations belong on stage-01, outside the enclave."
+       Root operations belong wherever CA_ROOT_DIR points - which is deliberately NOT
+       this machine, and need not be stage-01. A root key on a hardware token is
+       operated from whatever host has a USB port; CA_ROOT_DIR then names the removable
+       media holding the CA database, not a path on a server."
   :
 }
 require_issuing_host() {

@@ -54,11 +54,21 @@ n=$(grep -c 'BEGIN CERTIFICATE' "$CHAIN")
 [ "$n" -ge 2 ] || die "$CHAIN contains $n certificate(s) - expected the FULLCHAIN (leaf + issuing)"
 ok "fullchain has $n certificates"
 
-openssl verify -CAfile /etc/ssl/certs/ca-certificates.crt "$CHAIN" >/dev/null 2>&1 \
-  && ok "verifies against this machine's trust store" \
-  || say "  note: does not verify locally yet - is the enclave root installed? (ca.sh trust)"
+# -untrusted is REQUIRED for a fullchain file: without it openssl reads only the first
+# certificate and cannot find the intermediate, so a perfectly good chain reports as
+# unverifiable. That is what happened here, on a machine that did trust the root.
+if openssl verify -CAfile /etc/ssl/certs/ca-certificates.crt \
+     -untrusted "$CHAIN" "$CHAIN" >/dev/null 2>&1; then
+  ok "verifies against this machine's trust store"
+else
+  say "  note: does not verify locally - is the enclave root installed? (ca.sh trust)"
+fi
 
-install -d -m 0755 /etc/ssl/enclave /etc/nginx/enclave-tls
+# /etc/nginx/conf.d/ is included by Ubuntu's stock nginx.conf already. Writing here means
+# enable-tls.sh does not depend on the site vhost carrying a custom include - which it did,
+# and svc-repo-01 was running a vhost installed before that include existed, so nginx came
+# back cleanly on :80 and never listened on :443 at all.
+install -d -m 0755 /etc/ssl/enclave
 install -m 0644 "$CHAIN" "/etc/ssl/enclave/$NAME.fullchain.crt"
 chgrp www-data "$KEY" 2>/dev/null || true
 chmod 0640 "$KEY"
@@ -107,9 +117,9 @@ ok "installed /etc/ssl/enclave/$NAME.fullchain.crt"
     echo "    location / { try_files \$uri \$uri/ =404; }"
   fi
   echo "}"
-} > "/etc/nginx/enclave-tls/$NAME.conf"
-chmod 0644 "/etc/nginx/enclave-tls/$NAME.conf"
-ok "wrote /etc/nginx/enclave-tls/$NAME.conf"
+} > "/etc/nginx/conf.d/$NAME-tls.conf"
+chmod 0644 "/etc/nginx/conf.d/$NAME-tls.conf"
+ok "wrote /etc/nginx/conf.d/$NAME-tls.conf"
 
 nginx -t || die "nginx config is invalid - NOT reloading. The site is still serving on :80."
 systemctl reload nginx

@@ -64,13 +64,12 @@ real client over the network. See `docs/03-host-services.md`.
 | 22 | Revocation + name constraints | ✅ **BUILT, DORMANT** — `CA_CRL_URL`, `CA_CRL_DAYS`, `CA_OCSP_URL`, `CA_NAME_CONSTRAINTS`; `gen-crl`, `revoke`. **Nothing switched on** — none can be retrofitted, so they wait for the re-issuance event |
 | 23 | Kubernetes PKI boundary | ✅ **DECIDED** — k8s self-signs; the enclave PKI does not chain in. `CA_ISSUING_PATHLEN` stays 0. §2.9c |
 | 24 | Shared wildcard | ✅ **DESIGNED, NOT ISSUED** — `*.enclave.internal` + `*.apps.enclave.internal` + 7 IPs. Deliberately held for the re-issuance event |
-| 25 | `ca.sh inventory` / `backup-root` | ✅ **BUILT** — ⚠️ **`backup-root` HAS NOT BEEN RUN.** The root key is one copy on one Hyper-V VM |
+| 25 | `ca.sh inventory` / `backup-root` | ✅ **DONE 2026-09-04** — root CA archived and copied to removable media with SecureFX. ⚠️ Verify the checksum **on the media**, and `shred -u /srv/ca-backup/*` on stage-01 once confirmed |
 
 **Blocked or waiting — nothing here can be finished today:**
 
 | What | Blocked on |
 |---|---|
-| **Run `backup-root`** | Nothing. **This is the highest-value 10 minutes available.** §2.9b |
 | **Close the gap** | Nothing. `gap-state.sh close` + unplug port 4 when work stops |
 | The single re-issuance event | The FIPS YubiKey arriving. Folds together: hardware root, name constraints, CRL, and issuing the wildcard. §2.9b |
 | AO thread — 5 questions | Sending it. Three decide hardware purchases |

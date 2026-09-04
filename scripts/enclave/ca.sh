@@ -148,7 +148,11 @@ cmd_backup_root() {
   # restore time is a backup verified when it is already too late.
   tar -tzf "$out" >/dev/null 2>&1 || die "the archive does not read back - do not trust it"
   local n; n=$(tar -tzf "$out" | grep -c . )
-  sha256sum "$out" | awk '{print $1}' > "$out.sha256"
+  # STANDARD sha256sum FORMAT - "hash  filename", two spaces, basename only. A bare hash
+  # cannot be checked with `sha256sum -c`, which fails with "no properly formatted checksum
+  # lines found" on a perfectly good archive. Basename rather than full path so the check
+  # works from whatever directory the media is mounted at on another machine.
+  ( cd "$dest" && sha256sum "$(basename "$out")" > "$(basename "$out").sha256" )
   ok "wrote $out"
   ok "$n entries, archive verified readable"
   ok "sha256 recorded in $out.sha256"

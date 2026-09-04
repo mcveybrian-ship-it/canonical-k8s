@@ -136,6 +136,11 @@ HOSTS_BLOCK="$("$ENCLAVE_DIR/apply-addresses.sh" render | sed 's/^/      /')"
 # Shared operator tmux config, same file the bare-metal hosts get.
 TMUX_CONF=""
 [ -r "$ENCLAVE_DIR/tmux.conf" ] && TMUX_CONF="$(sed 's/^/      /' "$ENCLAVE_DIR/tmux.conf")"
+# The enclave root CA, so a VM trusts the PKI from its first boot rather than needing a visit.
+# A machine that does not trust the root cannot reach an HTTPS mirror - and the failure looks
+# like a certificate problem on the SERVER, which is where people look first.
+ROOT_CA=""
+[ -r "$ENCLAVE_DIR/root-ca.crt" ] && ROOT_CA="$(sed 's/^/      /' "$ENCLAVE_DIR/root-ca.crt")"
 # Find the keys under sudo, which is how this always runs. $HOME is /root there, so the
 # operator's own authorized_keys is invisible unless SUDO_USER is resolved back to a home
 # directory - and the failure looks like "you have no keys" rather than "I looked in the
@@ -220,6 +225,10 @@ write_files:
       Suites: $VM_MIRROR_SUITES
       Components: $VM_MIRROR_COMPONENTS
       Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+  - path: /usr/local/share/ca-certificates/enclave-root.crt
+    permissions: '0644'
+    content: |
+$ROOT_CA
   - path: /etc/tmux.conf
     permissions: '0644'
     content: |
@@ -236,6 +245,7 @@ package_update: true
 packages: [$(echo "${VM_EXTRA_PACKAGES:-}" | tr ' ' '\n' | sed '/^$/d' | paste -sd, -)]
 
 runcmd:
+  - [ update-ca-certificates ]
   - [ systemctl, enable, --now, ssh ]
   - [ sh, -c, "ip route | grep -q '^default' && echo 'WARNING: this VM has a default route' >> /etc/enclave-build-info || echo 'gateway=none-airgapped-no-default-route' >> /etc/enclave-build-info" ]
   - [ sh, -c, "echo \"composed=\$(date -Is) by 03-compose-vm.sh\" >> /etc/enclave-build-info" ]

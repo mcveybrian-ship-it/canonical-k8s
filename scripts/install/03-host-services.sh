@@ -14,6 +14,7 @@
 #     ./03-host-services.sh bridge     replace the NIC with a bridge   <-- can cut you off
 #     ./03-host-services.sh pool       define the libvirt storage pool
 #     ./03-host-services.sh tmux       tmux + the shared /etc/tmux.conf
+#     ./03-host-services.sh trustca    install the enclave root CA
 #     ./03-host-services.sh keyonly    disable password SSH  <-- do this LAST
 #     ./03-host-services.sh verify     prove all of the above, change nothing
 #     ./03-host-services.sh all        apt, libvirt, datavg, pool, verify (NOT bridge)
@@ -368,6 +369,25 @@ cmd_pool() {
 }
 
 # =========================================================================================
+cmd_trustca() {
+  need_root trustca
+  local src="$SELF/../enclave/root-ca.crt"
+  [ -r "$src" ] || die "no root CA at $src"
+  # The .crt extension is REQUIRED - update-ca-certificates silently ignores anything else,
+  # so a .pem here produces a machine that looks configured and trusts nothing.
+  local dst=/usr/local/share/ca-certificates/enclave-root.crt
+  if [ -f "$dst" ] && diff -q "$src" "$dst" >/dev/null 2>&1; then
+    skip "enclave root CA already trusted"
+  else
+    install -m 0644 "$src" "$dst"
+    update-ca-certificates 2>&1 | sed 's/^/    /'
+    ok "installed $dst"
+  fi
+  local fp; fp=$(openssl x509 -in "$src" -noout -fingerprint -sha256 | cut -d= -f2)
+  ok "trust anchor: $fp"
+}
+
+# =========================================================================================
 cmd_keyonly() {
   # No load_params: this step needs nothing from the params file, and requiring one would
   # stop it running on stage-01 and build-01, which have no services-params.env and are
@@ -539,8 +559,9 @@ case "${1:-}" in
   bridge)  cmd_bridge ;;
   pool)    cmd_pool ;;
   tmux)    cmd_tmux ;;
+  trustca) cmd_trustca ;;
   keyonly) cmd_keyonly ;;
   verify)  cmd_verify ;;
-  all)     cmd_apt; cmd_libvirt; cmd_datavg; cmd_pool; cmd_tmux; cmd_verify ;;
+  all)     cmd_apt; cmd_libvirt; cmd_datavg; cmd_pool; cmd_tmux; cmd_trustca; cmd_verify ;;
   *)       sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

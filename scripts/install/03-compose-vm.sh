@@ -139,8 +139,21 @@ TMUX_CONF=""
 # The enclave root CA, so a VM trusts the PKI from its first boot rather than needing a visit.
 # A machine that does not trust the root cannot reach an HTTPS mirror - and the failure looks
 # like a certificate problem on the SERVER, which is where people look first.
-ROOT_CA=""
-[ -r "$ENCLAVE_DIR/root-ca.crt" ] && ROOT_CA="$(sed 's/^/      /' "$ENCLAVE_DIR/root-ca.crt")"
+# EVERY anchor in trust-anchors/, not just this CA's root. A site running DoD PKI drops its
+# roots in there and composed VMs pick them up with no change here - which is the whole point
+# of that directory being a directory.
+ANCHOR_DIR="$ENCLAVE_DIR/trust-anchors"
+ROOT_CA=""; ANCHOR_COUNT=0
+if [ -d "$ANCHOR_DIR" ]; then
+  for _a in "$ANCHOR_DIR"/*.crt; do
+    [ -r "$_a" ] || continue
+    # Each anchor is its own list entry: "    - |" then the PEM indented under it.
+    ROOT_CA="${ROOT_CA}    - |
+$(sed 's/^/      /' "$_a")
+"
+    ANCHOR_COUNT=$((ANCHOR_COUNT + 1))
+  done
+fi
 # Delivered through cloud-init's `ca_certs` module, NOT through write_files plus a runcmd.
 # The module order on a composed VM, read off svc-mgmt-01 rather than remembered:
 #
@@ -157,11 +170,10 @@ ROOT_CA=""
 # An empty block is omitted entirely - `ca_certs: trusted: [ ]` with no cert is a parse error
 # waiting for the one build where root-ca.crt has not been staged yet.
 CA_CERTS_BLOCK=""
-if [ -n "$ROOT_CA" ]; then
+if [ "$ANCHOR_COUNT" -gt 0 ]; then
   CA_CERTS_BLOCK="ca_certs:
   trusted:
-    - |
-$ROOT_CA"
+${ROOT_CA%$'\n'}"
 fi
 # Find the keys under sudo, which is how this always runs. $HOME is /root there, so the
 # operator's own authorized_keys is invisible unless SUDO_USER is resolved back to a home

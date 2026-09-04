@@ -411,21 +411,15 @@ cmd_hosts() {
 
 cmd_trustca() {
   need_root trustca
-  local src="$SELF/../enclave/root-ca.crt"
-  [ -r "$src" ] || die "no root CA at $src"
-  # The .crt extension is REQUIRED - update-ca-certificates silently ignores anything else,
-  # so a .pem here produces a machine that looks configured and trusts nothing.
-  local dst=/usr/local/share/ca-certificates/enclave-root.crt
-  if [ -f "$dst" ] && diff -q "$src" "$dst" >/dev/null 2>&1; then
-    skip "enclave root CA already trusted"
-  else
-    install -m 0644 "$src" "$dst"
-    update-ca-certificates 2>&1 | sed 's/^/    /'
-    ok "installed $dst"
-  fi
-  local fp; fp=$(openssl x509 -in "$src" -noout -fingerprint -sha256 | cut -d= -f2)
-  ok "trust anchor: $fp"
+  # Delegates to ca.sh so there is ONE implementation of "what does this machine trust".
+  # This used to install a single hard-coded root-ca.crt, which quietly made the enclave CA
+  # the only PKI the build could ever use. A site running DoD PKI drops its roots into
+  # trust-anchors/ and needs no change here.
+  local ca="$SELF/../enclave/ca.sh"
+  [ -x "$ca" ] || die "no ca.sh at $ca"
+  "$ca" trust
 }
+
 
 # =========================================================================================
 cmd_keyonly() {

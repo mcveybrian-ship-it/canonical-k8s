@@ -13,10 +13,13 @@
 #       sudo ./ca.sh sign-server <csr>      sign a CSR from another machine
 #
 #     ON any machine needing a certificate:
-#       sudo ./ca.sh request [name] [san...]  generate a key HERE and a CSR to send
+#       sudo ./ca.sh request [--profile P] [name] [san...]
+#                                         generate a key HERE and a CSR to send.
+#                                         Profiles live in csr-profiles/ - use one matching
+#                                         the PKI that will sign it (default: internal).
 #
 #     ON any machine:
-#       sudo ./ca.sh trust <root.crt>     install the root into the trust store
+#       sudo ./ca.sh trust [file|dir]     install trust anchors (default: trust-anchors/)
 #       ./ca.sh show <file>               summarise a cert, without dumping it
 #       ./ca.sh inventory                 every cert here, and how long it has left
 #
@@ -505,6 +508,30 @@ cmd_issue() {
 # =========================================================================================
 cmd_request() {
   [ "$(id -u)" -eq 0 ] || die "run with sudo"
+
+  # --profile selects WHAT THE CSR LOOKS LIKE, not who signs it. A site issuing from DoD PKI
+  # needs a subject DN its registration authority accepts; that is data, not a script edit,
+  # because the alternative is a fork of this function per customer.
+  local profile=internal
+  case "${1:-}" in
+    --profile) profile="${2:?--profile needs a name}"; shift 2 ;;
+    --profile=*) profile="${1#--profile=}"; shift ;;
+  esac
+  local pf="$SELF/csr-profiles/$profile.env"
+  if [ -r "$pf" ]; then
+    # shellcheck disable=SC1090
+    . "$pf"
+    say "profile: $profile  ->  signed by: ${CSR_SIGNED_BY:-unspecified}"
+  else
+    local avail="" _p
+    for _p in "$SELF/csr-profiles"/*.env; do
+      [ -e "$_p" ] || continue
+      _p="$(basename "$_p")"; avail="$avail ${_p%.env}"
+    done
+    die "no profile at $pf
+      Available:${avail:- (none - csr-profiles/ is empty)}"
+  fi
+
   local name="${1:-$(hostname -s)}"; shift || true
   local d=/etc/ssl/enclave
   install -d -m 0755 "$d"
@@ -533,12 +560,13 @@ cmd_request() {
     esac
   done
 
-  openssl genrsa -out "$d/$name.key" "${CA_LEAF_KEY_BITS:-3072}" 2>/dev/null || die "key generation failed"
+  openssl genrsa -out "$d/$name.key" "${CSR_KEY_BITS:-${CA_LEAF_KEY_BITS:-3072}}" 2>/dev/null \
+    || die "key generation failed"
   chmod 0640 "$d/$name.key"; chgrp root "$d/$name.key"
   ok "key: $d/$name.key (never leaves this host)"
 
-  openssl req -new -key "$d/$name.key" -"${CA_DIGEST:-sha256}" \
-    -subj "/C=${CA_COUNTRY:-US}/O=${CA_ORG:-Enclave}/OU=${CA_OU:-Enclave PKI}/CN=$name.$DOMAIN" \
+  openssl req -new -key "$d/$name.key" -"${CSR_DIGEST:-${CA_DIGEST:-sha256}}" \
+    -subj "/C=${CSR_COUNTRY:-${CA_COUNTRY:-US}}/O=${CSR_ORG:-${CA_ORG:-Enclave}}/OU=${CSR_OU:-${CA_OU:-Enclave PKI}}/CN=$name.$DOMAIN" \
     -addext "subjectAltName=$sans" -out "$d/$name.csr" || die "CSR creation failed"
   chmod 0444 "$d/$name.csr"
   ok "csr: $d/$name.csr"
@@ -601,15 +629,47 @@ cmd_show() {
 }
 
 # =========================================================================================
+# Install trust anchors. With no argument this installs EVERY .crt in trust-anchors/, which
+# is how a site that uses its own PKI rather than this CA is supported: its roots and
+# intermediates sit in that directory beside - or instead of - enclave-root.crt, and every
+# machine gets the same set. Nothing downstream cares where a certificate came from.
+#
+# A single file or a different directory can still be passed explicitly.
 cmd_trust() {
   [ "$(id -u)" -eq 0 ] || die "run with sudo"
-  local f="${1:-}"; [ -r "$f" ] || die "usage: sudo $0 trust <root.crt>"
-  openssl x509 -in "$f" -noout >/dev/null 2>&1 || die "$f is not a certificate"
-  # .crt in /usr/local/share/ca-certificates is the Debian/Ubuntu convention; anything else
-  # is silently ignored by update-ca-certificates.
-  install -m 0644 "$f" /usr/local/share/ca-certificates/enclave-root.crt
-  update-ca-certificates 2>&1 | sed 's/^/  /'
-  ok "root CA trusted on $(hostname)"
+  local src="${1:-$SELF/trust-anchors}"
+  local dst=/usr/local/share/ca-certificates
+  local n=0 f base
+
+  if [ -f "$src" ]; then
+    set -- "$src"
+  elif [ -d "$src" ]; then
+    # Nothing matched is not an error worth a stack trace, but it IS worth saying, because
+    # a machine that trusts nothing fails later and somewhere else.
+    set --
+    for f in "$src"/*.crt; do [ -e "$f" ] && set -- "$@" "$f"; done
+    [ $# -gt 0 ] || die "no .crt files in $src
+      The extension matters: update-ca-certificates ignores anything that is not .crt,
+      which produces a machine that looks configured and trusts nothing."
+  else
+    die "usage: sudo $0 trust [<file.crt> | <directory>]   (default: $SELF/trust-anchors)"
+  fi
+
+  for f in "$@"; do
+    openssl x509 -in "$f" -noout >/dev/null 2>&1 || die "$f is not a PEM certificate"
+    base="$(basename "$f")"
+    install -m 0644 "$f" "$dst/$base"
+    # Print the fingerprint of every anchor installed. This is the value an operator is
+    # supposed to compare out of band before trusting anything, and it is the one fact a
+    # compromised channel could usefully lie about - so it is printed at the moment of
+    # installation rather than left for someone to go and look up.
+    say "installed $base"
+    say "    subject: $(openssl x509 -in "$f" -noout -subject | sed 's/.*CN *= *//; s/,.*//')"
+    say "    sha256:  $(openssl x509 -in "$f" -noout -fingerprint -sha256 | cut -d= -f2)"
+    n=$((n + 1))
+  done
+  update-ca-certificates 2>&1 | sed 's/^/    /'
+  ok "$n trust anchor(s) installed on $(hostname)"
 }
 
 case "${1:-}" in

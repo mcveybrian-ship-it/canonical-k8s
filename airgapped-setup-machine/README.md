@@ -6,7 +6,7 @@
 *how* things were built and why; they have gone stale more than once. If they disagree with
 this section, this section wins and the other one gets fixed.
 
-Last updated **2026-09-04 00:40**.
+Last updated **2026-09-04 01:30**.
 
 **STAGE-01's work is DONE. Everything that does not need hardware is finished.**
 

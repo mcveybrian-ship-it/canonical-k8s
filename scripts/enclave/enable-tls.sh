@@ -5,6 +5,8 @@
 #     MACHINE: the machine that runs the service.
 #
 #     sudo ./enable-tls.sh <name> <fullchain.crt> [--root <docroot>] [--proxy <url>]
+#     sudo ./enable-tls.sh --redirect-http     serve NOTHING on :80, 301 everything to https
+#     sudo ./enable-tls.sh --restore-http      put the :80 sites back
 #
 #     sudo ./enable-tls.sh svc-repo-01 /tmp/svc-repo-01.fullchain.crt --root /srv/repo/mirror
 #     sudo ./enable-tls.sh svc-mgmt-01 /tmp/svc-mgmt-01.fullchain.crt --proxy http://127.0.0.1:8484
@@ -17,7 +19,85 @@
 # =========================================================================================
 set -euo pipefail
 
+# Helpers first. They used to sit BELOW the argument loop, which calls die() - and below the
+# :80 mode dispatch added later, which calls all of them. A shell only knows a function after
+# it has read the definition, so `--redirect-http` would have died with "say: command not
+# found" and a bad argument would have done the same instead of printing the usage. Neither
+# bash -n nor shellcheck catches this: both are happy with a call to a name defined later.
+say()  { printf '  %s\n' "$*"; }
+ok()   { printf '  [ok] %s\n' "$*"; }
+warn() { printf '  [!]  %s\n' "$*"; }
+die()  { printf '\n  [x] %s\n\n' "$*" >&2; exit 1; }
+
+
 NAME=""; CHAIN=""; DOCROOT=""; PROXY=""
+REDIR_CONF=/etc/nginx/conf.d/00-http-redirect.conf
+DISABLED_DIR=/etc/nginx/sites-disabled-http
+
+# ---- :80 modes -----------------------------------------------------------------------
+# A redirect-only listener rather than no listener at all. It serves no content, so nothing
+# crosses the wire in the clear - but anything still pointed at http keeps working and says
+# so in the redirect log, instead of failing with connection-refused on a machine inside the
+# gap that then cannot fetch a package until someone walks to it. apt follows 301s.
+#
+# The existing :80 server blocks are MOVED, not deleted, and --restore-http puts them back.
+redirect_http() {
+  [ "$(id -u)" -eq 0 ] || die "run with sudo"
+  install -d -m 0755 "$DISABLED_DIR"
+  local moved=0 f
+  for f in /etc/nginx/sites-enabled/*; do
+    [ -e "$f" ] || continue
+    # Only sites that actually listen on 80. A site serving 443 only must stay put.
+    if grep -qE '^\s*listen\s+(\[::\]:)?80(\s|;)' "$(readlink -f "$f")" 2>/dev/null; then
+      mv "$f" "$DISABLED_DIR/$(basename "$f")"
+      say "moved aside: $(basename "$f")"
+      moved=$((moved + 1))
+    fi
+  done
+  [ "$moved" -gt 0 ] || say "no :80 sites were enabled"
+
+  cat > "$REDIR_CONF" <<'NGINX'
+# Written by enable-tls.sh --redirect-http. Serves no content: every request on :80 gets a
+# 301 to the same URL over https. Removing the listener entirely was the alternative; a
+# redirect was chosen so that a machine still pointed at http is carried rather than broken.
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+    access_log /var/log/nginx/http-redirect.access.log;
+    return 301 https://$host$request_uri;
+}
+NGINX
+  chmod 0644 "$REDIR_CONF"
+  ok "wrote $REDIR_CONF"
+  nginx -t || die "nginx config is invalid - NOT reloading. Undo with: $0 --restore-http"
+  systemctl reload nginx
+  local c
+  c=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://localhost/" || true)
+  [ "$c" = "301" ] && ok "http://localhost/ -> 301" || warn "expected 301 on :80, got '$c'"
+  c=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "https://localhost/" -k || true)
+  case "$c" in 2*|3*|4*) ok "https still serving (HTTP $c)" ;; *) warn "https returned '$c'" ;; esac
+  exit 0
+}
+
+restore_http() {
+  [ "$(id -u)" -eq 0 ] || die "run with sudo"
+  rm -f "$REDIR_CONF"
+  local f n=0
+  for f in "$DISABLED_DIR"/*; do
+    [ -e "$f" ] || continue
+    mv "$f" "/etc/nginx/sites-enabled/$(basename "$f")"; n=$((n + 1))
+  done
+  ok "restored $n site(s), removed the redirect"
+  nginx -t && systemctl reload nginx && ok "nginx reloaded"
+  exit 0
+}
+
+case "${1:-}" in
+  --redirect-http) redirect_http ;;
+  --restore-http)  restore_http ;;
+esac
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --root)  DOCROOT="$2"; shift 2 ;;
@@ -27,9 +107,6 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-say()  { printf '  %s\n' "$*"; }
-ok()   { printf '  [ok] %s\n' "$*"; }
-die()  { printf '\n  [x] %s\n\n' "$*" >&2; exit 1; }
 
 [ "$(id -u)" -eq 0 ] || die "run with sudo"
 [ -n "$NAME" ] && [ -r "$CHAIN" ] || die "usage: sudo $0 <name> <fullchain.crt> [--root DIR | --proxy URL]"

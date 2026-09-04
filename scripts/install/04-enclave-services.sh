@@ -104,6 +104,20 @@ ProtectControlGroups=yes
 ProtectClock=yes
 ProtectHostname=yes
 RestrictAddressFamilies=AF_INET AF_INET6
+
+# LOOPBACK ONLY. contracts-airgapped has no bind-address option - only --port - so it
+# listens on 0.0.0.0 and there is no way to tell it otherwise. nginx fronts it with TLS on
+# :443 and proxies to 127.0.0.1, so nothing off-box has any business reaching :8484
+# directly; leaving it open means a plaintext route to the same service, sitting beside the
+# encrypted one, for anyone who finds the port.
+#
+# systemd enforces this with a BPF filter on the socket rather than a firewall rule, so it
+# travels with the unit and cannot be left behind when someone flushes nftables. Verify
+# with `ss -ltn` from another machine, not from localhost - localhost is allowed and will
+# always answer.
+IPAddressDeny=any
+IPAddressAllow=localhost
+
 RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes

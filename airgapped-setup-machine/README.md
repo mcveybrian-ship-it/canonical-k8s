@@ -6,9 +6,14 @@
 *how* things were built and why; they have gone stale more than once. If they disagree with
 this section, this section wins and the other one gets fixed.
 
-Last updated **2026-09-04 01:30**.
+Last updated **2026-09-04 02:00**.
 
-**STAGE-01's work is DONE. Everything that does not need hardware is finished.**
+**STAGE-01's work is DONE, and the enclave is now AIR-GAPPED — 2026-09-04.**
+
+GS105E port 4 is unplugged and `stage-01`'s temporary foot in the enclave subnet is removed.
+`host-4`, `svc-mgmt-01` and `svc-repo-01` are unreachable from any machine with a route to the
+internet. `svc-repo-01` serves the 318 GB mirror to the other two and installs from its own
+tree. The isolation is physical, not configured.
 
 **host-4 does not need the SSD to make progress.** It has no default route, but it reaches
 `stage-01`'s nginx on its own subnet (`HTTP 200`), and `stage-01` has `ip_forward=0`, so that

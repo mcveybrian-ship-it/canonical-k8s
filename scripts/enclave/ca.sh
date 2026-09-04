@@ -443,8 +443,11 @@ cmd_request() {
   ok "csr: $d/$name.csr"
   say "sans: $sans"
   say ""
+  # Print the FULL path. A bare filename reads as "it is in the current directory", which it
+  # is not - it is in /etc/ssl/enclave - and the next command then fails with a usage error
+  # that says nothing about the real problem.
   say "  Send the CSR to svc-mgmt-01 and sign it:"
-  say "    sudo ./ca.sh sign-server $name.csr"
+  say "    sudo ./ca.sh sign-server $d/$name.csr"
   say "  then bring back $name.fullchain.crt and drop it in $d/"
 }
 

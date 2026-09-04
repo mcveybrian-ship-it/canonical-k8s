@@ -10,7 +10,10 @@
 #       sudo ./ca.sh init-issuing         create the issuing key and its CSR
 #       sudo ./ca.sh install-issuing <crt>  install the signed certificate
 #       sudo ./ca.sh issue <name> [san...]  issue a cert for a service ON THIS machine
-#       sudo ./ca.sh sign-server <csr>      sign a CSR from another machine
+#       sudo ./ca.sh sign-server <csr> [--san DNS:a,IP:b]
+#                                         sign a CSR from another machine. --san
+#                                         supplies SANs for an appliance CSR that
+#                                         has none; it REPLACES, it does not merge.
 #       sudo ./ca.sh gen-crl                generate the CRL (if CA_CRL_URL is set)
 #       sudo ./ca.sh revoke <cert>          revoke, then regenerate the CRL
 #
@@ -687,7 +690,24 @@ cmd_request() {
 cmd_sign_server() {
   [ "$(id -u)" -eq 0 ] || die "run with sudo"
   require_issuing_host
-  local csr="${1:-}"; [ -r "$csr" ] || die "usage: sudo $0 sign-server <name.csr>"
+  # --san exists for CSRs THIS PROJECT DID NOT GENERATE. Firewalls, load balancers and
+  # appliance management UIs generate their own CSR, and a great many of them still emit one
+  # with a CN and no subjectAltName at all. Modern clients ignore CN entirely, so such a
+  # certificate is signed successfully and then rejected by every browser that sees it.
+  # Supplying the SANs at signing time is the only fix that does not involve begging the
+  # appliance vendor for a better CSR form.
+  local csr="" sans_override=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --san)   sans_override="$2"; shift 2 ;;
+      --san=*) sans_override="${1#--san=}"; shift ;;
+      *)       csr="$1"; shift ;;
+    esac
+  done
+  [ -r "$csr" ] || die "usage: sudo $0 sign-server <name.csr> [--san DNS:a,DNS:b,IP:1.2.3.4]
+      --san supplies subjectAltName for a CSR that has none - common with firewall and
+      appliance UIs, which frequently emit a CN and nothing else.
+      It REPLACES rather than merges: list every name the certificate needs."
   local d="$CA_ISSUING_DIR"
   [ -r "$d/certs/issuing.crt" ] || die "issuing CA is not signed yet"
 
@@ -724,7 +744,16 @@ cmd_sign_server() {
     echo "authorityKeyIdentifier = keyid,issuer"
     [ -n "${CA_CRL_URL:-}" ]  && echo "crlDistributionPoints  = URI:$CA_CRL_URL"
     [ -n "${CA_OCSP_URL:-}" ] && echo "authorityInfoAccess    = OCSP;URI:$CA_OCSP_URL"
+    # Only when asked. Verified against a scratch CA, all three cases:
+    #   CSR without SAN + override  -> the override lands
+    #   CSR with SAN, no override   -> the CSR's own SANs are preserved
+    #   CSR with SAN + override     -> THE OVERRIDE WINS, the CSR's are discarded
+    # The last is why this is conditional: emitting it unconditionally would silently throw
+    # away the SANs of every CSR this project generates. It also means --san REPLACES rather
+    # than merges, so an override must list every name the certificate needs.
+    [ -n "$sans_override" ] && echo "subjectAltName         = $sans_override"
   } > "$extf"
+  [ -n "$sans_override" ] && say "san override: $sans_override"
   [ -n "${CA_CRL_URL:-}" ] && say "crl dp: $CA_CRL_URL"
 
   openssl ca -config "$d/openssl.cnf" -extfile "$extf" -extensions v3_server \
@@ -735,7 +764,15 @@ cmd_sign_server() {
   chmod 0444 "$d/certs/$name.fullchain.crt"
 
   local n; n=$(openssl x509 -in "$d/certs/$name.crt" -noout -ext subjectAltName 2>/dev/null | grep -c ':' || true)
-  [ "$n" -ge 1 ] || die "the signed certificate has NO subjectAltName - check copy_extensions"
+  [ "$n" -ge 1 ] || die "the signed certificate has NO subjectAltName.
+      Modern clients ignore CN entirely, so this certificate would be rejected by every
+      browser and by curl, with an error naming the hostname rather than the missing
+      extension.
+      If this CSR came from a firewall or appliance UI, it very likely contains no SAN at
+      all. Re-sign supplying them:
+        sudo $0 sign-server $csr --san DNS:fw-01.${DOMAIN:-enclave.internal},IP:10.2.20.1
+      The certificate just written has been recorded in the CA database - revoke it or
+      simply let it go unused; the serial is spent either way."
   ok "signed: $d/certs/$name.fullchain.crt (send THIS back, not the bare cert)"
   say ""
   cmd_show "$d/certs/$name.crt"

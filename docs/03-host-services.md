@@ -552,6 +552,39 @@ copy costs ~600 MB each (measured: 607 MiB), 6 GB across the fleet against 1.9 T
 `ens3` on others. Guessing wrong yields a VM with no address *and* no default route —
 unreachable, recoverable only from a console.
 
+## 5d2. A shared tmux config, on every machine
+
+`host-4` is where most hands-on time goes, and the long jobs here — a 318 GB restore, an
+hour-long rsync — all want a session that survives a dropped connection. Every machine gets the
+same `/etc/tmux.conf` rather than each being configured by hand:
+
+```bash
+### MACHINE: each host ###
+sudo ./03-host-services.sh tmux      # also included in `all`
+```
+
+VMs receive it through cloud-init, from the same
+[`scripts/enclave/tmux.conf`](../scripts/enclave/tmux.conf).
+
+`/etc/tmux.conf` rather than `~/.tmux.conf`, so it applies to every account — and a user can
+still override any of it in their own file without editing one the scripts manage.
+
+**Two things in it that are corrections, not preferences:**
+
+**`ncurses-term` is a hard dependency.** `default-terminal "tmux-256color"` needs that terminfo
+entry, and **without it tmux refuses to start at all** — "missing or unsuitable terminal" —
+rather than falling back. The Minimal cloud image does not ship it, so both install paths pull
+it explicitly.
+
+**No clipboard tool, `set -g set-clipboard on` instead.** A `copy-pipe-and-cancel 'wl-copy'`
+binding — Wayland's clipboard — cannot work on a headless server, and because a second
+`bind ... y` silently overrides the first, it takes working copy down with it. OSC 52 sends the
+selection to the terminal, so it lands in the operator's own clipboard over SSH.
+
+> **With `mouse on`, hold SHIFT to select for your local clipboard.** Otherwise dragging selects
+> into tmux's buffer. Worth knowing before it surprises you halfway through pasting a command
+> block.
+
 ## 5e. Key-only SSH, and the `sshd` rule that hid it
 
 Run **last**, after everything else works and after every key that needs access is installed:

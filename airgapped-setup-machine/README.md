@@ -685,6 +685,32 @@ harmless here. **That is luck, not design.** An override for the deployed series
 in-gap clients to the internet while the file looked correct in every other respect, so the
 script now asserts that no override or series block for `TARGET_SERIES` bypasses the enclave.
 
+**5. THE aptURL IS THE PARENT OF `/ubuntu`, and this one cost the most.** The pro client
+builds `<aptURL>/ubuntu/pool/` itself. An `aptURL` ending in `/ubuntu` therefore produces
+`/ubuntu/ubuntu/pool/` and a 404:
+
+```
+E: Failed to fetch
+   http://svc-repo-01.enclave.internal/esm.ubuntu.com/infra/ubuntu/ubuntu/pool/  404
+```
+
+Correct: `http://svc-repo-01.enclave.internal/esm.ubuntu.com/infra`
+Wrong:   `http://svc-repo-01.enclave.internal/esm.ubuntu.com/infra/ubuntu`
+
+**Derive it from what the client requests, not from the mirror's directory layout.** The
+packages genuinely do live under `.../infra/ubuntu/pool/` — which is exactly why the wrong
+answer looks right.
+
+**What makes this worth a section is when it surfaced.** The file generated cleanly, passed a
+four-way URL check, passed the override/series check, was carried across an air gap, installed,
+and `pro attach` succeeded. It failed only at `pro enable`, the last step, on a machine that
+cannot be reached from outside. Every check confirmed the file said what was *meant*; none
+confirmed a client could *fetch* it.
+
+The generator now requests `<aptURL>/ubuntu/pool/` for every rewritten URL, exactly as the
+client will, and reports which resolve — so a depth error is caught on stage-01 rather than
+three machines and one air gap later.
+
 **Regenerate whenever an address or the domain changes.** It was regenerated on 2026-09-04
 after the move from `enclave.local` to `enclave.internal` — the old copy named a host that no
 longer resolves, and nothing would have reported it until a client tried to `pro attach`.

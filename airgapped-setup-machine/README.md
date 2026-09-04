@@ -6,7 +6,7 @@
 *how* things were built and why; they have gone stale more than once. If they disagree with
 this section, this section wins and the other one gets fixed.
 
-Last updated **2026-09-03 23:15**.
+Last updated **2026-09-04 00:10**.
 
 **STAGE-01's work is DONE. Everything that does not need hardware is finished.**
 
@@ -30,7 +30,7 @@ real client over the network. See `docs/03-host-services.md`.
 | 10 | Artifact corrected + republished | ✅ **DONE** — 3 factual errors fixed, dated four-host callout added |
 | 11 | Private material backed up off-box | ✅ **DONE** — `private-sync.sh backup` to `build-01`, checksum-verified |
 | 13 | **Write the SSD** | ✅ **DONE 2026-09-02** — 318 G mirror (91,073 files, byte-identical to source) + 4.3 G extras (29 files), `MANIFEST.sha256` verified. 931.5 G WD SN550, ext4 `LABEL=enclave-xfer`. Procedure §6.1a, ssh key §6.1b |
-| 14 | **`restore-mirror.sh` in the gap** | ✅ **DONE 2026-09-03.** All 9 suites `Release 200 / pool 200`. **Proven end to end:** host-4 downloaded tcpdump from `svc-repo-01`, GPG-verified, SHA-256 matching the advertised value. The enclave now feeds itself |
+| 14 | **`restore-mirror.sh` in the gap** | ✅ **DONE 2026-09-03.** All 9 suites `Release 200 / pool 200`. **All 3 verification levels pass.** host-4 downloaded tcpdump GPG-verified with a matching SHA-256; and `usg 24.04.8` + `openssl-fips-module-3 3.0.13-0ubuntu3.15+Fips1` resolved against the **carried Pro keyrings**. The enclave feeds itself |
 | 12 | **Q23 — which `k8s` version** | ✅ **DECIDED** — **v1.36.4, snap revision 5526**. LTS line; the build is `grade: stable`; and side-loading pins the revision, so the channel stops mattering once it crosses |
 | — | `ceph-csi` against deb-deployed Ceph | ⚠️ **UNTESTED** — load-bearing on the storage design. A lab test, not a paper question |
 

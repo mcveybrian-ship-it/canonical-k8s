@@ -465,10 +465,34 @@ A client inside the enclave resolved a package through nginx, apt verified the `
 signature against the archive keyring, and the delivered bytes match the hash the repository
 advertises. Until that happened, all that was known was that files were on a disk.
 
-**Still owed at this point:** the ESM/FIPS/USG suites are served and return `200`, but have not
-been proven through a GPG-verified `apt` resolution — they are signed by the carried Ubuntu Pro
-keyrings, not the archive keyring, so the test above does not cover them. That needs a sources
-list using `signed-by=` against `/keys/`, downloading `usg` and `openssl-fips-module-3`.
+**All three verification levels now pass**, and level 3 is automated in `restore-mirror.sh`
+rather than left as a paragraph telling the operator to do it by hand:
+
+```
+== proving a GPG-verified apt resolution (ESM/FIPS/USG) ==
+  fetched 12 index file(s), signatures verified
+  usg                          24.04.8                    - dpkg-deb OK
+  openssl-fips-module-3        3.0.13-0ubuntu3.15+Fips1   - dpkg-deb OK
+```
+
+**Those two packages are the point of the Pro subscription.** `openssl-fips-module-3` is the
+FIPS 140-3 module the whole IL5 crypto story rests on, and `usg` is what runs the STIG
+hardening at step 05. Both were fetched through nginx from the carried tree, signature-verified
+against the **carried Pro keyrings** — not the archive keyring — and confirmed readable by
+`dpkg-deb`, on a machine with no route to Canonical.
+
+The suite-to-keyring mapping was established with `gpgv` against the real `InRelease` files
+rather than inferred from filenames:
+
+| Tree | Suite | Keyring |
+|---|---|---|
+| `infra` | `noble-infra-security` / `-updates` | `ubuntu-pro-esm-infra.gpg` |
+| `apps` | `noble-apps-security` / `-updates` | `ubuntu-pro-esm-apps.gpg` |
+| `fips-updates` | `noble-updates` | `ubuntu-pro-fips.gpg` |
+| `usg` | `noble` | `ubuntu-pro-cis.gpg` |
+
+**Still owed:** `airgapped-contracts.yaml` carries `svc-repo-01.enclave.local` from before the
+domain decision and must be regenerated on `stage-01` before any client runs `pro attach`.
 
 ### 6.2 Rebuilding the bundle — what step 1 actually does
 

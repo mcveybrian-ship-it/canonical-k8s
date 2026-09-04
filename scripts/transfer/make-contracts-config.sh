@@ -84,16 +84,25 @@ say "token  : loaded from $TOKEN_FILE (${#TOKEN} chars, not shown)"
 # match the archive they serve - that is the naming trap recorded in README §0.3:
 #   * the token and entitlement for USG print under "cis"; "usg" is an alias
 #   * FIPS updates live in the "fips-updates" archive, not under "fips"
+#
+# AND NOTE THE DEPTH. The aptURL is the parent of /ubuntu, NOT the directory the packages sit
+# in. The pro client builds "<aptURL>/ubuntu/pool/" itself, so an aptURL ending in /ubuntu
+# produces /ubuntu/ubuntu/pool/ and a 404 at enable time - long after the file has been
+# generated, verified, carried in and installed. Found 2026-09-04 by `pro enable esm-infra`:
+#
+#     E: Failed to fetch http://svc-repo-01.enclave.internal/esm.ubuntu.com/infra/ubuntu/ubuntu/pool/  404
+#
+# Derive it from what the client requests, not from the mirror's directory layout.
 BASE="http://${REPO_ADDRESS}"
 say "target : $BASE"
 
 INPUT=$(cat <<EOF
 {
   "$TOKEN": {
-    "esm-infra": { "directives": { "aptURL": "$BASE/esm.ubuntu.com/infra/ubuntu" } },
-    "esm-apps":  { "directives": { "aptURL": "$BASE/esm.ubuntu.com/apps/ubuntu" } },
-    "fips-updates": { "directives": { "aptURL": "$BASE/esm.ubuntu.com/fips-updates/ubuntu" } },
-    "cis":       { "directives": { "aptURL": "$BASE/esm.ubuntu.com/usg/ubuntu" } }
+    "esm-infra": { "directives": { "aptURL": "$BASE/esm.ubuntu.com/infra" } },
+    "esm-apps":  { "directives": { "aptURL": "$BASE/esm.ubuntu.com/apps" } },
+    "fips-updates": { "directives": { "aptURL": "$BASE/esm.ubuntu.com/fips-updates" } },
+    "cis":       { "directives": { "aptURL": "$BASE/esm.ubuntu.com/usg" } }
   }
 }
 EOF
@@ -130,10 +139,10 @@ printf '%s\n' "$INPUT" | pro-airgapped --output "$TMP" \
 # their Canonical URLs: they are not mirrored and are not available in the gap. An earlier
 # version failed on "any Canonical URL remains", which rejected a perfectly good file.
 _missing=""
-for _u in "$BASE/esm.ubuntu.com/infra/ubuntu" \
-          "$BASE/esm.ubuntu.com/apps/ubuntu" \
-          "$BASE/esm.ubuntu.com/fips-updates/ubuntu" \
-          "$BASE/esm.ubuntu.com/usg/ubuntu"; do
+for _u in "$BASE/esm.ubuntu.com/infra" \
+          "$BASE/esm.ubuntu.com/apps" \
+          "$BASE/esm.ubuntu.com/fips-updates" \
+          "$BASE/esm.ubuntu.com/usg"; do
   grep -qF "aptURL: $_u" "$TMP" || _missing="$_missing
          $_u"
 done
@@ -172,6 +181,33 @@ for t, w, u in bad: print(f"       {t} {w} -> {u}", file=sys.stderr)
 sys.exit(1 if bad else 0)
 PYEOF
 ok "no override or series block for ${TARGET_SERIES:-noble} bypasses the enclave"
+
+# PROVE THE URLS RESOLVE, here, now. Every check above confirms the file says what we meant;
+# none of them confirm the client can fetch it. The depth error was invisible until
+# `pro enable` ran on a machine inside the gap - the file generated cleanly, verified
+# cleanly, was carried in and installed, and failed at the last possible moment.
+#
+# The client requests "<aptURL>/ubuntu/pool/". Ask for exactly that.
+if command -v curl >/dev/null; then
+  _probe_fail=0
+  for _u in $(grep -oE "aptURL: ${BASE}[^ ]*" "$TMP" | sed 's/aptURL: //' | sort -u); do
+    _code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$_u/ubuntu/pool/" || true)
+    if [ "${_code:-000}" = "200" ]; then
+      say "  $(printf '%-58s' "$_u/ubuntu/pool/") $_code"
+    else
+      say "  $(printf '%-58s' "$_u/ubuntu/pool/") ${_code:-no response}  <-- WRONG"
+      _probe_fail=1
+    fi
+  done
+  if [ "$_probe_fail" -eq 0 ]; then
+    ok "every aptURL resolves as the pro client will request it"
+  else
+    warn "an aptURL did not resolve. If the repo is not serving yet this is expected;"
+    warn "if it IS serving, the URL depth is wrong and 'pro enable' will 404."
+  fi
+else
+  say "  curl not present - skipping the resolve check"
+fi
 
 # Report - not fail on - the entitlements that stay at Canonical, because knowing which
 # capabilities are NOT available in the gap is worth having in front of you.

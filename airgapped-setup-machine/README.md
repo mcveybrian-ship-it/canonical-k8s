@@ -6,13 +6,24 @@
 *how* things were built and why; they have gone stale more than once. If they disagree with
 this section, this section wins and the other one gets fixed.
 
-Last updated **2026-09-04 16:00**.
+Last updated **2026-09-04 21:15**.
 
-**STAGE-01's work is DONE, and the enclave is now AIR-GAPPED — 2026-09-04.**
+**STAGE-01's build work is DONE. The enclave is currently in STATE A (BUILD), not gapped.**
 
-GS105E port 4 is unplugged and `stage-01`'s temporary foot in the enclave subnet is removed.
-`host-4`, `svc-mgmt-01` and `svc-repo-01` are unreachable from any machine with a route to the
-internet. `svc-repo-01` serves the 318 GB mirror to the other two and installs from its own
+⚠️ **Corrected 2026-09-04 21:15.** This section previously claimed the enclave was air-gapped
+with port 4 unplugged and `stage-01`'s enclave address removed. That was true at the cutover
+and is **not true now** — `gap-state.sh status` reports State A, `stage-01` holds
+`10.2.20.160` alongside its internet-facing `10.0.20.160`, and `host-4` is reachable from it.
+The gap was reopened for the PKI and TLS work below, which needed `push-repo-to-host.sh` to
+every enclave machine.
+
+`ip_forward = 0`, so `stage-01` is multi-homed rather than routing — but multi-homed to both
+the internet and the enclave is **not** an air gap, and the distinction is exactly what an
+assessor will press on. **Close it with `gap-state.sh close` and unplug port 4 when the
+current work stops.** Verify with `gap-state.sh status`, never by memory of the last cutover.
+
+When closed: `host-4`, `svc-mgmt-01`, `svc-repo-01` and `svc-harbor-01` are unreachable from
+any machine with a route to the internet. `svc-repo-01` serves the 318 GB mirror to the other two and installs from its own
 tree. The isolation is physical, not configured.
 
 **host-4 does not need the SSD to make progress.** It has no default route, but it reaches
@@ -38,6 +49,41 @@ real client over the network. See `docs/03-host-services.md`.
 | 14 | **`restore-mirror.sh` in the gap** | ✅ **DONE 2026-09-03.** All 9 suites `Release 200 / pool 200`. **All 3 verification levels pass.** host-4 downloaded tcpdump GPG-verified with a matching SHA-256; and `usg 24.04.8` + `openssl-fips-module-3 3.0.13-0ubuntu3.15+Fips1` resolved against the **carried Pro keyrings**. The enclave feeds itself |
 | 12 | **Q23 — which `k8s` version** | ✅ **DECIDED** — **v1.36.4, snap revision 5526**. LTS line; the build is `grade: stable`; and side-loading pins the revision, so the channel stops mattering once it crosses |
 | — | `ceph-csi` against deb-deployed Ceph | ⚠️ **UNTESTED** — load-bearing on the storage design. A lab test, not a paper question |
+
+**2026-09-04 evening — PKI, TLS and time. All in the gap, all verified on hardware.**
+
+| # | What | State |
+|---|---|---|
+| 15 | Internal CA — two tier | ✅ **DONE** — root on `stage-01` (offline-*intended*), issuing CA on `svc-mgmt-01`. Only a CSR crosses. runbook §2.9 |
+| 16 | HTTPS across the enclave | ✅ **DONE** — mirror and contracts server on TLS; **zero** plaintext refs on any machine; `pro refresh` over https. §2.9a |
+| 17 | Plaintext closed | ✅ **DONE** — `:80` → 301 redirect-only on both service VMs; `:8484` loopback-only via systemd `IPAddressDeny`. Verified from off-box |
+| 18 | CA-before-apt, both build paths | ✅ **DONE** — composer moved to cloud-init `ca_certs`; bare metal gained `hosts` + `trustca` before `apt`. **Both were broken** |
+| 19 | `svc-harbor-01` composed | ✅ **DONE** — built entirely over HTTPS, cloud-init ready in 52.69 s, 16 packages, zero plaintext. This was the gate on #17 |
+| 20 | Enclave time | ✅ **DONE** — `host-4` is the source (stratum 10, `local`); all VMs `^* host-4`. Nothing was syncing before. §2.10 |
+| 21 | Portability — two PKIs | ✅ **DONE** — `trust-anchors/` is a directory; `csr-profiles/` for an RA's DN policy. Verified on host-4. §2.9 |
+| 22 | Revocation + name constraints | ✅ **BUILT, DORMANT** — `CA_CRL_URL`, `CA_CRL_DAYS`, `CA_OCSP_URL`, `CA_NAME_CONSTRAINTS`; `gen-crl`, `revoke`. **Nothing switched on** — none can be retrofitted, so they wait for the re-issuance event |
+| 23 | Kubernetes PKI boundary | ✅ **DECIDED** — k8s self-signs; the enclave PKI does not chain in. `CA_ISSUING_PATHLEN` stays 0. §2.9c |
+| 24 | Shared wildcard | ✅ **DESIGNED, NOT ISSUED** — `*.enclave.internal` + `*.apps.enclave.internal` + 7 IPs. Deliberately held for the re-issuance event |
+| 25 | `ca.sh inventory` / `backup-root` | ✅ **BUILT** — ⚠️ **`backup-root` HAS NOT BEEN RUN.** The root key is one copy on one Hyper-V VM |
+
+**Blocked or waiting — nothing here can be finished today:**
+
+| What | Blocked on |
+|---|---|
+| **Run `backup-root`** | Nothing. **This is the highest-value 10 minutes available.** §2.9b |
+| **Close the gap** | Nothing. `gap-state.sh close` + unplug port 4 when work stops |
+| The single re-issuance event | The FIPS YubiKey arriving. Folds together: hardware root, name constraints, CRL, and issuing the wildcard. §2.9b |
+| AO thread — 5 questions | Sending it. Three decide hardware purchases |
+| MAAS on `svc-mgmt-01` | Boot images — Track B |
+| Harbor on `svc-harbor-01` | Images — Track B. The VM exists and has nothing to run |
+| Landscape, Enterprise Store | Never mirrored — Track B |
+| `host-1..3` | Hardware |
+| #5 leaf lifetime · #8 containerd→Harbor trust · #9 CP/CPS | Decisions and assembly; #8 needs Harbor to exist |
+
+**TRACK B IS THE CRITICAL PATH.** Landscape, `snap-store-proxy`, Harbor + Trivy images, the
+Trivy vulnerability DB and MAAS boot images were never mirrored, and they need a trip outside
+the gap. Q6 — the container-image bundle size — still gates Harbor's disk sizing and the BOM.
+
 
 **What is staged, in `/srv/bundle-staging` — 28 items, 4.3 GB:**
 

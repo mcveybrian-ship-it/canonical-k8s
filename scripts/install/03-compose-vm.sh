@@ -133,6 +133,9 @@ ok "disk    : $DISK (independent copy, sparse, grown to ${DISK_GB}G)"
 # The hosts block comes from apply-addresses.sh so there is exactly one renderer. A VM that
 # writes its own copy is a second source of truth waiting to disagree.
 HOSTS_BLOCK="$("$ENCLAVE_DIR/apply-addresses.sh" render | sed 's/^/      /')"
+# Shared operator tmux config, same file the bare-metal hosts get.
+TMUX_CONF=""
+[ -r "$ENCLAVE_DIR/tmux.conf" ] && TMUX_CONF="$(sed 's/^/      /' "$ENCLAVE_DIR/tmux.conf")"
 # Find the keys under sudo, which is how this always runs. $HOME is /root there, so the
 # operator's own authorized_keys is invisible unless SUDO_USER is resolved back to a home
 # directory - and the failure looks like "you have no keys" rather than "I looked in the
@@ -217,6 +220,10 @@ write_files:
       Suites: $VM_MIRROR_SUITES
       Components: $VM_MIRROR_COMPONENTS
       Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+  - path: /etc/tmux.conf
+    permissions: '0644'
+    content: |
+$TMUX_CONF
   - path: /etc/hosts
     permissions: '0644'
     content: |

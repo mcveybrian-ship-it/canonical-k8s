@@ -13,6 +13,7 @@
 #     ./03-host-services.sh datavg     create LVs on vg-data and mount them
 #     ./03-host-services.sh bridge     replace the NIC with a bridge   <-- can cut you off
 #     ./03-host-services.sh pool       define the libvirt storage pool
+#     ./03-host-services.sh tmux       tmux + the shared /etc/tmux.conf
 #     ./03-host-services.sh keyonly    disable password SSH  <-- do this LAST
 #     ./03-host-services.sh verify     prove all of the above, change nothing
 #     ./03-host-services.sh all        apt, libvirt, datavg, pool, verify (NOT bridge)
@@ -435,6 +436,36 @@ CONF
 }
 
 # =========================================================================================
+cmd_tmux() {
+  need_root tmux; load_params
+  local pkgs="tmux ncurses-term"
+  local missing=""
+  for _p in $pkgs; do dpkg -s "$_p" >/dev/null 2>&1 || missing="$missing $_p"; done
+  if [ -n "$missing" ]; then
+    say "installing:$missing"
+    # ncurses-term is NOT optional. It provides the tmux-256color terminfo entry, and without
+    # it tmux refuses to start entirely - "missing or unsuitable terminal" - rather than
+    # falling back. The Minimal cloud image does not ship it.
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $missing \
+      || die "could not install$missing - is apt pointed at a working mirror?"
+  else
+    skip "tmux and ncurses-term already installed"
+  fi
+
+  local src="$SELF/../enclave/tmux.conf"
+  [ -r "$src" ] || die "no tmux.conf at $src"
+  if [ -f /etc/tmux.conf ] && diff -q "$src" /etc/tmux.conf >/dev/null 2>&1; then
+    skip "/etc/tmux.conf already current"
+  else
+    install -m 0644 "$src" /etc/tmux.conf
+    ok "installed /etc/tmux.conf"
+  fi
+  infocmp tmux-256color >/dev/null 2>&1 \
+    && ok "tmux-256color terminfo present" \
+    || warn "tmux-256color terminfo MISSING - tmux will not start"
+}
+
+# =========================================================================================
 cmd_verify() {
   load_params
   local fail=0
@@ -507,8 +538,9 @@ case "${1:-}" in
   datavg)  cmd_datavg ;;
   bridge)  cmd_bridge ;;
   pool)    cmd_pool ;;
+  tmux)    cmd_tmux ;;
   keyonly) cmd_keyonly ;;
   verify)  cmd_verify ;;
-  all)     cmd_apt; cmd_libvirt; cmd_datavg; cmd_pool; cmd_verify ;;
+  all)     cmd_apt; cmd_libvirt; cmd_datavg; cmd_pool; cmd_tmux; cmd_verify ;;
   *)       sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

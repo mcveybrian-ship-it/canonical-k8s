@@ -79,6 +79,17 @@ ExecStart=/usr/bin/contracts-airgapped --input $CONTRACTS_CONF --port $CONTRACTS
 Restart=on-failure
 RestartSec=5
 
+# contracts-airgapped GENERATES AND STORES A ROOT SIGNING KEY under \$HOME, in config.RootKey().
+# Undocumented, and the failure is a Go panic rather than a message:
+#     panic: mkdir /home/contracts: permission denied
+# A --no-create-home system account has nowhere to put it, and ProtectHome=yes would block
+# /home regardless. StateDirectory gives it /var/lib/contracts-airgapped at 0700 owned by the
+# service user - created by systemd, removed with the unit, and exempt from ProtectHome.
+StateDirectory=contracts-airgapped
+StateDirectoryMode=0700
+Environment=HOME=/var/lib/contracts-airgapped
+WorkingDirectory=/var/lib/contracts-airgapped
+
 # This process reads a file mapping contract tokens to entitlements and listens on the
 # network. It needs to read one file and open one socket; everything else is denied.
 NoNewPrivileges=yes
@@ -138,10 +149,15 @@ cmd_verify() {
 
   # Answering is not the same as answering correctly, but a non-empty HTTP response at least
   # proves the process is serving rather than merely running.
+  # NOT `|| echo 000`: curl PRINTS 000 on failure AND exits non-zero, so the fallback
+  # concatenates into "000000" - which is not equal to "000", so the check passes on a
+  # connection that never happened. Exactly the trap `grep -c || echo 0` set yesterday.
   local code
-  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://localhost:$CONTRACTS_PORT/" || echo 000)
-  [ "$code" != "000" ] && ok "responds on :$CONTRACTS_PORT (HTTP $code)" \
-                       || { warn "no HTTP response on :$CONTRACTS_PORT"; fail=1; }
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://localhost:$CONTRACTS_PORT/" || true)
+  case "${code:-000}" in
+    000|"") warn "no HTTP response on :$CONTRACTS_PORT"; fail=1 ;;
+    *)      ok "responds on :$CONTRACTS_PORT (HTTP $code)" ;;
+  esac
 
   echo
   [ "$fail" -eq 0 ] && ok "contracts server ready" || warn "INCOMPLETE - see above"

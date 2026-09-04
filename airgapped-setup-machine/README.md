@@ -76,7 +76,8 @@ real client over the network. See `docs/03-host-services.md`.
 | AO thread — 5 questions | Sending it. Three decide hardware purchases |
 | MAAS on `svc-mgmt-01` | Boot images — Track B |
 | Harbor on `svc-harbor-01` | Images — Track B. The VM exists and has nothing to run |
-| Landscape, Enterprise Store | Never mirrored — Track B |
+| Landscape | ✅ **DONE 2026-09-04** — 97 debs, 293 M, verified. Track B item 1 |
+| ~~Enterprise Store~~ | ❌ **DROPPED 2026-09-04** — runbook §4.6. 3 snaps, 7 VMs, `k8s` pinned; served as files from `svc-repo-01` instead. **Deciding this found that the snaps were never inside the gap at all** — fixed in the vhost, the TLS block and `restore-mirror.sh` |
 | `host-1..3` | Hardware |
 | #5 leaf lifetime · #8 containerd→Harbor trust · #9 CP/CPS | Decisions and assembly; #8 needs Harbor to exist |
 

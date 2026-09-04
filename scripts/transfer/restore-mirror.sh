@@ -232,8 +232,8 @@ EOF
   note "self-hosted: file://$REPO_ROOT/mirror/, signatures verified"
 fi
 
-head2 "staging keys and debs for HTTP"
-run install -d -m 0755 "$REPO_ROOT/keys" "$REPO_ROOT/debs"
+head2 "staging keys, debs and snaps for HTTP"
+run install -d -m 0755 "$REPO_ROOT/keys" "$REPO_ROOT/debs" "$REPO_ROOT/snaps"
 if compgen -G "$SRC/bundle/keys/*.gpg" >/dev/null; then
   run cp -a "$SRC"/bundle/keys/*.gpg "$REPO_ROOT/keys/"
   note "keys   : $(ls -1 "$SRC"/bundle/keys/*.gpg 2>/dev/null | wc -l) served at /keys/"
@@ -241,6 +241,34 @@ fi
 if compgen -G "$SRC/bundle/debs/*.deb" >/dev/null; then
   run cp -a "$SRC"/bundle/debs/*.deb "$REPO_ROOT/debs/"
   note "debs   : $(ls -1 "$SRC"/bundle/debs/*.deb 2>/dev/null | wc -l) served at /debs/"
+fi
+
+# SNAPS. These were carried on the transfer media from the first trip and then left there:
+# nothing placed them into the served tree, so the k8s snap the entire cluster depends on was
+# reachable only from a disconnected SSD. Found 2026-09-04 while deciding not to deploy the
+# Enterprise Store - the store would have hidden this rather than fixed it.
+#
+# A .snap without its .assert is useless: `snap install` refuses an unasserted snap, and the
+# error names the snap rather than the missing assertion. So the pairing is CHECKED here,
+# where the media is still attached, rather than discovered on a VM inside the gap.
+if compgen -G "$SRC/bundle/snaps/*.snap" >/dev/null; then
+  run cp -a "$SRC"/bundle/snaps/*.snap "$REPO_ROOT/snaps/"
+  compgen -G "$SRC/bundle/snaps/*.assert" >/dev/null \
+    && run cp -a "$SRC"/bundle/snaps/*.assert "$REPO_ROOT/snaps/"
+  _sn=0; _miss=""
+  for _s in "$REPO_ROOT"/snaps/*.snap; do
+    [ -e "$_s" ] || continue
+    _sn=$((_sn + 1))
+    [ -e "${_s%.snap}.assert" ] || _miss="$_miss $(basename "$_s")"
+  done
+  note "snaps  : $_sn served at /snaps/"
+  if [ -n "$_miss" ]; then
+    warn "these snaps have NO matching .assert and cannot be installed:$_miss"
+  else
+    note "snaps  : every .snap has its .assert"
+  fi
+else
+  note "snaps  : none in the bundle"
 fi
 
 head2 "serving the tree"

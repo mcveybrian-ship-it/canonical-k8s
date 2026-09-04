@@ -233,6 +233,11 @@ say "nginx $NGINX_VER - http2 via $( [ -n "$H2_LISTEN" ] && echo 'listen directi
     echo "    location ^~ /keys/ { alias ${DOCROOT%/mirror}/keys/; autoindex on; }"
     echo "    location ^~ /debs/ { alias ${DOCROOT%/mirror}/debs/; autoindex on;"
     echo "                         default_type application/vnd.debian.binary-package; }"
+    # Snaps over TLS too. Omitting this from the 443 block while keeping it on 80 is exactly
+    # the kind of asymmetry that survives until :80 is closed and then breaks the cluster
+    # build with a 404 nobody expects.
+    echo "    location ^~ /snaps/ { alias ${DOCROOT%/mirror}/snaps/; autoindex on;"
+    echo "                          default_type application/octet-stream; }"
     echo "    location / { try_files \$uri \$uri/ =404; }"
   fi
   echo "}"

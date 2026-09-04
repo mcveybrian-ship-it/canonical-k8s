@@ -38,12 +38,26 @@ skip() { printf '  [--] %s\n' "$*"; }
 warn() { printf '  [!!] %s\n' "$*" >&2; }
 die()  { printf '\n  [x] %s\n\n' "$*" >&2; exit 1; }
 
-[ -r "$PARAMS" ] || die "no params at $PARAMS
+# `trust` and `show` need NO parameters - they install or read a certificate and nothing more.
+# Requiring a params file for them meant every machine that only has to TRUST the CA needed a
+# copy of the CA's configuration, which is both pointless and misleading about what that
+# machine does. Found on svc-repo-01, which will never issue anything.
+case "${1:-}" in
+  trust|show) CA_NEED_PARAMS=0 ;;
+  *)          CA_NEED_PARAMS=1 ;;
+esac
+
+if [ "$CA_NEED_PARAMS" -eq 1 ]; then
+  [ -r "$PARAMS" ] || die "no params at $PARAMS
        cp $SELF/ca-params.env.example $PARAMS && chmod 600 $PARAMS"
-# shellcheck disable=SC1090
-. "$PARAMS"
-: "${CA_COUNTRY:?}" "${CA_ORG:?}" "${CA_OU:?}" "${CA_ROOT_CN:?}" "${CA_ISSUING_CN:?}"
-: "${CA_KEY_BITS:?}" "${CA_DIGEST:?}" "${CA_ROOT_DAYS:?}" "${CA_ROOT_DIR:?}" "${CA_ISSUING_DIR:?}"
+  # shellcheck disable=SC1090
+  . "$PARAMS"
+  : "${CA_COUNTRY:?}" "${CA_ORG:?}" "${CA_OU:?}" "${CA_ROOT_CN:?}" "${CA_ISSUING_CN:?}"
+  : "${CA_KEY_BITS:?}" "${CA_DIGEST:?}" "${CA_ROOT_DAYS:?}" "${CA_ROOT_DIR:?}" "${CA_ISSUING_DIR:?}"
+elif [ -r "$PARAMS" ]; then
+  # shellcheck disable=SC1090
+  . "$PARAMS"
+fi
 
 # The domain and addresses come from the same file everything else uses, so a certificate
 # cannot name a host the addressing plan does not. Only needed by 'issue', which lands next.

@@ -58,7 +58,10 @@ set +a
 MEDIA_MOUNT="${MOUNT_OVERRIDE:-${MEDIA_MOUNT:?}}"
 RSYNC_BWLIMIT="${RSYNC_BWLIMIT:-0}"
 
-SSH_CMD="ssh -i $SSH_KEY -o BatchMode=yes -o StrictHostKeyChecking=accept-new"
+# ConnectTimeout so an unreachable host fails in seconds rather than sitting through the
+# default TCP timeout with no output. build-01 spent two minutes looking dead on
+# 2026-09-04 because its params still named a pre-migration address.
+SSH_CMD="ssh -i $SSH_KEY -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10"
 REMOTE="$STAGE_USER@$STAGE_HOST"
 
 # --- 1. the target must be a REAL mounted filesystem ------------------------------------------
@@ -101,7 +104,12 @@ fi
 
 # --- 2. reachability and size -------------------------------------------------------------------
 head2 "checking STAGE-01"
-$SSH_CMD "$REMOTE" true 2>/dev/null || die "cannot ssh to $REMOTE with $SSH_KEY"
+if ! $SSH_CMD "$REMOTE" true 2>/dev/null; then
+  die "cannot ssh to $REMOTE with $SSH_KEY.
+       STAGE_HOST is $STAGE_HOST - is that still correct? transfer-params.env is gitignored,
+       so it does NOT travel with push-repo-to-host.sh and each machine keeps its own copy.
+       After any renumbering, every machine's params must be updated by hand."
+fi
 note "ssh    : ok"
 
 need=$($SSH_CMD "$REMOTE" "du -sBG '$MIRROR_BASE/mirror' 2>/dev/null | cut -f1 | tr -dc '0-9'")

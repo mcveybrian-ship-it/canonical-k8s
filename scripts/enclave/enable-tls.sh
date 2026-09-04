@@ -74,12 +74,24 @@ chgrp www-data "$KEY" 2>/dev/null || true
 chmod 0640 "$KEY"
 ok "installed /etc/ssl/enclave/$NAME.fullchain.crt"
 
+# HTTP/2 is configured differently either side of nginx 1.25.1: the standalone `http2 on;`
+# directive was introduced there, and before it the only form is `listen ... ssl http2`.
+# Ubuntu 24.04 ships 1.24, where `http2 on;` is not a directive at all and nginx refuses to
+# start. Emitting the form this nginx understands is cheaper than pinning a version.
+NGINX_VER=$(nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo 0.0.0)
+if [ "$(printf '%s\n1.25.1\n' "$NGINX_VER" | sort -V | head -1)" = "1.25.1" ]; then
+  H2_LISTEN=""; H2_DIRECTIVE="    http2 on;"
+else
+  H2_LISTEN=" http2"; H2_DIRECTIVE=""
+fi
+say "nginx $NGINX_VER - http2 via $( [ -n "$H2_LISTEN" ] && echo 'listen directive' || echo 'http2 on;' )"
+
 {
   echo "# TLS for $NAME. Written by enable-tls.sh on $(date -Is)."
   echo "server {"
-  echo "    listen 443 ssl;"
-  echo "    listen [::]:443 ssl;"
-  echo "    http2 on;"
+  echo "    listen 443 ssl$H2_LISTEN;"
+  echo "    listen [::]:443 ssl$H2_LISTEN;"
+  [ -n "$H2_DIRECTIVE" ] && echo "$H2_DIRECTIVE"
   echo "    server_name $NAME ${NAME}.\${ENCLAVE_DOMAIN:-enclave.internal} _;"
   echo ""
   echo "    ssl_certificate     /etc/ssl/enclave/$NAME.fullchain.crt;"

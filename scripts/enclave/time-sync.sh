@@ -2,7 +2,10 @@
 # =========================================================================================
 # time-sync.sh - give the enclave one clock.
 #
-#   sudo ./time-sync.sh master    this machine becomes the enclave time source
+#   sudo ./time-sync.sh master [--upstream <host>...]
+#                                 this machine becomes the enclave time source. With
+#                                 --upstream it is disciplined by a real reference and
+#                                 serves that onward - clients need no change.
 #   sudo ./time-sync.sh client    follow the enclave time source
 #        ./time-sync.sh verify    read-only: are we synchronised, and to what
 #        ./time-sync.sh drift     read-only: how far is this machine from a reference
@@ -81,6 +84,20 @@ install_chrony() {
 # ---------------------------------------------------------------------------- master
 cmd_master() {
   need_root
+  # --upstream is how a real reference gets adopted WITHOUT touching a single client.
+  # host-4 stays the machine every client points at; it simply stops being the origin of
+  # the time and starts being a relay for one. `local stratum 10` below is deliberately
+  # poor, so chrony prefers any genuine source and falls back to the local clock only if
+  # the reference dies - which is exactly the behaviour you want from an appliance that
+  # can lose GPS lock.
+  local upstream=() u
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --upstream) upstream+=("${2:?--upstream needs a host}"); shift 2 ;;
+      --upstream=*) upstream+=("${1#--upstream=}"); shift ;;
+      *) die "unknown argument: $1" ;;
+    esac
+  done
   # systemd-detect-virt EXITS 1 WHEN IT FINDS NO VIRTUALISATION. It is reporting "no", not
   # failing, but `cmd || echo unknown` therefore fires on bare metal and appends a second
   # line - so $virt became "none\nunknown" and the guard rejected the one machine that
@@ -97,6 +114,17 @@ cmd_master() {
   {
     echo "# Enclave time master. Written by time-sync.sh on $(date -Is)."
     echo "#"
+    if [ ${#upstream[@]} -gt 0 ]; then
+      echo "# Disciplined by a real reference. Clients still point at this machine and need"
+      echo "# no change; it relays this source onward at one stratum lower."
+      for u in "${upstream[@]}"; do echo "server $u iburst"; done
+      echo ""
+    else
+      echo "# NO EXTERNAL REFERENCE. The enclave's time is this machine's RTC. Every node will"
+      echo "# agree with every other node and the whole set will drift from UTC together."
+      echo "# Add one with:  sudo ./time-sync.sh master --upstream <address>"
+      echo "#"
+    fi
     echo "# 'local stratum 10' is the load-bearing line: without it chrony will NOT serve time"
     echo "# while it is itself unsynchronised, which in an air gap is always. Stratum 10 is"
     echo "# deliberately poor - it says 'I am a local reference, believe me only because there"
@@ -117,7 +145,12 @@ cmd_master() {
   systemctl restart chrony
   systemctl enable chrony >/dev/null 2>&1 || true
   sleep 2
-  ok "$(hostname -s) is the enclave time source, serving $ALLOW"
+  if [ ${#upstream[@]} -gt 0 ]; then
+    ok "$(hostname -s) serves $ALLOW, disciplined by: ${upstream[*]}"
+    say "    clients need NO change - they already point here"
+  else
+    ok "$(hostname -s) is the enclave time source, serving $ALLOW"
+  fi
   cmd_verify
 }
 
@@ -184,9 +217,14 @@ cmd_verify() {
     stratum=$(chronyc tracking 2>/dev/null | awk -F': *' '/Stratum/{print $2}')
     if [ "$leap" = "Normal" ]; then
       ok "serving as the enclave reference (stratum ${stratum:-?}, leap $leap)"
-      say "    timedatectl will report 'synchronized: no' on this machine, correctly:"
-      say "    nothing synchronises the reference. Absolute accuracy is this machine's RTC"
-      say "    until an external source exists - see the honest limit in this script's header."
+      if grep -q '^server ' "$DROPIN"; then
+        say "    upstream: $(grep '^server ' "$DROPIN" | awk '{print $2}' | tr '\n' ' ')"
+        say "    this machine relays a real reference - stratum should be above 1, not 10."
+      else
+        say "    timedatectl will report 'synchronized: no' on this machine, correctly:"
+        say "    nothing synchronises the reference. Absolute accuracy is this machine's RTC"
+        say "    until an external source exists - see the honest limit in this header."
+      fi
     else
       warn "chrony is not serving: leap status '$leap'"
       fail=1
@@ -223,7 +261,7 @@ cmd_drift() {
 }
 
 case "${1:-}" in
-  master) cmd_master ;;
+  master) shift; cmd_master "$@" ;;
   client) cmd_client ;;
   verify) cmd_verify ;;
   drift)  shift; cmd_drift "$@" ;;

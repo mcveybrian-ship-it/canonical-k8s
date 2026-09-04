@@ -18,7 +18,7 @@
 #       sudo ./ca.sh revoke <cert>          revoke, then regenerate the CRL
 #
 #     ON any machine needing a certificate:
-#       sudo ./ca.sh request [--profile P] [name] [san...]
+#       sudo ./ca.sh request [--profile P] [--wildcard LABEL] [name] [san...]
 #                                         generate a key HERE and a CSR to send.
 #                                         Profiles live in csr-profiles/ - use one matching
 #                                         the PKI that will sign it (default: internal).
@@ -596,10 +596,22 @@ cmd_request() {
   # --profile selects WHAT THE CSR LOOKS LIKE, not who signs it. A site issuing from DoD PKI
   # needs a subject DN its registration authority accepts; that is data, not a script edit,
   # because the alternative is a fork of this function per customer.
-  local profile=internal
-  case "${1:-}" in
-    --profile) profile="${2:?--profile needs a name}"; shift 2 ;;
-    --profile=*) profile="${1#--profile=}"; shift ;;
+  local profile=internal wildcard=""
+  while [ $# -gt 0 ]; do
+    case "${1:-}" in
+      --profile)    profile="${2:?--profile needs a name}"; shift 2 ;;
+      --profile=*)  profile="${1#--profile=}"; shift ;;
+      # --wildcard apps  ->  CN=*.apps.enclave.internal
+      # Takes the LABEL, never the star. A '*' in an argument is a glob the shell may expand
+      # against the current directory before this script ever sees it, and it has no business
+      # in a filename either.
+      --wildcard)   wildcard="${2:?--wildcard needs a label, e.g. apps}"; shift 2 ;;
+      --wildcard=*) wildcard="${1#--wildcard=}"; shift ;;
+      *) break ;;
+    esac
+  done
+  case "$wildcard" in
+    *\**) die "give --wildcard the LABEL only, without the star: --wildcard apps" ;;
   esac
   local pf="$SELF/csr-profiles/$profile.env"
   if [ -r "$pf" ]; then
@@ -629,20 +641,36 @@ cmd_request() {
        Reusing it is fine - send $d/$name.csr for signing. Delete both only if you mean to
        invalidate every certificate issued against that key."
 
-  local ip sans var
-  var=$(printf '%s' "$name" | tr 'a-z-' 'A-Z_')
-  ip="${!var:-}"
-  # Fall back to this machine's own address rather than omitting the SAN - the addressing file
-  # may not be present on a host that only needs a certificate.
-  [ -z "$ip" ] && ip=$(ip -4 -br addr | awk '$1!="lo"{split($3,a,"/"); print a[1]; exit}')
-  sans="DNS:$name.$DOMAIN,DNS:$name"
-  [ -n "$ip" ] && sans="$sans,IP:$ip"
-  for extra in "$@"; do
-    case "$extra" in
-      *[0-9].[0-9]*) sans="$sans,IP:$extra" ;;
-      *)             sans="$sans,DNS:$extra" ;;
-    esac
-  done
+  local ip sans var cn
+  if [ -n "$wildcard" ]; then
+    # A wildcard certificate for the application layer: one certificate covering every
+    # hostname under a label, which is how ingress is normally terminated.
+    #
+    # A WILDCARD MATCHES EXACTLY ONE LABEL. *.apps.enclave.internal covers
+    # foo.apps.enclave.internal and does NOT cover bar.foo.apps.enclave.internal. It also
+    # does not cover the apex, so apps.enclave.internal is added explicitly - clients do not
+    # infer it and the omission shows up as a certificate error on the one URL everybody
+    # tries first.
+    name="wildcard-$wildcard"          # the FILENAME. No star ever reaches the filesystem.
+    cn="*.$wildcard.$DOMAIN"
+    sans="DNS:*.$wildcard.$DOMAIN,DNS:$wildcard.$DOMAIN"
+    for extra in "$@"; do sans="$sans,DNS:$extra"; done
+  else
+    var=$(printf '%s' "$name" | tr 'a-z-' 'A-Z_')
+    ip="${!var:-}"
+    # Fall back to this machine's own address rather than omitting the SAN - the addressing
+    # file may not be present on a host that only needs a certificate.
+    [ -z "$ip" ] && ip=$(ip -4 -br addr | awk '$1!="lo"{split($3,a,"/"); print a[1]; exit}')
+    cn="$name.$DOMAIN"
+    sans="DNS:$name.$DOMAIN,DNS:$name"
+    [ -n "$ip" ] && sans="$sans,IP:$ip"
+    for extra in "$@"; do
+      case "$extra" in
+        *[0-9].[0-9]*) sans="$sans,IP:$extra" ;;
+        *)             sans="$sans,DNS:$extra" ;;
+      esac
+    done
+  fi
 
   openssl genrsa -out "$d/$name.key" "${CSR_KEY_BITS:-${CA_LEAF_KEY_BITS:-3072}}" 2>/dev/null \
     || die "key generation failed"
@@ -650,11 +678,24 @@ cmd_request() {
   ok "key: $d/$name.key (never leaves this host)"
 
   openssl req -new -key "$d/$name.key" -"${CSR_DIGEST:-${CA_DIGEST:-sha256}}" \
-    -subj "/C=${CSR_COUNTRY:-${CA_COUNTRY:-US}}/O=${CSR_ORG:-${CA_ORG:-Enclave}}/OU=${CSR_OU:-${CA_OU:-Enclave PKI}}/CN=$name.$DOMAIN" \
+    -subj "/C=${CSR_COUNTRY:-${CA_COUNTRY:-US}}/O=${CSR_ORG:-${CA_ORG:-Enclave}}/OU=${CSR_OU:-${CA_OU:-Enclave PKI}}/CN=$cn" \
     -addext "subjectAltName=$sans" -out "$d/$name.csr" || die "CSR creation failed"
   chmod 0444 "$d/$name.csr"
   ok "csr: $d/$name.csr"
+  say "cn:   $cn"
   say "sans: $sans"
+  if [ -n "$wildcard" ]; then
+    say ""
+    say "  A WILDCARD IS ONE KEY PROTECTING EVERY APPLICATION UNDER $wildcard.$DOMAIN."
+    say "  For ingress that is normal and it is why you asked for it. Be aware of the two"
+    say "  consequences before this reaches an assessor:"
+    say "    - the key will live in the cluster as a TLS secret, readable by anything that"
+    say "      can read secrets in that namespace"
+    say "    - compromise of it is compromise of every application it fronts, and revocation"
+    say "      means reissuing and redeploying all of them at once"
+    say "  Per-service certificates avoid both and cost more renewals. That trade is a"
+    say "  decision to record, not a default to inherit."
+  fi
   say ""
   # The next step DEPENDS ON THE PROFILE. Printing "send it to svc-mgmt-01" after a dod-pki
   # request tells the operator to do the exact opposite of what that profile exists for -

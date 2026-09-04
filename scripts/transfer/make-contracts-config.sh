@@ -57,7 +57,11 @@ done
 # shellcheck disable=SC1090
 . "$PARAMS"
 : "${REPO_ADDRESS:?REPO_ADDRESS must be set in $PARAMS}"
-OUT="${OUT:-${STAGING_DIR:-/srv/bundle-staging}/config/airgapped-contracts.yaml}"
+# Write to MIRROR_BASE, which is where build-transfer-bundle.sh looks for it and copies it
+# into the bundle from. Writing straight into the staging dir bypassed that, so the builder
+# kept checking - and would have kept carrying - the previous copy. Two files, one stale, and
+# the check reporting on the wrong one.
+OUT="${OUT:-${MIRROR_BASE:-/srv/apt-mirror}/airgapped-contracts.yaml}"
 
 command -v pro-airgapped >/dev/null || die "pro-airgapped not installed. It is in ppa:yellow/ua-airgapped."
 
@@ -180,8 +184,24 @@ if [ -n "$_remote" ]; then
   say ""
 fi
 
-install -m 0600 "$TMP" "$OUT"
-ok "wrote $OUT (0600, $n aptURLs rewritten to $BASE)"
+# MIRROR_BASE is owned by apt-mirror, so this needs root - and once written as root, the
+# account that runs build-transfer-bundle.sh cannot read it. 0600 root:root would be the
+# strictest thing and would break the next step; 0644 would expose a credential to every
+# account on the box. root:<operator> 0640 is the documented middle ground, and it is what
+# build-transfer-bundle.sh already tells you to set by hand when it finds the file unreadable.
+if [ "$(id -u)" -ne 0 ] && [ ! -w "$(dirname "$OUT")" ]; then
+  die "cannot write $OUT - $(dirname "$OUT") is owned by $(stat -c '%U' "$(dirname "$OUT")").
+       Re-run with sudo:  sudo -E $0 $*
+       (-E preserves PRO_TOKEN_FILE; without it the token is still found via SUDO_USER.)"
+fi
+install -m 0640 "$TMP" "$OUT"
+_owner="${SUDO_USER:-$(id -un)}"
+if [ "$(id -u)" -eq 0 ]; then
+  chown "root:$_owner" "$OUT"
+  ok "wrote $OUT (0640 root:$_owner, $n aptURLs rewritten to $BASE)"
+else
+  ok "wrote $OUT (0640, $n aptURLs rewritten to $BASE)"
+fi
 say ""
 say "It is a credential. Do not commit it, do not print it."
 say "On svc-repo-01 it is installed by restore-mirror.sh to /etc/ubuntu-advantage/."

@@ -193,7 +193,11 @@ if [ -f "$CONTRACTS" ]; then
   # Rewritten aptURLs are the whole point of the file. If an entitlement we mirror still
   # points at Canonical, clients inside the gap will try to reach it and fail at enable
   # time - so surface the count rather than trusting the generation step.
-  local_urls=$(grep -c "aptURL: *http://$REPO_ADDRESS" "$CONTRACTS" 2>/dev/null || echo 0)
+  # NOT `|| echo 0`: grep -c prints "0" AND exits 1 when nothing matches, so the fallback
+  # appends a second zero and the result is the two-line string "0\n0" - which then fails
+  # the integer test below with "integer expression expected".
+  local_urls=$(grep -c "aptURL: *http://$REPO_ADDRESS" "$CONTRACTS" 2>/dev/null || true)
+  local_urls=${local_urls:-0}
   note "aptURLs pointing at $REPO_ADDRESS: $local_urls  (expect 4: esm-infra, esm-apps, fips-updates, cis)"
   [ "$local_urls" -ge 4 ] || note "  WARNING: fewer than 4 - check the overrides in the pro-airgapped input"
 else

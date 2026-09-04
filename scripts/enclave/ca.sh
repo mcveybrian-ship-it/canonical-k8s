@@ -67,8 +67,13 @@ cmd_init_root() {
        Refusing to overwrite it - every certificate ever issued chains to that key.
        Move it aside deliberately if you really mean to start over."
 
-  install -d -m 0700 "$d" "$d/private" "$d/certs" "$d/newcerts"
-  : > "$d/index.txt"; echo 1000 > "$d/serial"; chmod 0600 "$d/index.txt" "$d/serial"
+  # 0755 on the directory and on certs/, 0700 on private/. Certificates are PUBLIC - the root
+  # cert has to reach every machine's trust store - and locking them inside a 0700 directory
+  # means even reading one needs root, which is friction with no security value. The key is
+  # what needs protecting, and it is the only thing that gets it.
+  install -d -m 0755 "$d" "$d/certs"
+  install -d -m 0700 "$d/private" "$d/newcerts"
+  : > "$d/index.txt"; echo 1000 > "$d/serial"; chmod 0644 "$d/index.txt" "$d/serial"
 
   cat > "$d/openssl.cnf" <<CNF
 [ ca ]
@@ -187,8 +192,9 @@ cmd_init_issuing() {
   [ -e "$d/private/issuing.key" ] && die "an issuing CA already exists at $d.
        Refusing to overwrite - every certificate it has issued chains to that key."
 
-  install -d -m 0700 "$d" "$d/private" "$d/certs" "$d/newcerts"
-  : > "$d/index.txt"; echo 1000 > "$d/serial"; chmod 0600 "$d/index.txt" "$d/serial"
+  install -d -m 0755 "$d" "$d/certs"
+  install -d -m 0700 "$d/private" "$d/newcerts"
+  : > "$d/index.txt"; echo 1000 > "$d/serial"; chmod 0644 "$d/index.txt" "$d/serial"
 
   cat > "$d/openssl.cnf" <<CNF
 [ ca ]
@@ -224,7 +230,7 @@ extendedKeyUsage       = serverAuth
 subjectKeyIdentifier   = hash
 authorityKeyIdentifier = keyid,issuer
 CNF
-  chmod 0600 "$d/openssl.cnf"
+  chmod 0644 "$d/openssl.cnf"
 
   # The issuing key is generated HERE and never leaves. Only the CSR travels to the root.
   openssl genrsa -out "$d/private/issuing.key" "$CA_KEY_BITS" 2>/dev/null \

@@ -108,7 +108,7 @@ the gap. Q6 — the container-image bundle size — still gates Harbor's disk si
 | `svc-mgmt-01` | `10.2.20.161` | **air-gapped** | **CONTRACTS SERVER RUNNING 2026-09-04.** Attached to its own contracts server; esm-infra/esm-apps/fips-updates/usg all entitled. MAAS still to come |
 | `svc-repo-01` | `10.2.20.162` | **air-gapped** | **SERVING 2026-09-03.** 318 GB mirror over nginx, 9/9 suites verified, keys at `/keys/`, the 3 PPA debs at `/debs/`. host-4 installs from it |
 
-**THE MIRROR IS COMPLETE — 318 GB, 90,853 packages, six archives.**
+**THE MIRROR — 320 GB, seven archives.** Landscape added 2026-09-04 (Track B item 1).
 
 | Archive | Size | Packages | Note |
 |---|---|---|---|
@@ -116,6 +116,7 @@ the gap. Q6 — the container-image bundle size — still gates Harbor's disk si
 | `esm/fips-updates` | 68 G | 3,836 | incl. **353 FIPS kernel images** |
 | `esm/apps` | 2.4 G | 1,059 | |
 | **`ppa maas/3.7`** | **239 M** | **53** | **Added 2026-08-31** — MAAS as debs, because the snap needs a non-FIPS `core24` base |
+| **`ppa landscape/self-hosted-24.04`** | **293 M** | **97** | **Added 2026-09-04** — Track B item 1. `landscape-server 24.04.14`. `InRelease` is dual-signed; only the RSA-4096 key is trusted, the legacy RSA-1024 one is deliberately NOT imported |
 | `esm/usg` | 3.3 M | 3 | `usg`, `usg-benchmarks`, `usg-benchmarks-1` |
 | `esm/infra` | 404 K | 4 | Thin by design on a young LTS — see §0.4 |
 

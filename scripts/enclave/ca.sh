@@ -647,12 +647,34 @@ cmd_request() {
   ok "csr: $d/$name.csr"
   say "sans: $sans"
   say ""
-  # Print the FULL path. A bare filename reads as "it is in the current directory", which it
-  # is not - it is in /etc/ssl/enclave - and the next command then fails with a usage error
-  # that says nothing about the real problem.
-  say "  Send the CSR to svc-mgmt-01 and sign it:"
-  say "    sudo ./ca.sh sign-server $d/$name.csr"
-  say "  then bring back $name.fullchain.crt and drop it in $d/"
+  # The next step DEPENDS ON THE PROFILE. Printing "send it to svc-mgmt-01" after a dod-pki
+  # request tells the operator to do the exact opposite of what that profile exists for -
+  # and it is the kind of wrong instruction that gets followed, because it is confident and
+  # it is the last thing on the screen.
+  #
+  # Print the FULL path either way. A bare filename reads as "it is in the current
+  # directory", which it is not - it is in /etc/ssl/enclave.
+  case "$profile" in
+    internal)
+      say "  Send the CSR to svc-mgmt-01 and sign it:"
+      say "    sudo ./ca.sh sign-server $d/$name.csr"
+      say "  then bring back $name.fullchain.crt and drop it in $d/"
+      ;;
+    *)
+      say "  This CSR is for an EXTERNAL authority, not svc-mgmt-01:"
+      say "    ${CSR_SIGNED_BY:-<CSR_SIGNED_BY not set in $profile.env>}"
+      say "    csr to submit: $d/$name.csr"
+      say ""
+      say "  When the certificate comes back:"
+      say "    1. put that authority's root and intermediates in trust-anchors/ FIRST,"
+      say "       and run 'sudo ./ca.sh trust' on every machine that must validate it -"
+      say "       otherwise enable-tls.sh correctly refuses a perfectly good certificate"
+      say "    2. drop the fullchain in $d/ and run enable-tls.sh"
+      say ""
+      say "  If the authority returns a BARE certificate, build the chain yourself:"
+      say "    cat <leaf>.crt <intermediate>.crt > $name.fullchain.crt"
+      ;;
+  esac
 }
 
 # =========================================================================================

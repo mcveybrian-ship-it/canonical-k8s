@@ -98,3 +98,8 @@ scripts/transfer/transfer-params.env
 .pro-contract-token
 *.pro-contract-token
 airgapped-contracts.yaml
+
+# Live CA params
+ca-params.env
+*/ca-params.env
+scripts/enclave/ca-params.env

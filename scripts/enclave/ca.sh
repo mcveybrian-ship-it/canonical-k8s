@@ -460,7 +460,12 @@ cmd_sign_server() {
   local cn; cn=$(openssl req -in "$csr" -noout -subject | sed 's/.*CN *= *//;s/,.*//')
   local name="${cn%%.*}"
   say "signing: $cn"
-  openssl req -in "$csr" -noout -ext subjectAltName 2>/dev/null | sed 's/^/  /'
+  # `-ext` is an x509 option, NOT a req option - `openssl req -noout -ext ...` errors, and
+  # under `set -o pipefail` that took the whole script down after printing one line and
+  # nothing else. Third time a diagnostic pipeline has killed a script in this project.
+  # Diagnostics must never be able to fail the thing they are describing: `|| true`.
+  openssl req -in "$csr" -noout -text 2>/dev/null \
+    | grep -A1 -i 'Subject Alternative Name' | sed 's/^/  /' || true
 
   # copy_extensions=copy in the issuing config carries the CSR's SANs into the certificate.
   # Without it a certificate signs cleanly and arrives with NO SANs at all, which modern
@@ -472,7 +477,7 @@ cmd_sign_server() {
   cat "$d/certs/$name.crt" "$d/certs/issuing.crt" > "$d/certs/$name.fullchain.crt"
   chmod 0444 "$d/certs/$name.fullchain.crt"
 
-  local n; n=$(openssl x509 -in "$d/certs/$name.crt" -noout -ext subjectAltName | grep -c ':')
+  local n; n=$(openssl x509 -in "$d/certs/$name.crt" -noout -ext subjectAltName 2>/dev/null | grep -c ':' || true)
   [ "$n" -ge 1 ] || die "the signed certificate has NO subjectAltName - check copy_extensions"
   ok "signed: $d/certs/$name.fullchain.crt (send THIS back, not the bare cert)"
   say ""
@@ -482,9 +487,13 @@ cmd_sign_server() {
 # =========================================================================================
 cmd_show() {
   local f="${1:-}"; [ -r "$f" ] || die "usage: $0 show <certificate>"
-  openssl x509 -in "$f" -noout -subject -issuer -dates -ext basicConstraints,keyUsage,subjectAltName 2>/dev/null \
-    | sed 's/^/    /'
-  printf '    fingerprint: %s\n' "$(openssl x509 -in "$f" -noout -fingerprint -sha256 | cut -d= -f2)"
+  # Every pipeline here is guarded. cmd_show is called at the END of init-root, sign-issuing,
+  # issue and sign-server - so a failure inside it would report failure on work that has
+  # already succeeded, and send someone looking for a problem in the wrong place.
+  openssl x509 -in "$f" -noout -subject -issuer -dates \
+    -ext basicConstraints,keyUsage,subjectAltName 2>/dev/null | sed 's/^/    /' || true
+  printf '    fingerprint: %s\n' \
+    "$(openssl x509 -in "$f" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2 || echo unavailable)"
 }
 
 # =========================================================================================

@@ -402,6 +402,24 @@ Everything except the bridge, in one go:
 sudo ./03-host-services.sh all
 ```
 
+`all` runs **`hosts`, `trustca`, `apt`, `libvirt`, `datavg`, `pool`, `tmux`, `verify`** — in
+that order, and the order is load-bearing at the front:
+
+| step | why it comes before `apt` |
+|---|---|
+| `hosts` | writes `/etc/hosts` from `enclave-addresses.env`. `MIRROR_URL` names `svc-repo-01` rather than an IP, so without this apt points at a host the machine cannot resolve. Nothing tracked used to do this — host-4's entry was added by hand, which worked and was not reproducible. |
+| `trustca` | installs every `.crt` in `scripts/enclave/trust-anchors/` into the system trust store. The mirror is HTTPS; a machine that does not trust the anchor cannot fetch a single package, and the error reads as a problem with the *server*. |
+
+`all` used to run `apt` first and the CA sixth. That worked only while the mirror was
+plaintext. `cmd_apt` now guards itself as well, so running the `apt` subcommand alone is
+correct too, and it fails with the name it could not resolve rather than "apt-get update
+failed".
+
+**`trustca` is how a site that does not use this CA is supported.** It installs a
+*directory*, not one file, so a site running DoD PKI drops its roots and intermediates into
+`trust-anchors/` and every machine picks them up with no change to any script. See
+`scripts/enclave/trust-anchors/README.md`.
+
 Then the bridge, **from a session you can afford to lose**:
 
 ```bash

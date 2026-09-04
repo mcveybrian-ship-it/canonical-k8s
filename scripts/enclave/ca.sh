@@ -46,9 +46,12 @@ die()  { printf '\n  [x] %s\n\n' "$*" >&2; exit 1; }
 # Requiring a params file for them meant every machine that only has to TRUST the CA needed a
 # copy of the CA's configuration, which is both pointless and misleading about what that
 # machine does. Found on svc-repo-01, which will never issue anything.
+# `trust` and `show` need nothing. `request` needs only the identity fields and key size,
+# all of which have defaults - so a machine that merely needs a certificate does not have to
+# carry the CA's configuration. Only the operations that actually run a CA do.
 case "${1:-}" in
-  trust|show) CA_NEED_PARAMS=0 ;;
-  *)          CA_NEED_PARAMS=1 ;;
+  trust|show|request) CA_NEED_PARAMS=0 ;;
+  *)                  CA_NEED_PARAMS=1 ;;
 esac
 
 if [ "$CA_NEED_PARAMS" -eq 1 ]; then
@@ -61,6 +64,14 @@ if [ "$CA_NEED_PARAMS" -eq 1 ]; then
 elif [ -r "$PARAMS" ]; then
   # shellcheck disable=SC1090
   . "$PARAMS"
+elif [ -r "$SELF/ca-params.env.example" ]; then
+  # Every line in the example is VAR="${VAR:-default}", so sourcing it only supplies defaults
+  # and overrides nothing. That gives a machine issuing a CSR the same C/O/OU as every other
+  # certificate in the enclave, WITHOUT it needing a copy of the live CA configuration - a
+  # subject that differs from the rest is a certificate that looks like it came from somewhere
+  # else.
+  # shellcheck disable=SC1091
+  . "$SELF/ca-params.env.example"
 fi
 
 # The domain and addresses come from the same file everything else uses, so a certificate

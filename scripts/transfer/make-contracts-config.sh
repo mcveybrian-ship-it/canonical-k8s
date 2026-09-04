@@ -27,7 +27,16 @@ set -euo pipefail
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PARAMS="${PARAMS:-$SELF/transfer-params.env}"
-TOKEN_FILE="${PRO_TOKEN_FILE:-$HOME/.pro-contract-token}"
+# Resolve SUDO_USER's home, not $HOME. If this is ever run under sudo, $HOME is /root and the
+# operator's token file becomes invisible - the script then says "no token file" on a machine
+# that plainly has one. Exactly the failure 03-compose-vm.sh hit with ssh keys on 2026-09-03.
+if [ -n "${PRO_TOKEN_FILE:-}" ]; then
+  TOKEN_FILE="$PRO_TOKEN_FILE"
+elif [ -n "${SUDO_USER:-}" ] && _h=$(getent passwd "$SUDO_USER" | cut -d: -f6) && [ -n "$_h" ]; then
+  TOKEN_FILE="$_h/.pro-contract-token"
+else
+  TOKEN_FILE="$HOME/.pro-contract-token"
+fi
 OUT=""; DRY=0
 
 say()  { printf '  %s\n' "$*"; }

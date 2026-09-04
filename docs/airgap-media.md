@@ -494,6 +494,164 @@ rather than inferred from filenames:
 **Still owed:** `airgapped-contracts.yaml` carries `svc-repo-01.enclave.local` from before the
 domain decision and must be regenerated on `stage-01` before any client runs `pro attach`.
 
+### 6.1f Five more found by actually running it — 2026-09-03/04
+
+§6.1c lists four defects found by *reading* `restore-mirror.sh`. Running it found five more.
+None were caught by `bash -n`, `shellcheck`, or a dry run.
+
+**1. `systemctl reload nginx` returns before the config is live.** The proof ran 5 seconds
+after the reload and failed 5 of 9 checks. The tree was complete and byte-identical the whole
+time — three requests were answered by nginx's *previous* config, which on that run was the
+stock default site, because nginx had only just been installed.
+
+The tell was that the three failures landed in the **default access log** while the six
+successes landed in `apt-mirror.access.log` — same second, two different files. Without the
+vhost defining its own `access_log` this would have read as a corrupt mirror, and the honest
+response to a failed integrity proof is to re-copy 318 GB. There is now a poll-until-serving
+step between configuring nginx and proving it.
+
+**2. `cmd | grep -q` fails under `set -o pipefail`.** The ESM proof reported failure on a run
+that had succeeded:
+
+```bash
+set -euo pipefail; seq 1 100000 | grep -qE "^1$"       # FAILS
+set -euo pipefail; seq 1 100000 > f; grep -qE "^1$" f  # OK
+```
+
+`grep -q` exits at the first match, closing the pipe; the producer takes `SIGPIPE`; `pipefail`
+reports the pipeline as failed. **The check failed because it succeeded quickly.** Redirect to
+a file and inspect it separately.
+
+**3. `grep -c pattern file || echo 0` yields `0\n0`.** `grep -c` *prints* `0` **and** exits 1
+when nothing matches, so the fallback appends a second zero. The result fails an integer test
+with `integer expression expected`. Use `|| true` and default the empty case.
+
+**4. The repo server was still installing from stage-01.** The VM was composed pointing at
+whatever mirror existed at the time; nothing afterwards told it that it had *become* the repo.
+The one machine that can never afford to lose its package source was depending on a box outside
+the boundary that gets unplugged at cutover. It now writes its own sources over `file://` —
+deliberately not `http://localhost`, so it can patch itself with nginx down, mid-reload, or
+misconfigured.
+
+**5. Two copies of the contracts config, disagreeing.** `build-transfer-bundle.sh` reads
+`$MIRROR_BASE/airgapped-contracts.yaml`; the generator wrote into the staging directory
+instead. The source had 4 `enclave.local` URLs and staging had 4 `enclave.internal`, and the
+builder faithfully checked — and would have carried — the stale one. Every individual step
+reported success.
+
+#### The pattern worth carrying forward
+
+**Four of these five produced no error at all, or an error pointing at the wrong thing.** A
+passing check reported as failing, a stale file reported as present, a complete mirror reported
+as corrupt. On an air-gapped system that pattern is the norm rather than the exception, because
+the usual feedback — a package that will not install, a page that will not load — is exactly
+what you are trying to cause deliberately.
+
+The two things that made these findable were **split access logs** and a **serial console log
+written to a file**. Neither is a fix; both are what turned "it does not work" into a diagnosis.
+
+### 6.1e Carrying the SSD in and out — the repeatable cycle
+
+**This happens on every trip**, and the disk is the only thing that crosses the boundary. Each
+direction is four steps, and two of them are on a different machine from the one you are
+looking at.
+
+#### Taking it IN — build-01 → svc-repo-01
+
+**1. Write it** (`build-01`, disk plugged in there):
+
+```bash
+### MACHINE: build-01 (10.2.10.124) ###
+sudo mount LABEL=enclave-xfer /mnt/transfer
+sudo chown encadmin:encadmin /mnt/transfer
+cd ~/canonical-k8s/scripts/transfer && ./write-transfer-media.sh
+sudo umount /mnt/transfer
+```
+
+Mounted by **`LABEL=`**, never by device name. See the identification trap below.
+
+**2. Move the disk to `host-4`** and identify it there:
+
+```bash
+### MACHINE: host-4 (10.2.20.158) ###
+lsblk -o NAME,SIZE,TRAN,MODEL,SERIAL,FSTYPE,LABEL | grep -v '^loop'
+ls -l /dev/disk/by-label/enclave-xfer
+```
+
+**3. Attach it to the VM** — `virsh` runs on the **host**, not inside the guest:
+
+```bash
+### MACHINE: host-4 (10.2.20.158) ###
+sudo virsh attach-disk svc-repo-01 /dev/disk/by-label/enclave-xfer \
+  vdc --targetbus virtio --sourcetype block --mode readonly
+sudo virsh domblklist svc-repo-01
+```
+
+**`vdc`, not `vdb`.** `vda` is the VM disk and **`vdb` is the cloud-init seed**, which lives on
+virtio rather than a SATA cdrom (see `docs/03-host-services.md` §5c). Using `vdb` fails with
+`target 'vdb' duplicated`.
+
+**`--mode readonly` is structural, not caution.** `restore-mirror.sh` only ever reads the
+source, so the guest has no business being able to write to the disk you carry.
+
+**4. Mount and restore** (inside the guest):
+
+```bash
+### MACHINE: svc-repo-01 (10.2.20.162) ###
+sudo mkdir -p /mnt/transfer
+sudo mount -o ro /dev/vdc /mnt/transfer
+cd ~/canonical-k8s/scripts/transfer && sudo ./restore-mirror.sh
+```
+
+#### Taking it OUT — svc-repo-01 → build-01
+
+**Reverse order, and the first two steps are on different machines:**
+
+```bash
+### MACHINE: svc-repo-01 (10.2.20.162) ###
+sudo umount /mnt/transfer
+```
+
+```bash
+### MACHINE: host-4 (10.2.20.158) ###
+sudo virsh detach-disk svc-repo-01 vdc
+sudo virsh domblklist svc-repo-01        # expect vda and vdb only
+```
+
+Then unplug and carry it back. **Unmount before detach, detach before unplug.** Pulling a disk
+out from under a running guest is how filesystems get corrupted, and this one holds 318 GB that
+took an hour to write.
+
+> `virsh` is **not installed inside the guests** — they are Minimal cloud images. Running
+> `sudo virsh detach-disk` on `svc-repo-01` gives `virsh: command not found`, which reads like
+> a missing package and is really a wrong-machine error.
+
+#### Identifying the disk — the serial does NOT work on host-4
+
+§6.1a says to verify by serial before anything destructive. **That check silently finds nothing
+on host-4**, because the USB enclosure does not pass the drive's serial through:
+
+| Machine | What it reports |
+|---|---|
+| `build-01` | `SERIAL 204188801050` — the real drive serial |
+| `host-4` | `SERIAL 0000000000000000` — the enclosure hides it |
+
+**And this matters more than it looks: `host-4`'s own OS disk is the same model** —
+`WDS100T3X0C-00SJG0`, serial `203979803263`. A destructive command keyed on the model would hit
+the boot disk of the machine running every enclave VM.
+
+Use **`LABEL=enclave-xfer`** as the identifier. It is on the filesystem, it is unique, and it
+travels with the disk. The enclosure's own id also works on host-4 if you need a device path:
+`/dev/disk/by-id/usb-WDS100T3_X0C-00SJG0_01293805CF74-0:0`.
+
+#### When the disk needs re-writing
+
+Any change to the mirror, the bundle scripts, the nginx vhost, or `airgapped-contracts.yaml`
+means the SSD is stale. **Nothing currently detects this** — the bundle records no provenance,
+and a carried script older than the repo looks identical to a current one. It was caught on
+2026-09-03 only by reading the file. Until `build-transfer-bundle.sh` stamps the git commit
+into the manifest, re-stage and re-sync whenever any of those change, and do not assume.
+
 ### 6.2 Rebuilding the bundle — what step 1 actually does
 
 `build-transfer-bundle.sh` is safe to re-run at any time and is expected to be run repeatedly

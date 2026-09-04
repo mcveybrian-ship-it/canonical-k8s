@@ -141,6 +141,28 @@ TMUX_CONF=""
 # like a certificate problem on the SERVER, which is where people look first.
 ROOT_CA=""
 [ -r "$ENCLAVE_DIR/root-ca.crt" ] && ROOT_CA="$(sed 's/^/      /' "$ENCLAVE_DIR/root-ca.crt")"
+# Delivered through cloud-init's `ca_certs` module, NOT through write_files plus a runcmd.
+# The module order on a composed VM, read off svc-mgmt-01 rather than remembered:
+#
+#   cloud_init_modules   ... write_files, ca_certs, ...
+#   cloud_config_modules ... apt_configure, runcmd, ...        <- runcmd only WRITES the script
+#   cloud_final_modules  ... package_update_upgrade_install, ..., scripts_user
+#                                                              ^ this is where runcmd RUNS
+#
+# So packages install before runcmd ever executes. `update-ca-certificates` in runcmd is too
+# late by two module groups: with an https mirror the very first apt run happens against an
+# untrusted root and fails, on a VM with no other route to a package. ca_certs runs in the
+# first group, before apt_configure has even read the sources.
+#
+# An empty block is omitted entirely - `ca_certs: trusted: [ ]` with no cert is a parse error
+# waiting for the one build where root-ca.crt has not been staged yet.
+CA_CERTS_BLOCK=""
+if [ -n "$ROOT_CA" ]; then
+  CA_CERTS_BLOCK="ca_certs:
+  trusted:
+    - |
+$ROOT_CA"
+fi
 # Find the keys under sudo, which is how this always runs. $HOME is /root there, so the
 # operator's own authorized_keys is invisible unless SUDO_USER is resolved back to a home
 # directory - and the failure looks like "you have no keys" rather than "I looked in the
@@ -212,6 +234,8 @@ $SSH_KEYS_YAML
 # every one of them. cloud-init then fell back to trying 'snap install' for each package -
 # 30 seconds apiece against a store it cannot reach - and sat in 'running' for minutes.
 # Preserving the list and writing the file ourselves is the only way to control components.
+$CA_CERTS_BLOCK
+
 apt:
   preserve_sources_list: true
 
@@ -225,10 +249,6 @@ write_files:
       Suites: $VM_MIRROR_SUITES
       Components: $VM_MIRROR_COMPONENTS
       Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
-  - path: /usr/local/share/ca-certificates/enclave-root.crt
-    permissions: '0644'
-    content: |
-$ROOT_CA
   - path: /etc/tmux.conf
     permissions: '0644'
     content: |
@@ -245,7 +265,6 @@ package_update: true
 packages: [$(echo "${VM_EXTRA_PACKAGES:-}" | tr ' ' '\n' | sed '/^$/d' | paste -sd, -)]
 
 runcmd:
-  - [ update-ca-certificates ]
   - [ systemctl, enable, --now, ssh ]
   - [ sh, -c, "ip route | grep -q '^default' && echo 'WARNING: this VM has a default route' >> /etc/enclave-build-info || echo 'gateway=none-airgapped-no-default-route' >> /etc/enclave-build-info" ]
   - [ sh, -c, "echo \"composed=\$(date -Is) by 03-compose-vm.sh\" >> /etc/enclave-build-info" ]

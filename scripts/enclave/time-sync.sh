@@ -167,12 +167,40 @@ cmd_verify() {
   say "sources:"
   chronyc sources 2>/dev/null | sed 's/^/    /' || true
   say ""
-  # timedatectl is what an assessor and every other script will look at.
-  if timedatectl show -p NTPSynchronized --value 2>/dev/null | grep -q yes; then
-    ok "System clock synchronized: yes"
+  # THE TWO ROLES HAVE DIFFERENT SUCCESS CRITERIA, and conflating them reports a healthy
+  # master as broken.
+  #
+  # A client is synchronised when the kernel says so - chrony clears the kernel's UNSYNC flag
+  # once it has disciplined the clock from a source, and that is what timedatectl reads.
+  #
+  # THE MASTER HAS NO SOURCE. It IS the source. chrony never disciplines its clock from
+  # anything, so the kernel flag stays set and timedatectl will report "no" forever. That is
+  # not a fault, it is the honest state of an enclave with no external reference: the time is
+  # this machine's RTC, and every other machine agrees with it. Checking for "yes" here says
+  # a correctly-serving master is broken.
+  if [ -f "$DROPIN" ] && grep -q '^local stratum' "$DROPIN"; then
+    local leap stratum
+    leap=$(chronyc tracking 2>/dev/null | awk -F': *' '/Leap status/{print $2}')
+    stratum=$(chronyc tracking 2>/dev/null | awk -F': *' '/Stratum/{print $2}')
+    if [ "$leap" = "Normal" ]; then
+      ok "serving as the enclave reference (stratum ${stratum:-?}, leap $leap)"
+      say "    timedatectl will report 'synchronized: no' on this machine, correctly:"
+      say "    nothing synchronises the reference. Absolute accuracy is this machine's RTC"
+      say "    until an external source exists - see the honest limit in this script's header."
+    else
+      warn "chrony is not serving: leap status '$leap'"
+      fail=1
+    fi
+    say ""
+    say "the check that actually matters is on a CLIENT:"
+    say "    ./time-sync.sh verify        # expect  ^* $MASTER_NAME  and synchronized: yes"
   else
-    warn "System clock synchronized: NO - chrony has not settled, or cannot reach $MASTER"
-    fail=1
+    if timedatectl show -p NTPSynchronized --value 2>/dev/null | grep -q yes; then
+      ok "System clock synchronized: yes"
+    else
+      warn "System clock synchronized: NO - chrony has not settled, or cannot reach $MASTER"
+      fail=1
+    fi
   fi
   return $fail
 }

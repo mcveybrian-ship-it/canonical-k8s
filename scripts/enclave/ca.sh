@@ -596,7 +596,7 @@ cmd_request() {
   # --profile selects WHAT THE CSR LOOKS LIKE, not who signs it. A site issuing from DoD PKI
   # needs a subject DN its registration authority accepts; that is data, not a script edit,
   # because the alternative is a fork of this function per customer.
-  local profile=internal wildcard=""
+  local profile=internal wildcards=() w
   while [ $# -gt 0 ]; do
     case "${1:-}" in
       --profile)    profile="${2:?--profile needs a name}"; shift 2 ;;
@@ -605,14 +605,20 @@ cmd_request() {
       # Takes the LABEL, never the star. A '*' in an argument is a glob the shell may expand
       # against the current directory before this script ever sees it, and it has no business
       # in a filename either.
-      --wildcard)   wildcard="${2:?--wildcard needs a label, e.g. apps}"; shift 2 ;;
-      --wildcard=*) wildcard="${1#--wildcard=}"; shift ;;
+      # Repeatable. ONE certificate can carry several wildcard SANs, which is what "the same
+      # cert for everything but the cluster" requires: a wildcard matches exactly one label,
+      # so *.enclave.internal does NOT cover *.apps.enclave.internal and both must be named.
+      --wildcard)   wildcards+=("${2:?--wildcard needs a label or suffix}"); shift 2 ;;
+      --wildcard=*) wildcards+=("${1#--wildcard=}"); shift ;;
       *) break ;;
     esac
   done
-  case "$wildcard" in
-    *\**) die "give --wildcard the LABEL only, without the star: --wildcard apps" ;;
-  esac
+  for w in ${wildcards+"${wildcards[@]}"}; do
+    case "$w" in
+      *\**) die "give --wildcard the name without the star: --wildcard apps
+      or a full suffix: --wildcard apps.enclave.internal" ;;
+    esac
+  done
   local pf="$SELF/csr-profiles/$profile.env"
   if [ -r "$pf" ]; then
     # shellcheck disable=SC1090
@@ -642,7 +648,7 @@ cmd_request() {
        invalidate every certificate issued against that key."
 
   local ip sans var cn
-  if [ -n "$wildcard" ]; then
+  if [ ${#wildcards[@]} -gt 0 ]; then
     # A wildcard certificate for the application layer: one certificate covering every
     # hostname under a label, which is how ingress is normally terminated.
     #
@@ -651,10 +657,29 @@ cmd_request() {
     # does not cover the apex, so apps.enclave.internal is added explicitly - clients do not
     # infer it and the omission shows up as a certificate error on the one URL everybody
     # tries first.
-    name="wildcard-$wildcard"          # the FILENAME. No star ever reaches the filesystem.
-    cn="*.$wildcard.$DOMAIN"
-    sans="DNS:*.$wildcard.$DOMAIN,DNS:$wildcard.$DOMAIN"
-    for extra in "$@"; do sans="$sans,DNS:$extra"; done
+    local suffix first=""
+    sans=""
+    for w in "${wildcards[@]}"; do
+      # A value containing a dot is taken as a full suffix (enclave.internal); a bare label
+      # is taken as one level under $DOMAIN (apps -> apps.enclave.internal). Both forms are
+      # natural to type and guessing wrong is expensive, so both are accepted.
+      case "$w" in
+        *.*) suffix="$w" ;;
+        *)   suffix="$w.$DOMAIN" ;;
+      esac
+      [ -n "$first" ] || first="$suffix"
+      # Both the wildcard and the apex. Clients do not infer the apex from a wildcard, and
+      # its omission presents as a certificate error on the one URL everybody tries first.
+      sans="${sans:+$sans,}DNS:*.$suffix,DNS:$suffix"
+    done
+    name="wildcard-${first//./-}"      # the FILENAME. No star ever reaches the filesystem.
+    cn="*.$first"
+    for extra in "$@"; do
+      case "$extra" in
+        *[0-9].[0-9]*) sans="$sans,IP:$extra" ;;
+        *)             sans="$sans,DNS:$extra" ;;
+      esac
+    done
   else
     var=$(printf '%s' "$name" | tr 'a-z-' 'A-Z_')
     ip="${!var:-}"
@@ -684,17 +709,20 @@ cmd_request() {
   ok "csr: $d/$name.csr"
   say "cn:   $cn"
   say "sans: $sans"
-  if [ -n "$wildcard" ]; then
+  if [ ${#wildcards[@]} -gt 0 ]; then
     say ""
-    say "  A WILDCARD IS ONE KEY PROTECTING EVERY APPLICATION UNDER $wildcard.$DOMAIN."
-    say "  For ingress that is normal and it is why you asked for it. Be aware of the two"
-    say "  consequences before this reaches an assessor:"
-    say "    - the key will live in the cluster as a TLS secret, readable by anything that"
-    say "      can read secrets in that namespace"
-    say "    - compromise of it is compromise of every application it fronts, and revocation"
-    say "      means reissuing and redeploying all of them at once"
-    say "  Per-service certificates avoid both and cost more renewals. That trade is a"
-    say "  decision to record, not a default to inherit."
+    say "  A WILDCARD IS ONE KEY PROTECTING EVERYTHING IT COVERS."
+    say "  If this certificate is shared across machines, note what that changes:"
+    say "    - THE KEY MUST TRAVEL. Every other path in this script is built so that only a"
+    say "      CSR ever leaves a host. A shared certificate breaks that deliberately, and"
+    say "      the copy has to be handled as the secret it is - never through /tmp on an"
+    say "      intermediate host, never in a shell that logs, 0640 root:ssl-cert at rest."
+    say "    - compromise of ANY machine holding it compromises every service it fronts,"
+    say "      and revocation means reissuing and redeploying all of them at once."
+    say "    - in the cluster it lives as a TLS secret, readable by anything that can read"
+    say "      secrets in that namespace."
+    say "  One renewal a year instead of many is a real operational gain in an air gap."
+    say "  Record the trade; do not inherit it silently."
   fi
   say ""
   # The next step DEPENDS ON THE PROFILE. Printing "send it to svc-mgmt-01" after a dod-pki

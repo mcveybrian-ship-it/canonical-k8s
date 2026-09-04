@@ -93,7 +93,15 @@ say "token  : loaded from $TOKEN_FILE (${#TOKEN} chars, not shown)"
 #     E: Failed to fetch http://svc-repo-01.enclave.internal/esm.ubuntu.com/infra/ubuntu/ubuntu/pool/  404
 #
 # Derive it from what the client requests, not from the mirror's directory layout.
-BASE="http://${REPO_ADDRESS}"
+# https by default. The enclave has an internal CA precisely so that nothing here has to
+# run in the clear, and an assessor reading a config full of http:// URLs will not care that
+# the wire happens to be inside a locked room. Override with REPO_SCHEME=http only to
+# reproduce a pre-CA build.
+#
+# NOTE the host must be a name the certificate actually carries. svc-repo-01's SANs are the
+# FQDN, the short name and the IP, so any of the three validate - but REPO_ADDRESS is a name
+# that must match one of them, or every apt fetch fails certificate verification.
+BASE="${REPO_SCHEME:-https}://${REPO_ADDRESS}"
 say "target : $BASE"
 
 INPUT=$(cat <<EOF

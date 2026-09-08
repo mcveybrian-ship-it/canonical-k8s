@@ -178,7 +178,7 @@ that are not part of ESM, `usg`'s token printing under `cis`, and the `pro-airga
 schema. They are written down at the step that hits them, not collected here, so they are read
 in context.
 
-**What this sequence does NOT get you:** the Kubernetes half — snaps, container images, Harbor,
+**What this sequence does NOT get you:** container images, Harbor,
 MAAS boot images. That is Stage B, blocked on Q8, and nothing of it is staged yet.
 
 ### 0.3 Three `.deb`s the mirror can never serve — carry them separately
@@ -320,7 +320,7 @@ OS decision. So Q9 is not optional; it just is not blocking the work in flight.
 | VM provisioned | **Done** 2026-08-29 — `10.0.20.160`, 8 vCPU / 16 GB, 989 G free |
 | SSH key auth from Windows | **Done** 2026-08-30 — was broken, see §4.5 |
 | Dev toolchain (§4.4) | **Done** — all ten present |
-| Mirror + Stage-B tooling | **Done** — `nginx`, `snapd`, `qemu-utils`, `apt-mirror`, `regctl`, `regsync`, `store-admin` |
+| Mirror + Stage-B tooling | **Done** — `nginx`, `snapd`, `qemu-utils`, `apt-mirror`, `regctl`, `regsync` |  *(`store-admin` removed 2026-09-08 — the Enterprise Store was dropped, runbook §4.6)*
 | This repo cloned on it | **Done** 2026-08-30 |
 | Push access to `origin` | **Done** 2026-08-30 — deploy key registered, agent set up (§4.6) |
 | Pre-push guard fired against the live remote | **Done** 2026-08-30 — four tests, `docs/open-questions.md` |

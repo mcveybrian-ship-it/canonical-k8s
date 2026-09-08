@@ -395,6 +395,39 @@ note "checked: $checked suite(s)"
 # The suite -> keyring mapping below was VERIFIED WITH gpgv on 2026-09-03, not inferred from
 # the filenames. To re-verify:
 #     gpgv --keyring /srv/repo/keys/<key>.gpg <tree>/dists/<suite>/InRelease
+head2 "proving the served side-load trees are actually reachable"
+# COPYING IS NOT SERVING. The snaps were copied correctly on 2026-09-08 and still returned
+# 403, because `cp -a` had preserved mode 0600 from `snap download` and nginx runs as
+# www-data. Worse, the failure was PARTIAL: the .assert files happened to be 0664 and
+# downloaded fine, so it looked like a broken server rather than a permission bit.
+#
+# Fetching one file from each tree turns that class of mistake into a line of output here,
+# where the media is still attached, instead of into a confusing failure at cluster build.
+_served_fail=0
+for _tree in keys debs snaps; do
+  _f=$(find "$REPO_ROOT/$_tree" -maxdepth 1 -type f -printf '%f\n' 2>/dev/null | head -1)
+  if [ -z "$_f" ]; then
+    note "$_tree   : empty, nothing to prove"
+    continue
+  fi
+  # No pipeline: a `curl | grep` here would report success on SIGPIPE under pipefail, which
+  # is a mistake this project has made three times.
+  _code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "http://localhost/$_tree/$_f" || true)
+  case "$_code" in
+    200) note "$_tree   : /$_tree/$_f -> 200" ;;
+    403) warn "$_tree   : /$_tree/$_f -> 403 - nginx cannot READ these files.
+       Check the mode: they must be world-readable, and 'cp -a' preserves the SOURCE mode.
+         sudo chmod 0644 $REPO_ROOT/$_tree/*"
+         _served_fail=1 ;;
+    404) warn "$_tree   : /$_tree/$_f -> 404 - the vhost has no 'location ^~ /$_tree/'.
+       The TLS block in enable-tls.sh needs it too, not only the :80 vhost."
+         _served_fail=1 ;;
+    *)   warn "$_tree   : /$_tree/$_f -> '$_code'"; _served_fail=1 ;;
+  esac
+done
+[ "$_served_fail" -eq 0 ] && ok "keys, debs and snaps are all served" \
+  || warn "one or more served trees are NOT reachable - fix before crossing the gap"
+
 head2 "proving a GPG-verified apt resolution (ESM/FIPS/USG)"
 if [ -z "${ESM_PROOF_PACKAGES:-}" ]; then
   note "ESM_PROOF_PACKAGES unset - skipping. Set it in $PARAMS to enable."

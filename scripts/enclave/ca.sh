@@ -857,7 +857,18 @@ cmd_sign_server() {
 
   openssl req -in "$csr" -noout -verify >/dev/null 2>&1 || die "$csr is not a valid CSR"
   local cn; cn=$(openssl req -in "$csr" -noout -subject | sed 's/.*CN *= *//;s/,.*//')
-  local name="${cn%%.*}"
+  # A WILDCARD CN MUST NOT BECOME A FILENAME. "${cn%%.*}" on "*.enclave.internal" yields a
+  # bare "*", so this wrote /etc/enclave-ca/certs/*.crt and *.fullchain.crt - literal asterisk
+  # files. `request` was careful to keep the star off the filesystem and this reintroduced it
+  # at signing time. A file named *.crt is a live footgun: any later `rm *.crt` or `cp *.crt`
+  # matches it through glob expansion and does something nobody intended.
+  #
+  # Derived to match what `request --wildcard` names its files, so the pair stays together.
+  local name
+  case "$cn" in
+    \*.*) name="wildcard-$(printf '%s' "${cn#\*.}" | tr '.' '-')" ;;
+    *)    name="${cn%%.*}" ;;
+  esac
   say "signing: $cn"
   # `-ext` is an x509 option, NOT a req option - `openssl req -noout -ext ...` errors, and
   # under `set -o pipefail` that took the whole script down after printing one line and

@@ -142,6 +142,41 @@ TMUX_CONF=""
 # EVERY anchor in trust-anchors/, not just this CA's root. A site running DoD PKI drops its
 # roots in there and composed VMs pick them up with no change here - which is the whole point
 # of that directory being a directory.
+# ---- the admin password -------------------------------------------------------------------
+# EVERY VM GETS ONE, and it is not optional.
+#
+# The composer used to create the user with `sudo: ALL=(ALL) NOPASSWD:ALL` and NO password at
+# all. That works right up until the DISA STIG is applied: usg removes NOPASSWD (correctly -
+# STIG requires sudo to authenticate), and sudo then asks for a password that was never set.
+# There is no number of attempts that succeeds. On svc-harbor-01 on 2026-09-08 that locked
+# the only sudo-capable account out of root on a headless VM, recoverable only by editing the
+# disk offline from the hypervisor.
+#
+# Had it been found later it would have done that to all six Kubernetes nodes at once.
+#
+# NOPASSWD is KEPT as well, deliberately: it is convenient before hardening, and STIG removes
+# it afterwards - at which point the password below is what keeps the machine usable.
+#
+# A HASH goes in the user-data, never the password. cloud-init's user-data sits on the seed
+# ISO and in /var/lib/cloud on the guest, both readable.
+VM_ADMIN_HASH="${VM_ADMIN_PASSWORD_HASH:-}"
+if [ -z "$VM_ADMIN_HASH" ] && [ "$DRY" -eq 0 ]; then
+  if [ -t 0 ]; then
+    printf '  no VM_ADMIN_PASSWORD_HASH set - enter a password for %s on %s\n' "${VM_USER:-encadmin}" "$VM"
+    read -rsp '  password: ' _p1; echo
+    read -rsp '  again:    ' _p2; echo
+    [ -n "$_p1" ] || die "refusing to create a VM with an empty password - STIG will make it unusable"
+    [ "$_p1" = "$_p2" ] || die "the two entries do not match"
+    # -stdin keeps it off the command line and out of ps.
+    VM_ADMIN_HASH=$(printf '%s' "$_p1" | openssl passwd -6 -stdin) || die "hashing failed"
+    unset _p1 _p2
+  else
+    die "no VM_ADMIN_PASSWORD_HASH and no terminal to prompt on.
+      Generate one:   openssl passwd -6
+      Then:           VM_ADMIN_PASSWORD_HASH='<hash>' sudo -E ./03-compose-vm.sh $VM"
+  fi
+fi
+
 ANCHOR_DIR="$ENCLAVE_DIR/trust-anchors"
 ROOT_CA=""; ANCHOR_COUNT=0
 if [ -d "$ANCHOR_DIR" ]; then
@@ -234,6 +269,8 @@ users:
     groups: [adm, sudo]
     shell: /bin/bash
     sudo: ALL=(ALL) NOPASSWD:ALL
+    lock_passwd: false
+    passwd: $VM_ADMIN_HASH
     ssh_authorized_keys:
 $SSH_KEYS_YAML
 # preserve_sources_list: true is LOAD-BEARING. With the 'primary'/'security' form, cloud-init

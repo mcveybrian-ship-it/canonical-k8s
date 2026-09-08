@@ -179,8 +179,13 @@ that are not part of ESM, `usg`'s token printing under `cis`, and the `pro-airga
 schema. They are written down at the step that hits them, not collected here, so they are read
 in context.
 
-**What this sequence does NOT get you:** container images, Harbor,
-MAAS boot images. That is Stage B, blocked on Q8, and nothing of it is staged yet.
+**What this sequence does NOT get you:** container images and Harbor — Track B item 3, still
+unfetched, and the item that answers Q6.
+
+**MAAS boot images ARE staged as of 2026-09-08** (852 MB, runbook §4.5a). They live *inside*
+`$MIRROR_BASE/mirror/`, so `write-transfer-media.sh` carries them with the mirror rsync and
+`restore-mirror.sh` places them — no extra step, no extra flag. Q8 was answered separately;
+it never blocked this.
 
 ### 0.3 Three `.deb`s the mirror can never serve — carry them separately
 

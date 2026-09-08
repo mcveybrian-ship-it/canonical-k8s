@@ -235,11 +235,13 @@ fi
 head2 "staging keys, debs and snaps for HTTP"
 run install -d -m 0755 "$REPO_ROOT/keys" "$REPO_ROOT/debs" "$REPO_ROOT/snaps"
 if compgen -G "$SRC/bundle/keys/*.gpg" >/dev/null; then
-  run cp -a "$SRC"/bundle/keys/*.gpg "$REPO_ROOT/keys/"
+  run cp "$SRC"/bundle/keys/*.gpg "$REPO_ROOT/keys/"
+  run chmod 0644 "$REPO_ROOT"/keys/*.gpg
   note "keys   : $(ls -1 "$SRC"/bundle/keys/*.gpg 2>/dev/null | wc -l) served at /keys/"
 fi
 if compgen -G "$SRC/bundle/debs/*.deb" >/dev/null; then
-  run cp -a "$SRC"/bundle/debs/*.deb "$REPO_ROOT/debs/"
+  run cp "$SRC"/bundle/debs/*.deb "$REPO_ROOT/debs/"
+  run chmod 0644 "$REPO_ROOT"/debs/*.deb
   note "debs   : $(ls -1 "$SRC"/bundle/debs/*.deb 2>/dev/null | wc -l) served at /debs/"
 fi
 
@@ -252,9 +254,16 @@ fi
 # error names the snap rather than the missing assertion. So the pairing is CHECKED here,
 # where the media is still attached, rather than discovered on a VM inside the gap.
 if compgen -G "$SRC/bundle/snaps/*.snap" >/dev/null; then
-  run cp -a "$SRC"/bundle/snaps/*.snap "$REPO_ROOT/snaps/"
+  run cp "$SRC"/bundle/snaps/*.snap "$REPO_ROOT/snaps/"
   compgen -G "$SRC/bundle/snaps/*.assert" >/dev/null \
-    && run cp -a "$SRC"/bundle/snaps/*.assert "$REPO_ROOT/snaps/"
+    && run cp "$SRC"/bundle/snaps/*.assert "$REPO_ROOT/snaps/"
+  # NOT `cp -a`, and then an explicit chmod. -a preserves the SOURCE mode, and snaps arrive
+  # 0600 from `snap download`. nginx runs as www-data, so a 0600 file is served as 403 - and
+  # because the .assert files happen to be 0664, the failure is PARTIAL: assertions download,
+  # snaps do not, and it reads as a broken server rather than a permission bit.
+  # Caught on svc-repo-01 2026-09-08 before the first reload.
+  run chmod 0644 "$REPO_ROOT"/snaps/*
+  run chown root:root "$REPO_ROOT"/snaps/*
   _sn=0; _miss=""
   for _s in "$REPO_ROOT"/snaps/*.snap; do
     [ -e "$_s" ] || continue

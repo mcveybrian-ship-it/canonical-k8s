@@ -75,7 +75,7 @@ real client over the network. See `docs/03-host-services.md`.
 | The single re-issuance event | The FIPS YubiKey arriving. Folds together: hardware root, name constraints, CRL, and issuing the wildcard. §2.9b |
 | AO thread — 5 questions | Sending it. Three decide hardware purchases |
 | MAAS on `svc-mgmt-01` | ✅ **RUNNING 2026-09-08** — `maas 1:3.7.3` installed, PostgreSQL stood up by dbconfig-common, admin created, boot source repointed at the mirror. **6 noble/amd64 images + 4 bootloaders synced, 828 MB.** Follow-ups: `:5240` is plain HTTP; DHCP not yet enabled so PXE cannot boot. Was: **UNBLOCKED 2026-09-08** — 852 MB of boot images mirrored, carried and served (`/maas-images/`, squashfs 200 from host-4). `maas 1:3.7.3` now installable after `add-mirrored-ppa.sh maas/3.7`. Ready to install |
-| Harbor on `svc-harbor-01` | Images — Track B. The VM exists and has nothing to run |
+| Harbor on `svc-harbor-01` | ✅ **UNBLOCKED 2026-09-08** — installer 697 MB cosign-verified and served; docker.io/docker-compose-v2/containerd all already mirrored; 483 G free, 15 G RAM. Ready to install. Needs a TLS cert decision first (runbook §4.5b) |
 | Landscape | ✅ **DONE 2026-09-04** — 97 debs, 293 M, verified. Track B item 1 |
 | ~~Enterprise Store~~ | ❌ **DROPPED — replacement PROVEN 2026-09-08.** 12 files served at `/snaps/` over TLS; `k8s_5526.snap` fetched by host-4 is byte-identical to the source (`c86cf856…`). Original note 2026-09-04 — runbook §4.6. 3 snaps, 7 VMs, `k8s` pinned; served as files from `svc-repo-01` instead. **Deciding this found that the snaps were never inside the gap at all** — fixed in the vhost, the TLS block and `restore-mirror.sh` |
 | `host-1..3` | Hardware |

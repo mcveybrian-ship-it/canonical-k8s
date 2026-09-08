@@ -194,7 +194,20 @@ cmd_install_wildcard() {
 
   local d=/etc/ssl/enclave
   install -d -m 0755 "$d"
-  local base; base=$(basename "$chain" .fullchain.crt)
+
+  # NAME IT FROM THE CERTIFICATE, NOT FROM THE FILE IT ARRIVED IN. Deriving the name with
+  # `basename "$chain" .fullchain.crt` meant a transfer file called wc.crt produced
+  # /etc/ssl/enclave/wc.crt.key and wc.crt.fullchain.crt - correct content under a name that
+  # says nothing, in the directory every service config points at. The transit filename is
+  # arbitrary; the CN is not.
+  local cn base
+  cn=$(openssl x509 -in "$chain" -noout -subject 2>/dev/null | sed 's/.*CN *= *//; s/,.*//')
+  [ -n "$cn" ] || die "cannot read a CN from $chain - is it a certificate?"
+  case "$cn" in
+    \*.*) base="wildcard-$(printf '%s' "${cn#\*.}" | tr '.' '-')" ;;
+    *)    base="${cn%%.*}" ;;
+  esac
+  say "certificate CN: $cn  ->  installing as $base"
   # 0640 root:root. The services that read it start as root and drop privileges after opening
   # the file, so no group needs it. Widen only if something demonstrably cannot read it.
   install -m 0640 -o root -g root "$key"   "$d/$base.key"

@@ -55,6 +55,7 @@ SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MASTER="${TIME_MASTER:?TIME_MASTER must be set in enclave-addresses.env}"
 MASTER_NAME="${TIME_MASTER_NAME:-time-master}"
 ALLOW="${TIME_ALLOW:-10.2.20.0/24}"
+MAXPOLL="${TIME_MAXPOLL:-16}"
 CONF=/etc/chrony/chrony.conf
 DROPIN=/etc/chrony/conf.d/10-enclave.conf
 
@@ -117,7 +118,7 @@ cmd_master() {
     if [ ${#upstream[@]} -gt 0 ]; then
       echo "# Disciplined by a real reference. Clients still point at this machine and need"
       echo "# no change; it relays this source onward at one stratum lower."
-      for u in "${upstream[@]}"; do echo "server $u iburst"; done
+      for u in "${upstream[@]}"; do echo "server $u iburst maxpoll $MAXPOLL"; done
       echo ""
     else
       echo "# NO EXTERNAL REFERENCE. The enclave's time is this machine's RTC. Every node will"
@@ -181,7 +182,9 @@ cmd_client() {
     echo "# The enclave has exactly one source. Pointing at anything else - including a public"
     echo "# pool that is unreachable in the gap - produces a machine that never synchronises"
     echo "# and says so only in timedatectl, which nobody reads until something breaks."
-    echo "server $MASTER iburst"
+    echo "# maxpoll is a STIG requirement (chronyd_or_ntpd_set_maxpoll), not a tuning choice."
+    echo "# Its OVAL object is obj_chrony_all_server_has_maxpoll - EVERY server line needs it."
+    echo "server $MASTER iburst maxpoll $MAXPOLL"
     echo ""
     echo "makestep 1.0 3"
     echo "rtcsync"

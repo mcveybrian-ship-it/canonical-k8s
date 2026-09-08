@@ -72,6 +72,7 @@ real client over the network. See `docs/03-host-services.md`.
 |---|---|
 | **Verify the root-CA backup on the thumb drive**, then `shred -u /srv/ca-backup/*` | Nothing — deferred 2026-09-04 evening. The `.sha256` from that run holds a BARE hash, so use the one-liner in runbook §2.9b, not `sha256sum -c`. Until the shred, the root key is on a network-attached VM |
 | **Close the gap** | Nothing. `gap-state.sh close` + unplug port 4 when work stops |
+| **TOUCH-UP: replace the interim wildcard** | The FIPS YubiKey. Issued 2026-09-08 from the software root with no CRL DP and no name constraints, so Harbor could be stood up. **Must not survive to assessment.** |
 | The single re-issuance event | The FIPS YubiKey arriving. Folds together: hardware root, name constraints, CRL, and issuing the wildcard. §2.9b |
 | AO thread — 5 questions | Sending it. Three decide hardware purchases |
 | MAAS on `svc-mgmt-01` | ✅ **RUNNING 2026-09-08** — `maas 1:3.7.3` installed, PostgreSQL stood up by dbconfig-common, admin created, boot source repointed at the mirror. **6 noble/amd64 images + 4 bootloaders synced, 828 MB.** Follow-ups: `:5240` is plain HTTP; DHCP not yet enabled so PXE cannot boot. Was: **UNBLOCKED 2026-09-08** — 852 MB of boot images mirrored, carried and served (`/maas-images/`, squashfs 200 from host-4). `maas 1:3.7.3` now installable after `add-mirrored-ppa.sh maas/3.7`. Ready to install |

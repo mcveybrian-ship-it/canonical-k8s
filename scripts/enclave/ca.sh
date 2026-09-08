@@ -701,9 +701,6 @@ cmd_request() {
   # on at least two machines, readable by root on each, recoverable from the filesystem after
   # deletion. Exactly the reasoning that keeps the issuing key off stage-01, applied one level
   # down. Only a CSR leaves this host.
-  [ -e "$d/$name.key" ] && die "a key already exists at $d/$name.key.
-       Reusing it is fine - send $d/$name.csr for signing. Delete both only if you mean to
-       invalidate every certificate issued against that key."
 
   local ip sans var cn
   if [ ${#wildcards[@]} -gt 0 ]; then
@@ -765,6 +762,15 @@ cmd_request() {
       esac
     done
   fi
+
+  # CHECKED HERE, NOT EARLIER. $name is only final once the wildcard block has run: before
+  # that it still holds the hostname default, so `request --wildcard enclave.internal` on
+  # svc-mgmt-01 tested for svc-mgmt-01.key, found the machine's own existing key, and refused
+  # to issue a wildcard that had nothing to do with it. The error named a real file and a real
+  # rule and was still completely wrong about what was happening.
+  [ -e "$d/$name.key" ] && die "a key already exists at $d/$name.key.
+       Reusing it is fine - send $d/$name.csr for signing. Delete both only if you mean to
+       invalidate every certificate issued against that key."
 
   openssl genrsa -out "$d/$name.key" "${CSR_KEY_BITS:-${CA_LEAF_KEY_BITS:-3072}}" 2>/dev/null \
     || die "key generation failed"

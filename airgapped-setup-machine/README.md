@@ -74,7 +74,7 @@ real client over the network. See `docs/03-host-services.md`.
 | **Close the gap** | Nothing. `gap-state.sh close` + unplug port 4 when work stops |
 | The single re-issuance event | The FIPS YubiKey arriving. Folds together: hardware root, name constraints, CRL, and issuing the wildcard. §2.9b |
 | AO thread — 5 questions | Sending it. Three decide hardware purchases |
-| MAAS on `svc-mgmt-01` | Boot images — Track B |
+| MAAS on `svc-mgmt-01` | ✅ **UNBLOCKED 2026-09-08** — 852 MB of boot images mirrored, carried and served (`/maas-images/`, squashfs 200 from host-4). `maas 1:3.7.3` now installable after `add-mirrored-ppa.sh maas/3.7`. Ready to install |
 | Harbor on `svc-harbor-01` | Images — Track B. The VM exists and has nothing to run |
 | Landscape | ✅ **DONE 2026-09-04** — 97 debs, 293 M, verified. Track B item 1 |
 | ~~Enterprise Store~~ | ❌ **DROPPED — replacement PROVEN 2026-09-08.** 12 files served at `/snaps/` over TLS; `k8s_5526.snap` fetched by host-4 is byte-identical to the source (`c86cf856…`). Original note 2026-09-04 — runbook §4.6. 3 snaps, 7 VMs, `k8s` pinned; served as files from `svc-repo-01` instead. **Deciding this found that the snaps were never inside the gap at all** — fixed in the vhost, the TLS block and `restore-mirror.sh` |
@@ -116,6 +116,7 @@ the gap. Q6 — the container-image bundle size — still gates Harbor's disk si
 | `archive.ubuntu.com` | 248 G | 85,898 | noble, -updates, -security; main+universe, amd64 |
 | `esm/fips-updates` | 68 G | 3,836 | incl. **353 FIPS kernel images** |
 | `esm/apps` | 2.4 G | 1,059 | |
+| **maas boot images** | **852 M** | — | **Added 2026-09-08** — `ephemeral-v3/stable`, noble/amd64, 6 kernel flavours + 7 bootloaders. Lives INSIDE the mirror tree so it needs no nginx, bundle or restore changes |
 | **`ppa maas/3.7`** | **239 M** | **53** | **Added 2026-08-31** — MAAS as debs, because the snap needs a non-FIPS `core24` base |
 | **`ppa landscape/self-hosted-24.04`** | **293 M** | **97** | **Added 2026-09-04** — Track B item 1. `landscape-server 24.04.14`. `InRelease` is dual-signed; only the RSA-4096 key is trusted, the legacy RSA-1024 one is deliberately NOT imported |
 | `esm/usg` | 3.3 M | 3 | `usg`, `usg-benchmarks`, `usg-benchmarks-1` |

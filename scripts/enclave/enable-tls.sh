@@ -176,7 +176,16 @@ fi
 # and svc-repo-01 was running a vhost installed before that include existed, so nginx came
 # back cleanly on :80 and never listened on :443 at all.
 install -d -m 0755 /etc/ssl/enclave
-install -m 0644 "$CHAIN" "/etc/ssl/enclave/$NAME.fullchain.crt"
+# Re-running this script with the chain it already installed is a NORMAL thing to do -
+# it is how you re-emit the nginx block after the script itself changes. `install` refuses
+# when source and destination are the same file, which killed the run under `set -e` after
+# every check had passed and before anything was written. A script that cannot be handed its
+# own output is not idempotent.
+if [ "$(readlink -f "$CHAIN")" = "$(readlink -f "/etc/ssl/enclave/$NAME.fullchain.crt")" ]; then
+  say "chain is already at /etc/ssl/enclave/$NAME.fullchain.crt - leaving it"
+else
+  install -m 0644 "$CHAIN" "/etc/ssl/enclave/$NAME.fullchain.crt"
+fi
 chgrp www-data "$KEY" 2>/dev/null || true
 chmod 0640 "$KEY"
 ok "installed /etc/ssl/enclave/$NAME.fullchain.crt"

@@ -46,11 +46,16 @@ cmd_list() {
   # autoindex gives us plain hrefs; no pipeline into grep -q anywhere in this script.
   local top; top=$(curl -sS --max-time 15 "$BASE/" 2>/dev/null || true)
   [ -n "$top" ] || die "cannot reach $BASE/ - is the mirror serving, and is the root CA trusted?"
+  # nginx autoindex emits a "../" parent link in every directory, and the character class
+  # matches it because '.' and '-' are in it. Listing "landscape/.." as an installable PPA
+  # makes the whole output untrustworthy, which defeats the point of a --list.
   local owner
   for owner in $(printf '%s' "$top" | grep -oE 'href="[a-z0-9.-]+/"' | cut -d'"' -f2 | tr -d '/'); do
+    case "$owner" in ''|.|..) continue ;; esac
     local sub; sub=$(curl -sS --max-time 15 "$BASE/$owner/" 2>/dev/null || true)
     local rel
     for rel in $(printf '%s' "$sub" | grep -oE 'href="[a-zA-Z0-9._-]+/"' | cut -d'"' -f2 | tr -d '/'); do
+      case "$rel" in ''|.|..) continue ;; esac
       say "    $owner/$rel"
     done
   done

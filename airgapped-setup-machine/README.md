@@ -6,7 +6,7 @@
 *how* things were built and why; they have gone stale more than once. If they disagree with
 this section, this section wins and the other one gets fixed.
 
-Last updated **2026-09-04 21:15**.
+Last updated **2026-09-08 21:00**.
 
 **STAGE-01's build work is DONE. The enclave is currently in STATE A (BUILD), not gapped.**
 
@@ -77,6 +77,7 @@ real client over the network. See `docs/03-host-services.md`.
 | AO thread — 5 questions | Sending it. Three decide hardware purchases |
 | MAAS on `svc-mgmt-01` | ✅ **RUNNING + DHCP 2026-09-08** — dynamic `.100-.149`, reserved `.150-.254`, `dhcp_on=True`, **no `option routers`** so PXE'd machines get no default route. dhcpd on `0.0.0.0:67`, TFTP on `.161:69`, HTTP boot on `:5248`. ⚠️ Installing MAAS SPLIT THE ENCLAVE CLOCK — see runbook §2.10. Was: **RUNNING 2026-09-08** — `maas 1:3.7.3` installed, PostgreSQL stood up by dbconfig-common, admin created, boot source repointed at the mirror. **6 noble/amd64 images + 4 bootloaders synced, 828 MB.** Follow-ups: `:5240` is plain HTTP; DHCP not yet enabled so PXE cannot boot. Was: **UNBLOCKED 2026-09-08** — 852 MB of boot images mirrored, carried and served (`/maas-images/`, squashfs 200 from host-4). `maas 1:3.7.3` now installable after `add-mirrored-ppa.sh maas/3.7`. Ready to install |
 | Harbor on `svc-harbor-01` | ✅ **RUNNING 2026-09-08** — v2.15.2, 11 containers, all 8 components healthy incl. Trivy. Serving `https://svc-harbor-01.enclave.internal` on the enclave wildcard, validated from host-4 with no `-k`. **Trivy pulls its DB from Harbor itself** — proven in Harbor's access log (`trivy/0.72.0` pulled the 117 MB blob, zero ghcr.io). A real image was pushed and scanned successfully. java-db configured but unexercised. Was: **UNBLOCKED 2026-09-08** — installer 697 MB cosign-verified and served; docker.io/docker-compose-v2/containerd all already mirrored; 483 G free, 15 G RAM. Ready to install. Needs a TLS cert decision first (runbook §4.5b) |
+| **FIPS + STIG on `svc-harbor-01`** | ✅ **DONE 2026-09-08** — FIPS kernel from the enclave mirror, `usg fix stig-v1r1` applied, rebooted, re-audited. **51 pass / 68 fail → 205 pass / 11 fail.** The 11 are the findings register — runbook §6.3. ⚠️ **`usg fix` LOCKED THE ADMIN ACCOUNT OUT OF SUDO** (no password + STIG removes NOPASSWD). Fixed at source in `03-compose-vm.sh`; `vm-rescue.sh` gets you back in. §6.3a. ⚠️ **Two of the 11 are our own bug** — `time-sync.sh` writes a chrony drop-in the STIG check does not read, and sets no `maxpoll`. **Fix it before hardening `svc-mgmt-01`** |
 | Landscape | ✅ **DONE 2026-09-04** — 97 debs, 293 M, verified. Track B item 1 |
 | ~~Enterprise Store~~ | ❌ **DROPPED — replacement PROVEN 2026-09-08.** 12 files served at `/snaps/` over TLS; `k8s_5526.snap` fetched by host-4 is byte-identical to the source (`c86cf856…`). Original note 2026-09-04 — runbook §4.6. 3 snaps, 7 VMs, `k8s` pinned; served as files from `svc-repo-01` instead. **Deciding this found that the snaps were never inside the gap at all** — fixed in the vhost, the TLS block and `restore-mirror.sh` |
 | `host-1..3` | Hardware |

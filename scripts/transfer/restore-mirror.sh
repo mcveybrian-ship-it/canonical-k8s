@@ -403,9 +403,30 @@ head2 "proving the served side-load trees are actually reachable"
 #
 # Fetching one file from each tree turns that class of mistake into a line of output here,
 # where the media is still attached, instead of into a confusing failure at cluster build.
+# Two shapes of served tree, and BOTH need proving:
+#   siblings of mirror/  - keys, debs, snaps  - reached through their own nginx `location`
+#   inside mirror/       - bin, harbor, maas-images, oci - reached because the mirror root
+#                          is served at /, so they need no location at all
+#
+# The second kind is easy to forget precisely because it needs no nginx config: nothing in
+# the vhost mentions them, so nothing prompts you to check them. maas-images and harbor both
+# arrived that way, and a rebuild that silently failed to serve them would present as MAAS
+# unable to import and Harbor unable to install.
 _served_fail=0
-for _tree in keys debs snaps; do
-  _f=$(find "$REPO_ROOT/$_tree" -maxdepth 1 -type f -printf '%f\n' 2>/dev/null | head -1)
+for _tree in keys debs snaps bin harbor maas-images oci; do
+  case "$_tree" in
+    keys|debs|snaps) _dir="$REPO_ROOT/$_tree" ;;
+    *)               _dir="$REPO_ROOT/mirror/$_tree" ;;
+  esac
+  [ -d "$_dir" ] || { note "$_tree   : not present, skipped"; continue; }
+  # -print -quit rather than `| head -1`: find receives SIGPIPE when head closes the pipe,
+  # and under `set -o pipefail` that fails the whole assignment. This project has hit that
+  # exact trap three times.
+  #
+  # No -maxdepth either. maas-images nests four levels
+  # (ephemeral-v3/stable/streams/v1/index.sjson) and a depth limit found nothing there while
+  # reporting success for the shallower trees - a check that passes by not looking.
+  _f=$(cd "$_dir" && find . -type f -print -quit 2>/dev/null | sed 's|^\./||')
   if [ -z "$_f" ]; then
     note "$_tree   : empty, nothing to prove"
     continue
@@ -417,7 +438,7 @@ for _tree in keys debs snaps; do
     200) note "$_tree   : /$_tree/$_f -> 200" ;;
     403) warn "$_tree   : /$_tree/$_f -> 403 - nginx cannot READ these files.
        Check the mode: they must be world-readable, and 'cp -a' preserves the SOURCE mode.
-         sudo chmod 0644 $REPO_ROOT/$_tree/*"
+         sudo chmod -R a+rX $_dir"
          _served_fail=1 ;;
     404) warn "$_tree   : /$_tree/$_f -> 404 - the vhost has no 'location ^~ /$_tree/'.
        The TLS block in enable-tls.sh needs it too, not only the :80 vhost."
@@ -425,7 +446,7 @@ for _tree in keys debs snaps; do
     *)   warn "$_tree   : /$_tree/$_f -> '$_code'"; _served_fail=1 ;;
   esac
 done
-[ "$_served_fail" -eq 0 ] && ok "keys, debs and snaps are all served" \
+[ "$_served_fail" -eq 0 ] && ok "every served tree is reachable" \
   || warn "one or more served trees are NOT reachable - fix before crossing the gap"
 
 head2 "proving a GPG-verified apt resolution (ESM/FIPS/USG)"

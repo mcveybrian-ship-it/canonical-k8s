@@ -148,7 +148,11 @@ UNIT
 # =========================================================================================
 cmd_pro() {
   need_root pro
-  local url="${CONTRACTS_URL:-http://svc-mgmt-01.enclave.internal:$CONTRACTS_PORT}"
+  # HTTPS through nginx, NOT http://...:8484. The contracts server's own port was bound to
+  # loopback only (systemd IPAddressDeny, runbook 2.9a) once nginx was fronting it with TLS,
+  # so this default would now fail from any machine except svc-mgmt-01 itself - and the
+  # failure looks like a broken contracts server rather than a stale URL.
+  local url="${CONTRACTS_URL:-https://svc-mgmt-01.${ENCLAVE_DOMAIN:-enclave.internal}}"
   local tokfile="${PRO_TOKEN_FILE:-}"
   if [ -z "$tokfile" ]; then
     local h; h=$(getent passwd "${SUDO_USER:-root}" | cut -d: -f6)
@@ -240,6 +244,41 @@ cmd_verify() {
     000|"") warn "no HTTP response on :$CONTRACTS_PORT"; fail=1 ;;
     *)      ok "responds on :$CONTRACTS_PORT (HTTP $code)" ;;
   esac
+
+  # THE TLS FRONT, which is how every other machine actually reaches this service. Checking
+  # only :8484 proves the daemon runs while clients are broken - and :8484 is loopback-only
+  # by design, so it is reachable HERE and nowhere else.
+  #
+  # INSTALLING MAAS STOPPED AND DISABLED nginx on 2026-09-08 at 15:31, taking the contracts
+  # server offline for every client with no error anywhere. MAAS runs its own nginx for
+  # :5248 and evidently does not want a second one enabled. Nothing surfaced it; it was found
+  # by chance hours later. Hence this check.
+  if systemctl is-active --quiet nginx 2>/dev/null; then
+    ok "nginx active (the TLS front)"
+    systemctl is-enabled --quiet nginx 2>/dev/null \
+      && ok "nginx enabled at boot" \
+      || { warn "nginx NOT enabled at boot - a reboot loses the TLS front.
+       Installing MAAS disables it:  sudo systemctl enable --now nginx"; fail=1; }
+  else
+    warn "nginx NOT active - clients cannot reach the contracts server.
+       sudo systemctl enable --now nginx"; fail=1
+  fi
+
+  local url="${CONTRACTS_URL:-https://svc-mgmt-01.${ENCLAVE_DOMAIN:-enclave.internal}}"
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "$url/v1/resources" || true)
+  case "${code:-000}" in
+    200) ok "clients can reach $url/v1/resources (HTTP 200)" ;;
+    000|"") warn "NO response at $url/v1/resources - the TLS front is down"; fail=1 ;;
+    *)   warn "$url/v1/resources returned HTTP $code, expected 200"; fail=1 ;;
+  esac
+
+  # MAAS's own nginx must survive whatever we do to the system one - they are separate
+  # instances on separate ports and both are needed.
+  if ss -ltn 2>/dev/null | grep -q ":5248"; then
+    ok "MAAS http boot still listening on :5248"
+  else
+    warn "nothing on :5248 - MAAS cannot serve boot images"; fail=1
+  fi
 
   echo
   [ "$fail" -eq 0 ] && ok "contracts server ready" || warn "INCOMPLETE - see above"

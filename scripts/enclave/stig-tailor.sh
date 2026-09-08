@@ -147,7 +147,9 @@ cmd_audit() {
   # The customised profile id is fixed by usg's generator: <profile>_customized.
   local cprof; cprof="$(grep -oE 'Profile id="[^"]+_customized"' "$OUT" | head -1 | sed 's/.*id="//; s/"//')"
   [ -n "$cprof" ] || die "cannot find the customised profile id in $OUT"
-  say "auditing with $cprof"
+  # Print the command. If usg's flag ordering differs on a future release, the failure is
+  # then obvious rather than looking like a problem with the tailoring file itself.
+  say "running: usg audit --tailoring-file $OUT $cprof"
   usg audit --tailoring-file "$OUT" "$cprof"
 }
 

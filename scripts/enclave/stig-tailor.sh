@@ -59,7 +59,7 @@ trap 'rm -rf "${tmp:-}"' EXIT
 #
 deviations() {
 cat <<'EOF'
-set-value	value_var_multiple_time_servers	__TIME_MASTER__	chronyd_specify_remote_server (STIG ID: __STIG_ID__ - take it from the comment above the rule in the generated file). The DISA profile pins the approved time source to 0.us.pool.ntp.mil, which is unreachable from inside the boundary BY DESIGN - reaching it would be the finding. The enclave's authoritative source is __TIME_MASTER_NAME__ (__TIME_MASTER__), a physical machine serving the enclave subnet only. The rule's INTENT - synchronise only to an organisation-approved source - is met in full; only the list of approved sources differs. This is a retarget, not an exception.
+set-value	value_var_multiple_time_servers	__TIME_MASTER__	__STIG_ID__ / chronyd_specify_remote_server. The DISA profile pins the approved time source to 0.us.pool.ntp.mil, which is unreachable from inside the boundary BY DESIGN - reaching it would be the finding. The enclave's authoritative source is __TIME_MASTER_NAME__ (__TIME_MASTER__), a physical machine serving the enclave subnet only. The rule's INTENT - synchronise only to an organisation-approved source - is met in full; only the list of approved sources differs. This is a retarget, not an exception.
 EOF
 }
 #
@@ -94,40 +94,91 @@ cmd_generate() {
 
   grep -q '</Profile>' "$tmp/base.xml" || die "generated file has no </Profile> - unexpected format"
 
-  # Build the deviation block, then splice it in before </Profile>. XCCDF 1.2 allows
-  # select/set-value in any order within a Profile, so appending is schema-valid and does
-  # not depend on where usg happened to put the rule we are overriding.
-  local block="$tmp/dev.xml" n=0 missing=0
-  : > "$block"
-  echo "    <!-- ================= ENCLAVE DEVIATIONS - generated $(date -Is) ================= -->" >> "$block"
+  # REPLACE IN PLACE, DO NOT APPEND. usg's generated file ALREADY carries a <set-value> for
+  # every value the profile refines - var_multiple_time_servers is pinned to
+  # 0.us.pool.ntp.mil, var_network_filtering_service to ufw, and so on. XCCDF 1.2 declares a
+  # uniqueness constraint on set-value/@idref, so a second element for the same idref is not
+  # "the last one wins" - it makes the whole file INVALID and oscap refuses to run at all.
+  #
+  # So: rewrite the element that is already there, and only append when there is none.
+  local dev="$tmp/dev.tsv" status="$tmp/status.tsv" n=0 missing=0
+  : > "$dev"
   while IFS=$'\t' read -r kind id value why; do
     [ -n "${kind:-}" ] || continue
     value="${value//__TIME_MASTER__/$TIME_MASTER}"
     why="${why//__TIME_MASTER__/$TIME_MASTER}"
     why="${why//__TIME_MASTER_NAME__/$TIME_MASTER_NAME}"
 
-    # A deviation naming a rule the benchmark no longer has is a SILENT no-op otherwise -
-    # exactly the failure this script exists to prevent. Say so loudly and keep going.
+    # A deviation naming a rule or value the benchmark no longer has is a SILENT no-op
+    # otherwise - exactly the way a tailoring file rots. Say so loudly and keep going.
     if ! grep -q "content_${id}" "$tmp/base.xml"; then
       warn "NOT IN THIS BENCHMARK: $id - deviation skipped, review it"
       missing=$((missing + 1))
       continue
     fi
-    {
-      echo "    <!-- DEVIATION: $why -->"
-      case "$kind" in
-        set-value) echo "    <set-value idref=\"xccdf_org.ssgproject.content_${id}\">${value}</set-value>" ;;
-        deselect)  echo "    <select idref=\"xccdf_org.ssgproject.content_${id}\" selected=\"false\"/>" ;;
-        *) die "unknown deviation kind: $kind" ;;
-      esac
-    } >> "$block"
+    printf '%s\t%s\t%s\t%s\n' "$kind" "$id" "$value" "$why" >> "$dev"
     n=$((n + 1))
   done < <(deviations)
 
-  awk -v blockfile="$block" '
-    /<\/Profile>/ && !done { while ((getline line < blockfile) > 0) print line; done=1 }
-    { print }
+  awk -v devfile="$dev" -v statusfile="$status" '
+    BEGIN {
+      while ((getline line < devfile) > 0) {
+        split(line, f, "\t")
+        id = f[2]
+        kind[id] = f[1]; val[id] = f[3]; why[id] = f[4]
+        full[id] = "xccdf_org.ssgproject.content_" id
+        ids[++k] = id
+      }
+    }
+    # THE STIG ID COMES FROM THE BENCHMARK, NOT FROM US. usg writes a comment carrying the
+    # UBTU-24-xxxxx id directly above each element, so the justification can cite the id the
+    # installed benchmark actually uses. Typing it by hand is how a document ends up quoting
+    # an id that moved - and citing the wrong control to an assessor is worse than citing none.
+    function emit(id, sid,   ind, w) {
+      ind = "    "
+      w = why[id]
+      gsub(/__STIG_ID__/, (sid != "" ? sid : "not stated in this benchmark"), w)
+      print ind "<!-- DEVIATION: " w " -->"
+      if (kind[id] == "set-value")
+        print ind "<set-value idref=\"" full[id] "\">" val[id] "</set-value>"
+      else
+        print ind "<select idref=\"" full[id] "\" selected=\"false\"/>"
+    }
+    {
+      # Remember the most recent UBTU id seen. usg puts it in a comment immediately above the
+      # element it belongs to, so when we match an element on the next line this still holds
+      # the id for that element. (No apostrophes in here - the awk program is inside single
+      # quotes, and one stray quote silently ends it and hands the rest to bash.)
+      if (match($0, /UBTU-24-[0-9]+/)) lastid = substr($0, RSTART, RLENGTH)
+
+      for (i = 1; i <= k; i++) {
+        id = ids[i]
+        if (done[id]) continue
+        tag = (kind[id] == "set-value") ? "<set-value idref=\"" : "<select idref=\""
+        if (index($0, tag full[id] "\"") > 0) {
+          emit(id, lastid); done[id] = 1
+          print "replaced\t" id "\t" (lastid == "" ? "-" : lastid) > statusfile
+          next
+        }
+      }
+      if ($0 ~ /<\/Profile>/) {
+        # Appended elements have no neighbouring comment, so there is no id to cite.
+        for (i = 1; i <= k; i++) {
+          id = ids[i]
+          if (done[id]) continue
+          emit(id, ""); done[id] = 1
+          print "appended\t" id "\t-" > statusfile
+        }
+      }
+      print
+    }
   ' "$tmp/base.xml" > "$tmp/out.xml"
+
+  # Report which shape each deviation took. "replaced" means we overrode a value the profile
+  # itself sets - the interesting case, and the one worth reading in a review.
+  if [ -s "$status" ]; then
+    while IFS=$'\t' read -r how id sid; do say "  $how: $id  [$sid]"; done < "$status"
+  fi
 
   # Prove the result still parses before it replaces anything. A tailoring file that fails
   # to parse makes `usg audit` fall back or fail outright, and the failure arrives at the

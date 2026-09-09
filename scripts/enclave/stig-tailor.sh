@@ -48,6 +48,9 @@ warn() { printf '  [!]  %s\n' "$*"; }
 die()  { printf '\n  [x] %s\n\n' "$*" >&2; exit 1; }
 need_root() { [ "$(id -u)" -eq 0 ] || die "run with sudo"; }
 
+tmp=""
+trap 'rm -rf "${tmp:-}"' EXIT
+
 # ---------------------------------------------------------------------------- deviations
 #
 # Fields, tab-separated:  kind | xccdf id (without the content_ prefix) | value | why
@@ -81,7 +84,10 @@ cmd_generate() {
   command -v usg >/dev/null 2>&1 || die "usg is not installed - 'sudo pro enable usg' first"
   install -d -m 0755 "$(dirname "$OUT")"
 
-  local tmp; tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+  # NOT `local`. The EXIT trap fires after this function has returned, so a local is already
+  # out of scope by then and `set -u` aborts the script on the way out - which looks like a
+  # failure of whatever ran last rather than of the cleanup.
+  tmp="$(mktemp -d)"
   say "generating from profile $PROFILE"
   ( cd "$tmp" && usg generate-tailoring "$PROFILE" base.xml >/dev/null ) \
     || die "usg generate-tailoring failed - is '$PROFILE' the right name? check 'usg list'"
@@ -144,13 +150,16 @@ cmd_generate() {
 cmd_audit() {
   need_root
   [ -f "$OUT" ] || die "$OUT does not exist - run '$0 generate' first"
-  # The customised profile id is fixed by usg's generator: <profile>_customized.
+  # PASS THE FILE, NOT A PROFILE. usg rejects both together - "You cannot provide both a
+  # tailoring file and a profile!" - because the tailoring file already names the customised
+  # profile it defines. Reported here anyway, so the audit output says what it evaluated.
   local cprof; cprof="$(grep -oE 'Profile id="[^"]+_customized"' "$OUT" | head -1 | sed 's/.*id="//; s/"//')"
   [ -n "$cprof" ] || die "cannot find the customised profile id in $OUT"
-  # Print the command. If usg's flag ordering differs on a future release, the failure is
-  # then obvious rather than looking like a problem with the tailoring file itself.
-  say "running: usg audit --tailoring-file $OUT $cprof"
-  usg audit --tailoring-file "$OUT" "$cprof"
+  say "profile in the tailoring file: $cprof"
+  # Print the command. If usg's arguments change on a future release, the failure is then
+  # obvious rather than looking like a problem with the tailoring file itself.
+  say "running: usg audit --tailoring-file $OUT"
+  usg audit --tailoring-file "$OUT"
 }
 
 # ---------------------------------------------------------------------------- show

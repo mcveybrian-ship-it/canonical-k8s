@@ -638,6 +638,144 @@ fixups_verify() {
   return 0
 }
 
+# ---------------------------------------------------------------------------- preflight
+#
+# WHAT WILL `usg fix` TAKE AWAY FROM THIS MACHINE.
+#
+# The STIG profile does not only tighten settings - it REMOVES packages and DISABLES services.
+# On svc-harbor-01 that was harmless: nothing in the profile targeted anything Harbor needed,
+# and we got away with reading the failing list and hoping.
+#
+# svc-mgmt-01 is different. It runs isc-dhcp-server (MAAS DHCP), python3-txtftp (PXE TFTP),
+# squid (maas-proxy) and nginx. A single package_*_removed rule that matches one of those
+# takes out commissioning - and commissioning is how host-1..3 get built. Finding that out
+# from a broken PXE boot next week is not the same as finding it out now.
+#
+# So: cross-reference the SELECTED rules against what is actually installed and running, and
+# print the collisions BEFORE anything is remediated. Rule ids carry the target in the middle:
+# package_<name>_removed, service_<name>_disabled, service_<name>_masked.
+#
+# This does not decide anything. It tells you what to decide.
+
+cmd_preflight() {
+  local me; me="$(hostname -s)"
+  command -v usg >/dev/null 2>&1 \
+    || die "usg is not installed on $me - runbook 6.0 step 6 first (pro enable usg)"
+
+  # Prefer the tailoring file if one exists: it is the authoritative selected set for THIS
+  # enclave, deviations included. Fall back to the benchmark's own stig profile block.
+  local src block
+  if [ -f "$OUT" ]; then
+    src="$OUT"
+    block="$(grep -oE 'idref="xccdf_org.ssgproject.content_rule_[a-z0-9_.-]+"[^>]*selected="true"' "$src" \
+             | sed 's/.*content_rule_//; s/".*//')"
+  else
+    src="$(ls /usr/share/usg-benchmarks/*/ssg-ubuntu2404-xccdf.xml 2>/dev/null | head -1)"
+    [ -n "$src" ] || src=/usr/share/ubuntu-scap-security-guides/1/benchmarks/ssg-ubuntu2404-xccdf.xml
+    [ -f "$src" ] || die "cannot find the benchmark XCCDF - is usg-benchmarks installed?"
+    block="$(awk '/Profile id="xccdf_org.ssgproject.content_profile_stig"/,/<\/xccdf-1.2:Profile>/' "$src" \
+             | grep -oE 'content_rule_[a-z0-9_.-]+' | sed 's/content_rule_//' | sort -u)"
+  fi
+  [ -n "$block" ] || die "found no selected rules in $src - inspect it by hand"
+
+  printf '\n  preflight for %s\n  source: %s\n  selected rules: %s\n\n' \
+    "$me" "$src" "$(printf '%s\n' "$block" | wc -l)"
+
+  local hits=0 name rule
+
+  printf '  PACKAGES the profile wants REMOVED that are INSTALLED here\n'
+  while read -r rule; do
+    case "$rule" in
+      package_*_removed) name="${rule#package_}"; name="${name%_removed}" ;;
+      *) continue ;;
+    esac
+    if dpkg -s "$name" >/dev/null 2>&1 && dpkg -s "$name" 2>/dev/null | grep -q '^Status: install ok installed'; then
+      warn "  $name   (rule: $rule)"
+      hits=$((hits + 1))
+    fi
+  done < <(printf '%s\n' "$block")
+  [ "$hits" -gt 0 ] || ok "  none"
+
+  local shits=0
+  printf '\n  SERVICES the profile wants DISABLED or MASKED that are ACTIVE here\n'
+  while read -r rule; do
+    case "$rule" in
+      service_*_disabled) name="${rule#service_}"; name="${name%_disabled}" ;;
+      service_*_masked)   name="${rule#service_}"; name="${name%_masked}" ;;
+      *) continue ;;
+    esac
+    if systemctl is-active "$name" >/dev/null 2>&1; then
+      warn "  $name is ACTIVE   (rule: $rule)"
+      shits=$((shits + 1))
+    fi
+  done < <(printf '%s\n' "$block")
+  [ "$shits" -gt 0 ] || ok "  none"
+
+  say ""
+  if [ $((hits + shits)) -eq 0 ]; then
+    ok "nothing the profile removes or disables is present on this machine"
+  else
+    warn "$((hits + shits)) collision(s). For EACH one, decide before running fix:"
+    say "   - is it actually needed here?  (MAAS needs DHCP, TFTP and its proxy)"
+    say "   - if yes, it is a TAILORING DEVIATION with a justification, not a surprise"
+    say "   - if no, let fix remove it and the machine is smaller"
+    say "   Add deviations to the table in this script, then re-run generate."
+  fi
+  # --- NOPASSWD grants to SERVICE accounts ------------------------------------------------
+  #
+  # `usg fix` strips NOPASSWD from sudoers - correctly, STIG requires sudo to authenticate.
+  # On svc-harbor-01 that locked out the only human admin (6.3a). On svc-mgmt-01 it does
+  # something quieter and worse: MAAS ships FOUR sudoers files granting its own service
+  # account per-command NOPASSWD for starting maas-dhcpd, running lshw and blockdev during
+  # commissioning, and reloading maas-agent/http/proxy/syslog, chrony and bind9.
+  #
+  # The `maas` user is non-interactive with no password. Take NOPASSWD away and sudo prompts
+  # into the void: no DHCP, no hardware inventory, no PXE. THIS IS NOT A PACKAGE OR SERVICE
+  # RULE, so the two checks above cannot see it.
+  local np_files nf=0
+  printf '\n  NOPASSWD grants that `usg fix` will strip\n'
+  np_files="$(grep -rlE '^[^#]*NOPASSWD' /etc/sudoers /etc/sudoers.d/ 2>/dev/null || true)"
+  if [ -z "$np_files" ] && [ "$(id -u)" -ne 0 ]; then
+    # NEVER report "none" from a check that could not read its inputs. /etc/sudoers.d is
+    # root-only, so unprivileged this finds nothing whether or not anything is there - and a
+    # false "none" here is what lets someone run fix and break MAAS.
+    warn "  INCOMPLETE - /etc/sudoers.d is not readable as $(id -un)."
+    say  "     This check found nothing because it could not look, NOT because there is"
+    say  "     nothing. Re-run:  sudo $0 preflight"
+    nf=1
+  elif [ -z "$np_files" ]; then
+    ok "  none found (checked as root, so this is a real answer)"
+  else
+    local f who shell
+    for f in $np_files; do
+      while read -r who; do
+        [ -n "$who" ] || continue
+        shell="$(getent passwd "$who" 2>/dev/null | cut -d: -f7)"
+        case "$shell" in
+          ""|*/nologin|*/false)
+            warn "  $who in $(basename "$f") - SERVICE ACCOUNT (shell: ${shell:-none})"
+            say  "     stripping this breaks whatever it automates, silently"
+            nf=$((nf + 1)) ;;
+          *)
+            say  "  $who in $(basename "$f") - interactive account (shell: $shell)"
+            say  "     MUST have a working password before fix runs, or it is locked out (6.3a)"
+            nf=$((nf + 1)) ;;
+        esac
+      done < <(grep -hE '^[^#]*NOPASSWD' "$f" 2>/dev/null | awk '{print $1}' | grep -v '^%' | sort -u)
+    done
+    say ""
+    say "   Back these up OUTSIDE /etc/sudoers.d before fix - $STIG_BACKUP_DIR - then restore"
+    say "   only the SERVICE-ACCOUNT grants afterwards, as a documented deviation. Restoring"
+    say "   per-command NOPASSWD for a service account is a far better story than a blanket"
+    say "   deviation on the rule, and the human admin stays authenticated as STIG wants."
+  fi
+
+  say ""
+  say "NOTE: the package and service checks only catch rules whose id names the target. A rule"
+  say "that breaks something as a side effect of a SETTING - like the NOPASSWD strip above -"
+  say "will not appear in them. The baseline audit and the failing list still matter."
+}
+
 # ---------------------------------------------------------------------------- ufw
 #
 # WHAT THE RULES ACTUALLY REQUIRE, read from the benchmark on 2026-09-10:
@@ -804,8 +942,9 @@ cmd_ufw() {
 case "${1:-}" in
   generate) shift; cmd_generate "$@" ;;
   fixups)   shift; cmd_fixups "$@" ;;
+  preflight) shift; cmd_preflight "$@" ;;
   ufw)      shift; cmd_ufw "$@" ;;
   audit)    shift; cmd_audit "$@" ;;
   show)     shift; cmd_show "$@" ;;
-  *) printf 'usage: %s {generate|audit|show|fixups [--apply] [--with-rsyslog] [--verify]|ufw [--apply]}\n' "$0" >&2; exit 2 ;;
+  *) printf 'usage: %s {generate|audit|show|preflight|fixups [--apply] [--with-rsyslog] [--verify]|ufw [--apply]}\n' "$0" >&2; exit 2 ;;
 esac

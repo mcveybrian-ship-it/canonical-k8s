@@ -256,7 +256,22 @@ cmd_show() {
 VARCONF_SRC=/usr/lib/tmpfiles.d/var.conf
 VARCONF_DST=/etc/tmpfiles.d/var.conf
 APT_LOGROTATE=/etc/logrotate.d/apt
+RSYSLOG_LOGROTATE=/etc/logrotate.d/rsyslog
+RSYSLOG_STIG=/etc/rsyslog.d/60-stig.conf
+DAEMON_LOG=/var/log/daemon.log
 LOGMODE="${STIG_LOG_MODE:-0640}"
+
+# The three regexes rsyslog_remote_access_monitoring tests for, verbatim from
+# ssg-ubuntu2404-oval.xml (obj_remote_method_monitoring_{auth,authpriv,daemon}). They are
+# EXISTENCE checks against /etc/rsyslog.conf and /etc/rsyslog.d/*.conf with no state, so the
+# destination path is irrelevant - only the selector has to appear.
+RE_AUTH='^[^#\n]*auth(,\w+)*\.\*[^\n]*$'
+RE_AUTHPRIV='^[^#\n]*authpriv(,\w+)*\.\*[^\n]*$'
+RE_DAEMON='^[^#\n]*daemon(,\w+)*\.\*[^\n]*$'
+
+rsyslog_selector_present() {
+  grep -qhP "$1" /etc/rsyslog.conf /etc/rsyslog.d/*.conf 2>/dev/null
+}
 
 fixups_plan() {
   printf '\n  STIG fixups - what `usg fix` does not fix\n'
@@ -290,6 +305,20 @@ fixups_plan() {
     say "                        visible to anyone who looks. NOT done by this script."
     say "   pass --with-rsyslog to install it (from the enclave mirror) and set the group."
   fi
+  printf '\n  4. rsyslog_remote_access_monitoring - selectors auth.*, authpriv.*, daemon.*\n'
+  say "   NOTE: this rule only came into scope BECAUSE rsyslog was installed. It was"
+  say "         notapplicable while no syslog daemon existed."
+  if rsyslog_selector_present "$RE_AUTH"; then say "   auth.*     present"; else say "   auth.*     MISSING"; fi
+  if rsyslog_selector_present "$RE_AUTHPRIV"; then say "   authpriv.* present"; else say "   authpriv.* MISSING"; fi
+  if rsyslog_selector_present "$RE_DAEMON"; then say "   daemon.*   present"; else say "   daemon.*   MISSING"; fi
+  say "   Ubuntu's 'auth,authpriv.*  /var/log/auth.log' satisfies the first two - the OVAL"
+  say "   pattern allows a comma list and any non-# prefix. Usually only daemon.* is missing."
+  say "   fix: $RSYSLOG_STIG with 'daemon.*  -$DAEMON_LOG'"
+  say "   NOT /var/log/syslog: '*.*' already sends daemon there, so that would write every"
+  say "        daemon message TWICE into the same file."
+  say "   and: add $DAEMON_LOG to $RSYSLOG_LOGROTATE - Ubuntu's stanza does not list it, so"
+  say "        a new log file would otherwise grow forever on a service VM."
+
   printf '\n  nothing above has been changed. re-run with --apply\n\n'
 }
 
@@ -401,6 +430,64 @@ cmd_fixups() {
     failed=1
   fi
 
+  # ---- 4. rsyslog selectors (only relevant once rsyslog is installed) -------------------
+  if ! command -v rsyslogd >/dev/null 2>&1; then
+    say "4. rsyslog not installed - rule is notapplicable, nothing to do"
+  elif rsyslog_selector_present "$RE_DAEMON"; then
+    say "4. a daemon.* selector is already present - not touching rsyslog config"
+  else
+    # One selector line. Deliberately its own drop-in rather than an edit to the packaged
+    # 50-default.conf, so an apt upgrade of rsyslog cannot silently drop it.
+    cat > "$RSYSLOG_STIG" <<EOF
+# STIG rsyslog_remote_access_monitoring. Written by stig-tailor.sh.
+#
+# The rule requires the selectors auth.*, authpriv.* and daemon.* to appear somewhere in
+# /etc/rsyslog.conf or /etc/rsyslog.d/*.conf. It is an EXISTENCE check with no state, so the
+# destination does not matter to the check - only the selector.
+#
+# Ubuntu's 50-default.conf already carries "auth,authpriv.*  /var/log/auth.log", which
+# satisfies the first two: the OVAL pattern allows a comma-separated facility list and any
+# prefix that is not a comment. Only daemon.* was missing.
+#
+# NOT sent to /var/log/syslog: 50-default.conf line "*.*;auth,authpriv.none -/var/log/syslog"
+# already delivers daemon messages there, so pointing this at syslog would duplicate every
+# daemon line in a single file.
+daemon.*                        -$DAEMON_LOG
+EOF
+    chmod 0644 "$RSYSLOG_STIG"
+    if rsyslogd -N1 >/dev/null 2>&1; then
+      systemctl restart rsyslog && ok "4. wrote $RSYSLOG_STIG (daemon.* -> $DAEMON_LOG)"
+    else
+      local rsout; rsout="$(rsyslogd -N1 2>&1)"
+      rm -f "$RSYSLOG_STIG"
+      warn "4. rsyslog rejected the config - REVERTED. Its output:"
+      printf '%s\n' "$rsout" | sed 's/^/       /'
+      failed=1
+    fi
+  fi
+
+  # A NEW LOG FILE THAT NOTHING ROTATES IS A DISK THAT FILLS. Ubuntu's rsyslog stanza names
+  # its files explicitly, so daemon.log is not covered until it is added.
+  if [ -f "$RSYSLOG_STIG" ] && [ -f "$RSYSLOG_LOGROTATE" ]; then
+    if grep -q "^${DAEMON_LOG}\$" "$RSYSLOG_LOGROTATE"; then
+      say "   $DAEMON_LOG already in $RSYSLOG_LOGROTATE"
+    else
+      cp -a "$RSYSLOG_LOGROTATE" "$RSYSLOG_LOGROTATE.pre-stig"
+      sed -i "\#^/var/log/syslog\$#a $DAEMON_LOG" "$RSYSLOG_LOGROTATE"
+      local lr2 rc2=0 st2; st2="$(mktemp)"
+      lr2="$(logrotate -d -s "$st2" "$RSYSLOG_LOGROTATE" 2>&1)" || rc2=$?
+      rm -f "$st2"
+      if [ "$rc2" -ne 0 ] || ! printf '%s' "$lr2" | grep -qE 'Handling [0-9]+ logs'; then
+        mv "$RSYSLOG_LOGROTATE.pre-stig" "$RSYSLOG_LOGROTATE"
+        warn "   logrotate rejected the rsyslog edit - REVERTED. Its output:"
+        printf '%s\n' "$lr2" | sed 's/^/       /'
+        failed=1
+      else
+        ok "   added $DAEMON_LOG to $RSYSLOG_LOGROTATE (backup: .pre-stig)"
+      fi
+    fi
+  fi
+
   say ""
   [ "$failed" -eq 0 ] || warn "one or more fixups did not complete - see above"
   say ""
@@ -430,6 +517,17 @@ fixups_verify() {
   getent group syslog >/dev/null 2>&1 || { warn "no syslog group - file_groupowner_var_log fails"; fail=1; }
   [ "$(stat -c '%G' /var/log)" = "syslog" ] || { warn "/var/log is not group syslog"; fail=1; }
   find /var/log/apt -type f -perm /0137 -printf '  [!]  too permissive: %M %p\n' 2>/dev/null
+  if command -v rsyslogd >/dev/null 2>&1; then
+    for sel in AUTH AUTHPRIV DAEMON; do
+      eval "re=\$RE_$sel"
+      if rsyslog_selector_present "$re"; then say "rsyslog selector $sel present"
+      else warn "rsyslog selector $sel MISSING - rsyslog_remote_access_monitoring fails"; fail=1; fi
+    done
+    [ ! -e "$DAEMON_LOG" ] || say "$(stat -c '%A %U:%G %n' "$DAEMON_LOG")"
+    if [ -f "$RSYSLOG_STIG" ] && ! grep -q "^${DAEMON_LOG}\$" "$RSYSLOG_LOGROTATE" 2>/dev/null; then
+      warn "$DAEMON_LOG is NOT in $RSYSLOG_LOGROTATE - it will grow forever"; fail=1
+    fi
+  fi
   say ""
   [ "$fail" -eq 0 ] && ok "all checks passed" || warn "some checks failed - see above"
   return 0

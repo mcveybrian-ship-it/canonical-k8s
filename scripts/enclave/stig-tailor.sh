@@ -64,13 +64,26 @@ trap 'rm -rf "${tmp:-}"' EXIT
 
 # ---------------------------------------------------------------------------- deviations
 #
-# Fields, tab-separated:  kind | xccdf id (without the content_ prefix) | value | why
+# Fields, tab-separated:  machine | kind | xccdf id (without content_) | value | why
+#
+# USE `-` FOR AN EMPTY VALUE, NEVER AN EMPTY FIELD. Tab is IFS whitespace, so bash collapses
+# consecutive tabs into one delimiter - an empty value column silently shifts `why` into
+# `value` and the justification never reaches the XML comment. Found 2026-09-10 when the
+# deselect row printed its reasoning as its value.
+#
+# THE MACHINE COLUMN IS NOT DECORATION. `*` means every machine; a hostname means only that
+# one. It was added 2026-09-10 after svc-mgmt-01's post-fix audit produced a deviation that
+# must NOT apply anywhere else: sudo_require_authentication fails there because MAAS holds
+# per-command NOPASSWD grants, and it PASSES cleanly on svc-harbor-01. A global deviation
+# would have silently switched off a control on a machine that satisfies it - which is how a
+# tailoring file quietly becomes a blanket exemption.
 #
 # ACTIVE. These are decided.
 #
 deviations() {
 cat <<'EOF'
-set-value	value_var_multiple_time_servers	__TIME_MASTER__	__STIG_ID__ / chronyd_specify_remote_server. The DISA profile pins the approved time source to 0.us.pool.ntp.mil, which is unreachable from inside the boundary BY DESIGN - reaching it would be the finding. The enclave's authoritative source is __TIME_MASTER_NAME__ (__TIME_MASTER__), a physical machine serving the enclave subnet only. The rule's INTENT - synchronise only to an organisation-approved source - is met in full; only the list of approved sources differs. This is a retarget, not an exception.
+*	set-value	value_var_multiple_time_servers	__TIME_MASTER__	__STIG_ID__ / chronyd_specify_remote_server. The DISA profile pins the approved time source to 0.us.pool.ntp.mil, which is unreachable from inside the boundary BY DESIGN - reaching it would be the finding. The enclave's authoritative source is __TIME_MASTER_NAME__ (__TIME_MASTER__), a physical machine serving the enclave subnet only. The rule's INTENT - synchronise only to an organisation-approved source - is met in full; only the list of approved sources differs. This is a retarget, not an exception.
+svc-mgmt-01	deselect	rule_sudo_require_authentication	-	__STIG_ID__ / sudo_require_authentication. MAAS ships four sudoers files granting its own service account PER-COMMAND NOPASSWD - start/stop maas-dhcpd, lshw and blockdev for commissioning, reload of maas-agent/http/proxy/syslog, chrony and bind9. The maas user is non-interactive (/usr/sbin/nologin) with no password, so requiring authentication means those commands can never run: no DHCP, no hardware inventory, no PXE - and PXE is how host-1..3 are built. NOTE WHAT IS NOT BEING EXCEPTED: usg fix commented out the BLANKET `encadmin ALL=(ALL) NOPASSWD:ALL` grant and that stays removed - the human administrator authenticates. The residual grants are per-command, not ALL, for an account that cannot log in. This deviation is scoped to svc-mgmt-01 ONLY; the rule passes unmodified on every other machine in the enclave.
 EOF
 }
 #
@@ -114,8 +127,16 @@ cmd_generate() {
   # So: rewrite the element that is already there, and only append when there is none.
   local dev="$tmp/dev.tsv" status="$tmp/status.tsv" n=0 missing=0
   : > "$dev"
-  while IFS=$'\t' read -r kind id value why; do
+  local me_gen; me_gen="$(hostname -s)"
+  while IFS=$'\t' read -r scope kind id value why; do
     [ -n "${kind:-}" ] || continue
+    # Machine scoping: `*` is everywhere, anything else must match this host exactly.
+    case "$scope" in
+      '*') : ;;
+      "$me_gen") : ;;
+      *) say "  skipped (scoped to $scope): $id"; continue ;;
+    esac
+    [ "$value" != "-" ] || value=""     # `-` is the explicit empty-value placeholder
     value="${value//__TIME_MASTER__/$TIME_MASTER}"
     why="${why//__TIME_MASTER__/$TIME_MASTER}"
     why="${why//__TIME_MASTER_NAME__/$TIME_MASTER_NAME}"
@@ -227,12 +248,19 @@ cmd_audit() {
 # ---------------------------------------------------------------------------- show
 cmd_show() {
   printf '\n  Enclave STIG deviations - profile %s\n\n' "$PROFILE"
-  while IFS=$'\t' read -r kind id value why; do
+  local me_show; me_show="$(hostname -s)"
+  while IFS=$'\t' read -r scope kind id value why; do
     [ -n "${kind:-}" ] || continue
+    [ "$value" != "-" ] || value=""
     value="${value//__TIME_MASTER__/$TIME_MASTER}"
     why="${why//__TIME_MASTER__/$TIME_MASTER}"
     why="${why//__TIME_MASTER_NAME__/$TIME_MASTER_NAME}"
-    printf '  %s\n    %s = %s\n    %s\n\n' "$kind" "$id" "$value" "$why"
+    case "$scope" in
+      '*')        printf '  %-12s %s\n' "[all]" "$kind" ;;
+      "$me_show") printf '  %-12s %s\n' "[THIS BOX]" "$kind" ;;
+      *)          printf '  %-12s %s\n' "[$scope]" "$kind" ;;
+    esac
+    printf '    %s = %s\n    %s\n\n' "$id" "${value:-(deselected)}" "$why"
   done < <(deviations)
 }
 

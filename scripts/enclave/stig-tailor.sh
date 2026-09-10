@@ -284,6 +284,7 @@ cmd_show() {
 VARCONF_SRC=/usr/lib/tmpfiles.d/var.conf
 VARCONF_DST=/etc/tmpfiles.d/var.conf
 APT_LOGROTATE=/etc/logrotate.d/apt
+APT_HOOK=/etc/apt/apt.conf.d/99-stig-log-perms
 RSYSLOG_LOGROTATE=/etc/logrotate.d/rsyslog
 RSYSLOG_STIG=/etc/rsyslog.d/60-stig.conf
 DAEMON_LOG=/var/log/daemon.log
@@ -487,8 +488,10 @@ cmd_fixups() {
   fi
 
   # ---- 2. logrotate for apt, then the existing files ------------------------------------
-  if grep -q '^[[:space:]]*create ' "$APT_LOGROTATE" 2>/dev/null; then
-    say "2. $APT_LOGROTATE already has a 'create' line - not touching it"
+  if grep -q '^[[:space:]]*create ' "$APT_LOGROTATE" 2>/dev/null && [ -f "$APT_HOOK" ]; then
+    say "2. $APT_LOGROTATE has a 'create' line and $APT_HOOK exists - nothing to do"
+  elif grep -q '^[[:space:]]*create ' "$APT_LOGROTATE" 2>/dev/null; then
+    say "2. $APT_LOGROTATE already has a 'create' line - adding the missing apt hook below"
   elif [ -f "$APT_LOGROTATE" ]; then
     backup_file "$APT_LOGROTATE"; local aptbak="$LAST_BACKUP"
     sed -i -E "s/^([[:space:]]*)rotate 12$/\1rotate 12\n\1create $LOGMODE root adm/" "$APT_LOGROTATE"
@@ -505,9 +508,35 @@ cmd_fixups() {
   else
     warn "2. $APT_LOGROTATE not present - skipped"
   fi
-  # The existing files are worth correcting whether or not the logrotate edit took: the mode
-  # on disk is what the audit reads. If logrotate failed, rotation will undo this - which the
-  # warning above has already said.
+  # APT RESETS THE MODE ON EVERY RUN. This is the third layer of the same fix and the one
+  # that actually holds.
+  #
+  #   logrotate `create 0640`  - governs files created by ROTATION
+  #   a one-time chmod         - governs the file as it is RIGHT NOW
+  #   this hook                - governs what apt does NEXT TIME
+  #
+  # Proof it matters: on svc-harbor-01 the order was `apt install`, then chmod, and
+  # file_permissions_var_log_stig PASSED. On svc-mgmt-01 the order was chmod, then
+  # `apt install libxml2-utils` two minutes later - and history.log was 0644 again, so the
+  # rule FAILED. Same fix, same script, opposite result, purely from sequence. A chmod cannot
+  # hold a value that another program sets.
+  if [ -d /etc/apt/apt.conf.d ]; then
+    cat > "$APT_HOOK" <<EOF
+// STIG file_permissions_var_log_stig. Written by stig-tailor.sh.
+// apt sets the mode of its own logs when it writes them, so a one-time chmod lasts until the
+// next apt run. This re-tightens them immediately after every dpkg invocation.
+DPkg::Post-Invoke { "find /var/log/apt -type f -exec chmod $LOGMODE {} + 2>/dev/null || true"; };
+EOF
+    chmod 0644 "$APT_HOOK"
+    if apt-config dump >/dev/null 2>&1; then
+      ok "   wrote $APT_HOOK - apt re-tightens its own logs after every run"
+    else
+      rm -f "$APT_HOOK"
+      warn "   apt rejected $APT_HOOK - REMOVED. A bad apt.conf.d file breaks ALL apt use,"
+      warn "   which on this enclave means nothing can be installed anywhere."
+      failed=1
+    fi
+  fi
   if find /var/log/apt -type f -exec chmod "$LOGMODE" {} + 2>/dev/null; then
     ok "   existing /var/log/apt files set to $LOGMODE"
   fi
@@ -624,6 +653,12 @@ fixups_verify() {
   # file_permissions_var_log_stig was still failing - MAAS writes its own logs and nothing
   # was looking at them. A verify that only re-checks what you already fixed cannot tell you
   # the rule still fails; it can only tell you your fix applied.
+  if [ -f "$APT_HOOK" ]; then
+    say "apt log-permission hook present ($APT_HOOK)"
+  else
+    warn "$APT_HOOK MISSING - the next apt run will reset /var/log/apt modes to 0644"
+    fail=1
+  fi
   local offenders
   offenders="$(find /var/log -type f -perm /0137 -printf '%M %U:%G %p\n' 2>/dev/null | sort -k3)"
   if [ -n "$offenders" ]; then

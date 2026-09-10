@@ -695,6 +695,18 @@ cmd_ufw() {
     esac
   done
 
+  # ufw ARRIVES WITH `usg fix` - it is not installed on a machine that has not been hardened
+  # yet. Without this check, --apply swallows a "command not found" on the reset and then dies
+  # on the first real rule, which reads like a script bug rather than "harden this box first".
+  if ! command -v ufw >/dev/null 2>&1; then
+    die "ufw is not installed on $me.
+      It is installed by \`usg fix\` (the STIG profile selects package_ufw_installed and
+      deliberately does NOT enable the service). So this machine has not been through the
+      hardening sequence yet - do runbook 6.0 steps 4-11 first, then come back to ufw.
+      Installing ufw by hand here would work, and would also mean firewalling a machine whose
+      baseline audit has never been taken."
+  fi
+
   local mine; mine="$(ufw_rules | awk -F'\t' -v m="$me" '$1==m')"
   if [ -z "$mine" ]; then
     die "no ufw rule table for '$me'.

@@ -683,6 +683,127 @@ fixups_verify() {
   return 0
 }
 
+# ---------------------------------------------------------------------------- usb
+#
+# USB STORAGE, ON THE ONE MACHINE THAT NEEDS IT.
+#
+# `kernel_module_usb` wants USB storage unavailable. On the seven VMs that is free - they have
+# no USB and never will. On **host-4 it is not free**: host-4 is where the 318 GB transfer SSD
+# plugs in, inside the gap, and there is no other route for media (docs/airgap-media.md 6.1a).
+# Hardening it without a way back would mean a machine that cannot accept a transfer.
+#
+# A PERMANENT EXCEPTION IS THE WRONG ANSWER. A TOGGLE IS BETTER, because the deviation
+# becomes a WINDOW with a start, an end, and a log - which is a far better thing to hand an
+# assessor than "USB storage is enabled on the hypervisor".
+#
+#   disable  - the compliant state. This is where host-4 lives.
+#   enable   - opens the window for a transfer. Logged, and it tells you to close it.
+#   status   - which state, and how long it has been open.
+#
+# BOTH MODULES MATTER. A modern USB SSD enclosure usually binds `uas` (USB Attached SCSI),
+# NOT `usb_storage`. Blocking only usb_storage would leave a UAS enclosure working - the
+# control would look applied and not be - and enabling only usb_storage would leave the SSD
+# undetected while apparently permitted. Handle both, always.
+USB_MODULES="usb_storage uas"
+USB_BLOCK=/etc/modprobe.d/99-stig-usb-storage.conf
+USB_LOG=/var/log/stig-usb-window.log
+
+usb_blocked() { [ -f "$USB_BLOCK" ]; }
+usb_loaded()  { lsmod 2>/dev/null | awk '{print $1}' | grep -qxE "$(echo $USB_MODULES | tr ' ' '|')"; }
+
+usb_log() {
+  # The window IS the evidence. Append-only, and never silently fail to record.
+  printf '%s  %-8s by=%s modules="%s"  %s\n' \
+    "$(date -Is)" "$1" "${SUDO_USER:-$(id -un)}" "$USB_MODULES" "${2:-}" >> "$USB_LOG" 2>/dev/null \
+    || warn "could not write $USB_LOG - the window is UNRECORDED, fix that before relying on this"
+  chmod 0640 "$USB_LOG" 2>/dev/null || true
+}
+
+cmd_usb() {
+  local action="${1:-status}" mins=""
+  shift || true
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --minutes) mins="${2:?--minutes needs a number}"; shift 2 ;;
+      --minutes=*) mins="${1#--minutes=}"; shift ;;
+      *) die "unknown argument: $1" ;;
+    esac
+  done
+
+  case "$action" in
+    status)
+      printf '\n  USB storage on %s\n\n' "$(hostname -s)"
+      if usb_blocked; then ok "  BLOCKED - $USB_BLOCK present (compliant state)"
+      else warn "  NOT BLOCKED - no $USB_BLOCK. kernel_module_usb will fail"; fi
+      if usb_loaded; then warn "  module LOADED: $(lsmod | awk '{print $1}' | grep -xE "$(echo $USB_MODULES | tr ' ' '|')" | tr '\n' ' ')"
+      else ok "  no USB storage module loaded"; fi
+      if [ -r "$USB_LOG" ]; then
+        say ""
+        say "  last 5 window events:"
+        tail -5 "$USB_LOG" | sed 's/^/    /'
+      else
+        say "  no window log yet ($USB_LOG)"
+      fi
+      say ""
+      ;;
+
+    disable)
+      need_root
+      cat > "$USB_BLOCK" <<EOF
+# STIG kernel_module_usb. Managed by stig-tailor.sh - do not hand-edit.
+# Both modules: a USB SSD enclosure usually binds uas, not usb_storage, so blocking one
+# leaves the other working and the control only appears to be applied.
+install usb_storage /bin/false
+install uas /bin/false
+blacklist usb_storage
+blacklist uas
+EOF
+      chmod 0644 "$USB_BLOCK"
+      local m
+      for m in $USB_MODULES; do modprobe -r "$m" 2>/dev/null || true; done
+      if usb_loaded; then
+        warn "a module is still loaded - something is USING it. Unmount the media first:"
+        say  "    lsblk -o NAME,LABEL,MOUNTPOINT | grep -i usb   # then umount, then retry"
+        usb_log DISABLE "INCOMPLETE - module still loaded"
+        return 1
+      fi
+      ok "USB storage blocked and unloaded"
+      usb_log DISABLE "window closed"
+      ;;
+
+    enable)
+      need_root
+      # Move the block aside rather than relying on modprobe.d precedence between files -
+      # that ordering is version-dependent and this is not a place to be clever.
+      [ ! -f "$USB_BLOCK" ] || mv "$USB_BLOCK" "$USB_BLOCK.disabled-by-stig-tailor"
+      local m ok_any=0
+      for m in $USB_MODULES; do modprobe "$m" 2>/dev/null && ok_any=1; done
+      [ "$ok_any" -eq 1 ] || warn "no USB storage module would load - check dmesg"
+      warn "USB STORAGE IS NOW ENABLED on $(hostname -s) - this is an OPEN DEVIATION WINDOW"
+      say  "   close it as soon as the transfer is done:  sudo $0 usb disable"
+      if [ -n "$mins" ]; then
+        # Auto-close. An open window nobody remembers is how a temporary exception becomes
+        # permanent - so offer to close it without depending on anyone remembering.
+        if systemd-run --on-active="${mins}m" --unit="stig-usb-autoclose" \
+             --description="auto-close the STIG USB window" \
+             "$(readlink -f "$0")" usb disable >/dev/null 2>&1; then
+          ok "auto-close scheduled in ${mins} minutes (unit: stig-usb-autoclose)"
+          usb_log ENABLE "window opened, auto-close in ${mins}m"
+        else
+          warn "could not schedule auto-close - you MUST close it by hand"
+          usb_log ENABLE "window opened, auto-close FAILED to schedule"
+        fi
+      else
+        usb_log ENABLE "window opened, NO auto-close - manual close required"
+      fi
+      say ""
+      lsblk -o NAME,SIZE,LABEL,FSTYPE,MOUNTPOINT 2>/dev/null | sed 's/^/    /'
+      ;;
+
+    *) die "usage: $0 usb {status|enable [--minutes N]|disable}" ;;
+  esac
+}
+
 # ---------------------------------------------------------------------------- preflight
 #
 # WHAT WILL `usg fix` TAKE AWAY FROM THIS MACHINE.
@@ -1021,8 +1142,9 @@ case "${1:-}" in
   generate) shift; cmd_generate "$@" ;;
   fixups)   shift; cmd_fixups "$@" ;;
   preflight) shift; cmd_preflight "$@" ;;
+  usb)      shift; cmd_usb "$@" ;;
   ufw)      shift; cmd_ufw "$@" ;;
   audit)    shift; cmd_audit "$@" ;;
   show)     shift; cmd_show "$@" ;;
-  *) printf 'usage: %s {generate|audit|show|preflight|fixups [--apply] [--with-rsyslog] [--verify]|ufw [--apply]}\n' "$0" >&2; exit 2 ;;
+  *) printf 'usage: %s {generate|audit|show|preflight|fixups [...]|ufw [--apply]|usb {status|enable|disable}}\n' "$0" >&2; exit 2 ;;
 esac

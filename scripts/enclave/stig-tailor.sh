@@ -739,6 +739,8 @@ fixups_verify() {
 # NOT `usb_storage`. Blocking only usb_storage would leave a UAS enclosure working - the
 # control would look applied and not be - and enabling only usb_storage would leave the SSD
 # undetected while apparently permitted. Handle both, always.
+# Module names for load/unload (modprobe accepts either spelling; these are the canonical
+# in-kernel names as they appear in lsmod).
 USB_MODULES="usb_storage uas"
 USB_BLOCK=/etc/modprobe.d/99-stig-usb-storage.conf
 USB_LOG=/var/log/stig-usb-window.log
@@ -785,11 +787,21 @@ cmd_usb() {
     disable)
       need_root
       cat > "$USB_BLOCK" <<EOF
-# STIG kernel_module_usb. Managed by stig-tailor.sh - do not hand-edit.
-# Both modules: a USB SSD enclosure usually binds uas, not usb_storage, so blocking one
-# leaves the other working and the control only appears to be applied.
+# STIG kernel_module_usb-storage_disabled. Managed by stig-tailor.sh - do not hand-edit.
+#
+# SPELLING IS LOAD-BEARING. The OVAL patterns are literal text matches:
+#     ^\s*install\s+usb-storage\s+(/bin/false|/bin/true)\$
+#     ^blacklist\s+usb-storage\$
+# HYPHEN, not underscore. modprobe treats usb-storage and usb_storage as the same module, so
+# the underscore form BLOCKS correctly and still FAILS THE CHECK. Both spellings are written:
+# the hyphen form is what the benchmark reads, the underscore form is belt-and-braces.
+#
+# uas is here for a different reason - it is functional, not compliance. A USB SSD enclosure
+# usually binds uas (USB Attached SCSI), so blocking only usb-storage leaves it working.
+install usb-storage /bin/false
 install usb_storage /bin/false
 install uas /bin/false
+blacklist usb-storage
 blacklist usb_storage
 blacklist uas
 EOF

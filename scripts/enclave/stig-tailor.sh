@@ -745,7 +745,22 @@ USB_MODULES="usb_storage uas"
 USB_BLOCK=/etc/modprobe.d/99-stig-usb-storage.conf
 USB_LOG=/var/log/stig-usb-window.log
 
-usb_blocked() { [ -f "$USB_BLOCK" ]; }
+# EVERY FILE THAT BLOCKS, NOT JUST OURS.
+#
+# `usg fix` writes /etc/modprobe.d/usb-storage.conf itself, with the same hyphen spellings.
+# An earlier version of `enable` moved only OUR file aside, so usg's file kept the block, the
+# modules did not load, and the script printed "USB STORAGE IS NOW ENABLED" while it was not.
+# A false success on a hypervisor you are standing in front of with a disk in your hand.
+#
+# So: discover the blocking files, stash ALL of them, and verify with lsmod rather than
+# trusting modprobe's exit status.
+USB_PATHS="/etc/modprobe.d /run/modprobe.d /usr/lib/modprobe.d"
+USB_STASH="$STIG_BACKUP_DIR/usb-window"
+
+usb_block_files() {
+  grep -rlE '^[[:space:]]*(install|blacklist)[[:space:]]+(usb.?storage|uas)' $USB_PATHS 2>/dev/null | sort -u
+}
+usb_blocked() { [ -n "$(usb_block_files)" ]; }
 usb_loaded()  { lsmod 2>/dev/null | awk '{print $1}' | grep -qxE "$(echo $USB_MODULES | tr ' ' '|')"; }
 
 usb_log() {
@@ -770,8 +785,18 @@ cmd_usb() {
   case "$action" in
     status)
       printf '\n  USB storage on %s\n\n' "$(hostname -s)"
-      if usb_blocked; then ok "  BLOCKED - $USB_BLOCK present (compliant state)"
-      else warn "  NOT BLOCKED - no $USB_BLOCK. kernel_module_usb will fail"; fi
+      if usb_blocked; then
+        ok "  BLOCKED by:"
+        usb_block_files | sed 's/^/       /'
+      else
+        warn "  NOT BLOCKED - no file in $USB_PATHS blocks usb-storage or uas"
+        say  "     kernel_module_usb-storage_disabled will FAIL"
+      fi
+      if [ -d "$USB_STASH" ] && [ -n "$(ls -A "$USB_STASH" 2>/dev/null)" ]; then
+        warn "  A WINDOW IS OPEN - files stashed in $USB_STASH:"
+        ls -1 "$USB_STASH" | sed 's/^/       /'
+        say  "     close it with:  sudo $0 usb disable"
+      fi
       if usb_loaded; then warn "  module LOADED: $(lsmod | awk '{print $1}' | grep -xE "$(echo $USB_MODULES | tr ' ' '|')" | tr '\n' ' ')"
       else ok "  no USB storage module loaded"; fi
       if [ -r "$USB_LOG" ]; then
@@ -786,6 +811,17 @@ cmd_usb() {
 
     disable)
       need_root
+      # Put back anything a previous `enable` stashed, so the compliant state is restored
+      # exactly rather than approximated.
+      if [ -d "$USB_STASH" ] && [ -n "$(ls -A "$USB_STASH" 2>/dev/null)" ]; then
+        local st
+        for st in "$USB_STASH"/*; do
+          [ -f "$st" ] || continue
+          # Stashed as <dir-with-slashes-as-%>%<name> so the original path is recoverable.
+          local orig; orig="$(basename "$st" | tr '%' '/')"
+          mv "$st" "$orig" && ok "restored $orig"
+        done
+      fi
       cat > "$USB_BLOCK" <<EOF
 # STIG kernel_module_usb-storage_disabled. Managed by stig-tailor.sh - do not hand-edit.
 #
@@ -820,12 +856,29 @@ EOF
 
     enable)
       need_root
-      # Move the block aside rather than relying on modprobe.d precedence between files -
-      # that ordering is version-dependent and this is not a place to be clever.
-      [ ! -f "$USB_BLOCK" ] || mv "$USB_BLOCK" "$USB_BLOCK.disabled-by-stig-tailor"
-      local m ok_any=0
-      for m in $USB_MODULES; do modprobe "$m" 2>/dev/null && ok_any=1; done
-      [ "$ok_any" -eq 1 ] || warn "no USB storage module would load - check dmesg"
+      # Stash EVERY blocking file, not just ours - see the note above usb_block_files().
+      # Stashed outside modprobe.d, because a leftover .conf there is still live config
+      # (the same lesson as /etc/logrotate.d in 6.3c).
+      install -d -m 0700 "$USB_STASH"
+      local bf n_stashed=0
+      while IFS= read -r bf; do
+        [ -n "$bf" ] || continue
+        mv "$bf" "$USB_STASH/$(printf '%s' "$bf" | tr '/' '%')" && n_stashed=$((n_stashed + 1))
+        say "stashed $bf"
+      done < <(usb_block_files)
+      [ "$n_stashed" -gt 0 ] || say "nothing was blocking - modules may already be loadable"
+
+      local m
+      for m in $USB_MODULES; do modprobe "$m" 2>/dev/null || true; done
+      # VERIFY WITH lsmod, not with modprobe's exit status. `install <mod> /bin/false` makes
+      # modprobe succeed while loading nothing.
+      if ! usb_loaded; then
+        warn "NO USB STORAGE MODULE LOADED - the window did NOT open."
+        say  "   check:  dmesg | tail -20   and   modprobe -v usb_storage"
+        usb_log ENABLE "FAILED - no module loaded after stashing $n_stashed file(s)"
+        return 1
+      fi
+      ok "loaded: $(lsmod | awk '{print $1}' | grep -xE "$(echo $USB_MODULES | tr ' ' '|')" | tr '\n' ' ')"
       warn "USB STORAGE IS NOW ENABLED on $(hostname -s) - this is an OPEN DEVIATION WINDOW"
       say  "   close it as soon as the transfer is done:  sudo $0 usb disable"
       if [ -n "$mins" ]; then

@@ -708,21 +708,31 @@ cmd_ufw() {
   printf '  %-10s %-7s %s\n' PORT ACTION WHY
   printf '%s\n' "$mine" | awk -F'\t' '{printf "  %-10s %-7s %s\n", $2, $3, $4}'
 
-  # Anything listening that the table does not mention is either surface to remove or a rule
-  # we forgot. Say which ports those are - do not silently firewall a service into the dark.
-  local listening unlisted
-  listening="$(ss -tulnH 2>/dev/null | awk '{print $5}' | sed 's/.*://' | grep -E '^[0-9]+$' | sort -un)"
-  unlisted=""
-  local pt
-  for pt in $listening; do
-    printf '%s\n' "$mine" | awk -F'\t' '{print $2}' | cut -d/ -f1 | grep -qx "$pt" || unlisted="$unlisted $pt"
-  done
-  if [ -n "$unlisted" ]; then
+  # Anything EXTERNALLY BOUND that the table does not mention is either surface to remove or
+  # a rule we forgot. Say which - do not silently firewall a service into the dark.
+  #
+  # ONLY EXTERNALLY BOUND. The first version of this check stripped the address and kept the
+  # port, so it reported 25, 53, 323, 1514 and 40249 as "will be BLOCKED" when every one of
+  # them was bound to loopback - which ufw does not filter. Five false alarms in the first
+  # run it ever made. A check that cries wolf is a check that gets ignored, and then the one
+  # real warning goes past unread.
+  local unlisted
+  unlisted="$(ss -tulnH 2>/dev/null | awk '{print $5}' \
+    | grep -vE '^(127\.|\[::1\])' | grep -v '%lo:' \
+    | sed 's/.*:\([0-9]*\)$/\1/' | grep -E '^[0-9]+$' | sort -un \
+    | while read -r pt; do
+        printf '%s\n' "$mine" | awk -F'\t' '{print $2}' | cut -d/ -f1 | grep -qx "$pt" || echo "$pt"
+      done | tr '\n' ' ')"
+  if [ -n "${unlisted// /}" ]; then
     say ""
-    warn "listening but NOT in the table:$unlisted"
-    say "   these will be BLOCKED once ufw is active. Each is either surface to remove or a"
-    say "   missing rule. Loopback-only listeners are fine - ufw does not filter lo."
-    say "   Check with:  ss -tulnp | grep -E \"$(echo $unlisted | tr ' ' '|')\""
+    warn "EXTERNALLY BOUND but NOT in the table: $unlisted"
+    say "   these WILL be blocked once ufw is active. Each is either surface to remove or a"
+    say "   rule that was forgotten. Identify them before applying:"
+    say "     sudo ss -tulnp | grep -E \":($(echo $unlisted | tr ' ' '|'))\\b\""
+  else
+    say ""
+    ok "every externally bound listener is covered by the table"
+    say "   (loopback-only listeners are not listed - ufw does not filter lo)"
   fi
 
   if [ "$apply" -eq 0 ]; then

@@ -879,6 +879,20 @@ EOF
         return 1
       fi
       ok "loaded: $(lsmod | awk '{print $1}' | grep -xE "$(echo $USB_MODULES | tr ' ' '|')" | tr '\n' ' ')"
+      # WAIT FOR udev BEFORE LOOKING. The device node appears almost immediately, but LABEL
+      # and FSTYPE are filled in by blkid via udev a moment later. Checking too early shows a
+      # partition with no label and reads exactly like "the disk did not come back".
+      udevadm settle --timeout=15 2>/dev/null || warn "udevadm settle timed out - labels may lag"
+      # AND EXPECT A DIFFERENT DEVICE NAME. On host-4 the transfer SSD came back as sda after
+      # having been sdb - unloading and reloading the modules re-enumerates. Anything that
+      # touches this disk must use LABEL=enclave-xfer, never /dev/sdX.
+      local xfer; xfer="$(lsblk -o NAME,SIZE,LABEL,FSTYPE 2>/dev/null | grep -i 'enclave-xfer' || true)"
+      if [ -n "$xfer" ]; then
+        ok "transfer media present: $xfer"
+      else
+        say "no volume labelled enclave-xfer yet - if the disk is attached, give udev a moment"
+        say "   and re-check with:  lsblk -o NAME,SIZE,LABEL,FSTYPE"
+      fi
       warn "USB STORAGE IS NOW ENABLED on $(hostname -s) - this is an OPEN DEVIATION WINDOW"
       say  "   close it as soon as the transfer is done:  sudo $0 usb disable"
       if [ -n "$mins" ]; then

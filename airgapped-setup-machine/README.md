@@ -6,7 +6,7 @@
 *how* things were built and why; they have gone stale more than once. If they disagree with
 this section, this section wins and the other one gets fixed.
 
-Last updated **2026-09-10 22:30 UTC** (17:30 Central). All timestamps in this repo are **UTC** — every enclave machine runs UTC and the audit logs are UTC, so mixing local time into an auditable procedure is how two records stop lining up.
+Last updated **2026-09-10 23:10 UTC** (18:10 Central). All timestamps in this repo are **UTC** — every enclave machine runs UTC and the audit logs are UTC, so mixing local time into an auditable procedure is how two records stop lining up.
 
 ## 0a. WORKING LIST — priority order as of 2026-09-10 16:20
 
@@ -34,7 +34,7 @@ instead of ~20. Full write-up: runbook **§10.1**.
 | E3 | **Hardened machine vs V1R6** | ✅ **DONE — Q18 ANSWERED.** `svc-mgmt-01`, full run, 9m07s: **20 Open / 14 Not Reviewed / 150 NF / 10 NA of 194**, vs **USG's 7 fail** on the same machine. Unhardened was 118 Open, so `usg fix` closes 83% — **but the residual against the revision DISA will assess is 20, not 7.** 3 high Open + 2 high NR. runbook §10.1 |
 | E3a | **Two contradictions worth reading twice** | ⚠️ **UBTU-24-600160 is Open** — the chrony control we *tailored* in USG. **A USG deviation does not travel to the tool DISA uses**, so every justification needs an Answer File too. ⚠️ **UBTU-24-100010** — `systemd-timesyncd` at `deinstall ok config-files` counts as installed; **`apt-get purge` closes it.** A real finding USG hid |
 | E3b | **Triage the 20 + 14 on `svc-mgmt-01`** | 🔄 **IN PROGRESS — 3 fixed, 6 false positives, 11 left.** ✅ **FIXED + verified NF:** V-270645 (`purge systemd-timesyncd`), V-270750 (sticky bit — the dirs were **created by the scanner**; `rm -rf /tmp/.dotnet`), V-270676 (`audit=1` — needed a **grub.d drop-in**, because `50-cloudimg-settings.cfg` hard-assigns `GRUB_CMDLINE_LINUX_DEFAULT` and silently discards edits to `/etc/default/grub`). ⚠️ **FALSE POSITIVES → Answer File:** V-270699 + V-270703 (DISA's own CheckText filters the very groups it flagged; `chgrp root` would break Postfix and D-Bus), V-270778/799/814/815 (all four rules **already present** at usrmerged paths; DISA's grep checks all match). **Next: the 3 high-severity Open** — V-270675 is entangled with the GRUB password. runbook §10.1 |
-| E3c | **Back-apply to `svc-harbor-01`** | ⬜ It was hardened before steps 13a–13d existed and **has never been scanned with Evaluate-STIG.** A machine measured by one scanner is not done |
+| E3c | **Back-apply to `svc-harbor-01`** | 🔄 **STARTED** — bundle + PowerShell being staged to `/srv/stig-tools`, prereqs (`lshw dmidecode bc`) from the mirror. First use is verifying **V-270675** after the GRUB change. Full V1R6 scan still owed |
 | E4 | ~~One full run, no exclusions~~ | ✅ **DONE** — `svc-mgmt-01` 2026-09-10, 9m07s with AIDE included. The 5 AIDE controls were **not** expensive in practice; `--ExcludeVuln` is for iterating, not for the artefact |
 | E5 | **Answer Files for our deviations** | ⬜ Per-Vuln-ID justifications so a CKLB carries its own rationale — UBTU-24-600160, UBTU-24-300021, the USB window, `encrypt_partitions` |
 | E6 | **USG ↔ Evaluate-STIG correlator** | ⬜ Join key is the `UBTU-24-xxxxxx` STIG ID; the map already exists in `/etc/usg/enclave-tailoring.xml`. **Ask the AO about STIG Manager first** — if the programme runs it, feed it instead of building this |
@@ -49,7 +49,7 @@ the transfer bundle. Do not let the shortcut become the procedure.
 
 | What | State |
 |---|---|
-| **GRUB password** | ✅ decided, ❌ **not implemented** — pbkdf2 + `--unrestricted` on the default entry, and a **reboot test per machine** |
+| **GRUB password** | 🔄 **IMPLEMENTED + BOOT-TESTED on `svc-harbor-01` 2026-09-10 23:01 UTC.** Three parts, and **DISA's FixText only gives two** — it omits `--unrestricted`, so following it literally leaves a headless machine that will not boot. `40_custom` gets `set superusers` + `password_pbkdf2`; `10_linux` line 34 gets `--unrestricted` on `CLASS`; then `update-grub` and **count the menuentries without it before rebooting**. Only `'UEFI Firmware Settings'` stayed restricted, which is the right end state. Rebooted unattended, FIPS `1`, Harbor recovered itself. ⚠️ `10_linux` is a **`grub-common` conffile** — re-check after any upgrade. ⚠️ Recovery mode is unrestricted; **the locked root account is what actually blocks a maintenance shell** — say so in the Answer File. **Scanner agrees: V-270675 = `NF`** (13-second targeted verify) — confirmed at all three levels: config, unattended boot, DISA check. runbook §6.3i. ⬜ Still to do: `svc-mgmt-01`, then `host-4` **last, with a console plan** (bare metal, no `vm-rescue.sh` safety net) |
 | **MAAS ufw rule table** | ~30 ports (`5239-5284`, `3128`, `8000`, `53`, `67/udp`, `69/udp`, `5353`). `stig-tailor.sh ufw` **refuses** without a table. §6.3e |
 | SSSD / CAC ×2 | Waits on the FIPS YubiKey |
 | `encrypt_partitions` | Compensating-control write-up — LUKS is under the guest, not in it |

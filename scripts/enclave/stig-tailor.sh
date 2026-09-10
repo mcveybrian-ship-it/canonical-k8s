@@ -4,9 +4,20 @@
 #
 #     MACHINE: any enclave machine being hardened. Needs `usg` installed and Pro attached.
 #
-#     sudo ./stig-tailor.sh generate
+#     sudo ./stig-tailor.sh generate          # the tailoring file
 #     sudo ./stig-tailor.sh audit
 #     ./stig-tailor.sh show
+#     ./stig-tailor.sh fixups                 # what usg fix leaves behind - PLAN ONLY
+#     sudo ./stig-tailor.sh fixups --apply    # ... and apply it
+#
+# TWO JOBS, DELIBERATELY IN ONE PLACE:
+#
+#   generate/audit - DEVIATIONS. Rules that cannot pass here, answered by tailoring.
+#   fixups         - REMEDIATION. Rules that CAN pass but that `usg fix` does not fix.
+#
+#   They are the same domain - this enclave's STIG posture - and splitting them across two
+#   scripts means two places to look and two things to keep in step. `fixups` shows its plan
+#   and changes nothing without --apply.
 #
 # WHY A GENERATOR AND NOT A CHECKED-IN XML:
 #
@@ -225,9 +236,157 @@ cmd_show() {
   done < <(deviations)
 }
 
+# ---------------------------------------------------------------------------- fixups
+#
+# WHAT THIS IS FOR. `usg fix` leaves rules failing that are perfectly fixable - it simply has
+# no automated remediation for them. Left alone they become permanent findings that look like
+# accepted risk when they are really just unfinished work.
+#
+# WHY NOT A chmod AT A PROMPT. Two of these have a mechanism that reasserts the value:
+#
+#   wtmp/btmp/lastlog  - systemd-tmpfiles rewrites the mode from /usr/lib/tmpfiles.d/var.conf
+#                        on every boot. A chmod passes the audit you run five minutes later
+#                        and is GONE after the next reboot. That is the worst kind of fix:
+#                        it produces evidence of compliance and no compliance.
+#   apt history.log    - apt creates it 0644 when it does not exist, and the logrotate stanza
+#                        carries no `create` line, so the mode comes back on rotation.
+#
+# So each fix goes in at the layer that owns the value, not on the file.
+
+VARCONF_SRC=/usr/lib/tmpfiles.d/var.conf
+VARCONF_DST=/etc/tmpfiles.d/var.conf
+APT_LOGROTATE=/etc/logrotate.d/apt
+LOGMODE="${STIG_LOG_MODE:-0640}"
+
+fixups_plan() {
+  printf '\n  STIG fixups - what `usg fix` does not fix\n'
+  printf '\n  1. file_permissions_var_log_stig - wtmp, btmp, lastlog\n'
+  say "   owner of the value: systemd-tmpfiles, via $VARCONF_SRC"
+  say "   fix: $VARCONF_DST - a FULL COPY with the three modes set to $LOGMODE"
+  say "   note: a same-named file in /etc MASKS the whole /usr/lib file, so it must be a copy"
+  say "         and not just the three lines - otherwise every other var.conf entry stops"
+  say "         being applied. 'fixups --verify' reports drift if the package changes it."
+  if [ -f "$VARCONF_DST" ]; then say "   state: $VARCONF_DST EXISTS"; else say "   state: not present"; fi
+
+  printf '\n  2. file_permissions_var_log_stig - apt history.log and term.log\n'
+  say "   owner of the value: apt creates them 0644; the logrotate stanza has no 'create'"
+  say "   fix: add 'create $LOGMODE root adm' to each stanza in $APT_LOGROTATE, then chmod"
+  say "        the existing files once"
+  if grep -q '^\s*create ' "$APT_LOGROTATE" 2>/dev/null; then
+    say "   state: a 'create' line is already present"
+  else
+    say "   state: no 'create' line"
+  fi
+
+  printf '\n  3. file_groupowner_var_log - /var/log must be group-owned by syslog\n'
+  if getent group syslog >/dev/null 2>&1; then
+    say "   state: syslog group EXISTS - fix is 'chgrp syslog /var/log'"
+  else
+    say "   state: NO syslog group. It comes with rsyslog, which is not installed."
+    say "   DECISION REQUIRED - this one is not ours to make silently:"
+    say "     install rsyslog  - the group is real, the rule passes legitimately, and you get"
+    say "                        a syslog path you will need for log offload anyway"
+    say "     groupadd syslog  - passes the check with no syslog daemon behind it. Hollow, and"
+    say "                        visible to anyone who looks. NOT done by this script."
+    say "   pass --with-rsyslog to install it (from the enclave mirror) and set the group."
+  fi
+  printf '\n  nothing above has been changed. re-run with --apply\n\n'
+}
+
+cmd_fixups() {
+  local apply=0 with_rsyslog=0 verify=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --apply) apply=1; shift ;;
+      --with-rsyslog) with_rsyslog=1; shift ;;
+      --verify) verify=1; shift ;;
+      *) die "unknown argument: $1" ;;
+    esac
+  done
+
+  if [ "$verify" -eq 1 ]; then fixups_verify; return; fi
+  if [ "$apply" -eq 0 ]; then fixups_plan; return; fi
+
+  need_root
+  # 1. tmpfiles - full copy, three modes tightened.
+  [ -f "$VARCONF_SRC" ] || die "$VARCONF_SRC does not exist - has the layout changed?"
+  install -d -m 0755 /etc/tmpfiles.d
+  if [ -f "$VARCONF_DST" ]; then
+    say "$VARCONF_DST exists - leaving it alone. Edit it by hand or remove it first."
+  else
+    sed -E 's#^(f /var/log/(wtmp|btmp|lastlog)[[:space:]]+)[0-7]{4}#\1'"$LOGMODE"'#' \
+      "$VARCONF_SRC" > "$VARCONF_DST"
+    chmod 0644 "$VARCONF_DST"
+    # Prove the substitution actually hit all three before trusting it.
+    local hits; hits=$(grep -cE "^f /var/log/(wtmp|btmp|lastlog)[[:space:]]+$LOGMODE" "$VARCONF_DST" || true)
+    [ "$hits" -eq 3 ] || die "expected 3 tightened lines in $VARCONF_DST, found $hits - inspect it"
+    ok "wrote $VARCONF_DST (full copy, wtmp/btmp/lastlog at $LOGMODE)"
+  fi
+  systemd-tmpfiles --create 2>/dev/null || warn "systemd-tmpfiles --create reported an issue"
+
+  # 2. logrotate for apt, then the existing files.
+  if grep -q '^\s*create ' "$APT_LOGROTATE" 2>/dev/null; then
+    say "$APT_LOGROTATE already has a 'create' line - not touching it"
+  elif [ -f "$APT_LOGROTATE" ]; then
+    cp -a "$APT_LOGROTATE" "$APT_LOGROTATE.pre-stig"
+    sed -i -E "s/^([[:space:]]*)rotate 12$/\1rotate 12\n\1create $LOGMODE root adm/" "$APT_LOGROTATE"
+    logrotate -d "$APT_LOGROTATE" >/dev/null 2>&1 \
+      || { mv "$APT_LOGROTATE.pre-stig" "$APT_LOGROTATE"; die "logrotate rejected the edit - reverted"; }
+    ok "added 'create $LOGMODE root adm' to $APT_LOGROTATE (backup: .pre-stig)"
+  else
+    warn "$APT_LOGROTATE not present - skipped"
+  fi
+  find /var/log/apt -type f -exec chmod "$LOGMODE" {} + 2>/dev/null || true
+  ok "existing /var/log/apt files set to $LOGMODE"
+
+  # 3. /var/log group ownership.
+  if getent group syslog >/dev/null 2>&1; then
+    chgrp syslog /var/log && ok "/var/log group set to syslog"
+  elif [ "$with_rsyslog" -eq 1 ]; then
+    say "installing rsyslog from the enclave mirror"
+    apt-get install -y rsyslog >/dev/null 2>&1 || die "rsyslog install failed - is apt working?"
+    getent group syslog >/dev/null 2>&1 || die "rsyslog installed but no syslog group appeared"
+    chgrp syslog /var/log && ok "rsyslog installed, /var/log group set to syslog"
+  else
+    warn "no syslog group and --with-rsyslog not given - file_groupowner_var_log STILL FAILS"
+    say "   this is the decision in the plan output. Nothing was faked."
+  fi
+  say ""
+  say "verify with:  sudo $0 fixups --verify   then re-audit"
+}
+
+fixups_verify() {
+  local fail=0
+  printf '\n  verifying\n'
+  # The modes as they are NOW, and as tmpfiles would reassert them.
+  local f
+  for f in /var/log/wtmp /var/log/btmp /var/log/lastlog; do
+    [ -e "$f" ] || continue
+    say "$(stat -c '%A %U:%G %n' "$f")"
+    [ "$(stat -c '%a' "$f")" = "${LOGMODE#0}" ] || { warn "$f is not $LOGMODE"; fail=1; }
+  done
+  # DRIFT CHECK. A same-named file in /etc masks the vendor's entirely, so a package update
+  # to var.conf silently stops applying. Report it rather than discovering it in an audit.
+  if [ -f "$VARCONF_DST" ]; then
+    local d; d=$(diff <(sed -E 's/[[:space:]]+/ /g' "$VARCONF_SRC") \
+                      <(sed -E 's/[[:space:]]+/ /g' "$VARCONF_DST") | grep -cE '^[<>]' || true)
+    say "var.conf differs from the vendor copy in $d line(s) - expected 6 (3 pairs)"
+    [ "$d" -le 6 ] || { warn "MORE drift than the three mode changes - the package may have"
+                        warn "changed var.conf. Re-derive $VARCONF_DST from $VARCONF_SRC."; fail=1; }
+  fi
+  say "$(stat -c '%A %U:%G %n' /var/log)"
+  getent group syslog >/dev/null 2>&1 || { warn "no syslog group - file_groupowner_var_log fails"; fail=1; }
+  [ "$(stat -c '%G' /var/log)" = "syslog" ] || { warn "/var/log is not group syslog"; fail=1; }
+  find /var/log/apt -type f -perm /0137 -printf '  [!]  too permissive: %M %p\n' 2>/dev/null
+  say ""
+  [ "$fail" -eq 0 ] && ok "all checks passed" || warn "some checks failed - see above"
+  return 0
+}
+
 case "${1:-}" in
   generate) shift; cmd_generate "$@" ;;
+  fixups)   shift; cmd_fixups "$@" ;;
   audit)    shift; cmd_audit "$@" ;;
   show)     shift; cmd_show "$@" ;;
-  *) printf 'usage: %s {generate|audit|show}\n' "$0" >&2; exit 2 ;;
+  *) printf 'usage: %s {generate|audit|show|fixups [--apply] [--with-rsyslog] [--verify]}\n' "$0" >&2; exit 2 ;;
 esac

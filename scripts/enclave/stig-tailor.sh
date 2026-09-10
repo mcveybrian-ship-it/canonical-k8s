@@ -681,8 +681,8 @@ svc-repo-01	22/tcp	limit	ssh - safe to rate-limit, and what the rule is really a
 svc-repo-01	80/tcp	allow	nginx 301 redirect only; kept so a plaintext client gets a redirect rather than a timeout
 svc-repo-01	443/tcp	allow	THE MIRROR - 318 GB of apt over TLS, plus /keys /debs /snaps /maas-images. LIMIT here throttles apt for every machine in the enclave
 svc-harbor-01	22/tcp	limit	ssh
-svc-harbor-01	80/tcp	allow	Harbor 301 redirect only
-svc-harbor-01	443/tcp	allow	Harbor registry + Trivy DB pulls. LIMIT here throttles image pulls, which open parallel connections per layer
+svc-harbor-01	80/tcp	allow	NO-OP under Docker - docker-proxy DNATs this, so ufw INPUT never sees it. Kept for the day Harbor runs host-network. runbook 6.3e
+svc-harbor-01	443/tcp	allow	NO-OP under Docker - same reason. ufw on this host protects ssh and postfix, NOT the registry ports. Say so in the findings register
 EOF
 }
 
@@ -733,6 +733,28 @@ cmd_ufw() {
     say ""
     ok "every externally bound listener is covered by the table"
     say "   (loopback-only listeners are not listed - ufw does not filter lo)"
+  fi
+
+  # DOCKER BYPASSES ufw's INPUT CHAIN. If a port in the table is published by docker-proxy,
+  # the ufw rule for it does nothing at all - neither allow, deny, nor limit. Saying so here
+  # is the difference between "ufw is active on the registry" (true, and misleading) and a
+  # statement an assessor can rely on.
+  local dockered=""
+  if command -v docker >/dev/null 2>&1 && pgrep -x docker-proxy >/dev/null 2>&1; then
+    local tp
+    for tp in $(printf '%s\n' "$mine" | awk -F'\t' '{print $2}' | cut -d/ -f1); do
+      ss -tulnH 2>/dev/null | grep -qE "[:.]${tp} .*docker-proxy" && dockered="$dockered $tp"
+    done
+    if [ -n "${dockered// /}" ]; then
+      say ""
+      warn "PUBLISHED BY DOCKER, so the ufw rule is a NO-OP:$dockered"
+      say "   docker-proxy DNATs these in nat/PREROUTING; the traffic traverses FORWARD via"
+      say "   DOCKER-USER and never reaches ufw's INPUT chain. ufw on this host protects the"
+      say "   HOST listeners (ssh, postfix) and NOT those ports."
+      say "   Record that limitation in the findings register - 'ufw active' on a container"
+      say "   host overstates the control without it. Filtering container ports means rules"
+      say "   in the DOCKER-USER chain, which is separate work and is not ufw. runbook 6.3e"
+    fi
   fi
 
   if [ "$apply" -eq 0 ]; then

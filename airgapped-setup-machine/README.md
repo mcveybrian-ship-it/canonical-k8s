@@ -6,7 +6,7 @@
 *how* things were built and why; they have gone stale more than once. If they disagree with
 this section, this section wins and the other one gets fixed.
 
-Last updated **2026-09-10 17:45**.
+Last updated **2026-09-10 22:30**.
 
 ## 0a. WORKING LIST — priority order as of 2026-09-10 16:20
 
@@ -33,7 +33,7 @@ instead of ~20. Full write-up: runbook **§10.1**.
 | E2 | **Baseline: unhardened 24.04 vs DISA V1R6** | ✅ **DONE** — `stage-01`, 62 seconds: **118 Open / 49 NF / 17 NR / 10 NA of 194**; 8 high-severity open |
 | E3 | **Hardened machine vs V1R6** | ✅ **DONE — Q18 ANSWERED.** `svc-mgmt-01`, full run, 9m07s: **20 Open / 14 Not Reviewed / 150 NF / 10 NA of 194**, vs **USG's 7 fail** on the same machine. Unhardened was 118 Open, so `usg fix` closes 83% — **but the residual against the revision DISA will assess is 20, not 7.** 3 high Open + 2 high NR. runbook §10.1 |
 | E3a | **Two contradictions worth reading twice** | ⚠️ **UBTU-24-600160 is Open** — the chrony control we *tailored* in USG. **A USG deviation does not travel to the tool DISA uses**, so every justification needs an Answer File too. ⚠️ **UBTU-24-100010** — `systemd-timesyncd` at `deinstall ok config-files` counts as installed; **`apt-get purge` closes it.** A real finding USG hid |
-| E3b | **Triage the 20 + 14 on `svc-mgmt-01`** | ⬜ **NEXT.** Quick wins first: purge timesyncd, sticky bits, library/command group ownership, 4 audit rules. Then the 3 high Open individually |
+| E3b | **Triage the 20 + 14 on `svc-mgmt-01`** | 🔄 **IN PROGRESS — 3 fixed, 6 false positives, 11 left.** ✅ **FIXED + verified NF:** V-270645 (`purge systemd-timesyncd`), V-270750 (sticky bit — the dirs were **created by the scanner**; `rm -rf /tmp/.dotnet`), V-270676 (`audit=1` — needed a **grub.d drop-in**, because `50-cloudimg-settings.cfg` hard-assigns `GRUB_CMDLINE_LINUX_DEFAULT` and silently discards edits to `/etc/default/grub`). ⚠️ **FALSE POSITIVES → Answer File:** V-270699 + V-270703 (DISA's own CheckText filters the very groups it flagged; `chgrp root` would break Postfix and D-Bus), V-270778/799/814/815 (all four rules **already present** at usrmerged paths; DISA's grep checks all match). **Next: the 3 high-severity Open** — V-270675 is entangled with the GRUB password. runbook §10.1 |
 | E3c | **Back-apply to `svc-harbor-01`** | ⬜ It was hardened before steps 13a–13d existed and **has never been scanned with Evaluate-STIG.** A machine measured by one scanner is not done |
 | E4 | ~~One full run, no exclusions~~ | ✅ **DONE** — `svc-mgmt-01` 2026-09-10, 9m07s with AIDE included. The 5 AIDE controls were **not** expensive in practice; `--ExcludeVuln` is for iterating, not for the artefact |
 | E5 | **Answer Files for our deviations** | ⬜ Per-Vuln-ID justifications so a CKLB carries its own rationale — UBTU-24-600160, UBTU-24-300021, the USB window, `encrypt_partitions` |

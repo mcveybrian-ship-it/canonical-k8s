@@ -6,7 +6,7 @@
 *how* things were built and why; they have gone stale more than once. If they disagree with
 this section, this section wins and the other one gets fixed.
 
-Last updated **2026-09-10 22:30**.
+Last updated **2026-09-10 22:30 UTC** (17:30 Central). All timestamps in this repo are **UTC** — every enclave machine runs UTC and the audit logs are UTC, so mixing local time into an auditable procedure is how two records stop lining up.
 
 ## 0a. WORKING LIST — priority order as of 2026-09-10 16:20
 

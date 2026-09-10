@@ -6,7 +6,7 @@
 *how* things were built and why; they have gone stale more than once. If they disagree with
 this section, this section wins and the other one gets fixed.
 
-Last updated **2026-09-10 17:30**.
+Last updated **2026-09-10 17:45**.
 
 ## 0a. WORKING LIST — priority order as of 2026-09-10 16:20
 
@@ -21,14 +21,21 @@ Last updated **2026-09-10 17:30**.
 | 3 | **`svc-repo-01` — full §6.0 pass** | AIDE cleared (§6.3h), so nothing special needed. ufw at step 12b is where it genuinely enforces — plain nginx, no Docker, no bridge |
 | 4 | **`host-4` — full §6.0 pass, LAST** | Rebooting it takes every VM. The USB toggle is what makes it survivable |
 
-**Evaluate-STIG — NEW work stream, started 2026-09-10.** Full write-up: runbook **§10.1**.
+**Evaluate-STIG — now PART OF THE BUILD, not a side quest.** It is baked into the hardening
+sequence as **runbook §6.0 steps 13a–13d**: USG hardens and scores first, then Evaluate-STIG
+measures the residual and that gets triaged. **Order matters and is evidence-based** — `usg fix`
+is the only remediation engine, and scanning V1R6 first would mean 118 hand-worked findings
+instead of ~20. Full write-up: runbook **§10.1**.
 
 | # | What | State |
 |---|---|---|
 | E1 | Tool assessed, staged, and run | ✅ **DONE** — Evaluate-STIG 1.2607.0 at `/srv/bundle-staging/tools/`, PowerShell **7.4.20 LTS** beside it via `--PSPath`. **`pwsh` proven on a FIPS kernel.** Prereqs (`lshw dmidecode bc libicu74`) all mirrored — **`bc` is absent from the Minimal image** and kills the scan in 3 s |
 | E2 | **Baseline: unhardened 24.04 vs DISA V1R6** | ✅ **DONE** — `stage-01`, 62 seconds: **118 Open / 49 NF / 17 NR / 10 NA of 194**; 8 high-severity open |
-| E3 | **Hardened machine vs V1R6** | ⏳ **IN FLIGHT** on `svc-mgmt-01` (AIDE's 5 controls excluded for speed). This is **open question 18 answered with data**: V1R6 (Jul 2026) vs USG's V1R1 (Feb 2026) |
-| E4 | **One full run, no exclusions** | ⬜ An excluded run is an **incomplete checklist**. Needed for the artefact you hand over |
+| E3 | **Hardened machine vs V1R6** | ✅ **DONE — Q18 ANSWERED.** `svc-mgmt-01`, full run, 9m07s: **20 Open / 14 Not Reviewed / 150 NF / 10 NA of 194**, vs **USG's 7 fail** on the same machine. Unhardened was 118 Open, so `usg fix` closes 83% — **but the residual against the revision DISA will assess is 20, not 7.** 3 high Open + 2 high NR. runbook §10.1 |
+| E3a | **Two contradictions worth reading twice** | ⚠️ **UBTU-24-600160 is Open** — the chrony control we *tailored* in USG. **A USG deviation does not travel to the tool DISA uses**, so every justification needs an Answer File too. ⚠️ **UBTU-24-100010** — `systemd-timesyncd` at `deinstall ok config-files` counts as installed; **`apt-get purge` closes it.** A real finding USG hid |
+| E3b | **Triage the 20 + 14 on `svc-mgmt-01`** | ⬜ **NEXT.** Quick wins first: purge timesyncd, sticky bits, library/command group ownership, 4 audit rules. Then the 3 high Open individually |
+| E3c | **Back-apply to `svc-harbor-01`** | ⬜ It was hardened before steps 13a–13d existed and **has never been scanned with Evaluate-STIG.** A machine measured by one scanner is not done |
+| E4 | ~~One full run, no exclusions~~ | ✅ **DONE** — `svc-mgmt-01` 2026-09-10, 9m07s with AIDE included. The 5 AIDE controls were **not** expensive in practice; `--ExcludeVuln` is for iterating, not for the artefact |
 | E5 | **Answer Files for our deviations** | ⬜ Per-Vuln-ID justifications so a CKLB carries its own rationale — UBTU-24-600160, UBTU-24-300021, the USB window, `encrypt_partitions` |
 | E6 | **USG ↔ Evaluate-STIG correlator** | ⬜ Join key is the `UBTU-24-xxxxxx` STIG ID; the map already exists in `/etc/usg/enclave-tailoring.xml`. **Ask the AO about STIG Manager first** — if the programme runs it, feed it instead of building this |
 | E7 | `tools/` on the transfer manifest | ⬜ `build-transfer-bundle.sh` needs `tools/` in its directory list. Carry the tool **without** `powershell/` + the tarball = 184 MB |

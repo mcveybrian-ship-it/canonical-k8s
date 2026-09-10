@@ -290,6 +290,27 @@ rsyslog_selector_present() {
 # lesson as the clean-step guard in build-transfer-bundle.sh.
 LOGROTATE_MAIN=/etc/logrotate.conf
 LOGROTATE_OUT=""
+STIG_BACKUP_DIR="${STIG_BACKUP_DIR:-/var/backups/stig-tailor}"
+LAST_BACKUP=""
+
+# NEVER LEAVE A BACKUP INSIDE A conf.d DIRECTORY.
+#
+# /etc/logrotate.d is read WHOLE - every file in it, whatever the extension. An earlier
+# version of this script wrote its backups as /etc/logrotate.d/apt.pre-stig, which logrotate
+# then parsed as live configuration:
+#
+#   error: apt.pre-stig:1 duplicate log entry for /var/log/apt/term.log
+#   error: found error in file apt.pre-stig, skipping
+#
+# Rotation kept working - logrotate skips the file it faulted on - but the configuration was
+# permanently dirty and every validation from then on failed. The same is true of
+# /etc/cron.d, /etc/sudoers.d and /etc/rsyslog.d: a "harmless" copy left next to the original
+# is not inert, it is a second directive.
+backup_file() {
+  install -d -m 0700 "$STIG_BACKUP_DIR"
+  LAST_BACKUP="$STIG_BACKUP_DIR/$(basename "$1").$(date +%Y%m%dT%H%M%S)"
+  cp -a "$1" "$LAST_BACKUP"
+}
 
 # ONLY MEANINGFUL AS ROOT, IN BOTH DIRECTIONS.
 #
@@ -315,6 +336,18 @@ logrotate_config_ok() {
 
 fixups_plan() {
   printf '\n  STIG fixups - what `usg fix` does not fix\n'
+  local stray_list
+  stray_list="$(find /etc/logrotate.d -maxdepth 1 -type f \
+                  \( -name '*.pre-stig' -o -name '*.bak' -o -name '*.orig' -o -name '*.dpkg-*' \
+                     -o -name '*.ucf-*' -o -name '*~' \) 2>/dev/null)"
+  if [ -n "$stray_list" ]; then
+    printf '\n  0. STRAY FILES IN /etc/logrotate.d - being parsed as configuration\n'
+    printf '%s\n' "$stray_list" | sed 's/^/     /'
+    say "   logrotate reads that directory WHOLE, whatever the extension. A backup left there"
+    say "   is a second set of directives, not an inert copy."
+    say "   fix: move them to $STIG_BACKUP_DIR"
+  fi
+
   printf '\n  1. file_permissions_var_log_stig - wtmp, btmp, lastlog\n'
   say "   owner of the value: systemd-tmpfiles, via $VARCONF_SRC"
   say "   fix: $VARCONF_DST - a FULL COPY with the three modes set to $LOGMODE"
@@ -385,6 +418,21 @@ cmd_fixups() {
   # unrelated ones down with it.
   local failed=0
 
+  # ---- 0. evict anything in /etc/logrotate.d that is not configuration ----------------
+  # Runs FIRST, because every later validation reads the whole directory and will fail on a
+  # stray file regardless of what we just edited.
+  local stray n_stray=0
+  while IFS= read -r stray; do
+    [ -n "$stray" ] || continue
+    install -d -m 0700 "$STIG_BACKUP_DIR"
+    mv "$stray" "$STIG_BACKUP_DIR/$(basename "$stray").evicted.$(date +%Y%m%dT%H%M%S)"
+    warn "0. moved $stray out of /etc/logrotate.d - it was being PARSED AS CONFIG"
+    n_stray=$((n_stray + 1))
+  done < <(find /etc/logrotate.d -maxdepth 1 -type f \
+             \( -name '*.pre-stig' -o -name '*.bak' -o -name '*.orig' -o -name '*.dpkg-*' \
+                -o -name '*.ucf-*' -o -name '*~' \) 2>/dev/null)
+  [ "$n_stray" -eq 0 ] || say "   -> $STIG_BACKUP_DIR"
+
   # ---- 1. tmpfiles: wtmp, btmp, lastlog -------------------------------------------------
   if [ ! -f "$VARCONF_SRC" ]; then
     warn "1. $VARCONF_SRC does not exist - has the layout changed? SKIPPED"
@@ -414,17 +462,17 @@ cmd_fixups() {
   if grep -q '^[[:space:]]*create ' "$APT_LOGROTATE" 2>/dev/null; then
     say "2. $APT_LOGROTATE already has a 'create' line - not touching it"
   elif [ -f "$APT_LOGROTATE" ]; then
-    cp -a "$APT_LOGROTATE" "$APT_LOGROTATE.pre-stig"
+    backup_file "$APT_LOGROTATE"; local aptbak="$LAST_BACKUP"
     sed -i -E "s/^([[:space:]]*)rotate 12$/\1rotate 12\n\1create $LOGMODE root adm/" "$APT_LOGROTATE"
     # Validated through $LOGROTATE_MAIN - see logrotate_config_ok() for why testing a
     # fragment on its own is the wrong thing to test.
     if ! logrotate_config_ok; then
-      mv "$APT_LOGROTATE.pre-stig" "$APT_LOGROTATE"
+      cp -a "$aptbak" "$APT_LOGROTATE"
       warn "2. logrotate rejected the edit - REVERTED. Its output:"
       printf '%s\n' "$LOGROTATE_OUT" | sed 's/^/       /'
       failed=1
     else
-      ok "2. added 'create $LOGMODE root adm' to $APT_LOGROTATE (backup: .pre-stig)"
+      ok "2. added 'create $LOGMODE root adm' to $APT_LOGROTATE (backup: $aptbak)"
     fi
   else
     warn "2. $APT_LOGROTATE not present - skipped"
@@ -501,15 +549,15 @@ EOF
     if grep -q "^${DAEMON_LOG}\$" "$RSYSLOG_LOGROTATE"; then
       say "   $DAEMON_LOG already in $RSYSLOG_LOGROTATE"
     else
-      cp -a "$RSYSLOG_LOGROTATE" "$RSYSLOG_LOGROTATE.pre-stig"
+      backup_file "$RSYSLOG_LOGROTATE"; local rsbak="$LAST_BACKUP"
       sed -i "\#^/var/log/syslog\$#a $DAEMON_LOG" "$RSYSLOG_LOGROTATE"
       if ! logrotate_config_ok; then
-        mv "$RSYSLOG_LOGROTATE.pre-stig" "$RSYSLOG_LOGROTATE"
+        cp -a "$rsbak" "$RSYSLOG_LOGROTATE"
         warn "   logrotate rejected the rsyslog edit - REVERTED. Its output:"
         printf '%s\n' "$LOGROTATE_OUT" | sed 's/^/       /'
         failed=1
       else
-        ok "   added $DAEMON_LOG to $RSYSLOG_LOGROTATE (backup: .pre-stig)"
+        ok "   added $DAEMON_LOG to $RSYSLOG_LOGROTATE (backup: $rsbak)"
       fi
     fi
   fi
@@ -564,6 +612,15 @@ fixups_verify() {
       warn "/var/log is group-writable and $LOGROTATE_MAIN has NO 'su' directive -"
       warn "  logrotate will skip EVERY system log. Add 'su root adm'."; fail=1
     fi
+  fi
+  local sl
+  sl="$(find /etc/logrotate.d -maxdepth 1 -type f \
+          \( -name '*.pre-stig' -o -name '*.bak' -o -name '*.orig' -o -name '*.dpkg-*' \
+             -o -name '*.ucf-*' -o -name '*~' \) 2>/dev/null)"
+  if [ -n "$sl" ]; then
+    warn "stray files in /etc/logrotate.d being parsed as config:"
+    printf '%s\n' "$sl" | sed 's/^/       /'
+    fail=1
   fi
   if command -v logrotate >/dev/null 2>&1; then
     local lrrc=0

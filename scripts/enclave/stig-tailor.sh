@@ -308,49 +308,101 @@ cmd_fixups() {
   if [ "$apply" -eq 0 ]; then fixups_plan; return; fi
 
   need_root
-  # 1. tmpfiles - full copy, three modes tightened.
-  [ -f "$VARCONF_SRC" ] || die "$VARCONF_SRC does not exist - has the layout changed?"
-  install -d -m 0755 /etc/tmpfiles.d
-  if [ -f "$VARCONF_DST" ]; then
-    say "$VARCONF_DST exists - leaving it alone. Edit it by hand or remove it first."
+  # THE THREE FIXES ARE INDEPENDENT AND EACH REPORTS FOR ITSELF.
+  #
+  # An earlier version used `die` on a failure in fix 2, which skipped fix 3 entirely - so a
+  # logrotate problem silently prevented the rsyslog install, and the operator was left with a
+  # half-applied machine and no statement of which half. A fixup that fails must not take the
+  # unrelated ones down with it.
+  local failed=0
+
+  # ---- 1. tmpfiles: wtmp, btmp, lastlog -------------------------------------------------
+  if [ ! -f "$VARCONF_SRC" ]; then
+    warn "1. $VARCONF_SRC does not exist - has the layout changed? SKIPPED"
+    failed=1
+  elif [ -f "$VARCONF_DST" ]; then
+    say "1. $VARCONF_DST exists - leaving it alone. Edit it by hand or remove it first."
   else
+    install -d -m 0755 /etc/tmpfiles.d
     sed -E 's#^(f /var/log/(wtmp|btmp|lastlog)[[:space:]]+)[0-7]{4}#\1'"$LOGMODE"'#' \
       "$VARCONF_SRC" > "$VARCONF_DST"
     chmod 0644 "$VARCONF_DST"
     # Prove the substitution actually hit all three before trusting it.
     local hits; hits=$(grep -cE "^f /var/log/(wtmp|btmp|lastlog)[[:space:]]+$LOGMODE" "$VARCONF_DST" || true)
-    [ "$hits" -eq 3 ] || die "expected 3 tightened lines in $VARCONF_DST, found $hits - inspect it"
-    ok "wrote $VARCONF_DST (full copy, wtmp/btmp/lastlog at $LOGMODE)"
+    if [ "$hits" -eq 3 ]; then
+      ok "1. wrote $VARCONF_DST (full copy, wtmp/btmp/lastlog at $LOGMODE)"
+    else
+      rm -f "$VARCONF_DST"
+      warn "1. expected 3 tightened lines, found $hits - removed the file rather than leaving"
+      warn "   a PARTIAL override in place, which would mask the vendor file with the wrong"
+      warn "   contents. Inspect $VARCONF_SRC by hand."
+      failed=1
+    fi
+    systemd-tmpfiles --create 2>/dev/null || warn "   systemd-tmpfiles --create reported an issue"
   fi
-  systemd-tmpfiles --create 2>/dev/null || warn "systemd-tmpfiles --create reported an issue"
 
-  # 2. logrotate for apt, then the existing files.
-  if grep -q '^\s*create ' "$APT_LOGROTATE" 2>/dev/null; then
-    say "$APT_LOGROTATE already has a 'create' line - not touching it"
+  # ---- 2. logrotate for apt, then the existing files ------------------------------------
+  if grep -q '^[[:space:]]*create ' "$APT_LOGROTATE" 2>/dev/null; then
+    say "2. $APT_LOGROTATE already has a 'create' line - not touching it"
   elif [ -f "$APT_LOGROTATE" ]; then
     cp -a "$APT_LOGROTATE" "$APT_LOGROTATE.pre-stig"
     sed -i -E "s/^([[:space:]]*)rotate 12$/\1rotate 12\n\1create $LOGMODE root adm/" "$APT_LOGROTATE"
-    logrotate -d "$APT_LOGROTATE" >/dev/null 2>&1 \
-      || { mv "$APT_LOGROTATE.pre-stig" "$APT_LOGROTATE"; die "logrotate rejected the edit - reverted"; }
-    ok "added 'create $LOGMODE root adm' to $APT_LOGROTATE (backup: .pre-stig)"
+    # VALIDATE THE PARSE, NOT THE WORD "error".
+    #
+    # `logrotate -d` writes nothing, but it still READS its state file, and if it cannot it
+    # prints "error: error opening state file ... Permission denied" and exits 0. An earlier
+    # version here grepped the output for "error", matched that benign line, and reverted a
+    # perfectly valid edit - then discarded the message that would have explained it.
+    #
+    # So: hand it a throwaway state file (-s) so it has nothing to complain about, trust the
+    # exit code, and require it to say it parsed the stanzas. Errors about the state file are
+    # ignored explicitly rather than by accident.
+    local lrout lrrc=0 lrstate
+    lrstate="$(mktemp)"
+    lrout="$(logrotate -d -s "$lrstate" "$APT_LOGROTATE" 2>&1)" || lrrc=$?
+    rm -f "$lrstate"
+    if [ "$lrrc" -ne 0 ] \
+       || ! printf '%s' "$lrout" | grep -qE 'Handling [0-9]+ logs' \
+       || printf '%s' "$lrout" | grep -i 'error' | grep -qv 'state file'; then
+      mv "$APT_LOGROTATE.pre-stig" "$APT_LOGROTATE"
+      warn "2. logrotate rejected the edit (exit $lrrc) - REVERTED. Its output:"
+      printf '%s\n' "$lrout" | sed 's/^/       /'
+      failed=1
+    else
+      ok "2. added 'create $LOGMODE root adm' to $APT_LOGROTATE (backup: .pre-stig)"
+    fi
   else
-    warn "$APT_LOGROTATE not present - skipped"
+    warn "2. $APT_LOGROTATE not present - skipped"
   fi
-  find /var/log/apt -type f -exec chmod "$LOGMODE" {} + 2>/dev/null || true
-  ok "existing /var/log/apt files set to $LOGMODE"
+  # The existing files are worth correcting whether or not the logrotate edit took: the mode
+  # on disk is what the audit reads. If logrotate failed, rotation will undo this - which the
+  # warning above has already said.
+  if find /var/log/apt -type f -exec chmod "$LOGMODE" {} + 2>/dev/null; then
+    ok "   existing /var/log/apt files set to $LOGMODE"
+  fi
 
-  # 3. /var/log group ownership.
+  # ---- 3. /var/log group ownership -------------------------------------------------------
   if getent group syslog >/dev/null 2>&1; then
-    chgrp syslog /var/log && ok "/var/log group set to syslog"
+    chgrp syslog /var/log && ok "3. /var/log group set to syslog"
   elif [ "$with_rsyslog" -eq 1 ]; then
-    say "installing rsyslog from the enclave mirror"
-    apt-get install -y rsyslog >/dev/null 2>&1 || die "rsyslog install failed - is apt working?"
-    getent group syslog >/dev/null 2>&1 || die "rsyslog installed but no syslog group appeared"
-    chgrp syslog /var/log && ok "rsyslog installed, /var/log group set to syslog"
+    say "3. installing rsyslog from the enclave mirror"
+    if ! apt-get install -y rsyslog >/dev/null 2>&1; then
+      warn "3. rsyslog install failed - is apt working? file_groupowner_var_log STILL FAILS"
+      failed=1
+    elif ! getent group syslog >/dev/null 2>&1; then
+      warn "3. rsyslog installed but no syslog group appeared - inspect by hand"
+      failed=1
+    else
+      chgrp syslog /var/log && ok "3. rsyslog installed, /var/log group set to syslog"
+    fi
   else
-    warn "no syslog group and --with-rsyslog not given - file_groupowner_var_log STILL FAILS"
+    warn "3. no syslog group and --with-rsyslog not given - file_groupowner_var_log STILL FAILS"
     say "   this is the decision in the plan output. Nothing was faked."
+    failed=1
   fi
+
+  say ""
+  [ "$failed" -eq 0 ] || warn "one or more fixups did not complete - see above"
   say ""
   say "verify with:  sudo $0 fixups --verify   then re-audit"
 }

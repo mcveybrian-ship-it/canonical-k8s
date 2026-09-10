@@ -273,6 +273,46 @@ rsyslog_selector_present() {
   grep -qhP "$1" /etc/rsyslog.conf /etc/rsyslog.d/*.conf 2>/dev/null
 }
 
+# VALIDATE THROUGH THE ENTRY POINT THAT ACTUALLY RUNS. logrotate.timer runs
+# `logrotate /etc/logrotate.conf`, and that file carries a GLOBAL `su root adm` plus
+# `include /etc/logrotate.d`. Running `logrotate -d` on a fragment on its own reads neither -
+# so /var/log being group-writable by syslog (which is STOCK Ubuntu: rsyslog's postinst runs
+# `chgrp syslog /var/log; chmod g+w /var/log`) produces
+#
+#   error: skipping "/var/log/syslog" because parent directory has insecure permissions
+#
+# for every file, and the edit gets reverted for a problem that does not exist in production.
+#
+# WORSE, THE FALSE PASS: the same fragment-only command SUCCEEDS when run unprivileged,
+# because the parent-directory security check does not fire the same way for a non-root
+# caller. It was tested as a user, passed, and then failed under sudo on the real machine.
+# A check whose result depends on the caller being unprivileged is not a check - the same
+# lesson as the clean-step guard in build-transfer-bundle.sh.
+LOGROTATE_MAIN=/etc/logrotate.conf
+LOGROTATE_OUT=""
+
+# ONLY MEANINGFUL AS ROOT, IN BOTH DIRECTIONS.
+#
+#   as root, on a fragment   -> false FAILURE ("insecure permissions" - no global su in scope)
+#   as a user, on the whole  -> false FAILURE ("error switching euid ... not permitted")
+#   as a user, on a fragment -> false PASS (the parent-directory check does not fire at all)
+#
+# Only "as root, through /etc/logrotate.conf" reproduces what logrotate.timer actually does.
+# Every other combination answers a different question, so this returns 2 - UNKNOWN - rather
+# than inventing a verdict it cannot support.
+logrotate_config_ok() {
+  [ "$(id -u)" -eq 0 ] || { LOGROTATE_OUT="not root"; return 2; }
+  local st out rc=0
+  st="$(mktemp)"
+  out="$(logrotate -d -s "$st" "$LOGROTATE_MAIN" 2>&1)" || rc=$?
+  rm -f "$st"
+  LOGROTATE_OUT="$out"
+  [ "$rc" -eq 0 ] || return 1
+  printf '%s' "$out" | grep -q 'error:' && return 1
+  printf '%s' "$out" | grep -qE 'Handling [0-9]+ logs' || return 1
+  return 0
+}
+
 fixups_plan() {
   printf '\n  STIG fixups - what `usg fix` does not fix\n'
   printf '\n  1. file_permissions_var_log_stig - wtmp, btmp, lastlog\n'
@@ -376,26 +416,12 @@ cmd_fixups() {
   elif [ -f "$APT_LOGROTATE" ]; then
     cp -a "$APT_LOGROTATE" "$APT_LOGROTATE.pre-stig"
     sed -i -E "s/^([[:space:]]*)rotate 12$/\1rotate 12\n\1create $LOGMODE root adm/" "$APT_LOGROTATE"
-    # VALIDATE THE PARSE, NOT THE WORD "error".
-    #
-    # `logrotate -d` writes nothing, but it still READS its state file, and if it cannot it
-    # prints "error: error opening state file ... Permission denied" and exits 0. An earlier
-    # version here grepped the output for "error", matched that benign line, and reverted a
-    # perfectly valid edit - then discarded the message that would have explained it.
-    #
-    # So: hand it a throwaway state file (-s) so it has nothing to complain about, trust the
-    # exit code, and require it to say it parsed the stanzas. Errors about the state file are
-    # ignored explicitly rather than by accident.
-    local lrout lrrc=0 lrstate
-    lrstate="$(mktemp)"
-    lrout="$(logrotate -d -s "$lrstate" "$APT_LOGROTATE" 2>&1)" || lrrc=$?
-    rm -f "$lrstate"
-    if [ "$lrrc" -ne 0 ] \
-       || ! printf '%s' "$lrout" | grep -qE 'Handling [0-9]+ logs' \
-       || printf '%s' "$lrout" | grep -i 'error' | grep -qv 'state file'; then
+    # Validated through $LOGROTATE_MAIN - see logrotate_config_ok() for why testing a
+    # fragment on its own is the wrong thing to test.
+    if ! logrotate_config_ok; then
       mv "$APT_LOGROTATE.pre-stig" "$APT_LOGROTATE"
-      warn "2. logrotate rejected the edit (exit $lrrc) - REVERTED. Its output:"
-      printf '%s\n' "$lrout" | sed 's/^/       /'
+      warn "2. logrotate rejected the edit - REVERTED. Its output:"
+      printf '%s\n' "$LOGROTATE_OUT" | sed 's/^/       /'
       failed=1
     else
       ok "2. added 'create $LOGMODE root adm' to $APT_LOGROTATE (backup: .pre-stig)"
@@ -412,7 +438,10 @@ cmd_fixups() {
 
   # ---- 3. /var/log group ownership -------------------------------------------------------
   if getent group syslog >/dev/null 2>&1; then
-    chgrp syslog /var/log && ok "3. /var/log group set to syslog"
+    # Usually a no-op: rsyslog's postinst already runs `chgrp syslog /var/log; chmod g+w`.
+    # Kept because the rule is about the END STATE - a machine can arrive here with the group
+    # present and /var/log still owned by root:root.
+    chgrp syslog /var/log && ok "3. /var/log group is syslog"
   elif [ "$with_rsyslog" -eq 1 ]; then
     say "3. installing rsyslog from the enclave mirror"
     if ! apt-get install -y rsyslog >/dev/null 2>&1; then
@@ -474,13 +503,10 @@ EOF
     else
       cp -a "$RSYSLOG_LOGROTATE" "$RSYSLOG_LOGROTATE.pre-stig"
       sed -i "\#^/var/log/syslog\$#a $DAEMON_LOG" "$RSYSLOG_LOGROTATE"
-      local lr2 rc2=0 st2; st2="$(mktemp)"
-      lr2="$(logrotate -d -s "$st2" "$RSYSLOG_LOGROTATE" 2>&1)" || rc2=$?
-      rm -f "$st2"
-      if [ "$rc2" -ne 0 ] || ! printf '%s' "$lr2" | grep -qE 'Handling [0-9]+ logs'; then
+      if ! logrotate_config_ok; then
         mv "$RSYSLOG_LOGROTATE.pre-stig" "$RSYSLOG_LOGROTATE"
         warn "   logrotate rejected the rsyslog edit - REVERTED. Its output:"
-        printf '%s\n' "$lr2" | sed 's/^/       /'
+        printf '%s\n' "$LOGROTATE_OUT" | sed 's/^/       /'
         failed=1
       else
         ok "   added $DAEMON_LOG to $RSYSLOG_LOGROTATE (backup: .pre-stig)"
@@ -527,6 +553,28 @@ fixups_verify() {
     if [ -f "$RSYSLOG_STIG" ] && ! grep -q "^${DAEMON_LOG}\$" "$RSYSLOG_LOGROTATE" 2>/dev/null; then
       warn "$DAEMON_LOG is NOT in $RSYSLOG_LOGROTATE - it will grow forever"; fail=1
     fi
+  fi
+  # /var/log is group-writable by syslog on stock Ubuntu, so EVERY rotation depends on the
+  # global `su` in logrotate.conf. If anything ever removes it, rotation stops silently for
+  # every system log - no error until a disk fills.
+  if [ "$(stat -c '%A' /var/log | cut -c6)" = "w" ]; then
+    if grep -qE '^[[:space:]]*su ' "$LOGROTATE_MAIN" 2>/dev/null; then
+      say "logrotate global su: $(grep -hE '^[[:space:]]*su ' "$LOGROTATE_MAIN" | tr -s ' ')"
+    else
+      warn "/var/log is group-writable and $LOGROTATE_MAIN has NO 'su' directive -"
+      warn "  logrotate will skip EVERY system log. Add 'su root adm'."; fail=1
+    fi
+  fi
+  if command -v logrotate >/dev/null 2>&1; then
+    local lrrc=0
+    logrotate_config_ok || lrrc=$?
+    case "$lrrc" in
+      0) say "logrotate config parses clean" ;;
+      2) say "logrotate config check SKIPPED - needs root. Re-run with sudo to include it." ;;
+      *) warn "logrotate config has errors:"
+         printf '%s\n' "$LOGROTATE_OUT" | grep 'error:' | sed 's/^/       /'
+         fail=1 ;;
+    esac
   fi
   say ""
   [ "$fail" -eq 0 ] && ok "all checks passed" || warn "some checks failed - see above"

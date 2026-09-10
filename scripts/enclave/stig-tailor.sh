@@ -618,7 +618,24 @@ fixups_verify() {
   say "$(stat -c '%A %U:%G %n' /var/log)"
   getent group syslog >/dev/null 2>&1 || { warn "no syslog group - file_groupowner_var_log fails"; fail=1; }
   [ "$(stat -c '%G' /var/log)" = "syslog" ] || { warn "/var/log is not group syslog"; fail=1; }
-  find /var/log/apt -type f -perm /0137 -printf '  [!]  too permissive: %M %p\n' 2>/dev/null
+  # SCAN ALL OF /var/log, NOT JUST THE PATHS WE FIXED.
+  #
+  # This checked /var/log/apt only, so on svc-mgmt-01 it reported clean while
+  # file_permissions_var_log_stig was still failing - MAAS writes its own logs and nothing
+  # was looking at them. A verify that only re-checks what you already fixed cannot tell you
+  # the rule still fails; it can only tell you your fix applied.
+  local offenders
+  offenders="$(find /var/log -type f -perm /0137 -printf '%M %U:%G %p\n' 2>/dev/null | sort -k3)"
+  if [ -n "$offenders" ]; then
+    warn "files under /var/log more permissive than $LOGMODE - file_permissions_var_log_stig"
+    warn "will keep failing until each is dealt with:"
+    printf '%s\n' "$offenders" | sed 's/^/       /'
+    say  "     Fix at the layer that OWNS each one - the package that creates it, its"
+    say  "     logrotate stanza, or a tmpfiles entry. A bare chmod comes back. See 6.3c."
+    fail=1
+  else
+    ok "no file under /var/log is more permissive than $LOGMODE"
+  fi
   if command -v rsyslogd >/dev/null 2>&1; then
     for sel in AUTH AUTHPRIV DAEMON; do
       eval "re=\$RE_$sel"

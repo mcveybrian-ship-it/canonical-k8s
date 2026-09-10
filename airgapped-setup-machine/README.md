@@ -6,7 +6,41 @@
 *how* things were built and why; they have gone stale more than once. If they disagree with
 this section, this section wins and the other one gets fixed.
 
-Last updated **2026-09-10**.
+Last updated **2026-09-10 16:20**.
+
+## 0a. WORKING LIST — priority order as of 2026-09-10 16:20
+
+**Read this for "what next". The tables below record state; this records order.**
+
+**Finish what is in flight**
+
+| # | What | Notes |
+|---|---|---|
+| 1 | **Re-audit `svc-mgmt-01`** | The 8-fail figure predates the apt `Post-Invoke` hook that closed `file_permissions_var_log_stig`. It should be **7** — ⏳ **not yet confirmed, do not write 7 into the record on inference** |
+| 2 | ~~Close the USB window on `host-4`~~ | ✅ **DONE 16:24 — the auto-close fired and worked.** Block file restored from the stash, both modules unloaded, `enclave-xfer` gone, transient service `Result=success`. Full cycle proven; `host-4` is BLOCKED as its normal posture. §6.3g |
+| 3 | **`svc-repo-01` — full §6.0 pass** | AIDE cleared (§6.3h), so nothing special needed. ufw at step 12b is where it genuinely enforces — plain nginx, no Docker, no bridge |
+| 4 | **`host-4` — full §6.0 pass, LAST** | Rebooting it takes every VM. The USB toggle is what makes it survivable |
+
+**Decisions blocking the remaining machines**
+
+| What | State |
+|---|---|
+| **GRUB password** | ✅ decided, ❌ **not implemented** — pbkdf2 + `--unrestricted` on the default entry, and a **reboot test per machine** |
+| **MAAS ufw rule table** | ~30 ports (`5239-5284`, `3128`, `8000`, `53`, `67/udp`, `69/udp`, `5353`). `stig-tailor.sh ufw` **refuses** without a table. §6.3e |
+| SSSD / CAC ×2 | Waits on the FIPS YubiKey |
+| `encrypt_partitions` | Compensating-control write-up — LUKS is under the guest, not in it |
+| `auditd_offload_logs` | Folded into the log-collector thread, §6.3d |
+
+**Owed, and not blocked by anything**
+
+| What | Why it matters |
+|---|---|
+| **AO thread — 8 questions** | **The only item where the clock runs whether you work or not.** Three decide hardware purchases; one (retention) sizes `svc-log-01`'s disk, which decides whether it fits on `host-4` at all |
+| **Root-CA: verify on the drive, then `shred -u /srv/ca-backup/*`** | Until the shred **the root key is on a network-attached VM**. Use the one-liner in runbook §2.9b — the `.sha256` holds a BARE hash |
+| **Close the gap** | `gap-state.sh close` + unplug port 4. `stage-01` is multi-homed to the internet AND the enclave right now |
+| `ceph-csi` on deb-deployed Ceph | Untested and load-bearing on the storage design. A lab test, not a paper question |
+| Steps 06–10 | Cluster VMs, k8s bootstrap, storage, validation, day-2 patching — unwritten |
+| ⏰ 09:00 2026-09-11 | Reminder fires: audit-volume 24h delta, the hollow UBTU-24-100450 pass, and the three log questions for the AO |
 
 **STAGE-01's build work is DONE. The enclave is currently in STATE A (BUILD), not gapped.**
 
@@ -78,7 +112,7 @@ real client over the network. See `docs/03-host-services.md`.
 | MAAS on `svc-mgmt-01` | ✅ **RUNNING + DHCP 2026-09-08** — dynamic `.100-.149`, reserved `.150-.254`, `dhcp_on=True`, **no `option routers`** so PXE'd machines get no default route. dhcpd on `0.0.0.0:67`, TFTP on `.161:69`, HTTP boot on `:5248`. ⚠️ Installing MAAS SPLIT THE ENCLAVE CLOCK — see runbook §2.10. Was: **RUNNING 2026-09-08** — `maas 1:3.7.3` installed, PostgreSQL stood up by dbconfig-common, admin created, boot source repointed at the mirror. **6 noble/amd64 images + 4 bootloaders synced, 828 MB.** Follow-ups: `:5240` is plain HTTP; DHCP not yet enabled so PXE cannot boot. Was: **UNBLOCKED 2026-09-08** — 852 MB of boot images mirrored, carried and served (`/maas-images/`, squashfs 200 from host-4). `maas 1:3.7.3` now installable after `add-mirrored-ppa.sh maas/3.7`. Ready to install |
 | Harbor on `svc-harbor-01` | ✅ **RUNNING; SURVIVED A REBOOT 2026-09-10** — came back unattended via `harbor.service`, 8/8 components healthy, `HTTPS 200` validating to the enclave root. Was: ✅ **RUNNING 2026-09-08** — v2.15.2, 11 containers, all 8 components healthy incl. Trivy. Serving `https://svc-harbor-01.enclave.internal` on the enclave wildcard, validated from host-4 with no `-k`. **Trivy pulls its DB from Harbor itself** — proven in Harbor's access log (`trivy/0.72.0` pulled the 117 MB blob, zero ghcr.io). A real image was pushed and scanned successfully. java-db configured but unexercised. Was: **UNBLOCKED 2026-09-08** — installer 697 MB cosign-verified and served; docker.io/docker-compose-v2/containerd all already mirrored; 483 G free, 15 G RAM. Ready to install. Needs a TLS cert decision first (runbook §4.5b) |
 | **FIPS + STIG on `svc-harbor-01`** | ✅ **COMPLETE 2026-09-10 — no code fix outstanding.** **51/68 → 205/11 → 207/9 → 209/8 → 210 pass / 7 fail.** Every audit kept as evidence; progression table in runbook §6.3. ⚠️ **`usg fix` LOCKED THE ADMIN ACCOUNT OUT OF SUDO** — fixed at source in `03-compose-vm.sh`, `vm-rescue.sh` is the way back in. §6.3a. **Fixed:** chrony `maxpoll 16` (§6.3b) · approved-server list **UBTU-24-600160** tailored (§6.3b) · `wtmp/btmp/lastlog` `0640` via `/etc/tmpfiles.d/var.conf`, **proven across a reboot** · apt logs via logrotate `create` · `/var/log` group `syslog` · `daemon.*` selector (§6.3c). **`rsyslog` installed** — decided, and note it **expanded** the rule set. **The 7 remaining are the five decisions** — `docs/open-questions.md`. Next machine: `svc-mgmt-01` |
-| **FIPS + STIG on `svc-mgmt-01`** | ✅ **HARDENED 2026-09-10** — `fips_enabled=1`, kernel `6.8.0-138-fips`, `usg fix stig-v1r1`, reboot, tailoring, fixups. **54 pass / 66 fail → 206/11 → 208 pass / 8 fail** (Harbor was 205/11 at the same stage, so **runbook §6.0 generalises**). **MAAS survived intact** — all services, `dhcpd :67` + `rackd :69`, PXE path unbroken, PostgreSQL `scram-sha-256` through the FIPS swap, chrony `^* host-4`. **Two deviations, both scoped and justified:** `sudo_require_authentication` (**UBTU-24-300021**) deselected **on this machine only** — MAAS needs per-command `NOPASSWD` for `maas-dhcpd` and `lshw`, while the blanket `encadmin ALL=(ALL) NOPASSWD:ALL` stays commented out; and the time-server list (**UBTU-24-600160**) retargeted. ⏳ **One item open:** `file_permissions_var_log_stig` still fails — an offender under `/var/log` that is not `wtmp`/`btmp`/`lastlog` or apt, likely MAAS's own logs. Offender list is a 10-minute job. Then ufw at §6.0 step 12b. runbook §6.0–6.3f |
+| **FIPS + STIG on `svc-mgmt-01`** | ✅ **HARDENED 2026-09-10** — `fips_enabled=1`, kernel `6.8.0-138-fips`, `usg fix stig-v1r1`, reboot, tailoring, fixups. **54 pass / 66 fail → 206/11 → 208 pass / 8 fail** (⏳ then the apt hook closed `file_permissions_var_log_stig`, so it should be **209/7** — **re-audit to confirm, not yet verified**) (Harbor was 205/11 at the same stage, so **runbook §6.0 generalises**). **MAAS survived intact** — all services, `dhcpd :67` + `rackd :69`, PXE path unbroken, PostgreSQL `scram-sha-256` through the FIPS swap, chrony `^* host-4`. **Two deviations, both scoped and justified:** `sudo_require_authentication` (**UBTU-24-300021**) deselected **on this machine only** — MAAS needs per-command `NOPASSWD` for `maas-dhcpd` and `lshw`, while the blanket `encadmin ALL=(ALL) NOPASSWD:ALL` stays commented out; and the time-server list (**UBTU-24-600160**) retargeted. ⏳ **One item open:** `file_permissions_var_log_stig` still fails — an offender under `/var/log` that is not `wtmp`/`btmp`/`lastlog` or apt, likely MAAS's own logs. Offender list is a 10-minute job. Then ufw at §6.0 step 12b. runbook §6.0–6.3f |
 | Landscape | ✅ **DONE 2026-09-04** — 97 debs, 293 M, verified. Track B item 1 |
 | ~~Enterprise Store~~ | ❌ **DROPPED — replacement PROVEN 2026-09-08.** 12 files served at `/snaps/` over TLS; `k8s_5526.snap` fetched by host-4 is byte-identical to the source (`c86cf856…`). Original note 2026-09-04 — runbook §4.6. 3 snaps, 7 VMs, `k8s` pinned; served as files from `svc-repo-01` instead. **Deciding this found that the snaps were never inside the gap at all** — fixed in the vhost, the TLS block and `restore-mirror.sh` |
 | `host-1..3` | Hardware |

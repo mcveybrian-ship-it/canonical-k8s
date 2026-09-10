@@ -638,10 +638,130 @@ fixups_verify() {
   return 0
 }
 
+# ---------------------------------------------------------------------------- ufw
+#
+# WHAT THE RULES ACTUALLY REQUIRE, read from the benchmark on 2026-09-10:
+#
+#   check_ufw_active      - `ufw status` must not report "inactive". That is all.
+#   set_ufw_default_rule  - default DENY on incoming.
+#   ufw_rate_limit        - "If any port with a state of LISTEN is not marked with the LIMIT
+#                            action, this is a finding." EVERY listening port, not just ssh.
+#
+# AND THAT LAST ONE CONFLICTS WITH WHAT THIS ENCLAVE IS FOR.
+#
+#   `ufw limit` denies a source IP after 6 connections in 30 seconds. On ssh that is exactly
+#   right. On 443 of svc-repo-01 it rate-limits APT, and on 443 of svc-harbor-01 it
+#   rate-limits CONTAINER PULLS - containerd opens parallel connections per layer and apt
+#   pipelines. A rule set that satisfies the benchmark and breaks the package mirror has made
+#   the enclave worse, not safer.
+#
+#   So the action is a PER-PORT decision recorded in the table below, `limit` where it is
+#   safe and `allow` where limiting would break the service.
+#
+#   WHETHER 443 ACTUALLY BREAKS UNDER LIMIT IS TESTABLE, not a matter of opinion. The test
+#   is in runbook 6.3e: set `limit 443/tcp` on svc-harbor-01 (disposable), pull a
+#   multi-layer image from host-4, and watch for connection resets. If pulls survive, change
+#   this table to `limit` and the finding closes honestly. Until someone runs that test the
+#   service ports stay `allow` - a documented finding beats a throttled mirror.
+#
+# MACHINES DELIBERATELY ABSENT FROM THIS TABLE:
+#
+#   svc-mgmt-01 - MAAS opens ~30 ports (5239-5284, 3128, 8000, 53, 67/udp, 69/udp, 5353) and
+#                 getting it wrong breaks PXE and deploy, which is how host-1..3 get built.
+#   host-4      - it BRIDGES guest traffic over br0, and ufw's default FORWARD policy is DROP.
+#                 Enabling ufw on the hypervisor can cut off every VM depending on
+#                 br_netfilter. Same class of risk as MAAS, and it takes the whole enclave
+#                 with it rather than one machine.
+#
+#   The script REFUSES on a machine it has no table for. That is the guard, not a comment.
+
+ufw_rules() {
+cat <<'EOF'
+svc-repo-01	22/tcp	limit	ssh - safe to rate-limit, and what the rule is really aimed at
+svc-repo-01	80/tcp	allow	nginx 301 redirect only; kept so a plaintext client gets a redirect rather than a timeout
+svc-repo-01	443/tcp	allow	THE MIRROR - 318 GB of apt over TLS, plus /keys /debs /snaps /maas-images. LIMIT here throttles apt for every machine in the enclave
+svc-harbor-01	22/tcp	limit	ssh
+svc-harbor-01	80/tcp	allow	Harbor 301 redirect only
+svc-harbor-01	443/tcp	allow	Harbor registry + Trivy DB pulls. LIMIT here throttles image pulls, which open parallel connections per layer
+EOF
+}
+
+cmd_ufw() {
+  local apply=0 me; me="$(hostname -s)"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --apply) apply=1; shift ;;
+      *) die "unknown argument: $1" ;;
+    esac
+  done
+
+  local mine; mine="$(ufw_rules | awk -F'\t' -v m="$me" '$1==m')"
+  if [ -z "$mine" ]; then
+    die "no ufw rule table for '$me'.
+      This machine is deliberately not covered - see the comment above ufw_rules().
+      svc-mgmt-01: MAAS port list unconfirmed; breaking it breaks PXE and deploy.
+      host-4:      bridges guest traffic; ufw FORWARD policy can cut off every VM.
+      Add a table entry only after the port list is confirmed AND tested."
+  fi
+
+  printf '\n  ufw plan for %s\n\n' "$me"
+  printf '  %-10s %-7s %s\n' PORT ACTION WHY
+  printf '%s\n' "$mine" | awk -F'\t' '{printf "  %-10s %-7s %s\n", $2, $3, $4}'
+
+  # Anything listening that the table does not mention is either surface to remove or a rule
+  # we forgot. Say which ports those are - do not silently firewall a service into the dark.
+  local listening unlisted
+  listening="$(ss -tulnH 2>/dev/null | awk '{print $5}' | sed 's/.*://' | grep -E '^[0-9]+$' | sort -un)"
+  unlisted=""
+  local pt
+  for pt in $listening; do
+    printf '%s\n' "$mine" | awk -F'\t' '{print $2}' | cut -d/ -f1 | grep -qx "$pt" || unlisted="$unlisted $pt"
+  done
+  if [ -n "$unlisted" ]; then
+    say ""
+    warn "listening but NOT in the table:$unlisted"
+    say "   these will be BLOCKED once ufw is active. Each is either surface to remove or a"
+    say "   missing rule. Loopback-only listeners are fine - ufw does not filter lo."
+    say "   Check with:  ss -tulnp | grep -E \"$(echo $unlisted | tr ' ' '|')\""
+  fi
+
+  if [ "$apply" -eq 0 ]; then
+    say ""
+    say "nothing changed. re-run with --apply"
+    return 0
+  fi
+
+  need_root
+  # THE SSH RULE GOES IN BEFORE ENABLE, ALWAYS. Enabling a default-deny firewall over ssh
+  # without an ssh rule locks you out of a headless machine - and on svc-repo-01 nothing in
+  # the enclave could install the fix, because svc-repo-01 IS the source of the fix.
+  printf '%s\n' "$mine" | awk -F'\t' '$2 ~ /^22\// {found=1} END {exit !found}' \
+    || die "the table for $me has no rule for 22 - refusing to enable ufw"
+
+  ufw --force reset >/dev/null 2>&1 || true
+  ufw default deny incoming >/dev/null   # set_ufw_default_rule
+  ufw default allow outgoing >/dev/null
+  local port action why
+  while IFS=$'\t' read -r _ port action why; do
+    [ -n "${port:-}" ] || continue
+    ufw "$action" "$port" >/dev/null || die "ufw $action $port failed"
+    ok "ufw $action $port   ($why)"
+  done < <(printf '%s\n' "$mine")
+
+  ufw --force enable >/dev/null && ok "ufw enabled"
+  say ""
+  ufw status verbose | sed 's/^/  /'
+  say ""
+  warn "NOW VERIFY FROM ANOTHER MACHINE before you close this session:"
+  say "   ssh from host-4, and fetch something over 443. A firewall you have not tested"
+  say "   from off-box is a firewall you are guessing about."
+}
+
 case "${1:-}" in
   generate) shift; cmd_generate "$@" ;;
   fixups)   shift; cmd_fixups "$@" ;;
+  ufw)      shift; cmd_ufw "$@" ;;
   audit)    shift; cmd_audit "$@" ;;
   show)     shift; cmd_show "$@" ;;
-  *) printf 'usage: %s {generate|audit|show|fixups [--apply] [--with-rsyslog] [--verify]}\n' "$0" >&2; exit 2 ;;
+  *) printf 'usage: %s {generate|audit|show|fixups [--apply] [--with-rsyslog] [--verify]|ufw [--apply]}\n' "$0" >&2; exit 2 ;;
 esac

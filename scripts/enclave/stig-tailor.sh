@@ -670,9 +670,26 @@ cmd_preflight() {
     block="$(grep -oE 'idref="xccdf_org.ssgproject.content_rule_[a-z0-9_.-]+"[^>]*selected="true"' "$src" \
              | sed 's/.*content_rule_//; s/".*//')"
   else
-    src="$(ls /usr/share/usg-benchmarks/*/ssg-ubuntu2404-xccdf.xml 2>/dev/null | head -1)"
-    [ -n "$src" ] || src=/usr/share/ubuntu-scap-security-guides/1/benchmarks/ssg-ubuntu2404-xccdf.xml
-    [ -f "$src" ] || die "cannot find the benchmark XCCDF - is usg-benchmarks installed?"
+    # PICK THE BENCHMARK CHANNEL THAT MATCHES THE PROFILE. `ls */ssg-*.xml | head -1` took
+    # ubuntu2404_CIS_1 because CIS sorts before STIG - and BOTH channel files happen to
+    # contain a content_profile_stig, so the output looked entirely plausible while coming
+    # from the wrong vintage. Never let a glob choose which compliance benchmark you audit
+    # against.
+    local fam=STIG
+    case "$PROFILE" in
+      *cis*|*CIS*) fam=CIS ;;
+      *stig*|*STIG*) fam=STIG ;;
+      *) die "cannot tell which benchmark family '$PROFILE' belongs to - pass STIG_PROFILE" ;;
+    esac
+    local cand
+    cand="$(ls -d /usr/share/usg-benchmarks/*"$fam"* 2>/dev/null)"
+    [ -n "$cand" ] || die "no usg-benchmarks directory matching '$fam' - is usg-benchmarks installed?
+      found: $(ls -1 /usr/share/usg-benchmarks/ 2>/dev/null | tr '\n' ' ')"
+    [ "$(printf '%s\n' "$cand" | wc -l)" -eq 1 ] \
+      || die "more than one '$fam' benchmark directory - be explicit rather than guessing:
+$(printf '%s\n' "$cand" | sed 's/^/        /')"
+    src="$cand/ssg-ubuntu2404-xccdf.xml"
+    [ -f "$src" ] || die "expected $src and it is not there"
     block="$(awk '/Profile id="xccdf_org.ssgproject.content_profile_stig"/,/<\/xccdf-1.2:Profile>/' "$src" \
              | grep -oE 'content_rule_[a-z0-9_.-]+' | sed 's/content_rule_//' | sort -u)"
   fi
@@ -681,7 +698,7 @@ cmd_preflight() {
   printf '\n  preflight for %s\n  source: %s\n  selected rules: %s\n\n' \
     "$me" "$src" "$(printf '%s\n' "$block" | wc -l)"
 
-  local hits=0 name rule
+  local hits=0 fuzzy=0 name rule
 
   printf '  PACKAGES the profile wants REMOVED that are INSTALLED here\n'
   while read -r rule; do
@@ -689,12 +706,26 @@ cmd_preflight() {
       package_*_removed) name="${rule#package_}"; name="${name%_removed}" ;;
       *) continue ;;
     esac
-    if dpkg -s "$name" >/dev/null 2>&1 && dpkg -s "$name" 2>/dev/null | grep -q '^Status: install ok installed'; then
+    if dpkg -s "$name" 2>/dev/null | grep -q '^Status: install ok installed'; then
       warn "  $name   (rule: $rule)"
       hits=$((hits + 1))
+    else
+      # THE RULE ID IS NOT ALWAYS THE PACKAGE NAME. package_timesyncd_removed refers to
+      # `systemd-timesyncd`, so an exact dpkg lookup finds nothing and reports "none" - a
+      # false all-clear on the check that decides whether a service survives. So when the
+      # exact name misses, look for installed packages CONTAINING the token and flag them
+      # for a human. An unresolved name is reported, never silently dropped.
+      local matches
+      matches="$(dpkg-query -W -f='${Package} ${Status}\n' "*${name}*" 2>/dev/null \
+                 | awk '$NF=="installed" {print $1}' | tr '\n' ' ')"
+      if [ -n "${matches// /}" ]; then
+        warn "  $rule -> no package literally named '$name', but INSTALLED and similar:$matches"
+        say  "     VERIFY BY HAND which one the rule means before running fix"
+        fuzzy=$((fuzzy + 1))
+      fi
     fi
   done < <(printf '%s\n' "$block")
-  [ "$hits" -gt 0 ] || ok "  none"
+  [ $((hits + fuzzy)) -gt 0 ] || ok "  none"
 
   local shits=0
   printf '\n  SERVICES the profile wants DISABLED or MASKED that are ACTIVE here\n'
@@ -712,10 +743,12 @@ cmd_preflight() {
   [ "$shits" -gt 0 ] || ok "  none"
 
   say ""
-  if [ $((hits + shits)) -eq 0 ]; then
+  if [ $((hits + shits + fuzzy)) -eq 0 ]; then
     ok "nothing the profile removes or disables is present on this machine"
   else
-    warn "$((hits + shits)) collision(s). For EACH one, decide before running fix:"
+    [ "$fuzzy" -eq 0 ] || warn "$fuzzy rule(s) name a package that does not exist under that"
+    [ "$fuzzy" -eq 0 ] || say  "   exact name - resolve those by hand; they are NOT clear."
+    warn "$((hits + shits + fuzzy)) collision(s). For EACH one, decide before running fix:"
     say "   - is it actually needed here?  (MAAS needs DHCP, TFTP and its proxy)"
     say "   - if yes, it is a TAILORING DEVIATION with a justification, not a surprise"
     say "   - if no, let fix remove it and the machine is smaller"

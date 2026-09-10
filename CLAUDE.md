@@ -67,6 +67,30 @@ one. Label it on the line above the block:
 This applies to quoted vendor documentation too — Canonical's docs do not know which of your
 boxes they are talking about. The roster lives in `airgapped-setup-machine/README.md` §0.
 
+**A label is not a guard, and on 2026-09-10 that difference cost a wrong-machine run.** A block
+labelled `svc-harbor-01` was pasted into `stage-01`. Nothing happened — the SCAP benchmark is
+not installed there by design (README §0.2), so every read hit a missing file — but the label
+prevented nothing, because a comment cannot. His question was the right one: *"i though we had
+gaurdes for this hy was it allowed."*
+
+**So: any block that would do something wrong on the wrong machine carries a guard that
+actually refuses.** Keep the label as well — the label is for the reader, the guard is for the
+shell:
+
+```bash
+### MACHINE: svc-harbor-01 (10.2.20.163) ###
+if [ "$(hostname -s)" != svc-harbor-01 ]; then echo "WRONG MACHINE: $(hostname -s)"; else
+  sudo usg audit stig-v1r1
+fi
+```
+
+`if/else/fi` rather than `exit` — a pasted `exit` closes an interactive shell, so the guard
+would punish the operator instead of protecting them. Pure reads that fail harmlessly
+elsewhere (`ls`, `grep` of a path that will not exist) do not need it; anything that writes,
+installs, restarts or reboots does. Where the work belongs in a script, put the assertion
+*inside* the script instead — `time-sync.sh master` already refuses to run on a guest, which
+is the same idea and better, because it cannot be pasted around.
+
 **Show every command that changes anything — do not just run it.** Reads are free: `grep`,
 `find`, `curl -o /dev/null`, `snap info`, `bash -n`, `shellcheck`, checksums. Run those
 directly. But anything that **writes, deletes, moves, installs or pushes** goes to him as a

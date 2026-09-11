@@ -298,10 +298,17 @@ if [ -n "$VHOST" ]; then
   # (/srv/apt-mirror/...); on this machine the tree is under $REPO_ROOT. Rewriting only the
   # root left /keys/ and /debs/ aliased to directories that do not exist here - and those
   # serve the five keyrings and the three .debs an in-gap machine cannot get any other way.
+  #
+  # /snaps/ and /tools/ are rewritten too. They were written literally as /srv/repo/... in the
+  # carried vhost, which happens to be correct only because REPO_ROOT is /srv/repo today. A
+  # parameter that is right by coincidence is a parameter that breaks the first time someone
+  # uses it.
   run sed -i \
       -e "s#root .*/mirror;#root $REPO_ROOT/mirror;#" \
       -e "s#alias .*/keys/;#alias $REPO_ROOT/keys/;#" \
       -e "s#alias .*/debs/;#alias $REPO_ROOT/debs/;#" \
+      -e "s#alias .*/snaps/;#alias $REPO_ROOT/snaps/;#" \
+      -e "s#alias .*/tools/;#alias $REPO_ROOT/tools/;#" \
       /etc/nginx/sites-available/apt-mirror
   run ln -sf /etc/nginx/sites-available/apt-mirror /etc/nginx/sites-enabled/apt-mirror
   run rm -f /etc/nginx/sites-enabled/default   # also default_server; nginx refuses two

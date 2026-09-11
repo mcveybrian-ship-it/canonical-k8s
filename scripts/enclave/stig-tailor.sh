@@ -1244,9 +1244,42 @@ cmd_v1r6() {
           printf '%s="audit=1"\n' "$gl" >> /etc/default/grub
         fi
       done
-      # collapse any double space the sed may have produced in an empty value
-      sed -i -E 's|^(GRUB_CMDLINE_LINUX(_DEFAULT)?=")[[:space:]]+|\\1|' /etc/default/grub
-      ok "   /etc/default/grub now: $(v1r6_audit_default_grub | tr '\n' ' ')"
+      # Collapse the leading space a previously-empty value leaves behind.
+      #
+      # \1 IS A BACKREFERENCE ONLY IF sed ACTUALLY RECEIVES ONE BACKSLASH. The first version
+      # wrote '\\1' inside SINGLE quotes, so bash passed \\1 through verbatim, sed read it as
+      # an escaped backslash followed by a 1, and the replacement was the LITERAL TEXT \1.
+      # /etc/default/grub line 11 became:
+      #
+      #     \1audit=1"
+      #
+      # An unmatched quote in a file that grub-mkconfig SOURCES, which is why update-grub
+      # exited 2 with "EOF in backquote substitution" - and why GRUB_CMDLINE_LINUX looked
+      # deleted when it had only been mangled. The identical expression one line above works
+      # because it is double-quoted, where bash turns \\1 into \1 before sed sees it.
+      sed -i -E 's|^(GRUB_CMDLINE_LINUX(_DEFAULT)?=")[[:space:]]+|\1|' /etc/default/grub
+
+      # AND NOW VALIDATE, BECAUSE THIS FILE IS SOURCED BY THE BOOTLOADER GENERATOR.
+      #
+      # grub-mkconfig runs `. /etc/default/grub` with sh, so `sh -n` is exactly the right
+      # check - it catches an unbalanced quote or backtick before update-grub does. Any sed
+      # against a boot-critical file gets this treatment: edit, syntax-check, revert on
+      # failure. A broken /etc/default/grub is not dangerous on its own (the existing
+      # grub.cfg keeps booting), but it silently blocks every later grub change.
+      if ! sh -n /etc/default/grub 2>/dev/null; then
+        warn "   /etc/default/grub FAILED sh -n after the edit - REVERTING"
+        sh -n /etc/default/grub 2>&1 | sed 's/^/       /'
+        if [ -n "${LAST_BACKUP:-}" ] && [ -f "$LAST_BACKUP" ]; then
+          cp -a "$LAST_BACKUP" /etc/default/grub
+          ok "   restored from $LAST_BACKUP"
+        else
+          warn "   NO BACKUP TO RESTORE FROM - fix by hand before any update-grub"
+        fi
+        failed=1
+      else
+        ok "   /etc/default/grub passes sh -n"
+        ok "   now: $(v1r6_audit_default_grub | tr '\n' ' ')"
+      fi
       # 2. THE FILE THAT MAKES IT TRUE. On a cloud image 50-cloudimg-settings.cfg
       # hard-assigns GRUB_CMDLINE_LINUX_DEFAULT, so the value above never reaches the
       # kernel on its own. The drop-in sorts after it and appends.

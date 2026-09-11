@@ -247,6 +247,13 @@ say "nginx $NGINX_VER - http2 via $( [ -n "$H2_LISTEN" ] && echo 'listen directi
     # build with a 404 nobody expects.
     echo "    location ^~ /snaps/ { alias ${DOCROOT%/mirror}/snaps/; autoindex on;"
     echo "                          default_type application/octet-stream; }"
+    # STIG tooling over TLS, for the same reason as /snaps/ - and this one was learned the
+    # hard way twenty lines below the warning. /tools/ was added to the :80 vhost on
+    # 2026-09-11 and omitted here, so every fetch got a 404 from a server that looked
+    # correctly configured because the grep found the location in the OTHER file.
+    echo "    location ^~ /tools/ { alias ${DOCROOT%/mirror}/tools/; autoindex on;"
+    echo "                          autoindex_exact_size off;"
+    echo "                          default_type application/octet-stream; }"
     echo "    location / { try_files \$uri \$uri/ =404; }"
   fi
   echo "}"

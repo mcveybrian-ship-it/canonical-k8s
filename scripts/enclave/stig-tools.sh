@@ -203,18 +203,38 @@ cmd_fetch() {
   install -d -m 0755 "$DEST" "$EVIDENCE"
   say "fetching from https://$MIRROR/tools/ onto $me"
 
-  # 1. Evaluate-STIG. A directory tree over HTTP means walking the autoindex, which is
-  # fragile. The scanner ships as a tree, so mirror it with wget's recursive mode and cut the
-  # served prefix off - and FAIL rather than half-copy.
+  # 1. Evaluate-STIG. A directory tree over HTTP means walking the autoindex, so mirror it
+  # with wget's recursive mode.
+  #
+  # STAGE INTO A TEMP DIR, THEN MOVE. The first version wrote straight into $DEST with
+  # --cut-dirs=2, which strips BOTH `tools` and `Evaluate-STIG` from the served path - so 390
+  # files landed flat in /srv/stig-tools/ and the scanner was "installed" in a layout nothing
+  # could use. Counting path components in a flag is exactly the kind of arithmetic that is
+  # wrong once and then wrong everywhere; staging and checking the result is not.
   command -v wget >/dev/null 2>&1 || die "wget is not installed - apt-get install -y wget"
-  ( cd "$DEST" && wget -q --show-progress --no-verbose \
+  local TMPD; TMPD="$(mktemp -d "$DEST/.fetch.XXXXXX")"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$TMPD'" RETURN
+  ( cd "$TMPD" && wget -q --show-progress --no-verbose \
       --ca-certificate="$CA" \
-      -r -np -nH --cut-dirs=2 -R 'index.html*' \
+      -r -np -nH --cut-dirs=1 -R 'index.html*' \
       "https://$MIRROR/tools/Evaluate-STIG/" ) \
-    || die "Evaluate-STIG fetch failed - nothing was left half-installed at $DEST"
-  [ -f "$DEST/Evaluate-STIG/Evaluate-STIG_Bash.sh" ] \
-    || die "fetched, but $DEST/Evaluate-STIG/Evaluate-STIG_Bash.sh is missing"
-  ok "Evaluate-STIG: $(find "$DEST/Evaluate-STIG" -type f | wc -l) file(s)"
+    || die "Evaluate-STIG fetch failed - nothing was written to $DEST"
+  [ -f "$TMPD/Evaluate-STIG/Evaluate-STIG_Bash.sh" ] \
+    || die "fetched, but Evaluate-STIG_Bash.sh is not where it should be. Got:
+$(find "$TMPD" -maxdepth 2 | head -12 | sed 's/^/       /')
+       Nothing was written to $DEST."
+
+  # A PREVIOUS BAD LAYOUT HAS TO GO, or the flat copy sits alongside the good one and the next
+  # operator cannot tell which is live.
+  if [ -f "$DEST/Evaluate-STIG_Bash.sh" ] && [ ! -d "$DEST/Evaluate-STIG" ]; then
+    warn "removing an earlier flat extraction in $DEST"
+    ( cd "$DEST" && rm -rf AnswerFiles Doc Modules Prerequisites StigContent \
+        Evaluate-STIG.ps1 Evaluate-STIG_Bash.sh Evaluate-STIG_GUI.ps1 LICENSE Preferences.xml )
+  fi
+  rm -rf "$DEST/Evaluate-STIG"
+  mv "$TMPD/Evaluate-STIG" "$DEST/Evaluate-STIG"
+  ok "Evaluate-STIG: $(find "$DEST/Evaluate-STIG" -type f | wc -l) file(s) at $DEST/Evaluate-STIG"
 
   # 2. PowerShell, verified against the checksum written at publish time.
   if [ -d "$DEST/$PWSH_DIR" ] && [ -x "$DEST/$PWSH_DIR/pwsh" ]; then

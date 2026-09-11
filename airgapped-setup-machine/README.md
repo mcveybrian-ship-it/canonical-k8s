@@ -6,9 +6,9 @@
 *how* things were built and why; they have gone stale more than once. If they disagree with
 this section, this section wins and the other one gets fixed.
 
-Last updated **2026-09-11 00:45 UTC** (19:45 Central). All timestamps in this repo are **UTC** — every enclave machine runs UTC and the audit logs are UTC, so mixing local time into an auditable procedure is how two records stop lining up.
+Last updated **2026-09-11 00:50 UTC** (2026-09-10 19:50 Central). All timestamps in this repo are **UTC** — every enclave machine runs UTC and the audit logs are UTC, so mixing local time into an auditable procedure is how two records stop lining up.
 
-## 0a. WORKING LIST — priority order as of 2026-09-10 16:20
+## 0a. WORKING LIST — priority order as of 2026-09-11 00:50 UTC (2026-09-10 19:50 Central)
 
 **Read this for "what next". The tables below record state; this records order.**
 
@@ -34,7 +34,7 @@ instead of ~20. Full write-up: runbook **§10.1**.
 | E3 | **Hardened machine vs V1R6** | ✅ **DONE — Q18 ANSWERED.** `svc-mgmt-01`, full run, 9m07s: **20 Open / 14 Not Reviewed / 150 NF / 10 NA of 194**, vs **USG's 7 fail** on the same machine. Unhardened was 118 Open, so `usg fix` closes 83% — **but the residual against the revision DISA will assess is 20, not 7.** 3 high Open + 2 high NR. runbook §10.1 |
 | E3a | **Two contradictions worth reading twice** | ⚠️ **UBTU-24-600160 is Open** — the chrony control we *tailored* in USG. **A USG deviation does not travel to the tool DISA uses**, so every justification needs an Answer File too. ⚠️ **UBTU-24-100010** — `systemd-timesyncd` at `deinstall ok config-files` counts as installed; **`apt-get purge` closes it.** A real finding USG hid |
 | E3b | **Triage the 20 + 14 on `svc-mgmt-01`** | 🔄 **IN PROGRESS — 3 fixed, 6 false positives, 11 left.** ✅ **FIXED + verified NF:** V-270645 (`purge systemd-timesyncd`), V-270750 (sticky bit — the dirs were **created by the scanner**; `rm -rf /tmp/.dotnet`), V-270676 (`audit=1` — needed a **grub.d drop-in**, because `50-cloudimg-settings.cfg` hard-assigns `GRUB_CMDLINE_LINUX_DEFAULT` and silently discards edits to `/etc/default/grub`). ⚠️ **FALSE POSITIVES → Answer File:** V-270699 + V-270703 (DISA's own CheckText filters the very groups it flagged; `chgrp root` would break Postfix and D-Bus), V-270778/799/814/815 (all four rules **already present** at usrmerged paths; DISA's grep checks all match). **Next: the 3 high-severity Open** — V-270675 is entangled with the GRUB password. runbook §10.1 |
-| E3c | **Back-apply to `svc-harbor-01`** | 🔄 **STARTED** — bundle + PowerShell being staged to `/srv/stig-tools`, prereqs (`lshw dmidecode bc`) from the mirror. First use is verifying **V-270675** after the GRUB change. Full V1R6 scan still owed |
+| E3c | **Back-apply to `svc-harbor-01`** | 🔄 **TOOLING DONE** — Evaluate-STIG + PowerShell at `/srv/stig-tools`, prereqs installed, and **V-270675 verified `NF`** there after the GRUB change. ⬜ **Still owed: the full V1R6 scan** (9 min) — it is the second data point on whether the residual converges to the same set across machines |
 | E4 | ~~One full run, no exclusions~~ | ✅ **DONE** — `svc-mgmt-01` 2026-09-10, 9m07s with AIDE included. The 5 AIDE controls were **not** expensive in practice; `--ExcludeVuln` is for iterating, not for the artefact |
 | E5 | **Answer Files for our deviations** | ⬜ Per-Vuln-ID justifications so a CKLB carries its own rationale — UBTU-24-600160, UBTU-24-300021, the USB window, `encrypt_partitions` |
 | E6 | **USG ↔ Evaluate-STIG correlator** | ⬜ Join key is the `UBTU-24-xxxxxx` STIG ID; the map already exists in `/etc/usg/enclave-tailoring.xml`. **Ask the AO about STIG Manager first** — if the programme runs it, feed it instead of building this |
@@ -71,7 +71,7 @@ runbook §6.3j.
 |---|---|
 | **GRUB password** | 🔄 **IMPLEMENTED + BOOT-TESTED on `svc-harbor-01` 2026-09-10 23:01 UTC.** Three parts, and **DISA's FixText only gives two** — it omits `--unrestricted`, so following it literally leaves a headless machine that will not boot. `40_custom` gets `set superusers` + `password_pbkdf2`; `10_linux` line 34 gets `--unrestricted` on `CLASS`; then `update-grub` and **count the menuentries without it before rebooting**. Only `'UEFI Firmware Settings'` stayed restricted, which is the right end state. Rebooted unattended, FIPS `1`, Harbor recovered itself. ⚠️ `10_linux` is a **`grub-common` conffile** — re-check after any upgrade. ⚠️ Recovery mode is unrestricted; **the locked root account is what actually blocks a maintenance shell** — say so in the Answer File. **Scanner agrees: V-270675 = `NF`** (13-second targeted verify) — confirmed at all three levels: config, unattended boot, DISA check. runbook §6.3i. ✅ **`svc-mgmt-01` DONE 2026-09-11 00:05 UTC** — same three-part change plus `audit_backlog_limit=8192` in one reboot; came back unattended with FIPS `1`, the backlog arg on `/proc/cmdline`, and **all 7 MAAS services including `maas-dhcpd` — PXE survived**. ⚠️ Watch the paste: the append block ran twice and wrote a **second `password_pbkdf2 root` with an EMPTY hash** (`$H` was unset by then). Caught before `update-grub`; fixed with `head -n -2`. **Always count `superusers`/`password_pbkdf2` lines before regenerating.** ✅ **V-270675 = `NF` on both machines**, and **`audit_backlog_limit=8192` took `lost` from 460 to 0** — measured, not assumed. ⬜ Remaining: `host-4` **last, with a console plan** (bare metal, no `vm-rescue.sh` safety net) |
 | **MAAS ufw rule table** | ~30 ports (`5239-5284`, `3128`, `8000`, `53`, `67/udp`, `69/udp`, `5353`). `stig-tailor.sh ufw` **refuses** without a table. §6.3e |
-| SSSD / CAC ×2 | Waits on the FIPS YubiKey |
+| **SSSD / CAC — a FAMILY of 5 controls, not 2** | ⚠️ **Reframed 2026-09-11.** V-270663, V-270735, **V-270736 (HIGH)**, V-270722, V-270745 all need the same missing subsystem: **an LDAP directory holding user certificates, CAC/PIV hardware, and a DoD PKI trust path** — none of which exist in the gap, and the last conflicts with our internal CA (§2.9). **Not deferrable one rule at a time.** New AO question — thread is now **10 questions**. `docs/open-questions.md` |
 | `encrypt_partitions` | Compensating-control write-up — LUKS is under the guest, not in it |
 | `auditd_offload_logs` | Folded into the log-collector thread, §6.3d |
 
@@ -79,12 +79,12 @@ runbook §6.3j.
 
 | What | Why it matters |
 |---|---|
-| **AO thread — 9 questions** | **The only item where the clock runs whether you work or not.** Three decide hardware purchases; one (retention) sizes `svc-log-01`'s disk, which decides whether it fits on `host-4` at all; and **does the programme run STIG Manager?** — that one decides whether E6 gets built or replaced by a feed |
+| **AO thread — 10 questions** | **The only item where the clock runs whether you work or not.** Three decide hardware purchases; one (retention) sizes `svc-log-01`'s disk, which decides whether it fits on `host-4` at all; and **does the programme run STIG Manager?** — that one decides whether E6 gets built or replaced by a feed |
 | **Root-CA: verify on the drive, then `shred -u /srv/ca-backup/*`** | Until the shred **the root key is on a network-attached VM**. Use the one-liner in runbook §2.9b — the `.sha256` holds a BARE hash |
 | **Close the gap** | `gap-state.sh close` + unplug port 4. `stage-01` is multi-homed to the internet AND the enclave right now |
 | `ceph-csi` on deb-deployed Ceph | Untested and load-bearing on the storage design. A lab test, not a paper question |
 | Steps 06–10 | Cluster VMs, k8s bootstrap, storage, validation, day-2 patching — unwritten |
-| ⏰ 09:00 2026-09-11 | Reminder fires: audit-volume 24h delta, the hollow UBTU-24-100450 pass, and the three log questions for the AO |
+| ⏰ **2026-09-11 14:00 UTC = 09:00 Central** | Reminder fires: audit-volume 24h delta, the hollow UBTU-24-100450 pass, and the three log questions for the AO. *(Originally set to 09:00 **UTC** — which was 04:00 his time. Schedule in Central, store in UTC.)* |
 
 **STAGE-01's build work is DONE. The enclave is currently in STATE A (BUILD), not gapped.**
 

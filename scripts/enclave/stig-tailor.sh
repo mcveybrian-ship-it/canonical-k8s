@@ -1692,7 +1692,7 @@ AIDE_BIG_GB="${AIDE_BIG_GB:-5}"
 aide_excludes() {
 cat <<'EOF'
 svc-repo-01	/srv/repo	THE MIRROR - 321 GB, 91,073 files. Every file is covered by apt's own Release/Packages signature chain, which AIDE cannot improve on. Re-syncing the mirror is normal operation and would flag thousands of changes every run
-host-4	/var/lib/libvirt/images	VM DISK IMAGES - ~1.9 TB of qcow2 that change on every guest write. Hashing them is meaningless: a running VM guarantees the hash is stale before aide finishes. Guest integrity is the guest's own AIDE, which is what 6.0 installs on each one
+host-4	/var/lib/libvirt/images	VM DISK IMAGES on a dedicated LUKS volume. qcow2 files change on every guest write, so a running VM guarantees the hash is stale before aide finishes - the check cannot pass and its failure carries no information. Guest integrity is each guest's own AIDE, which runbook 6.0 installs on every one of them
 svc-harbor-01	/var/lib/docker	CONTAINER LAYER STORE - content-addressed by digest, which IS an integrity mechanism, and rewritten by every image push. Harbor's own content trust covers what matters here
 svc-mgmt-01	/var/lib/maas/boot-resources	MAAS BOOT IMAGES - re-downloaded and rotated by MAAS on its own schedule; each is checksummed by MAAS against its own index
 EOF
@@ -1706,7 +1706,12 @@ aide_fragment_body() {
     [ -n "${mach:-}" ] || continue
     [ "$mach" = '*' ] || [ "$mach" = "$me" ] || continue
     [ -e "$path" ] || continue
-    printf '# %s\n!%s\n' "$why" "$path"
+    # RECORD THE MEASURED SIZE, NOT THE ESTIMATE IN THE TABLE. The table said "~1.9 TB of
+    # qcow2" for host-4 because that is the VOLUME; 362 GB was actually present. An assessor
+    # reads this fragment, and a number that overstates by 5x undermines the justification it
+    # is supporting. The table now carries the reasoning; the fragment carries the fact.
+    printf '# %s\n# measured %s at %s\n!%s\n' \
+      "$why" "$(aide_human "$(aide_du_bytes "$path")")" "$(date -Is)" "$path"
     n=$((n + 1))
   done < <(aide_excludes)
   [ "$n" -gt 0 ] || printf '# no exclusions apply to %s\n' "$me"

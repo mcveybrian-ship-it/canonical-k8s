@@ -128,8 +128,19 @@ cmd_publish() {
   # does not have a location for is a file nobody can fetch, and that failure is silent until
   # the next machine tries.
   say ""
-  local code
-  code=$(curl_v -sI -o /dev/null -w '%{http_code}' "https://$MIRROR/tools/$PWSH_TARBALL" || echo 000)
+  # RETRY, BECAUSE nginx reload IS ASYNCHRONOUS. A single curl straight after a reload can be
+  # answered by a worker still running the old config - that is how /tools/ read as 404 on
+  # 2026-09-11 when the location was present and correct. restore-mirror.sh already carries a
+  # wait for the same reason. A check that races the thing it is checking reports a failure
+  # that never happened.
+  local code tries=0
+  while :; do
+    code=$(curl_v -sI -o /dev/null -w '%{http_code}' "https://$MIRROR/tools/$PWSH_TARBALL" || echo 000)
+    [ "$code" = 200 ] && break
+    tries=$((tries + 1)); [ "$tries" -ge 5 ] && break
+    say "  serving check: $code - retrying (nginx reload is asynchronous) $tries/5"
+    sleep 2
+  done
   if [ "$code" = 200 ]; then
     ok "https://$MIRROR/tools/$PWSH_TARBALL -> $code"
   else

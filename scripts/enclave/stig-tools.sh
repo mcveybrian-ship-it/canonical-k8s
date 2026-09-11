@@ -42,6 +42,21 @@ PWSH_DIR="${STIG_PWSH_DIR:-powershell-7.4.20}"
 ANSWERFILE="${STIG_ANSWERFILE:-$STAGING/answerfiles/Ubuntu24_AnswerFile.xml}"
 CA="${STIG_TOOLS_CA:-$HERE/trust-anchors/enclave-root.crt}"
 
+# BARE SSH FROM stage-01 INTO THE GAP FAILS. The agent key is not authorised there; the key
+# that is, is build01 - the same one push-repo-to-host.sh uses. Defaulting to the agent and
+# hoping is how this script's first run died on "Permission denied (publickey)".
+SSH_KEY="${REPO_PUSH_KEY:-$HOME/.ssh/build01}"
+
+# TWO KINDS OF REMOTE CALL, AND THE DIFFERENCE IS NOT COSMETIC.
+#
+# After `usg fix` there is no NOPASSWD anywhere, so `ssh host "sudo ..."` gets a password
+# prompt with no terminal to type into and hangs or fails. Anything privileged needs -t.
+# Anything unprivileged must NOT use -t, or its output is polluted with the DoD banner and
+# terminal escapes - which is exactly what makes a captured value unusable later.
+rsh()    { ssh -i "$SSH_KEY" -o ConnectTimeout=10 "$@"; }
+rsh_t()  { ssh -t -i "$SSH_KEY" -o ConnectTimeout=10 "$@"; }
+rscp()   { scp -q -i "$SSH_KEY" -o ConnectTimeout=10 "$@"; }
+
 say()  { printf '  %s\n' "$*"; }
 ok()   { printf '  [ok] %s\n' "$*"; }
 warn() { printf '  [!]  %s\n' "$*"; }
@@ -72,23 +87,42 @@ cmd_publish() {
   say "     has no authentication. Use: sudo $0 answers <machine>"
   say ""
 
-  ssh "$MIRROR_USER@$MIRROR" "sudo install -d -m 0755 '$REPO_ROOT/tools'" \
-    || die "cannot create $REPO_ROOT/tools on $MIRROR"
+  # STAGE INTO THE USER'S HOME, THEN ONE PRIVILEGED CALL.
+  #
+  # rsync --rsync-path="sudo rsync" needs a passwordless sudo on the far end, and `usg fix`
+  # removed every NOPASSWD grant in the enclave. So the bulk transfer runs unprivileged into
+  # a staging directory, and exactly one interactive sudo puts it in place. One prompt, and
+  # nothing half-written under $REPO_ROOT if the transfer dies.
+  local STAGE_REMOTE=".stig-tools-staging"
+  rsh "$MIRROR_USER@$MIRROR" "mkdir -p '$STAGE_REMOTE'" \
+    || die "cannot ssh to $MIRROR_USER@$MIRROR with $SSH_KEY.
+       Bare ssh from stage-01 into the gap is not authorised - build01 is the key that is.
+       Override with REPO_PUSH_KEY=<path>."
 
-  # --rsync-path so the remote side runs as root without needing this whole script there.
-  rsync -a --delete --info=progress2 --rsync-path="sudo rsync" \
-    "$STAGING/Evaluate-STIG" "$MIRROR_USER@$MIRROR:$REPO_ROOT/tools/" \
+  rsync -a --delete --info=progress2 -e "ssh -i $SSH_KEY" \
+    "$STAGING/Evaluate-STIG" "$MIRROR_USER@$MIRROR:$STAGE_REMOTE/" \
     || die "Evaluate-STIG transfer failed"
-  rsync -a --info=progress2 --rsync-path="sudo rsync" \
-    "$STAGING/$PWSH_TARBALL" "$MIRROR_USER@$MIRROR:$REPO_ROOT/tools/" \
+  rsync -a --info=progress2 -e "ssh -i $SSH_KEY" \
+    "$STAGING/$PWSH_TARBALL" "$MIRROR_USER@$MIRROR:$STAGE_REMOTE/" \
     || die "$PWSH_TARBALL transfer failed"
 
-  # A CHECKSUM FILE GENERATED ON THE SOURCE, so `fetch` verifies against what was published
-  # rather than against whatever arrived.
+  # The checksum is generated HERE, on the source, so `fetch` verifies against what was
+  # published and not against whatever happens to be sitting on the mirror.
   ( cd "$STAGING" && sha256sum "$PWSH_TARBALL" ) \
-    | ssh "$MIRROR_USER@$MIRROR" "sudo tee '$REPO_ROOT/tools/SHA256SUMS' >/dev/null" \
+    | rsh "$MIRROR_USER@$MIRROR" "cat > '$STAGE_REMOTE/SHA256SUMS'" \
     || die "could not write SHA256SUMS"
-  ssh "$MIRROR_USER@$MIRROR" "sudo chmod -R a+rX '$REPO_ROOT/tools'"
+
+  say ""
+  say "installing into $REPO_ROOT/tools - this asks for the sudo password on $MIRROR:"
+  rsh_t "$MIRROR_USER@$MIRROR" \
+    "sudo install -d -m 0755 '$REPO_ROOT/tools' \
+     && sudo rsync -a --delete '$STAGE_REMOTE/Evaluate-STIG' '$REPO_ROOT/tools/' \
+     && sudo install -m 0644 '$STAGE_REMOTE/$PWSH_TARBALL' '$REPO_ROOT/tools/' \
+     && sudo install -m 0644 '$STAGE_REMOTE/SHA256SUMS' '$REPO_ROOT/tools/' \
+     && sudo chown -R root:root '$REPO_ROOT/tools' \
+     && sudo chmod -R a+rX '$REPO_ROOT/tools' \
+     && rm -rf '$STAGE_REMOTE'" \
+    || die "install on $MIRROR failed - the staged copy is still at ~/$STAGE_REMOTE there"
 
   # PROVE IT SERVES, rather than trusting that the files landed. A file on disk that nginx
   # does not have a location for is a file nobody can fetch, and that failure is silent until
@@ -121,21 +155,37 @@ cmd_answers() {
   [ -f "$ANSWERFILE" ] || die "no Answer File at $ANSWERFILE"
   say "sending $(basename "$ANSWERFILE") to $MIRROR_USER@$target:$DEST/"
   say "  $(wc -l < "$ANSWERFILE") lines, $(grep -c '<Vuln ' "$ANSWERFILE" 2>/dev/null || echo '?') vuln entries"
-  ssh "$MIRROR_USER@$target" "sudo install -d -m 0755 '$DEST'" || die "cannot create $DEST on $target"
-  # The file itself stays root-readable only. It is not secret from the operator, but it has
-  # no business being world-readable on a multi-user machine either.
-  scp -q "$ANSWERFILE" "$MIRROR_USER@$target:/tmp/$(basename "$ANSWERFILE")" || die "scp failed"
-  ssh "$MIRROR_USER@$target" \
-    "sudo install -o root -g root -m 0640 '/tmp/$(basename "$ANSWERFILE")' '$DEST/$(basename "$ANSWERFILE")' \
-     && rm -f '/tmp/$(basename "$ANSWERFILE")'" || die "install on $target failed"
+  local BASE; BASE="$(basename "$ANSWERFILE")"
+  rscp "$ANSWERFILE" "$MIRROR_USER@$target:/tmp/$BASE" \
+    || die "scp failed - is $SSH_KEY authorised on $target?"
+  say "installing - this asks for the sudo password on $target:"
+  # 0640 root:root. Not secret from the operator, but it has no business being world-readable
+  # on a machine with other accounts.
+  rsh_t "$MIRROR_USER@$target" \
+    "sudo install -d -m 0755 '$DEST' \
+     && sudo install -o root -g root -m 0640 '/tmp/$BASE' '$DEST/$BASE' \
+     && rm -f '/tmp/$BASE'" || die "install on $target failed"
   ok "$DEST/$(basename "$ANSWERFILE") on $target, 0640 root:root"
   say "   use it with:  --AFPath $DEST"
 }
 
 # ----------------------------------------------------------------------------------- fetch
 cmd_fetch() {
-  need_root
+  # THE MACHINE CHECK COMES BEFORE THE PRIVILEGE CHECK, DELIBERATELY.
+  # With need_root first, pasting this on stage-01 answers "run with sudo" - which invites the
+  # operator to re-run it privileged on the wrong machine. Same shape as the build-transfer
+  # clean step that rejected /etc only because the caller happened to be unprivileged.
   local me; me="$(hostname -s)"
+  # REFUSE OUTSIDE THE BOUNDARY. This block was pasted into stage-01 on its first outing,
+  # under a heading that said svc-repo-01. The heading refused nothing. stage-01 and build-01
+  # are outside the ATO boundary and already hold the staging copy this publishes FROM -
+  # fetching it back would install a second, unversioned copy of the scanner there.
+  case "$me" in
+    stage-01|build-01)
+      die "fetch does not run on $me - it is outside the boundary and already has the
+       staging copy at $STAGING. Run this ON the machine being scanned." ;;
+  esac
+  need_root
   [ -f "$CA" ] || die "no enclave root CA at $CA - this script will not fetch over an
        unverified connection. Copy the repo, or set STIG_TOOLS_CA."
 

@@ -1025,8 +1025,17 @@ GRUB_CUSTOM=/etc/grub.d/40_custom
 # is what every generated menu entry's --class list comes from, so that line is the one that
 # decides whether the machine boots unattended.
 grubpw_unrestricted_ok() { grep -qE '^CLASS=.*--unrestricted' "$GRUB_10_LINUX" 2>/dev/null; }
-grubpw_pw_count()        { grep -c '^password_pbkdf2' "$GRUB_CUSTOM" 2>/dev/null || echo 0; }
-grubpw_su_count()        { grep -c '^set superusers' "$GRUB_CUSTOM" 2>/dev/null || echo 0; }
+# `grep -c` PRINTS 0 AND EXITS 1 WHEN NOTHING MATCHES. So `grep -c ... || echo 0` emits TWO
+# lines - "0" from grep and "0" from the fallback - and the caller's `[ "$n" -gt 0 ]` then dies
+# with "integer expression expected". It printed `0\n0` in grubpw status and would have
+# aborted `grubpw set` on its first real use. Take grep's own count and only default when the
+# capture is genuinely empty (no such file).
+_count_lines() {
+  local n; n="$(grep -c "$1" "$2" 2>/dev/null)" || true
+  printf '%s\n' "${n:-0}"
+}
+grubpw_pw_count()        { _count_lines '^password_pbkdf2' "$GRUB_CUSTOM"; }
+grubpw_su_count()        { _count_lines '^set superusers' "$GRUB_CUSTOM"; }
 
 cmd_grubpw() {
   local action="${1:-status}"
@@ -1047,7 +1056,7 @@ cmd_grubpw() {
         say "superusers lines:      $(grubpw_su_count)"
         say "password_pbkdf2 lines: $(grubpw_pw_count)   (want exactly 1)"
         if [ -f /boot/grub/grub.cfg ]; then
-          say "in the generated config: superusers=$(grep -c 'superusers' /boot/grub/grub.cfg) unrestricted=$(grep -c 'unrestricted' /boot/grub/grub.cfg)"
+          say "in the generated config: superusers=$(_count_lines 'superusers' /boot/grub/grub.cfg) unrestricted=$(_count_lines 'unrestricted' /boot/grub/grub.cfg)"
         fi
       else
         warn "run as root to read $GRUB_CUSTOM and grub.cfg - both are root-only, and an"
@@ -1145,8 +1154,8 @@ cmd_grubpw() {
       # PROVE BOTH HALVES REACHED THE GENERATED CONFIG. superusers without unrestricted is a
       # machine that will not boot unattended, and that is discovered at the rack.
       local g_su g_un
-      g_su="$(grep -c 'superusers' /boot/grub/grub.cfg 2>/dev/null || echo 0)"
-      g_un="$(grep -c 'unrestricted' /boot/grub/grub.cfg 2>/dev/null || echo 0)"
+      g_su="$(_count_lines 'superusers' /boot/grub/grub.cfg)"
+      g_un="$(_count_lines 'unrestricted' /boot/grub/grub.cfg)"
       say "   /boot/grub/grub.cfg: superusers=$g_su  unrestricted=$g_un"
       if [ "$g_su" -lt 1 ]; then
         die "superusers did NOT reach grub.cfg - do not reboot, investigate 40_custom"

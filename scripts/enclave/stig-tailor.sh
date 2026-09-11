@@ -9,6 +9,8 @@
 #     ./stig-tailor.sh show
 #     ./stig-tailor.sh fixups                 # what usg fix leaves behind - PLAN ONLY
 #     sudo ./stig-tailor.sh fixups --apply    # ... and apply it
+#     ./stig-tailor.sh aide status            # what AIDE would hash here - RUN BEFORE usg fix
+#     sudo ./stig-tailor.sh aide exclude --apply
 #
 # TWO JOBS, DELIBERATELY IN ONE PLACE:
 #
@@ -918,6 +920,231 @@ EOF
   esac
 }
 
+# -------------------------------------------------------------------------------- aide
+#
+# KEEP AIDE OFF THE BULK DATA - AND DECIDE IT BEFORE `usg fix`, NOT AFTER.
+#
+# `usg fix` installs AIDE and BUILDS THE DATABASE as part of remediation. Whatever is in
+# scope at that moment gets hashed. On svc-repo-01 that meant walking a 321 GB apt mirror at
+# ~26 MB/s - roughly three and a half hours, inside a fix run, with no progress output.
+#
+# I CONCLUDED THE OPPOSITE FIRST, AND THE WAY I GOT IT WRONG IS THE POINT.
+#
+#   Runbook 6.3h said "/srv is not an AIDE root, nothing to do." That was measured on
+#   svc-mgmt-01 - a machine WHOSE /srv IS EMPTY. The evidence (0 entries under /srv) was
+#   real and meant nothing: an empty directory produces zero entries whether it is in scope
+#   or not. A control verified on a machine that cannot exercise it is not verified.
+#
+#   So this does not reason about aide.conf precedence at all. It MEASURES: it walks what is
+#   actually on the disk, reports anything large that AIDE would reach, and makes you look at
+#   the number before you harden.
+#
+# WHY A FRAGMENT NUMBERED 90:
+#
+#   /etc/aide/aide.conf.d/99_aide_root holds the catch-all `/ 0 Full`. Fragments are included
+#   in filename order, so an exclusion has to sort BEFORE it. 90 leaves room either side.
+#   The filename carries no dot - aide.conf's @@x_include filter rejects names that do.
+#
+# WHY IT CAN RUN BEFORE AIDE IS INSTALLED:
+#
+#   That is the whole point. The directory is created here if the package has not arrived
+#   yet; dpkg will not remove a file it does not own. Seed the exclusion, THEN harden, and
+#   the database is built right the first time instead of being rebuilt for three hours.
+
+AIDE_CONF_D=/etc/aide/aide.conf.d
+AIDE_FRAGMENT="$AIDE_CONF_D/90_aide_enclave_exclude"
+AIDE_DB=/var/lib/aide/aide.db
+# Anything bigger than this inside AIDE's reach gets reported by `aide status`. Not a rule -
+# a prompt to look. Override with AIDE_BIG_GB=n.
+AIDE_BIG_GB="${AIDE_BIG_GB:-5}"
+
+# machine <TAB> path <TAB> why
+#
+# `*` means every machine. A path that does not exist on this machine is SKIPPED and said so -
+# excluding a path that is not there is noise in the artefact an assessor reads.
+#
+# EVERY ENTRY IS A COVERAGE REDUCTION AND NEEDS A REASON THAT SURVIVES BEING ASKED ABOUT.
+# The reason is always the same shape: this content has its own integrity mechanism that is
+# stronger than AIDE's, and it changes as part of normal operation.
+aide_excludes() {
+cat <<'EOF'
+svc-repo-01	/srv/repo	THE MIRROR - 321 GB, 91,073 files. Every file is covered by apt's own Release/Packages signature chain, which AIDE cannot improve on. Re-syncing the mirror is normal operation and would flag thousands of changes every run
+host-4	/var/lib/libvirt/images	VM DISK IMAGES - ~1.9 TB of qcow2 that change on every guest write. Hashing them is meaningless: a running VM guarantees the hash is stale before aide finishes. Guest integrity is the guest's own AIDE, which is what 6.0 installs on each one
+svc-harbor-01	/var/lib/docker	CONTAINER LAYER STORE - content-addressed by digest, which IS an integrity mechanism, and rewritten by every image push. Harbor's own content trust covers what matters here
+svc-mgmt-01	/var/lib/maas/boot-resources	MAAS BOOT IMAGES - re-downloaded and rotated by MAAS on its own schedule; each is checksummed by MAAS against its own index
+EOF
+}
+
+aide_fragment_body() {
+  local me="$1" mach path why n=0
+  printf '# Written by stig-tailor.sh on %s - do not edit by hand, edit the table in the script.\n' "$(date -Is)"
+  printf '# Numbered 90 so it is included BEFORE 99_aide_root, whose `/ 0 Full` is the catch-all.\n#\n'
+  while IFS=$'\t' read -r mach path why; do
+    [ -n "${mach:-}" ] || continue
+    [ "$mach" = '*' ] || [ "$mach" = "$me" ] || continue
+    [ -e "$path" ] || continue
+    printf '# %s\n!%s\n' "$why" "$path"
+    n=$((n + 1))
+  done < <(aide_excludes)
+  [ "$n" -gt 0 ] || printf '# no exclusions apply to %s\n' "$me"
+}
+
+# du that cannot wander off the machine. -x stays on one filesystem; the pseudo-filesystems
+# are named anyway because a bind mount of /proc inside a container root is not hypothetical.
+aide_du_bytes() {
+  du -sxb --exclude=/proc --exclude=/sys --exclude=/dev --exclude=/run "$1" 2>/dev/null \
+    | awk '{print $1}'
+}
+
+aide_human() { numfmt --to=iec --suffix=B "${1:-0}" 2>/dev/null || echo "${1:-0}"; }
+
+cmd_aide() {
+  local action="${1:-status}" apply=0
+  shift || true
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --apply) apply=1; shift ;;
+      *) die "unknown argument: $1" ;;
+    esac
+  done
+  local me; me="$(hostname -s)"
+
+  case "$action" in
+    status)
+      printf '\n  AIDE scope on %s\n\n' "$me"
+
+      if [ -f "$AIDE_FRAGMENT" ]; then
+        ok "exclusion fragment present: $AIDE_FRAGMENT"
+        grep -c '^!' "$AIDE_FRAGMENT" 2>/dev/null | sed 's/^/       excluding /;s/$/ path(s)/'
+        grep '^!' "$AIDE_FRAGMENT" 2>/dev/null | sed 's/^/         /'
+      else
+        warn "NO exclusion fragment - $AIDE_FRAGMENT does not exist"
+        say  "   if usg fix runs now, AIDE hashes whatever is below."
+      fi
+
+      printf '\n  what the table wants excluded here:\n'
+      local mach path why any=0
+      while IFS=$'\t' read -r mach path why; do
+        [ -n "${mach:-}" ] || continue
+        [ "$mach" = '*' ] || [ "$mach" = "$me" ] || continue
+        any=1
+        if [ -e "$path" ]; then
+          printf '     %-32s %10s   %s\n' "$path" "$(aide_human "$(aide_du_bytes "$path")")" "present"
+        else
+          printf '     %-32s %10s   %s\n' "$path" "-" "not on this machine - skipped"
+        fi
+      done < <(aide_excludes)
+      [ "$any" -eq 1 ] || say "     (none - this machine has no entry in the table)"
+
+      # THE PART THAT WOULD HAVE CAUGHT 6.3h.
+      #
+      # Do not ask the config what is in scope. Ask the disk what is big, then say whether it
+      # is covered. A directory that shows up here and is NOT covered is the next three-hour
+      # aideinit, wherever it lives and whatever the config seems to say.
+      printf '\n  anything over %s GB on this machine, and whether it is covered:\n' "$AIDE_BIG_GB"
+      # ONE du PASS, not one per directory. Nesting means per-directory du re-walks /var,
+      # /var/lib and /var/lib/docker separately - three passes over the same 300 GB. A check
+      # that is slow enough to skip is a check nobody runs.
+      local thresh=$((AIDE_BIG_GB * 1024 * 1024 * 1024)) sz d covered found=0
+      while read -r sz d; do
+        [ -n "${d:-}" ] || continue
+        [ "$d" = / ] && continue
+        covered=no
+        if [ -f "$AIDE_FRAGMENT" ]; then
+          # covered if the path itself, or any parent of it, is excluded
+          local p="$d"
+          while [ "$p" != / ] && [ -n "$p" ]; do
+            grep -q "^!${p}$" "$AIDE_FRAGMENT" && { covered=yes; break; }
+            p="$(dirname "$p")"
+          done
+        fi
+        found=1
+        if [ "$covered" = yes ]; then
+          printf '     %-40s %10s   excluded\n' "$d" "$(aide_human "$sz")"
+        else
+          printf '  [!] %-40s %10s   IN SCOPE - aideinit hashes all of it\n' "$d" "$(aide_human "$sz")"
+        fi
+      done < <(du -xb --max-depth=3 --threshold="$thresh" \
+                  --exclude=/proc --exclude=/sys --exclude=/dev --exclude=/run \
+                  --exclude=/var/lib/aide / 2>/dev/null | sort -rn)
+      [ "$found" -eq 1 ] || say "     nothing over ${AIDE_BIG_GB} GB"
+
+      printf '\n  database:\n'
+      if [ -f "$AIDE_DB" ]; then
+        say "     $AIDE_DB  $(ls -lh "$AIDE_DB" 2>/dev/null | awk '{print $5}')  built $(date -r "$AIDE_DB" -Is 2>/dev/null)"
+        if [ "$(id -u)" -eq 0 ]; then
+          say "     entries: $(zgrep -c . "$AIDE_DB" 2>/dev/null || grep -c . "$AIDE_DB" 2>/dev/null || echo '?')"
+        else
+          warn "   run as root to count entries - /var/lib/aide is 0600 and an unprivileged"
+          warn "   read returns EMPTY, which looks exactly like 'no entries'. That mistake is"
+          warn "   how 6.3h got written wrong the first time."
+        fi
+      else
+        say "     none yet - $AIDE_DB does not exist"
+      fi
+      echo
+      ;;
+
+    exclude)
+      if [ "$apply" -eq 0 ]; then
+        printf '\n  PLAN ONLY - would write %s\n\n' "$AIDE_FRAGMENT"
+        aide_fragment_body "$me" | sed 's/^/     /'
+        printf '\n  apply with:  sudo %s aide exclude --apply\n\n' "$0"
+        return 0
+      fi
+      need_root
+      # Created even if aide is not installed yet - seeding BEFORE `usg fix` is the whole
+      # reason this exists. dpkg will not remove a file the package does not own.
+      install -d -m 0755 "$AIDE_CONF_D"
+      if [ -f "$AIDE_FRAGMENT" ]; then
+        install -d -m 0700 "$STIG_BACKUP_DIR"
+        cp -a "$AIDE_FRAGMENT" "$STIG_BACKUP_DIR/$(basename "$AIDE_FRAGMENT").$(date +%Y%m%dT%H%M%S)"
+      fi
+      aide_fragment_body "$me" > "$AIDE_FRAGMENT"
+      chmod 0644 "$AIDE_FRAGMENT"
+      ok "wrote $AIDE_FRAGMENT"
+      grep '^!' "$AIDE_FRAGMENT" | sed 's/^/       /'
+      # A TABLE ENTRY THAT SILENTLY DID NOT APPLY IS THE FAILURE MODE HERE. If /srv/repo is
+      # an unmounted mountpoint at the moment this runs, the exclusion is quietly absent and
+      # you find out three hours into aideinit. Say it out loud.
+      local mach path why
+      while IFS=$'\t' read -r mach path why; do
+        [ -n "${mach:-}" ] || continue
+        [ "$mach" = '*' ] || [ "$mach" = "$me" ] || continue
+        [ -e "$path" ] && continue
+        warn "SKIPPED $path - the table has it for $me but it is not on the disk right now."
+        warn "  if that is a mountpoint, mount it and re-run before hardening."
+      done < <(aide_excludes)
+      if command -v aide >/dev/null 2>&1 && [ -f "$AIDE_DB" ]; then
+        warn "a database already exists and was built WITHOUT this exclusion."
+        warn "  it is stale until rebuilt:  sudo $0 aide init"
+      fi
+      ;;
+
+    init)
+      need_root
+      command -v aideinit >/dev/null 2>&1 \
+        || die "aideinit not present - aide-common arrives with \`usg fix\`. Seed the exclusion first, then harden."
+      [ -f "$AIDE_FRAGMENT" ] \
+        || die "no $AIDE_FRAGMENT - run \`sudo $0 aide exclude --apply\` FIRST. Initialising
+       without it is what took three and a half hours on svc-repo-01."
+      # An interrupted init leaves aide.db.new behind and aideinit then refuses or resumes
+      # from it. Clear it so the timing below means what it says.
+      rm -f /var/lib/aide/aide.db.new
+      say "initialising - this prints nothing until it finishes. Timing is reported."
+      say "excluded: $(grep -c '^!' "$AIDE_FRAGMENT") path(s)"
+      local t0 t1
+      t0=$(date +%s)
+      aideinit -y -f
+      t1=$(date +%s)
+      ok "aideinit finished in $(( (t1 - t0) / 60 ))m $(( (t1 - t0) % 60 ))s"
+      [ -f "$AIDE_DB" ] && ok "$AIDE_DB  $(ls -lh "$AIDE_DB" | awk '{print $5}')"
+      ;;
+
+    *) die "usage: $0 aide {status|exclude [--apply]|init}" ;;
+  esac
+}
+
 # ---------------------------------------------------------------------------- preflight
 #
 # WHAT WILL `usg fix` TAKE AWAY FROM THIS MACHINE.
@@ -1266,7 +1493,8 @@ case "${1:-}" in
   preflight) shift; cmd_preflight "$@" ;;
   usb)      shift; cmd_usb "$@" ;;
   ufw)      shift; cmd_ufw "$@" ;;
+  aide)     shift; cmd_aide "$@" ;;
   audit)    shift; cmd_audit "$@" ;;
   show)     shift; cmd_show "$@" ;;
-  *) printf 'usage: %s {generate|audit|show|preflight|fixups [...]|ufw [--apply]|usb {status|enable|disable}}\n' "$0" >&2; exit 2 ;;
+  *) printf 'usage: %s {generate|audit|show|preflight|aide {status|exclude [--apply]|init}|fixups [...]|ufw [--apply]|usb {status|enable|disable}}\n' "$0" >&2; exit 2 ;;
 esac

@@ -64,6 +64,7 @@ V-270799	UBTU-24-900280	the unix_update audit rule IS loaded, same usrmerge path
 V-270814	UBTU-24-900740	the kmod audit rule IS loaded, same usrmerge path mismatch
 V-270815	UBTU-24-900750	the fdisk audit rule IS loaded, same usrmerge path mismatch
 V-270751	UBTU-24-600160	no DOD time source is reachable in an air gap by design, and reaching one would itself be the finding
+V-270762	UBTU-24-700070	UBTU-24-700020 forbids setgid on the journal dirs, which is what made journald set the group - the two controls conflict, and root is MORE restrictive
 EOF
 }
 
@@ -191,6 +192,31 @@ elseif ($maxpoll.Count -gt 0) {
 }
 else {
     $V.Results = "OPEN. No maxpoll setting found under /etc/chrony* and this host is not configured as the enclave time master."
+}
+return $V
+EOF
+  ;;
+  V-270762) cat <<'EOF'
+$V = @{ Valid = $false; Results = "" }
+$bad = @(bash -c 'find /run/log/journal /var/log/journal -type f ! -group systemd-journal -printf "%g %04m %p
+" 2>/dev/null') | Where-Object { $_ -ne "" }
+if ($bad.Count -eq 0) {
+    $V.Valid = $true
+    $V.Results = "NOT A FINDING. DISA's CheckText was executed verbatim at scan time and every journal file is group-owned by systemd-journal."
+}
+else {
+    $looser = @($bad | Where-Object { ($_ -split ' ')[0] -ne 'root' })
+    $modes  = @($bad | Where-Object { [Convert]::ToInt32((($_ -split ' ')[1]), 8) -band 0027 })
+    if ($looser.Count -eq 0 -and $modes.Count -eq 0) {
+        $V.Valid = $true
+        $V.Results = "NOT A FINDING - the files are MORE restrictive than this control requires, and the cause is DISA's own remediation for UBTU-24-700020. " +
+          "Files not group systemd-journal: " + ($bad -join '; ') + " Every one is group ROOT at mode 0640, so it is readable by root alone. Group systemd-journal at 0640 would be readable by every member of that group, so the state measured here is STRICTER than the control asks for, not weaker. " +
+          "CAUSE, measured 2026-09-11: UBTU-24-700020 / V-270757 requires the journal directories at 0640 or less permissive, and the scanner implements that as 'find -perm /7137', which includes the SETGID bit - verified, a 2640 directory fails that check, as does systemd's own vendor default of 2750. Setgid on the directory is exactly what made journald create new files owned by group systemd-journal. Removing it, as UBTU-24-700020 requires, makes journald write new files with the creating process's group, which is root. The two controls cannot both be continuously satisfied. " +
+          "MITIGATION IN PLACE: /etc/tmpfiles.d/zzz-systemd-stig.conf carries DISA's complete FixText for both controls, including the recursive 'Z /var/log/journal/%m ~0640 root systemd-journal' lines, so existing files are corrected at every boot and at every systemd-tmpfiles run. Only files created since the last run can differ, and those are stricter, not looser."
+    }
+    else {
+        $V.Results = "OPEN. Journal files that are neither group systemd-journal nor a more restrictive root/0640: " + (($looser + $modes | Select-Object -Unique) -join '; ')
+    }
 }
 return $V
 EOF

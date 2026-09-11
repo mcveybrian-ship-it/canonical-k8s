@@ -365,6 +365,26 @@ logrotate_config_ok() {
   return 0
 }
 
+# POSTFIX ARRIVES WITH `usg fix` AND LISTENS ON EVERY INTERFACE.
+#
+# The STIG wants `space_left_action = email`, so usg installs an MTA to deliver it. Nobody
+# reviews the MTA. On svc-harbor-01 and again on svc-repo-01 it came up on 0.0.0.0:25 - an
+# unreviewed externally bound listener on a machine that has no business receiving mail from
+# anywhere, inside an enclave with no mail infrastructure at all.
+#
+# loopback-only keeps the audit warning working - that mail is local, from root to root - and
+# removes the surface. Doing it HERE rather than at a prompt means host-4 gets it too, and a
+# rebuilt machine gets it without anyone remembering.
+#
+# This is NOT a ufw rule. Filtering a listener that should not be listening is the wrong layer:
+# ufw would still leave postfix bound to the interface, and the finding "unreviewed listener"
+# would still be true.
+postfix_external() {
+  command -v postconf >/dev/null 2>&1 || return 1
+  ss -tulnH 2>/dev/null | awk '{print $5}' \
+    | grep -vE '^(127\.|\[::1\])' | grep -v '%lo:' | grep -qE '[:.]25$'
+}
+
 fixups_plan() {
   printf '\n  STIG fixups - what `usg fix` does not fix\n'
   local stray_list
@@ -422,6 +442,18 @@ fixups_plan() {
   say "        daemon message TWICE into the same file."
   say "   and: add $DAEMON_LOG to $RSYSLOG_LOGROTATE - Ubuntu's stanza does not list it, so"
   say "        a new log file would otherwise grow forever on a service VM."
+
+  printf '\n  5. postfix bound to all interfaces - installed by `usg fix`, never reviewed\n'
+  if ! command -v postconf >/dev/null 2>&1; then
+    say "   postfix is not installed here - nothing to do"
+  elif postfix_external; then
+    say "   state: LISTENING EXTERNALLY on :25 - $(postconf -h inet_interfaces 2>/dev/null)"
+    say "   fix: postconf -e 'inet_interfaces = loopback-only' + restart"
+    say "        local mail still works, which is all space_left_action = email needs."
+    say "   NOT a ufw rule - that would leave it bound and the finding still true."
+  else
+    say "   state: already loopback-only ($(postconf -h inet_interfaces 2>/dev/null))"
+  fi
 
   printf '\n  nothing above has been changed. re-run with --apply\n\n'
 }
@@ -621,6 +653,27 @@ EOF
     fi
   fi
 
+  # ---- 5. postfix: loopback-only -----------------------------------------------------
+  if command -v postconf >/dev/null 2>&1; then
+    local cur; cur="$(postconf -h inet_interfaces 2>/dev/null || echo '?')"
+    if [ "$cur" = "loopback-only" ]; then
+      say "5. postfix already loopback-only"
+    else
+      postconf -e 'inet_interfaces = loopback-only' \
+        && systemctl restart postfix 2>/dev/null
+      local new; new="$(postconf -h inet_interfaces 2>/dev/null || echo '?')"
+      if [ "$new" = "loopback-only" ] && ! postfix_external; then
+        ok "5. postfix inet_interfaces: $cur -> $new, no longer bound externally"
+      else
+        warn "5. postfix is STILL externally bound (inet_interfaces=$new) - check by hand:"
+        warn "   sudo ss -tulnp | grep ':25'"
+        failed=1
+      fi
+    fi
+  else
+    say "5. postfix not installed - nothing to do"
+  fi
+
   say ""
   [ "$failed" -eq 0 ] || warn "one or more fixups did not complete - see above"
   say ""
@@ -714,6 +767,14 @@ fixups_verify() {
          printf '%s\n' "$LOGROTATE_OUT" | grep 'error:' | sed 's/^/       /'
          fail=1 ;;
     esac
+  fi
+  if command -v postconf >/dev/null 2>&1; then
+    if postfix_external; then
+      warn "postfix is EXTERNALLY BOUND on :25 (inet_interfaces=$(postconf -h inet_interfaces 2>/dev/null))"
+      fail=1
+    else
+      say "postfix inet_interfaces: $(postconf -h inet_interfaces 2>/dev/null) - not externally bound"
+    fi
   fi
   say ""
   [ "$fail" -eq 0 ] && ok "all checks passed" || warn "some checks failed - see above"

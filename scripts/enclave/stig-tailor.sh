@@ -1014,9 +1014,16 @@ V1R6_REBOOT_NEEDED=0
 
 # ---- the checks, each one DISA's command ------------------------------------------------
 v1r6_timesyncd_installed() {
-  # `deinstall ok config-files` STILL COUNTS AS INSTALLED to DISA's check. The package name
-  # is systemd-timesyncd, not timesyncd - `dpkg -s timesyncd` returns a false "none".
-  dpkg-query -W -f='${Status}' systemd-timesyncd 2>/dev/null | grep -q 'ok installed'
+  # DISA'S CHECK IS `dpkg -l | grep systemd-timesyncd`, AND THAT IS WHAT THIS RUNS.
+  #
+  # The first version asked dpkg-query for `ok installed`, which is FALSE for the
+  # `deinstall ok config-files` state - the state `apt-get remove` leaves behind. That state
+  # prints as `rc` in `dpkg -l`, so DISA still calls it a finding, and my check reported
+  # svc-repo-01 clean while the scanner reported it Open.
+  #
+  # The comment on the fix already said `deinstall ok config-files` still counts. The check
+  # did not implement the comment. Run DISA's command, not a smarter one.
+  dpkg -l 2>/dev/null | grep -q 'systemd-timesyncd'
 }
 v1r6_nullok_files() {
   grep -l 'nullok' /etc/pam.d/common-auth /usr/share/pam-configs/unix 2>/dev/null || true
@@ -1042,7 +1049,28 @@ v1r6_cron_audit_ok() {
   auditctl -l 2>/dev/null | grep -qw -- '-w /etc/cron.d' && \
   auditctl -l 2>/dev/null | grep -qw -- '-w /var/spool/cron'
 }
-v1r6_audit_at_boot() { grep -qw 'audit=1' /proc/cmdline; }
+# V-270676 NEEDS audit=1 IN TWO PLACES, FOR TWO DIFFERENT REASONS.
+#
+# DISA's CheckText reads `/etc/default/grub` for GRUB_CMDLINE_LINUX and
+# GRUB_CMDLINE_LINUX_DEFAULT, then the generated grub.cfg. It does NOT read /proc/cmdline.
+# The first version of this check read /proc/cmdline only, found audit=1 there, and reported
+# PASS on a machine the scanner had marked Open - because /etc/default/grub said
+# "quiet splash".
+#
+# And on a cloud image /etc/default/grub is not sufficient on its own: 50-cloudimg-settings.cfg
+# HARD-ASSIGNS GRUB_CMDLINE_LINUX_DEFAULT and silently discards what came before, so a value
+# set only there never reaches the kernel (the grub trap in 6.3). So:
+#
+#   /etc/default/grub      - satisfies the CHECK
+#   /etc/default/grub.d/99 - makes the value TRUE at runtime
+#
+# Both, or the machine is compliant-on-paper or compliant-in-fact but never both.
+v1r6_audit_default_grub() { grep -hE '^GRUB_CMDLINE_LINUX(_DEFAULT)?=' /etc/default/grub 2>/dev/null || true; }
+v1r6_audit_at_boot() {
+  grep -qw 'audit=1' /proc/cmdline \
+    && v1r6_audit_default_grub | grep -q 'audit=1' \
+    && ! v1r6_audit_default_grub | grep -v 'audit=1' | grep -q 'GRUB_CMDLINE'
+}
 v1r6_journal_dirs()  { stat -c '%a %n' /var/log/journal /run/log/journal 2>/dev/null || true; }
 
 cmd_v1r6() {
@@ -1175,30 +1203,61 @@ cmd_v1r6() {
 
   # ---- V-270676  audit=1 at boot --------------------------------------------------------
   printf '\n  V-270676  UBTU-24-102010  session audits must start at boot\n'
+  say "   /proc/cmdline:      $(grep -o 'audit=[0-9]*' /proc/cmdline || echo 'audit= ABSENT')"
+  v1r6_audit_default_grub | sed 's|^|       /etc/default/grub:  |'
+  [ -f "$V1R6_GRUB_DROPIN" ] && grep -h 'audit=1' "$V1R6_GRUB_DROPIN" 2>/dev/null \
+    | sed "s|^|       $(basename "$V1R6_GRUB_DROPIN"):  |"
   if v1r6_audit_at_boot; then
-    ok "   audit=1 on /proc/cmdline"
+    ok "   audit=1 live AND in every GRUB_CMDLINE line DISA reads"
   else
     n_todo=$((n_todo+1))
     if [ "$apply" -eq 1 ]; then
-      # A GRUB.D DROP-IN, NEVER /etc/default/grub. On a cloud image
-      # 50-cloudimg-settings.cfg hard-assigns GRUB_CMDLINE_LINUX_DEFAULT and silently
-      # discards anything set earlier - see the grub trap in 6.3.
+      # 1. THE FILE DISA READS.
+      backup_file /etc/default/grub
+      local gl
+      for gl in GRUB_CMDLINE_LINUX_DEFAULT GRUB_CMDLINE_LINUX; do
+        if grep -qE "^$gl=" /etc/default/grub; then
+          grep -qE "^$gl=.*audit=1" /etc/default/grub \
+            || sed -i -E "s|^($gl=\")(.*)(\")|\\1\\2 audit=1\\3|" /etc/default/grub
+        else
+          printf '%s="audit=1"\n' "$gl" >> /etc/default/grub
+        fi
+      done
+      # collapse any double space the sed may have produced in an empty value
+      sed -i -E 's|^(GRUB_CMDLINE_LINUX(_DEFAULT)?=")[[:space:]]+|\\1|' /etc/default/grub
+      ok "   /etc/default/grub now: $(v1r6_audit_default_grub | tr '\n' ' ')"
+      # 2. THE FILE THAT MAKES IT TRUE. On a cloud image 50-cloudimg-settings.cfg
+      # hard-assigns GRUB_CMDLINE_LINUX_DEFAULT, so the value above never reaches the
+      # kernel on its own. The drop-in sorts after it and appends.
       install -d -m 0755 /etc/default/grub.d
-      if grep -q 'audit=1' "$V1R6_GRUB_DROPIN" 2>/dev/null; then
-        ok "   already in $V1R6_GRUB_DROPIN - pending reboot"
-      else
+      if ! grep -q 'audit=1' "$V1R6_GRUB_DROPIN" 2>/dev/null; then
         printf '# audit=1 for UBTU-24-102010. Written by stig-tailor.sh %s\n' "$(date -Is)" \
           >> "$V1R6_GRUB_DROPIN"
         printf 'GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT audit=1"\n' \
           >> "$V1R6_GRUB_DROPIN"
-        update-grub >/dev/null 2>&1 && ok "   $V1R6_GRUB_DROPIN written, update-grub done" \
-          || { warn "   update-grub FAILED"; failed=1; }
+        ok "   $V1R6_GRUB_DROPIN written"
+      else
+        ok "   $V1R6_GRUB_DROPIN already carries it"
+      fi
+      if update-grub >/dev/null 2>&1; then
+        # PROVE IT REACHED THE GENERATED CONFIG - DISA checks that too, and this is the step
+        # where a discarded /etc/default/grub edit shows up.
+        if grep -q 'audit=1' /boot/grub/grub.cfg 2>/dev/null; then
+          ok "   audit=1 present in the generated /boot/grub/grub.cfg"
+        else
+          warn "   update-grub ran but /boot/grub/grub.cfg has NO audit=1 - something is"
+          warn "   overriding it. Check /etc/default/grub.d/ ordering before rebooting."
+          failed=1
+        fi
+      else
+        warn "   update-grub FAILED"; failed=1
       fi
       V1R6_REBOOT_NEEDED=1
     else
-      say "   state: audit=1 NOT on the kernel command line"
-      say "   -> $V1R6_GRUB_DROPIN + update-grub, then REBOOT"
-      say "      NOT /etc/default/grub - 50-cloudimg-settings.cfg discards that silently"
+      say "   -> add audit=1 to BOTH GRUB_CMDLINE lines in /etc/default/grub (what DISA reads)"
+      say "      AND $V1R6_GRUB_DROPIN (what makes it true - cloudimg hard-assigns the"
+      say "      default, so the /etc/default/grub value alone never reaches the kernel)"
+      say "      then update-grub and REBOOT"
     fi
   fi
 

@@ -1183,7 +1183,28 @@ cmd_v1r6() {
           backup_file "$f"
           sed -i 's/[[:space:]]\{1,\}nullok//g' "$f"
         done
-        pam-auth-update --force >/dev/null 2>&1 || warn "   pam-auth-update reported an error"
+        # DEBIAN_FRONTEND=noninteractive, AND DO NOT SWALLOW THE OUTPUT.
+        #
+        # `pam-auth-update --force` goes through debconf, and debconf draws a whiptail
+        # dialog. With `>/dev/null 2>&1` that dialog is INVISIBLE and the script simply
+        # stops - on svc-repo-01 it sat with no output at all while a menu waited for a
+        # keypress nobody could see. Identical to piping grub-mkpasswd-pbkdf2 into a file
+        # and then wondering why the prompt never appeared. Second time in one night.
+        #
+        # noninteractive makes debconf answer itself; the timeout means a frontend that
+        # ignores that fails loudly instead of hanging; and the output is PRINTED.
+        local pau_out pau_rc=0
+        pau_out="$(DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true \
+                   timeout 60 pam-auth-update --force 2>&1)" || pau_rc=$?
+        [ -n "$pau_out" ] && printf '%s\n' "$pau_out" | sed 's/^/       /'
+        if [ "$pau_rc" -eq 124 ]; then
+          warn "   pam-auth-update TIMED OUT after 60s - it was waiting for input."
+          warn "   nullok is already out of both files, so the machine is correct; the"
+          warn "   regeneration is what is unproven. Run it by hand to see the dialog."
+          failed=1
+        elif [ "$pau_rc" -ne 0 ]; then
+          warn "   pam-auth-update exited $pau_rc"
+        fi
         if [ -z "$(v1r6_nullok_files)" ]; then
           ok "   nullok removed from both files, pam-auth-update re-run"
           warn "   VERIFY NOW, in this session:  sudo -k; sudo -v"

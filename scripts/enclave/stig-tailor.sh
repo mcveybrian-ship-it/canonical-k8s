@@ -455,6 +455,18 @@ fixups_plan() {
     say "   state: already loopback-only ($(postconf -h inet_interfaces 2>/dev/null))"
   fi
 
+  printf '\n  6. sudo passwd_tries - one faillock strike per invocation, not three\n'
+  if [ -f /etc/sudoers.d/99-stig-passwd-tries ]; then
+    say "   state: already set ($(grep -h passwd_tries /etc/sudoers.d/99-stig-passwd-tries 2>/dev/null))"
+  else
+    say "   state: NOT set - sudo allows 3 attempts per invocation and faillock is deny=3,"
+    say "          so ONE fumbled password locks the only admin account, permanently"
+    say "          (unlock_time=0). faillock is 'silent', so it looks like a typo."
+    say "   fix: /etc/sudoers.d/99-stig-passwd-tries with 'Defaults passwd_tries=1'"
+    say "        deny=3 is unchanged - the STIG control is untouched. Validated with visudo"
+    say "        on a temp file BEFORE install, and the whole set re-checked after."
+  fi
+
   printf '\n  nothing above has been changed. re-run with --apply\n\n'
 }
 
@@ -674,6 +686,64 @@ EOF
     say "5. postfix not installed - nothing to do"
   fi
 
+  # ---- 6. sudo passwd_tries: one strike per invocation, not three -----------------------
+  #
+  # `usg fix` sets pam_faillock deny=3 unlock_time=0 - three failures and the account is
+  # locked UNTIL AN ADMINISTRATOR RELEASES IT. sudo's own prompt allows three attempts per
+  # invocation, so ONE fumbled password exhausts the entire budget and locks the only account
+  # that can administer the machine. faillock.conf also sets `silent`, so the lock then
+  # presents as "Sorry, try again" - indistinguishable from a typo, which invites more
+  # attempts that cannot succeed because preauth is already refusing.
+  #
+  # That happened on svc-mgmt-01 on 2026-09-11. Recovery was a reboot - the tally lives in
+  # /run/faillock, which is tmpfs - but on host-4 that means a physical trip and the LUKS
+  # passphrase, on the machine that runs every VM.
+  #
+  # passwd_tries=1 costs one strike per invocation instead of three. deny=3 is unchanged, so
+  # the STIG control is untouched; the operator simply gets three separate attempts with a
+  # visible failure between each rather than losing everything in one prompt.
+  local TRIES_FILE=/etc/sudoers.d/99-stig-passwd-tries
+  if [ -f "$TRIES_FILE" ] && grep -q 'passwd_tries' "$TRIES_FILE"; then
+    say "6. sudo passwd_tries already set ($(grep -h passwd_tries "$TRIES_FILE"))"
+  else
+    # A SYNTAX ERROR IN sudoers BREAKS sudo ENTIRELY, and on these machines sudo is the only
+    # route to privilege. Write to a temp file, have visudo check THAT, and only install a
+    # file that has already been validated. Never edit a live sudoers file in place.
+    local tf; tf="$(mktemp)"
+    cat > "$tf" <<'SUDOERS'
+# One password attempt per sudo invocation.
+#
+# pam_faillock is deny=3 unlock_time=0: three failures lock the account until an
+# administrator releases it. sudo's default of three attempts per invocation means a single
+# fumbled password locks the only administrative account on the machine, and faillock's
+# `silent` makes that look like a typo rather than a lock.
+#
+# This does not weaken the STIG control - deny=3 still applies. It spends the budget one
+# strike at a time. Written by stig-tailor.sh fixups.
+Defaults passwd_tries=1
+SUDOERS
+    chmod 0440 "$tf"
+    if visudo -c -q -f "$tf" 2>/dev/null; then
+      install -o root -g root -m 0440 "$tf" "$TRIES_FILE"
+      # And check the WHOLE sudoers set still parses with the new file in place - a fragment
+      # can be valid alone and conflict once included.
+      if visudo -c -q 2>/dev/null; then
+        ok "6. wrote $TRIES_FILE (passwd_tries=1) - full sudoers set still parses"
+        warn "   VERIFY NOW, in this session:  sudo -k; sudo -v"
+      else
+        rm -f "$TRIES_FILE"
+        warn "6. the full sudoers set FAILED to parse with that file - REMOVED it"
+        visudo -c 2>&1 | sed 's/^/       /'
+        failed=1
+      fi
+    else
+      warn "6. the generated sudoers fragment did not pass visudo - NOT installed"
+      visudo -c -f "$tf" 2>&1 | sed 's/^/       /'
+      failed=1
+    fi
+    rm -f "$tf"
+  fi
+
   say ""
   [ "$failed" -eq 0 ] || warn "one or more fixups did not complete - see above"
   say ""
@@ -767,6 +837,12 @@ fixups_verify() {
          printf '%s\n' "$LOGROTATE_OUT" | grep 'error:' | sed 's/^/       /'
          fail=1 ;;
     esac
+  fi
+  if [ -f /etc/sudoers.d/99-stig-passwd-tries ]; then
+    say "sudo passwd_tries: $(grep -h passwd_tries /etc/sudoers.d/99-stig-passwd-tries)"
+  else
+    warn "sudo passwd_tries NOT set - one fumbled password locks this account permanently"
+    fail=1
   fi
   if command -v postconf >/dev/null 2>&1; then
     if postfix_external; then

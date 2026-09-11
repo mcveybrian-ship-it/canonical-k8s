@@ -200,7 +200,17 @@ cmd_fetch() {
   [ -f "$CA" ] || die "no enclave root CA at $CA - this script will not fetch over an
        unverified connection. Copy the repo, or set STIG_TOOLS_CA."
 
-  install -d -m 0755 "$DEST" "$EVIDENCE"
+  # THE EVIDENCE DIRECTORY BELONGS TO THE OPERATOR, NOT TO root.
+  #
+  # The scan runs under sudo but the `| tee` that captures its log does NOT - tee is the
+  # unprivileged half of the pipeline. A root-owned 0755 directory therefore fails the log
+  # write while the scan itself succeeds, which is a confusing way to lose the evidence.
+  # This is the same friction as /var/lib/usg being root-only (runbook 6.0 step 14); no
+  # reason to reproduce it in a directory we create ourselves.
+  install -d -m 0755 "$DEST"
+  install -d -m 0755 -o "${SUDO_USER:-root}" -g "${SUDO_USER:-root}" "$EVIDENCE" 2>/dev/null \
+    || install -d -m 0755 "$EVIDENCE"
+  [ -n "${SUDO_USER:-}" ] && chown "$SUDO_USER" "$EVIDENCE" 2>/dev/null || true
   say "fetching from https://$MIRROR/tools/ onto $me"
 
   # 1. Evaluate-STIG. A directory tree over HTTP means walking the autoindex, so mirror it
@@ -234,7 +244,20 @@ $(find "$TMPD" -maxdepth 2 | head -12 | sed 's/^/       /')
   fi
   rm -rf "$DEST/Evaluate-STIG"
   mv "$TMPD/Evaluate-STIG" "$DEST/Evaluate-STIG"
+  # SET THE MODE, DO NOT INHERIT IT. The tree came out of a 0700 mktemp staging directory and
+  # arrived drwx------, so `cd /srv/stig-tools/Evaluate-STIG` failed for the operator on a
+  # fetch that had just reported success. Anything this script installs for someone else to
+  # run must be readable and traversable by them, stated rather than assumed.
+  chmod -R a+rX "$DEST/Evaluate-STIG"
   ok "Evaluate-STIG: $(find "$DEST/Evaluate-STIG" -type f | wc -l) file(s) at $DEST/Evaluate-STIG"
+  if [ -n "${SUDO_USER:-}" ]; then
+    runuser -u "$SUDO_USER" -- test -r "$DEST/Evaluate-STIG/Evaluate-STIG_Bash.sh" \
+      && ok "readable by $SUDO_USER" \
+      || warn "NOT readable by $SUDO_USER - the scan command below will fail for them"
+    runuser -u "$SUDO_USER" -- test -w "$EVIDENCE" \
+      && ok "$EVIDENCE writable by $SUDO_USER (the \`| tee\` needs this)" \
+      || warn "$EVIDENCE NOT writable by $SUDO_USER - the scan log will not be captured"
+  fi
 
   # 2. PowerShell, verified against the checksum written at publish time.
   if [ -d "$DEST/$PWSH_DIR" ] && [ -x "$DEST/$PWSH_DIR/pwsh" ]; then

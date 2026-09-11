@@ -951,7 +951,7 @@ EOF
 #   yet; dpkg will not remove a file it does not own. Seed the exclusion, THEN harden, and
 #   the database is built right the first time instead of being rebuilt for three hours.
 
-AIDE_CONF_D=/etc/aide/aide.conf.d
+AIDE_CONF_D="${AIDE_CONF_D:-/etc/aide/aide.conf.d}"
 AIDE_FRAGMENT="$AIDE_CONF_D/90_aide_enclave_exclude"
 AIDE_DB=/var/lib/aide/aide.db
 # Anything bigger than this inside AIDE's reach gets reported by `aide status`. Not a rule -
@@ -1041,33 +1041,62 @@ cmd_aide() {
       # Do not ask the config what is in scope. Ask the disk what is big, then say whether it
       # is covered. A directory that shows up here and is NOT covered is the next three-hour
       # aideinit, wherever it lives and whatever the config seems to say.
-      printf '\n  anything over %s GB on this machine, and whether it is covered:\n' "$AIDE_BIG_GB"
-      # ONE du PASS, not one per directory. Nesting means per-directory du re-walks /var,
-      # /var/lib and /var/lib/docker separately - three passes over the same 300 GB. A check
-      # that is slow enough to skip is a check nobody runs.
+      printf '\n  anything over %s GB STILL IN SCOPE, after exclusions:\n' "$AIDE_BIG_GB"
+      # SIZE IS NOT SCOPE, AND ON THE FIRST REAL RUN THAT DIFFERENCE CRIED WOLF.
+      #
+      # svc-repo-01, 2026-09-11: with !/srv/repo applied, this printed
+      #     /srv/repo   321GB  excluded
+      # [!] /srv        321GB  IN SCOPE - aideinit hashes all of it
+      # Both lines are the same 321 GB. /srv is big only BECAUSE of the child that is already
+      # excluded, and what AIDE actually hashes under /srv is a few hundred bytes.
+      #
+      # A check that reports a problem it has itself already solved is a check the operator
+      # learns to skim. So: subtract every excluded subtree from its parents and threshold on
+      # what is LEFT.
       local thresh=$((AIDE_BIG_GB * 1024 * 1024 * 1024)) sz d covered found=0
+      local -a EXC_P=() EXC_S=()
+      if [ -f "$AIDE_FRAGMENT" ]; then
+        local e
+        while IFS= read -r e; do
+          [ -n "$e" ] || continue
+          EXC_P+=("$e"); EXC_S+=("$(aide_du_bytes "$e")")
+        done < <(grep '^!' "$AIDE_FRAGMENT" | sed 's/^!//')
+      fi
       while read -r sz d; do
         [ -n "${d:-}" ] || continue
         [ "$d" = / ] && continue
         covered=no
-        if [ -f "$AIDE_FRAGMENT" ]; then
-          # covered if the path itself, or any parent of it, is excluded
-          local p="$d"
-          while [ "$p" != / ] && [ -n "$p" ]; do
-            grep -q "^!${p}$" "$AIDE_FRAGMENT" && { covered=yes; break; }
-            p="$(dirname "$p")"
-          done
-        fi
+        local deduct=0 k ex
+        for k in "${!EXC_P[@]}"; do
+          ex="${EXC_P[$k]}"
+          case "$d" in "$ex"|"$ex"/*) covered=yes; break ;; esac
+          # an excluded path strictly BELOW d does not count against d's in-scope size
+          case "$ex" in "$d"/*) deduct=$(( deduct + ${EXC_S[$k]:-0} )) ;; esac
+        done
+        if [ "$covered" = yes ]; then continue; fi
+        local inscope=$(( sz - deduct ))
+        [ "$inscope" -ge "$thresh" ] || continue
         found=1
-        if [ "$covered" = yes ]; then
-          printf '     %-40s %10s   excluded\n' "$d" "$(aide_human "$sz")"
+        if [ "$deduct" -gt 0 ]; then
+          printf '  [!] %-40s %10s   IN SCOPE (of %s; the rest is excluded)\n' \
+                 "$d" "$(aide_human "$inscope")" "$(aide_human "$sz")"
         else
-          printf '  [!] %-40s %10s   IN SCOPE - aideinit hashes all of it\n' "$d" "$(aide_human "$sz")"
+          printf '  [!] %-40s %10s   IN SCOPE - aideinit hashes all of it\n' \
+                 "$d" "$(aide_human "$inscope")"
         fi
       done < <(du -xb --max-depth=3 --threshold="$thresh" \
                   --exclude=/proc --exclude=/sys --exclude=/dev --exclude=/run \
                   --exclude=/var/lib/aide / 2>/dev/null | sort -rn)
-      [ "$found" -eq 1 ] || say "     nothing over ${AIDE_BIG_GB} GB"
+      if [ "$found" -eq 1 ]; then
+        say "  nothing else over ${AIDE_BIG_GB} GB is in scope"
+      else
+        ok "nothing over ${AIDE_BIG_GB} GB is in scope"
+      fi
+      # What IS excluded, said once, plainly - the line above no longer repeats it per parent.
+      local k
+      for k in "${!EXC_P[@]}"; do
+        printf '     %-40s %10s   excluded\n' "${EXC_P[$k]}" "$(aide_human "${EXC_S[$k]}")"
+      done
 
       printf '\n  database:\n'
       if [ -f "$AIDE_DB" ]; then

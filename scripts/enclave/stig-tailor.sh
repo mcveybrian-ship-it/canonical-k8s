@@ -1224,7 +1224,7 @@ cmd_v1r6() {
 
   # ---- V-270676  audit=1 at boot --------------------------------------------------------
   printf '\n  V-270676  UBTU-24-102010  session audits must start at boot\n'
-  say "   /proc/cmdline:      $(grep -o 'audit=[0-9]*' /proc/cmdline || echo 'audit= ABSENT')"
+  say "   /proc/cmdline:      $(grep -o 'audit=[0-9]*' /proc/cmdline | sort -u | tr '\n' ' ' || echo 'audit= ABSENT')"
   v1r6_audit_default_grub | sed 's|^|       /etc/default/grub:  |'
   [ -f "$V1R6_GRUB_DROPIN" ] && grep -h 'audit=1' "$V1R6_GRUB_DROPIN" 2>/dev/null \
     | sed "s|^|       $(basename "$V1R6_GRUB_DROPIN"):  |"
@@ -1287,8 +1287,16 @@ cmd_v1r6() {
       if ! grep -q 'audit=1' "$V1R6_GRUB_DROPIN" 2>/dev/null; then
         printf '# audit=1 for UBTU-24-102010. Written by stig-tailor.sh %s\n' "$(date -Is)" \
           >> "$V1R6_GRUB_DROPIN"
-        printf 'GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT audit=1"\n' \
-          >> "$V1R6_GRUB_DROPIN"
+        # IDEMPOTENT APPEND. A bare `="$X audit=1"` adds it again every time the value
+        # already carries it - which it does now that /etc/default/grub sets it too, so
+        # svc-repo-01 booted with audit=1 twice on its command line. Harmless (the kernel
+        # takes the last one) but untidy in a file an assessor reads.
+        cat >> "$V1R6_GRUB_DROPIN" <<'DROPIN'
+case " $GRUB_CMDLINE_LINUX_DEFAULT " in
+  *" audit=1 "*) ;;
+  *) GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT audit=1" ;;
+esac
+DROPIN
         ok "   $V1R6_GRUB_DROPIN written"
       else
         ok "   $V1R6_GRUB_DROPIN already carries it"

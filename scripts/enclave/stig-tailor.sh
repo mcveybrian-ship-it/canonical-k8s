@@ -1712,6 +1712,23 @@ aide_fragment_body() {
   [ "$n" -gt 0 ] || printf '# no exclusions apply to %s\n' "$me"
 }
 
+# EVERY LOCAL FILESYSTEM, NOT JUST THE ROOT ONE.
+#
+# `du -x` stops at a mount point. On host-4 the 362 GB image store is its own filesystem at
+# /var/lib/libvirt/images, so a `du -x /` scan reported "nothing over 5 GB is in scope" on the
+# one machine where the check mattered most - while 362 GB sat unexcluded and AIDE, which
+# walks paths and does not care about mount boundaries, would have hashed all of it.
+#
+# So: enumerate the LOCAL filesystems and scan each. Network and pseudo filesystems are
+# excluded by type rather than by path, because a check that depends on remembering every
+# mount point is a check that misses the next one.
+aide_local_mounts() {
+  findmnt -rn -o TARGET,FSTYPE 2>/dev/null | awk '
+    $2 ~ /^(proc|sysfs|devtmpfs|devpts|tmpfs|cgroup|cgroup2|securityfs|pstore|efivarfs|bpf|tracefs|debugfs|mqueue|hugetlbfs|configfs|fusectl|ramfs|autofs|binfmt_misc|squashfs|nsfs|rpc_pipefs)$/ { next }
+    $2 ~ /^(nfs|nfs4|cifs|smb3|fuse\.sshfs|ceph|glusterfs)$/ { next }
+    { print $1 }' | sort -u || true
+}
+
 # du that cannot wander off the machine. -x stays on one filesystem; the pseudo-filesystems
 # are named anyway because a bind mount of /proc inside a container root is not hypothetical.
 aide_du_bytes() {
@@ -1807,14 +1824,33 @@ cmd_aide() {
           printf '  [!] %-40s %10s   IN SCOPE - aideinit hashes all of it\n' \
                  "$d" "$(aide_human "$inscope")"
         fi
-      done < <(du -xb --max-depth=3 --threshold="$thresh" \
-                  --exclude=/proc --exclude=/sys --exclude=/dev --exclude=/run \
-                  --exclude=/var/lib/aide / 2>/dev/null | sort -rn)
-      if [ "$found" -eq 1 ]; then
+      done < <(aide_local_mounts | while IFS= read -r mp; do
+                 [ -d "$mp" ] || continue
+                 du -xb --max-depth=3 --threshold="$thresh" \
+                    --exclude=/proc --exclude=/sys --exclude=/dev --exclude=/run \
+                    --exclude=/var/lib/aide "$mp" 2>/dev/null || true
+               done | sort -rn -k1,1 -u)
+      # THE SUMMARY MUST NOT CONTRADICT THE TABLE ABOVE IT. host-4 printed
+      #   /var/lib/libvirt/images  362GB  present
+      #   [ok] nothing over 5 GB is in scope
+      # in the same report. If a path the table wants excluded is on the disk and no fragment
+      # covers it, that is the answer, whatever the size scan found.
+      local uncovered=0 mach path why
+      while IFS=$'\t' read -r mach path why; do
+        [ -n "${mach:-}" ] || continue
+        [ "$mach" = '*' ] || [ "$mach" = "$me" ] || continue
+        [ -e "$path" ] || continue
+        grep -q "^!${path}$" "$AIDE_FRAGMENT" 2>/dev/null || uncovered=$((uncovered + 1))
+      done < <(aide_excludes)
+      if [ "$uncovered" -gt 0 ]; then
+        warn "$uncovered path(s) the table wants excluded are present and NOT covered by"
+        warn "  $AIDE_FRAGMENT - run: sudo $0 aide exclude --apply"
+      elif [ "$found" -eq 1 ]; then
         say "  nothing else over ${AIDE_BIG_GB} GB is in scope"
       else
         ok "nothing over ${AIDE_BIG_GB} GB is in scope"
       fi
+      say "  scanned filesystems: $(aide_local_mounts | tr '\n' ' ')"
       # What IS excluded, said once, plainly - the line above no longer repeats it per parent.
       local k
       for k in "${!EXC_P[@]}"; do

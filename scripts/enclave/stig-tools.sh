@@ -5,6 +5,7 @@
 #     sudo ./stig-tools.sh publish      MACHINE: stage-01. Pushes the tools to the mirror.
 #     sudo ./stig-tools.sh answers      MACHINE: stage-01. Pushes the Answer File, ssh only.
 #     sudo ./stig-tools.sh fetch        MACHINE: any in-gap machine. Pulls from the mirror.
+#     sudo ./stig-tools.sh scan         MACHINE: the machine being assessed. Scan + clean up.
 #     ./stig-tools.sh status            MACHINE: any. What is here and what is served.
 #
 # WHY THIS EXISTS:
@@ -294,6 +295,124 @@ $(find "$TMPD" -maxdepth 2 | head -12 | sed 's/^/       /')
     || warn "no Answer File here - from stage-01: sudo ./stig-tools.sh answers $me"
 }
 
+# ------------------------------------------------------------------------------------ scan
+#
+# RUN THE SCAN, AND LEAVE THE EVIDENCE IN A STATE SOMEONE CAN ACTUALLY COLLECT.
+#
+# The bare invocation is six flags long, and two things must happen afterwards or the run is
+# worth less than it looks:
+#
+#   1. `/tmp/.dotnet` must go. PowerShell creates it 0777 at startup; leaving a world-writable
+#      directory on a hardened machine is a real defect even though the control that reports
+#      it is answered (the scanner made the condition - see runbook 10.1).
+#
+#   2. THE OUTPUT MUST BE READABLE BY THE OPERATOR. The scan runs as root with umask 077, so
+#      every CKLB and CSV lands 0600 root:root. On svc-mgmt-01 that meant the checklist could
+#      not be copied off the machine at all - and §6.0 step 14 is "copy the reports off".
+#      **Evidence you cannot collect is evidence you do not have.**
+#
+#      A default ACL would fix it at creation, but `setfacl` is absent on three of the four
+#      machines and adding the `acl` package to hardened hosts to solve this is the wrong
+#      trade. So ownership is corrected here, and then VERIFIED as the operator.
+#
+# It also prints the tally, so nobody has to paste a python heredoc at a prompt to find out
+# what the scan said.
+
+cmd_scan() {
+  local me; me="$(hostname -s)"
+  case "$me" in
+    stage-01|build-01)
+      die "scan does not run on $me - it is outside the ATO boundary. Run it ON the machine
+       being assessed." ;;
+  esac
+  need_root
+  local owner="${SUDO_USER:-root}"
+
+  # PREREQUISITES, NAMED INDIVIDUALLY. "something is missing" costs a round trip.
+  local missing=0
+  [ -x "$DEST/$PWSH_DIR/pwsh" ] || { warn "no pwsh at $DEST/$PWSH_DIR"; missing=1; }
+  [ -f "$DEST/Evaluate-STIG/Evaluate-STIG_Bash.sh" ] || { warn "no scanner at $DEST/Evaluate-STIG"; missing=1; }
+  local af_arg=()
+  if [ -f "$DEST/$(basename "$ANSWERFILE")" ]; then
+    af_arg=(--AFPath "$DEST")
+  else
+    warn "NO ANSWER FILE at $DEST - every documented deviation will re-open as a finding."
+    warn "  From stage-01:  ./scripts/enclave/stig-tools.sh answers $me"
+  fi
+  for p in lshw dmidecode bc; do
+    command -v "$p" >/dev/null 2>&1 || { warn "$p missing - the scan dies seconds in"; missing=1; }
+  done
+  [ "$missing" -eq 0 ] || die "prerequisites missing - see above. sudo $0 fetch"
+
+  install -d -m 0755 -o "$owner" "$EVIDENCE" 2>/dev/null || install -d -m 0755 "$EVIDENCE"
+  local log; log="$EVIDENCE/scan-$me-$(date +%Y%m%dT%H%M).log"
+
+  say "scanning $me - about 7-11 minutes, printing as it goes"
+  say "log: $log"
+  say ""
+  # `tee`, NEVER `| tail` - tail buffers the whole run and prints at the end, so a ten-minute
+  # scan looks hung. runbook 6.3k.
+  ( cd "$DEST/Evaluate-STIG" && bash Evaluate-STIG_Bash.sh --NoUpstream \
+      --PSPath "$DEST/$PWSH_DIR" \
+      --SelectSTIG Ubuntu24 \
+      "${af_arg[@]}" \
+      --Output Summary,CKLB,CombinedCSV \
+      --OutputPath "$EVIDENCE" 2>&1 ) | tee "$log"
+
+  say ""
+  # ---- clean up after the tool ----------------------------------------------------------
+  if [ -d /tmp/.dotnet ]; then
+    rm -rf /tmp/.dotnet && ok "removed /tmp/.dotnet (PowerShell's 0777 leftover)"
+  fi
+  # `_Partial_{HOSTNAME^^}` is a bash uppercase expansion leaking as a literal from the
+  # vendor wrapper. Cosmetic, root-owned, and it has no business in an evidence tree.
+  local stray
+  stray="$(find "$EVIDENCE" -maxdepth 1 -name '_Partial_*' 2>/dev/null || true)"
+  if [ -n "$stray" ]; then
+    printf '%s\n' "$stray" | while IFS= read -r d; do rm -rf "$d"; done
+    ok "removed the wrapper's _Partial_* directory"
+  fi
+
+  # ---- make the evidence collectable, then PROVE it -------------------------------------
+  chown -R "$owner" "$EVIDENCE" 2>/dev/null || true
+  find "$EVIDENCE" -type d -exec chmod u+rwx {} + 2>/dev/null || true
+  find "$EVIDENCE" -type f -exec chmod u+rw {} + 2>/dev/null || true
+  local csv
+  csv="$(find "$EVIDENCE" -name '*COMBINED*.csv' -newermt '-30 minutes' 2>/dev/null | sort | tail -1)"
+  if [ -z "$csv" ]; then
+    warn "no COMBINED csv newer than 30 minutes - did the scan actually finish?"
+    return 1
+  fi
+  if [ "$owner" != root ]; then
+    runuser -u "$owner" -- test -r "$csv" \
+      && ok "$owner can read the checklist - it can be copied off this machine" \
+      || { warn "$owner still CANNOT read $csv - step 14 will fail"; return 1; }
+  fi
+
+  # ---- the tally, so nobody types a heredoc at a prompt ---------------------------------
+  say ""
+  python3 - "$csv" <<'PY'
+import csv, collections, os, sys, time
+f = sys.argv[1]
+rows = list(csv.DictReader(open(f, encoding='utf-8-sig')))
+c = collections.Counter(r['Status'] for r in rows)
+print("  file : %s" % f)
+print("  mtime: %s" % time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(os.path.getmtime(f))))
+print("  %d controls   NF=%d  Open=%d  NotReviewed=%d  NA=%d"
+      % (len(rows), c.get('NF', 0), c.get('O', 0), c.get('NR', 0), c.get('NA', 0)))
+op = sorted([r for r in rows if r['Status'] == 'O'], key=lambda r: (r['Severity'], r['GroupID']))
+if op:
+    print("\n  OPEN:")
+    for r in op:
+        print("    %-6s %-10s %-16s %s" % (r['Severity'], r['GroupID'], r['STIGID'], r['RuleTitle'][:50]))
+else:
+    print("\n  nothing Open.")
+PY
+  say ""
+  ok "scan complete. Copy the evidence off with, FROM stage-01:"
+  say "   scp -i ~/.ssh/build01 -r encadmin@<this machine>:$EVIDENCE/$(echo "$me" | tr '[:lower:]' '[:upper:]') ."
+}
+
 # ---------------------------------------------------------------------------------- status
 cmd_status() {
   local me; me="$(hostname -s)"
@@ -326,6 +445,7 @@ case "${1:-status}" in
   publish) shift; cmd_publish "$@" ;;
   answers) shift; cmd_answers "$@" ;;
   fetch)   shift; cmd_fetch "$@" ;;
+  scan)    shift; cmd_scan "$@" ;;
   status)  shift; cmd_status "$@" ;;
-  *) printf 'usage: %s {publish|answers <machine>|fetch|status}\n' "$0" >&2; exit 2 ;;
+  *) printf 'usage: %s {publish|answers <machine>|fetch|scan|status}\n' "$0" >&2; exit 2 ;;
 esac

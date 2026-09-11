@@ -6,7 +6,7 @@
 *how* things were built and why; they have gone stale more than once. If they disagree with
 this section, this section wins and the other one gets fixed.
 
-Last updated **2026-09-10 23:10 UTC** (18:10 Central). All timestamps in this repo are **UTC** — every enclave machine runs UTC and the audit logs are UTC, so mixing local time into an auditable procedure is how two records stop lining up.
+Last updated **2026-09-11 00:45 UTC** (19:45 Central). All timestamps in this repo are **UTC** — every enclave machine runs UTC and the audit logs are UTC, so mixing local time into an auditable procedure is how two records stop lining up.
 
 ## 0a. WORKING LIST — priority order as of 2026-09-10 16:20
 
@@ -44,6 +44,26 @@ instead of ~20. Full write-up: runbook **§10.1**.
 ⚠️ **The tool was pushed over the open gap (State A), not via media.** Expedient, and it bought
 E3 a week early — but **after cutover there is no network path**, so the documented route stays
 the transfer bundle. Do not let the shortcut become the procedure.
+
+**⚠️ THE VM CONSOLE NEVER WORKED — found and fixed 2026-09-11.** `vm-rescue.sh console` failed
+on every VM with `character device serial0 is not using a PTY`. Cause: `03-compose-vm.sh` asked
+for `--console pty` **and** `--serial file`, and libvirt **merges those into one device** (a
+`<console>` with `target type='serial'` is a *view* of serial0, not a second device) — the file
+definition won, so no VM had a pty at all. **Output only, nowhere to type.**
+
+**This was the stated recovery route for every risky change made on a VM** — the STIG lockout,
+the GRUB password, the USB toggle. It was false the whole time; what actually recovered the
+lockout was offline disk editing via `virt-customize`.
+
+| fix | state |
+|---|---|
+| `03-compose-vm.sh` → `--serial pty,log.file=...,log.append=on`, **and verifies the pty after defining** | ✅ done — the six k8s VMs will be born correct |
+| `vm-rescue.sh fix-console <vm>` — retrofits the **persistent** config, applies at next restart | ✅ done |
+| `vm-rescue.sh console` — detects a missing pty and explains what does work | ✅ done |
+| `svc-harbor-01` | ✅ **retrofitted, restarted, login prompt VERIFIED accepting input** |
+| `svc-repo-01` · `svc-mgmt-01` | ✅ config staged — ⬜ activate on next restart |
+
+runbook §6.3j.
 
 **Decisions blocking the remaining machines**
 

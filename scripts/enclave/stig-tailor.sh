@@ -1169,7 +1169,26 @@ cmd_grubpw() {
       echo
       warn "REBOOT IS THE TEST, and it is the only test. Confirm the machine comes back with"
       warn "  no keyboard, then confirm 'e' at the menu asks for a password."
-      warn "  Have the console route open first:  vm-rescue.sh console $me   (from host-4)"
+      # NAME THE RECOVERY ROUTE THAT EXISTS ON THIS MACHINE. The first version told host-4 to
+      # run `vm-rescue.sh console host-4` from host-4 - advice that is nonsense on the
+      # hypervisor, printed at the exact moment someone is deciding whether it is safe to
+      # reboot. A recovery instruction that is wrong is worse than none.
+      if [ "$(systemd-detect-virt 2>/dev/null || echo none)" = none ]; then
+        warn "  BARE METAL - there is no vm-rescue console here. Your routes are:"
+        if grep -q 'console=ttyS' /proc/cmdline 2>/dev/null; then
+          warn "    - the SERIAL console ($(grep -o 'console=ttyS[^ ]*' /proc/cmdline | head -1)),"
+          warn "      IF something is actually attached to that port. Verify that, do not assume it."
+        fi
+        if [ -e /dev/ipmi0 ] || [ -e /dev/ipmi/0 ]; then
+          warn "    - BMC serial-over-LAN (/dev/ipmi present)"
+        else
+          warn "    - NO BMC on this machine (no /dev/ipmi*), so otherwise: physical access."
+        fi
+        warn "    Do not reboot without one of those available."
+      else
+        warn "  Have the console route open first, FROM THE HYPERVISOR:"
+        warn "    ./scripts/enclave/vm-rescue.sh console $me"
+      fi
       ;;
 
     *) die "usage: $0 grubpw {status|prep|set}" ;;

@@ -570,6 +570,20 @@ copy costs ~600 MB each (measured: 607 MiB), 6 GB across the fleet against 1.9 T
 `ens3` on others. Guessing wrong yields a VM with no address *and* no default route —
 unreachable, recoverable only from a console.
 
+> ⚠️ **CORRECTION, 2026-09-11 — the console half of this was broken for a week.** The composer
+> asked for `--console pty,target_type=serial` **and** `--serial file,path=...`, which reads as
+> "both" and is not: in libvirt a `<console>` with `target type='serial'` is a **view** of the
+> first serial port, not a second device, so the two requests were reconciled and the **file**
+> definition won. Every VM came out with `<serial type='file'>` and **no pty**, meaning
+> `virsh console` failed with `character device serial0 is not using a PTY`. The log worked;
+> there was nowhere to type.
+>
+> `03-compose-vm.sh` now asks for a single device that does both —
+> `--serial pty,log.file=...,log.append=on` — and **verifies the pty exists after defining the
+> domain**, because the original failure was completely silent. Existing VMs are retrofitted
+> with `vm-rescue.sh fix-console <vm>`, which edits the persistent config so it applies at the
+> next restart. Full write-up: runbook §6.3j.
+
 ## 5d2. A shared tmux config, on every machine
 
 `host-4` is where most hands-on time goes, and the long jobs here — a 318 GB restore, an

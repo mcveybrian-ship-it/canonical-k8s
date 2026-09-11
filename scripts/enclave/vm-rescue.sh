@@ -5,6 +5,7 @@
 #   sudo ./vm-rescue.sh status   <vm>    what state is it in, and can we edit its disk
 #   sudo ./vm-rescue.sh password <vm>    reset the admin password OFFLINE
 #   sudo ./vm-rescue.sh console  <vm>    attach to the serial console (escape: Ctrl-])
+#   sudo ./vm-rescue.sh fix-console <vm> give a pre-2026-09-11 VM a real pty console
 #   sudo ./vm-rescue.sh nopasswd <vm>    restore NOPASSWD sudo - last resort, see below
 #
 # WHY THIS EXISTS:
@@ -188,8 +189,68 @@ cmd_console() {
   exec virsh console "$vm"
 }
 
+# ---------------------------------------------------------------------------- fix-console
+#
+# Retrofit a VM composed before 2026-09-11 so it has a real interactive console.
+#
+# Transforms the PERSISTENT config (dumpxml --inactive, not the live one) so the change
+# applies at the guest's next restart. `virsh define` on a running domain updates the stored
+# XML and leaves the running instance alone - so this can be done now and take effect with
+# whatever reboot is already planned, instead of forcing downtime on the DHCP/PXE machine.
+#
+# XML surgery in python rather than sed: the elements have children and the edit has to remove
+# <source> while adding <log>. A regex that gets this subtly wrong produces a domain that will
+# not define, on the tool you reach for when a VM is already broken.
+cmd_fix_console() {
+  local vm="${1:?usage: sudo $0 fix-console <vm>}"
+  need_root
+  command -v python3 >/dev/null 2>&1 || die "python3 is needed for the XML edit"
+
+  if virsh dumpxml --inactive "$vm" 2>/dev/null | grep -q "<serial type='pty'>"; then
+    ok "$vm already has a pty serial - nothing to do"
+    return 0
+  fi
+
+  local log="/var/lib/libvirt/images/console/$vm-console.log"
+  local tmp; tmp="$(mktemp)"; trap 'rm -f "$tmp"' RETURN
+  virsh dumpxml --inactive "$vm" > "$tmp" 2>/dev/null || die "cannot dump $vm - does it exist?"
+
+  python3 - "$tmp" "$log" <<'PYEOF' || die "XML transform failed - $vm NOT changed"
+import sys, xml.etree.ElementTree as ET
+path, logfile = sys.argv[1], sys.argv[2]
+tree = ET.parse(path); root = tree.getroot()
+dev = root.find('devices')
+changed = 0
+for tag in ('serial', 'console'):
+    for el in dev.findall(tag):
+        if el.get('type') != 'file':
+            continue
+        el.set('type', 'pty')
+        for src in el.findall('source'):
+            el.remove(src)
+        for old in el.findall('log'):
+            el.remove(old)
+        lg = ET.SubElement(el, 'log')
+        lg.set('file', logfile); lg.set('append', 'on')
+        for al in el.findall('alias'):   # libvirt assigns aliases itself
+            el.remove(al)
+        changed += 1
+if changed == 0:
+    sys.exit(1)
+tree.write(path)
+PYEOF
+
+  virsh define "$tmp" >/dev/null || die "virsh define rejected the edited XML - $vm unchanged"
+  ok "$vm persistent config updated: serial + console are now pty, logging to $log"
+  say ""
+  warn "TAKES EFFECT AT THE NEXT RESTART of $vm - the running guest is untouched."
+  say  "   sudo virsh shutdown $vm && sudo virsh start $vm"
+  say  "   then prove it:  sudo $0 console $vm"
+}
+
 case "${1:-}" in
   status)   shift; cmd_status "$@" ;;
+  fix-console) shift; cmd_fix_console "$@" ;;
   password) shift; cmd_password "$@" ;;
   nopasswd) shift; cmd_nopasswd "$@" ;;
   console)  shift; cmd_console "$@" ;;

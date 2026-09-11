@@ -981,6 +981,327 @@ EOF
   esac
 }
 
+# --------------------------------------------------------------------------------- v1r6
+#
+# THE DISA V1R6 RESIDUAL THAT `usg fix` DOES NOT TOUCH.
+#
+# `usg fix` remediates against Canonical's V1R1. Evaluate-STIG assesses against DISA V1R6,
+# and the gap is real: on a machine USG has finished with, V1R6 still reports ~14-20 Open.
+# Most are ordinary defects with mechanical fixes - they were hand-triaged on svc-mgmt-01
+# (20 Open -> 8) and were about to be hand-triaged again on svc-repo-01, and again on host-4.
+#
+# THREE TIMES BY HAND IS A PROCEDURE NOBODY CAN REPEAT. So the mechanical ones live here,
+# with the same plan / --apply / --verify shape as `fixups`.
+#
+# WHAT IS DELIBERATELY *NOT* HERE:
+#
+#   V-270675  GRUB password  - interactive by nature, and the hash must never be echoed. 6.3i
+#   V-270663/735/736/722     - the smart-card family. One missing subsystem, an AO decision
+#   V-270817/658             - audit offload. Blocked on svc-log-01 and three AO answers, 6.3d
+#   V-270751                 - chrony: unpassable in an air gap by design. Answer File, 10.1d
+#   V-270681, V-270699(dbus) - scanner false positives. Answer File, with the verbatim output
+#
+#   A fix that requires somebody to DECIDE does not belong in a script that applies fixes.
+#
+# EVERY CHECK BELOW IS DISA'S OWN CHECKTEXT, RUN VERBATIM - not a paraphrase of it. That is
+# what caught V-270681 and half of V-270699 as false positives: the scanner said Open, and
+# DISA's own command said otherwise.
+
+V1R6_GRUB_DROPIN=/etc/default/grub.d/99-zz-enclave-stig.cfg
+V1R6_AUDIT_RULES=/etc/audit/rules.d/99-enclave-stig.rules
+V1R6_JOURNAL_TMPFILES=/etc/tmpfiles.d/zzz-systemd-stig.conf
+V1R6_REBOOT_NEEDED=0
+
+# ---- the checks, each one DISA's command ------------------------------------------------
+v1r6_timesyncd_installed() {
+  # `deinstall ok config-files` STILL COUNTS AS INSTALLED to DISA's check. The package name
+  # is systemd-timesyncd, not timesyncd - `dpkg -s timesyncd` returns a false "none".
+  dpkg-query -W -f='${Status}' systemd-timesyncd 2>/dev/null | grep -q 'ok installed'
+}
+v1r6_nullok_files() {
+  grep -l 'nullok' /etc/pam.d/common-auth /usr/share/pam-configs/unix 2>/dev/null || true
+}
+v1r6_bad_libs() {
+  find /lib /lib64 /usr/lib /usr/lib64 -type f -name '*.so*' ! -group root \
+       -exec stat -c "%n %G" {} + 2>/dev/null || true
+}
+# EVERY ONE OF THESE READERS ENDS IN `|| true`, AND THAT IS LOAD-BEARING.
+#
+# `find` exits 1 after any permission-denied even when its output is complete; `grep -l`
+# exits 1 when nothing matches. Under `set -euo pipefail`, `local x; x="$(reader)"` with a
+# non-zero reader KILLS THE FUNCTION MID-REPORT - the caller sees a partial plan that looks
+# like a clean bill of health. That is precisely how `preflight` failed on 2026-09-10, it is
+# documented in 6.3f, and the first version of this function did it again.
+v1r6_sticky_missing() {
+  # DISA: world-writable directories must have the sticky bit. -xdev keeps it off the 321 GB
+  # mirror and host-4's 1.9 TB image store if they are separate filesystems.
+  find / -xdev \( -path /proc -o -path /sys -o -path /run \) -prune -o \
+       -type d -perm -0002 ! -perm -1000 -print 2>/dev/null || true
+}
+v1r6_cron_audit_ok() {
+  auditctl -l 2>/dev/null | grep -qw -- '-w /etc/cron.d' && \
+  auditctl -l 2>/dev/null | grep -qw -- '-w /var/spool/cron'
+}
+v1r6_audit_at_boot() { grep -qw 'audit=1' /proc/cmdline; }
+v1r6_journal_dirs()  { stat -c '%a %n' /var/log/journal /run/log/journal 2>/dev/null || true; }
+
+cmd_v1r6() {
+  local apply=0 verify=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --apply)  apply=1; shift ;;
+      --verify) verify=1; shift ;;
+      *) die "unknown argument: $1" ;;
+    esac
+  done
+  local me; me="$(hostname -s)"
+  [ "$apply" -eq 1 ] && need_root
+
+  printf '\n  DISA V1R6 residual on %s%s\n\n' "$me" \
+    "$([ "$apply" -eq 1 ] && echo ' - APPLYING' || echo ' - PLAN ONLY')"
+
+  local n_todo=0 failed=0
+
+  # ---- V-270645  systemd-timesyncd ------------------------------------------------------
+  printf '  V-270645  UBTU-24-100010  systemd-timesyncd must not be installed\n'
+  if v1r6_timesyncd_installed; then
+    n_todo=$((n_todo+1))
+    if [ "$apply" -eq 1 ]; then
+      # PURGE, not remove. `remove` leaves config-files state, which DISA still reads as
+      # installed - that is the whole trap in this control.
+      DEBIAN_FRONTEND=noninteractive apt-get purge -y systemd-timesyncd >/dev/null 2>&1 \
+        && ok "   purged" || { warn "   purge FAILED"; failed=1; }
+      systemctl is-active chrony >/dev/null 2>&1 \
+        && ok "   chrony still active - time keeps working" \
+        || { warn "   CHRONY IS NOT ACTIVE - this machine has no time source"; failed=1; }
+    else
+      say "   state: INSTALLED -> apt-get purge -y systemd-timesyncd"
+      say "          (purge, not remove: 'deinstall ok config-files' still reads as installed)"
+    fi
+  else
+    ok "   not installed"
+  fi
+
+  # ---- V-270750  the scanner's own 0777 directory, and sticky bits ----------------------
+  printf '\n  V-270750  UBTU-24-600150  sticky bit on public directories\n'
+  if [ -d /tmp/.dotnet ]; then
+    n_todo=$((n_todo+1))
+    if [ "$apply" -eq 1 ]; then
+      rm -rf /tmp/.dotnet && ok "   removed /tmp/.dotnet - PowerShell's own 0777 litter"
+    else
+      say "   /tmp/.dotnet  $(stat -c '%a' /tmp/.dotnet)  <- THE SCANNER CREATED THIS FINDING"
+      say "          pwsh writes it 0777 on every run. Remove it after scanning, not before."
+    fi
+  fi
+  local sticky; sticky="$(v1r6_sticky_missing)"
+  if [ -n "$sticky" ]; then
+    n_todo=$((n_todo+1))
+    printf '%s\n' "$sticky" | sed 's/^/       /'
+    if [ "$apply" -eq 1 ]; then
+      printf '%s\n' "$sticky" | while IFS= read -r d; do chmod a+t "$d" 2>/dev/null; done
+      [ -z "$(v1r6_sticky_missing)" ] && ok "   sticky bit set" \
+        || { warn "   some directories still lack it"; failed=1; }
+    else
+      say "   -> chmod a+t on each"
+    fi
+  else
+    ok "   every world-writable directory has the sticky bit"
+  fi
+
+  # ---- V-270699  library group ownership ------------------------------------------------
+  printf '\n  V-270699  UBTU-24-300009  shared libraries group-owned by root\n'
+  local badlibs; badlibs="$(v1r6_bad_libs)"
+  if [ -n "$badlibs" ]; then
+    n_todo=$((n_todo+1))
+    printf '%s\n' "$badlibs" | sed 's/^/       /'
+    say "   NOTE: the scanner also reports /usr/lib/dbus-1.0/dbus-daemon-launch-helper."
+    say "         That is NOT a *.so file, so DISA's own find does not return it, and it is"
+    say "         setgid messagebus - chowning it BREAKS D-Bus. Answer-File it, do not fix it."
+    if [ "$apply" -eq 1 ]; then
+      find /lib /lib64 /usr/lib /usr/lib64 -type f -name '*.so*' ! -group root \
+           -exec chown :root {} + 2>/dev/null
+      [ -z "$(v1r6_bad_libs)" ] && ok "   group set to root" \
+        || { warn "   some files still not group root"; failed=1; }
+    else
+      say "   -> find ... ! -group root -exec chown :root {} +   (DISA's FixText verbatim)"
+    fi
+  else
+    ok "   DISA's find returns nothing"
+  fi
+
+  # ---- V-270714  nullok -----------------------------------------------------------------
+  printf '\n  V-270714  UBTU-24-300028  PAM must not permit empty passwords (HIGH)\n'
+  local nullok; nullok="$(v1r6_nullok_files)"
+  if [ -n "$nullok" ]; then
+    n_todo=$((n_todo+1))
+    printf '%s\n' "$nullok" | sed 's/^/       carries nullok: /'
+    # THE GATE, BEFORE TOUCHING A PAM AUTH STACK ON A HEADLESS MACHINE.
+    local np; np="$(awk -F: '{print $1}' /etc/passwd | while read -r u; do
+        [ "$(passwd -S "$u" 2>/dev/null | awk '{print $2}')" = "NP" ] && echo "$u"
+      done || true)"
+    if [ -n "$np" ]; then
+      warn "   ACCOUNTS WITH NO PASSWORD - removing nullok LOCKS THESE OUT:"
+      printf '%s\n' "$np" | sed 's/^/         /'
+      warn "   REFUSING. Give them a password or lock them deliberately first."
+      failed=1
+    else
+      ok "   no NP accounts - removing nullok cannot lock anyone out"
+      if [ "$apply" -eq 1 ]; then
+        # BOTH FILES OR NEITHER. common-auth alone is undone by the next pam-auth-update;
+        # the pam-configs source alone does nothing until common-auth is regenerated.
+        local f
+        for f in /etc/pam.d/common-auth /usr/share/pam-configs/unix; do
+          [ -f "$f" ] || continue
+          backup_file "$f"
+          sed -i 's/[[:space:]]\{1,\}nullok//g' "$f"
+        done
+        pam-auth-update --force >/dev/null 2>&1 || warn "   pam-auth-update reported an error"
+        if [ -z "$(v1r6_nullok_files)" ]; then
+          ok "   nullok removed from both files, pam-auth-update re-run"
+          warn "   VERIFY NOW, in this session:  sudo -k; sudo -v"
+          warn "   /usr/share/pam-configs/unix is a PACKAGE file, not a conffile - a"
+          warn "   libpam-runtime upgrade reinstates nullok. Re-run --verify after upgrades."
+        else
+          warn "   nullok STILL PRESENT after the edit"; failed=1
+        fi
+      else
+        say "   -> strip nullok from BOTH files, then pam-auth-update --force"
+        say "      neither edit works alone - see runbook 10.1d"
+      fi
+    fi
+  else
+    ok "   no nullok in common-auth or pam-configs/unix"
+  fi
+
+  # ---- V-270676  audit=1 at boot --------------------------------------------------------
+  printf '\n  V-270676  UBTU-24-102010  session audits must start at boot\n'
+  if v1r6_audit_at_boot; then
+    ok "   audit=1 on /proc/cmdline"
+  else
+    n_todo=$((n_todo+1))
+    if [ "$apply" -eq 1 ]; then
+      # A GRUB.D DROP-IN, NEVER /etc/default/grub. On a cloud image
+      # 50-cloudimg-settings.cfg hard-assigns GRUB_CMDLINE_LINUX_DEFAULT and silently
+      # discards anything set earlier - see the grub trap in 6.3.
+      install -d -m 0755 /etc/default/grub.d
+      if grep -q 'audit=1' "$V1R6_GRUB_DROPIN" 2>/dev/null; then
+        ok "   already in $V1R6_GRUB_DROPIN - pending reboot"
+      else
+        printf '# audit=1 for UBTU-24-102010. Written by stig-tailor.sh %s\n' "$(date -Is)" \
+          >> "$V1R6_GRUB_DROPIN"
+        printf 'GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT audit=1"\n' \
+          >> "$V1R6_GRUB_DROPIN"
+        update-grub >/dev/null 2>&1 && ok "   $V1R6_GRUB_DROPIN written, update-grub done" \
+          || { warn "   update-grub FAILED"; failed=1; }
+      fi
+      V1R6_REBOOT_NEEDED=1
+    else
+      say "   state: audit=1 NOT on the kernel command line"
+      say "   -> $V1R6_GRUB_DROPIN + update-grub, then REBOOT"
+      say "      NOT /etc/default/grub - 50-cloudimg-settings.cfg discards that silently"
+    fi
+  fi
+
+  # ---- V-274870  cron audit rules -------------------------------------------------------
+  printf '\n  V-274870  UBTU-24-200270  audit anything cron runs as root\n'
+  if v1r6_cron_audit_ok; then
+    ok "   both watches loaded"
+  else
+    n_todo=$((n_todo+1))
+    if [ "$apply" -eq 1 ]; then
+      if ! grep -q 'cronjobs' "$V1R6_AUDIT_RULES" 2>/dev/null; then
+        cat >> "$V1R6_AUDIT_RULES" <<'RULES'
+# UBTU-24-200270 / V-274870 - audit anything cron runs as root. DISA FixText verbatim.
+-w /etc/cron.d/ -p wa -k cronjobs
+-w /var/spool/cron/ -p wa -k cronjobs
+RULES
+        chmod 0640 "$V1R6_AUDIT_RULES"
+        ok "   rules written to $V1R6_AUDIT_RULES"
+      fi
+      augenrules --load >/dev/null 2>&1 || true
+      if v1r6_cron_audit_ok; then
+        ok "   loaded live"
+      else
+        # auditd IN IMMUTABLE MODE (-e 2) REFUSES RULE CHANGES UNTIL REBOOT. That is not a
+        # failure - it is the control working. Say which it is rather than reporting an error.
+        if auditctl -s 2>/dev/null | grep -q 'enabled 2'; then
+          warn "   auditd is IMMUTABLE (-e 2) - rules are on disk and load at REBOOT"
+          V1R6_REBOOT_NEEDED=1
+        else
+          warn "   rules did not load and auditd is not immutable - investigate"; failed=1
+        fi
+      fi
+    else
+      say "   state: MISSING -> two -w watches in $V1R6_AUDIT_RULES"
+      say "          auditd is immutable, so this needs a REBOOT, not a reload"
+    fi
+  fi
+
+  # ---- V-270757  journal directory permissions ------------------------------------------
+  printf '\n  V-270757  UBTU-24-700020  journal must not reveal information\n'
+  v1r6_journal_dirs | sed 's/^/       /'
+  if v1r6_journal_dirs | awk '{print $1}' | grep -qv '^640$'; then
+    n_todo=$((n_todo+1))
+    if [ "$apply" -eq 1 ]; then
+      # DISA names this exact filename. MEASURED on svc-mgmt-01: it wins over
+      # /usr/lib/tmpfiles.d/systemd.conf's `Z ... ~2750` despite sorting later. Reasoning
+      # about tmpfiles precedence got this wrong; measuring got it right.
+      cat > "$V1R6_JOURNAL_TMPFILES" <<'TMPF'
+# UBTU-24-700020 / V-270757. DISA's FixText names this filename; it overrides
+# /usr/lib/tmpfiles.d/systemd.conf's `Z /var/log/journal ~2750`, measured 2026-09-11.
+z /var/log/journal 0640 root systemd-journal - -
+z /run/log/journal 0640 root systemd-journal - -
+TMPF
+      chmod 0644 "$V1R6_JOURNAL_TMPFILES"
+      systemd-tmpfiles --create >/dev/null 2>&1 || true
+      v1r6_journal_dirs | sed 's/^/       now: /'
+      systemctl is-active systemd-journald >/dev/null 2>&1 \
+        && ok "   journald still active" \
+        || { warn "   JOURNALD IS NOT ACTIVE"; failed=1; }
+      warn "   reboot verification owed - DISA says restart for these to take effect"
+      V1R6_REBOOT_NEEDED=1
+    else
+      say "   -> $V1R6_JOURNAL_TMPFILES + systemd-tmpfiles --create"
+      say "      0640 on a directory drops the x bit. It costs nothing here: usg fix already"
+      say "      made journalctl non-executable by non-root, so non-root reading was already"
+      say "      impossible. Confirm that on THIS machine before believing it."
+    fi
+  else
+    ok "   both directories are 0640"
+  fi
+
+  # ---- what is left, and who has to decide it -------------------------------------------
+  printf '\n  NOT HANDLED HERE - each needs a decision, not a command:\n'
+  say "   V-270675           GRUB password - interactive. runbook 6.3i"
+  say "   V-270663/735/736   smart card / CAC family - one missing subsystem, AO question"
+  say "   V-270722/745       DoD PKI + smart-card login - same family"
+  say "   V-270817 / 658     audit offload - svc-log-01, blocked on three AO answers (6.3d)"
+  say "   V-270751           chrony - unpassable in an air gap by design. Answer File (10.1d)"
+  say "   V-270681           rsyslog selectors - SCANNER FALSE POSITIVE. DISA's own grep"
+  say "                      returns both required lines. Answer File with that output."
+  say "   V-270754           ufw rate-limit - the 443 decision (6.3e)"
+
+  printf '\n'
+  ok "v1r6 report COMPLETE - if you did not see this line it exited early and the report"
+  ok "  above is PARTIAL. A partial report reads exactly like a clean one."
+  if [ "$verify" -eq 1 ]; then
+    # --verify IS the plan, scored. Same checks, but it exits non-zero when anything is
+    # outstanding so it can gate a re-scan or run from another script.
+    printf '\n'
+    if [ "$n_todo" -eq 0 ]; then ok "VERIFY PASSED - nothing mechanical left on $me"; return 0
+    else warn "VERIFY FAILED - $n_todo item(s) outstanding"; return 1; fi
+  fi
+  if [ "$apply" -eq 0 ]; then
+    say "$n_todo item(s) to fix. Nothing changed. Re-run with --apply"
+  else
+    [ "$failed" -eq 0 ] || warn "one or more fixes did not complete - see above"
+    [ "$V1R6_REBOOT_NEEDED" -eq 0 ] \
+      || warn "REBOOT REQUIRED - grub and/or audit rules. Then: sudo $0 v1r6 --verify"
+    say "then re-scan: runbook 10.1 step 13d"
+  fi
+  printf '\n'
+}
+
 # -------------------------------------------------------------------------------- aide
 #
 # KEEP AIDE OFF THE BULK DATA - AND DECIDE IT BEFORE `usg fix`, NOT AFTER.
@@ -1584,7 +1905,8 @@ case "${1:-}" in
   usb)      shift; cmd_usb "$@" ;;
   ufw)      shift; cmd_ufw "$@" ;;
   aide)     shift; cmd_aide "$@" ;;
+  v1r6)     shift; cmd_v1r6 "$@" ;;
   audit)    shift; cmd_audit "$@" ;;
   show)     shift; cmd_show "$@" ;;
-  *) printf 'usage: %s {generate|audit|show|preflight|aide {status|exclude [--apply]|init}|fixups [...]|ufw [--apply]|usb {status|enable|disable}}\n' "$0" >&2; exit 2 ;;
+  *) printf 'usage: %s {generate|audit|show|preflight|aide {status|exclude [--apply]|init}|v1r6 [--apply|--verify]|fixups [...]|ufw [--apply]|usb {status|enable|disable}}\n' "$0" >&2; exit 2 ;;
 esac

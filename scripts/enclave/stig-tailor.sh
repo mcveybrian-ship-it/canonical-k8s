@@ -1541,8 +1541,23 @@ DROPIN
 -w /etc/cron.d/ -p wa -k cronjobs
 -w /var/spool/cron/ -p wa -k cronjobs
 RULES
-        chmod 0640 "$V1R6_AUDIT_RULES"
-        ok "   rules written to $V1R6_AUDIT_RULES"
+        # 0600, NOT 0640. USG's file_permissions_etc_audit_rulesd says, verbatim:
+        #   "$ sudo chmod 0600 /etc/audit/rules.d/*.rules"
+        # The file arrives 0600 anyway from root's umask 077, and an explicit chmod 0640 here
+        # BROKE a rule that had been passing - a V1R6 fix that opened a V1R1 finding. Adding a
+        # file to a directory the STIG measures means matching that directory's required mode,
+        # not a mode that looks reasonable.
+        chmod 0600 "$V1R6_AUDIT_RULES"
+        ok "   rules written to $V1R6_AUDIT_RULES ($(stat -c '%a' "$V1R6_AUDIT_RULES"))"
+        # Prove it matches its neighbours rather than assuming chmod was enough.
+        local odd
+        odd="$(find /etc/audit/rules.d -maxdepth 1 -type f -name '*.rules' ! -perm 0600 \
+                 -exec stat -c '%a %n' {} + 2>/dev/null || true)"
+        if [ -n "$odd" ]; then
+          warn "   these are not 0600 and WILL fail file_permissions_etc_audit_rulesd:"
+          printf '%s\n' "$odd" | sed 's/^/         /'
+          failed=1
+        fi
       fi
       augenrules --load >/dev/null 2>&1 || true
       if v1r6_cron_audit_ok; then

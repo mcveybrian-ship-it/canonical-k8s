@@ -243,8 +243,13 @@ PYEOF
   virsh define "$tmp" >/dev/null || die "virsh define rejected the edited XML - $vm unchanged"
   ok "$vm persistent config updated: serial + console are now pty, logging to $log"
   say ""
-  warn "TAKES EFFECT AT THE NEXT RESTART of $vm - the running guest is untouched."
-  say  "   sudo virsh shutdown $vm && sudo virsh start $vm"
+  warn "THE DOMAIN MUST BE STOPPED AND STARTED - a reboot INSIDE the guest is NOT enough."
+  say  "   \`virsh define\` updated the persistent config, but a guest-initiated reboot keeps the"
+  say  "   same qemu process, so the device list is unchanged. libvirt only rebuilds the process"
+  say  "   on a full stop/start. Verified the hard way on svc-repo-01, 2026-09-11."
+  say  ""
+  say  "   sudo virsh shutdown $vm      # wait for it to be shut off"
+  say  "   sudo virsh start $vm"
   say  "   then prove it:  sudo $0 console $vm"
 }
 

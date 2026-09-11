@@ -995,9 +995,14 @@ $(printf '%s\n' "$cand" | sed 's/^/        /')"
       # false all-clear on the check that decides whether a service survives. So when the
       # exact name misses, look for installed packages CONTAINING the token and flag them
       # for a human. An unresolved name is reported, never silently dropped.
+      # `|| true` IS LOAD-BEARING. dpkg-query exits 1 when the glob matches nothing, and under
+      # `set -euo pipefail` a failing command substitution in an assignment aborts the whole
+      # function SILENTLY - preflight printed its "PACKAGES" header and then simply stopped,
+      # with no error and no exit code visible to the operator. Found on svc-repo-01
+      # 2026-09-11, on the first run after this fuzzy fallback was added.
       local matches
       matches="$(dpkg-query -W -f='${Package} ${Status}\n' "*${name}*" 2>/dev/null \
-                 | awk '$NF=="installed" {print $1}' | tr '\n' ' ')"
+                 | awk '$NF=="installed" {print $1}' | tr '\n' ' ' || true)"
       if [ -n "${matches// /}" ]; then
         warn "  $rule -> no package literally named '$name', but INSTALLED and similar:$matches"
         say  "     VERIFY BY HAND which one the rule means before running fix"
@@ -1087,6 +1092,9 @@ $(printf '%s\n' "$cand" | sed 's/^/        /')"
   say "NOTE: the package and service checks only catch rules whose id names the target. A rule"
   say "that breaks something as a side effect of a SETTING - like the NOPASSWD strip above -"
   say "will not appear in them. The baseline audit and the failing list still matter."
+  say ""
+  ok "preflight complete - if you did not see this line, it exited early and the report is"
+  ok "  INCOMPLETE. Do not run \`usg fix\` on a partial preflight."
 }
 
 # ---------------------------------------------------------------------------- ufw

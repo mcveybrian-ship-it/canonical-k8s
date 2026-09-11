@@ -112,10 +112,24 @@ say "bridge  : $BRIDGE"
 
 # ---- disk --------------------------------------------------------------------------------
 run install -d -m 0711 "$POOL/seed"
-# Log the serial console to a file as well as the pty. A VM with no default route that fails
-# to bring up networking is invisible: no ssh, and 'virsh console' needs an interactive root
-# session on the host. Without this the only evidence of what went wrong is gone the moment
-# nobody was watching. Costs nothing; answers the question every time.
+# Log the serial console to a file AND keep an interactive pty. A VM with no default route
+# that fails to bring up networking is invisible: no ssh, and the log is the only evidence of
+# what went wrong once nobody is watching.
+#
+# THIS WAS HALF-BROKEN UNTIL 2026-09-11 AND NOBODY NOTICED FOR A WEEK.
+#   --console pty,target_type=serial   +   --serial file,path=...
+# looks like "both", and is not. In libvirt a <console> with target type='serial' is a VIEW of
+# the first serial port, not a second device - they share alias serial0 - so the two requests
+# were reconciled and the FILE definition won. Every VM came out with:
+#     <serial type='file'> ... <console type='file'>
+# and NO pty at all. `virsh console` then fails with
+#     error: internal error: character device serial0 is not using a PTY
+# meaning no VM in the enclave had an interactive console: nothing could type a GRUB password,
+# drive a rescue shell, or answer an fsck prompt. The recovery route the runbook advertised
+# did not exist. See runbook 6.3j.
+#
+# The fix is ONE device that does both - a pty with a <log> child, supported by libvirt >=1.3.3
+# (host has 10.0.0) and exposed by virt-install 4.1.0 as log.file / log.append.
 LOGDIR="$POOL/console"
 run install -d -m 0755 "$LOGDIR"
 # The log is written by qemu, which recreates it under its own umask - so pre-creating it
@@ -371,7 +385,7 @@ virt-install \
   --network "bridge=$BRIDGE,model=virtio" \
   --graphics none \
   --console pty,target_type=serial \
-  --serial "file,path=$LOGDIR/$VM-console.log" \
+  --serial "pty,log.file=$LOGDIR/$VM-console.log,log.append=on" \
   --import --noautoconsole
 ok "defined and started"
 
@@ -382,6 +396,16 @@ ok "autostart enabled"
 chmod 0644 "$LOGDIR/$VM-console.log" 2>/dev/null \
   && ok "console log readable: $LOGDIR/$VM-console.log" \
   || warn "could not chmod the console log - it will need sudo to read"
+
+# PROVE THE PTY EXISTS. The whole point of the change above is an interactive console, and the
+# failure mode is silent - the VM runs perfectly and you find out only when you need it most.
+if virsh dumpxml "$VM" 2>/dev/null | grep -q "<serial type='pty'>"; then
+  ok "interactive console present - virsh console $VM will work"
+else
+  warn "NO PTY SERIAL - 'virsh console $VM' will fail with 'not using a PTY'."
+  warn "  This VM has no interactive console. Offline disk editing (vm-rescue.sh) is the only"
+  warn "  way back if it will not boot. See runbook 6.3j."
+fi
 
 say ""
 say "cloud-init takes a minute or two. Watch it:"

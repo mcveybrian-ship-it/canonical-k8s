@@ -153,6 +153,35 @@ cmd_nopasswd() {
 
 cmd_console() {
   local vm="${1:?usage: sudo $0 console <vm>}"
+
+  # CHECK FOR A PTY FIRST. Until 2026-09-11 every VM here was composed with a FILE-backed
+  # serial and no pty, so this subcommand died with libvirt's
+  #     error: internal error: character device serial0 is not using a PTY
+  # which tells the operator nothing about what to do instead. Worse, the runbook advertised
+  # this as THE recovery route for a VM that will not boot - so the message matters at exactly
+  # the moment someone is in trouble. runbook 6.3j.
+  if ! virsh dumpxml "$vm" 2>/dev/null | grep -q "<serial type='pty'>"; then
+    warn "$vm HAS NO INTERACTIVE CONSOLE."
+    say  "   Its serial device is file-backed, so there is output but nowhere to type."
+    say  "   virsh console would fail with: character device serial0 is not using a PTY"
+    say  ""
+    say  "   READ the boot output (no input possible):"
+    say  "     sudo tail -f /var/lib/libvirt/images/console/$vm-console.log"
+    say  ""
+    say  "   RECOVER by editing the disk offline - this DOES work and is what was used for the"
+    say  "   STIG lockout (runbook 6.3a):"
+    say  "     sudo $0 password $vm"
+    say  "     sudo $0 nopasswd $vm"
+    say  ""
+    say  "   FIX IT PERMANENTLY - needs the guest shut down, then reboot it:"
+    say  "     sudo virsh shutdown $vm"
+    say  "     sudo virsh edit $vm     # <serial type='file'> -> type='pty', keep a <log> child"
+    say  "     sudo virsh start $vm"
+    say  "   New VMs get this right: 03-compose-vm.sh now asks for"
+    say  "     --serial pty,log.file=...,log.append=on"
+    return 1
+  fi
+
   say "attaching to $vm - escape is Ctrl-]"
   say "if nothing appears, press Enter; the console only shows output since you attached."
   say "history is in /var/lib/libvirt/images/console/$vm-console.log"

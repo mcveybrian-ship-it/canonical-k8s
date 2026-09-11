@@ -76,7 +76,26 @@ $(echo "$DIRTY" | sed 's/^/       /')
   fi
 fi
 
-SSH_OPTS=(-i "$KEY" -o BatchMode=yes -o ConnectTimeout=10)
+# ONE TCP CONNECTION FOR THE WHOLE RUN, because the targets are firewalled now.
+#
+# This script makes five separate ssh calls: reachability, the tar stream, the file count,
+# the executable test, and the version stamp. `ufw limit 22/tcp` - which stig-tailor.sh puts
+# on every machine with a rule table - REJECTS a source after six connections in thirty
+# seconds. On 2026-09-11 that locked stage-01 out of svc-repo-01 immediately after the push,
+# and "Connection refused" reads like the host is down rather than like the firewall doing
+# exactly what it was configured to do.
+#
+# ControlMaster collapses all five onto one connection, so the limiter never sees a burst.
+# The socket lives in a private directory and is closed on exit, including on failure.
+CTL_DIR="$(mktemp -d "${TMPDIR:-/tmp}/push-repo.XXXXXX")"
+CTL="$CTL_DIR/ctl-%%C"
+cleanup() {
+  ssh -o ControlPath="$CTL" -O exit "$USER_NAME@$TARGET" 2>/dev/null || true
+  rm -rf "$CTL_DIR"
+}
+trap cleanup EXIT
+SSH_OPTS=(-i "$KEY" -o BatchMode=yes -o ConnectTimeout=10
+          -o ControlMaster=auto -o ControlPath="$CTL" -o ControlPersist=60)
 ssh "${SSH_OPTS[@]}" "$USER_NAME@$TARGET" true 2>/dev/null \
   || die "cannot ssh to $USER_NAME@$TARGET with $KEY"
 

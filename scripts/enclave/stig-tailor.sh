@@ -981,6 +981,192 @@ EOF
   esac
 }
 
+# ------------------------------------------------------------------------------- grubpw
+#
+# V-270675 / UBTU-24-102000 (HIGH) and USG's grub2_uefi_password - the GRUB password.
+#
+# TWO STEPS, AND THE ORDER IS THE WHOLE POINT.
+#
+#   prep - put `--unrestricted` in /etc/grub.d/10_linux
+#   set  - set superusers and the password hash
+#
+# `set superusers="root"` makes GRUB require authentication to **BOOT EVERY ENTRY**, not just
+# to edit one. `--unrestricted` on the menu entry class is what restores unattended boot while
+# keeping the editor locked - and **DISA's FixText does not mention it at all.** Follow DISA
+# verbatim on a headless machine and it does not come back from a reboot; on svc-repo-01 that
+# is the box every other machine installs from, and nothing in the enclave could install the
+# fix because svc-repo-01 IS the source of the fix.
+#
+# So `set` REFUSES until `prep` has run. That is a guard, not a note.
+#
+# THE PASSWORD IS NOT THIS SCRIPT'S BUSINESS.
+#
+#   It is one password for the whole enclave, held in the customer's controlled document, and
+#   deliberately nowhere in this repository - not host-params.env, not a parameter, not a
+#   comment. This script reads it from the terminal with `read -rsp`, pipes it straight into
+#   grub-mkpasswd-pbkdf2, and never echoes it or the hash.
+#
+#   Generate the hash HERE rather than copying one from another machine: pbkdf2 salts randomly,
+#   so both verify the same password, but a pasted hash travels through shell history and a
+#   clipboard and a generated one does not.
+#
+# WHY grub-mkpasswd-pbkdf2 IS PIPED AND NOT PROMPTED:
+#
+#   Its prompts go to STDOUT. `grub-mkpasswd-pbkdf2 > file` therefore captures the prompt and
+#   leaves the operator at a blind cursor that also swallows Ctrl-C. That happened on
+#   2026-09-10. Feed it on stdin instead and the prompt never matters.
+
+GRUB_10_LINUX=/etc/grub.d/10_linux
+GRUB_CUSTOM=/etc/grub.d/40_custom
+
+# ANCHORED TO THE CLASS LINE, not just "the word appears somewhere". 10_linux is 18 KB of
+# shell; a comment mentioning --unrestricted would otherwise read as "already configured",
+# and `set` would then happily lock the bootloader on a headless machine. The CLASS variable
+# is what every generated menu entry's --class list comes from, so that line is the one that
+# decides whether the machine boots unattended.
+grubpw_unrestricted_ok() { grep -qE '^CLASS=.*--unrestricted' "$GRUB_10_LINUX" 2>/dev/null; }
+grubpw_pw_count()        { grep -c '^password_pbkdf2' "$GRUB_CUSTOM" 2>/dev/null || echo 0; }
+grubpw_su_count()        { grep -c '^set superusers' "$GRUB_CUSTOM" 2>/dev/null || echo 0; }
+
+cmd_grubpw() {
+  local action="${1:-status}"
+  local me; me="$(hostname -s)"
+
+  case "$action" in
+    status)
+      printf '\n  GRUB password on %s\n\n' "$me"
+      if grubpw_unrestricted_ok; then
+        ok "--unrestricted present in $GRUB_10_LINUX"
+        grep -nE '^CLASS=' "$GRUB_10_LINUX" | sed 's/^/       /'
+      else
+        warn "--unrestricted ABSENT from $GRUB_10_LINUX"
+        say  "   setting a password now would make GRUB demand it to BOOT."
+        say  "   run:  sudo $0 grubpw prep"
+      fi
+      if [ "$(id -u)" -eq 0 ]; then
+        say "superusers lines:      $(grubpw_su_count)"
+        say "password_pbkdf2 lines: $(grubpw_pw_count)   (want exactly 1)"
+        if [ -f /boot/grub/grub.cfg ]; then
+          say "in the generated config: superusers=$(grep -c 'superusers' /boot/grub/grub.cfg) unrestricted=$(grep -c 'unrestricted' /boot/grub/grub.cfg)"
+        fi
+      else
+        warn "run as root to read $GRUB_CUSTOM and grub.cfg - both are root-only, and an"
+        warn "  unprivileged read returns EMPTY, which looks exactly like 'not configured'"
+      fi
+      echo
+      ;;
+
+    prep)
+      need_root
+      if grubpw_unrestricted_ok; then
+        ok "--unrestricted already in $GRUB_10_LINUX - nothing to do"
+        return 0
+      fi
+      # The CLASS variable is what every menu entry's --class list comes from. Appending
+      # --unrestricted there covers every generated entry rather than one of them.
+      grep -n '^CLASS=' "$GRUB_10_LINUX" | sed 's/^/       before: /'
+      backup_file "$GRUB_10_LINUX"
+      sed -i -E 's|^(CLASS=".*)(")$|\1 --unrestricted\2|' "$GRUB_10_LINUX"
+      grep -n '^CLASS=' "$GRUB_10_LINUX" | sed 's/^/       after:  /'
+      if ! grubpw_unrestricted_ok; then
+        warn "the edit did not take. Restoring and stopping."
+        [ -n "${LAST_BACKUP:-}" ] && cp -a "$LAST_BACKUP" "$GRUB_10_LINUX"
+        die "could not add --unrestricted to $GRUB_10_LINUX - do it by hand, runbook 6.3i"
+      fi
+      # 10_linux is a SHELL SCRIPT that grub-mkconfig executes. Syntax-check it, the same way
+      # /etc/default/grub gets sh -n - a boot generator that cannot parse is a machine whose
+      # grub.cfg can never be regenerated.
+      if ! sh -n "$GRUB_10_LINUX" 2>/dev/null; then
+        sh -n "$GRUB_10_LINUX" 2>&1 | sed 's/^/       /'
+        [ -n "${LAST_BACKUP:-}" ] && cp -a "$LAST_BACKUP" "$GRUB_10_LINUX"
+        die "$GRUB_10_LINUX failed sh -n - RESTORED from backup"
+      fi
+      ok "$GRUB_10_LINUX passes sh -n"
+      ok "prep done. Now: sudo $0 grubpw set"
+      say "   NOTE: 10_linux is a PACKAGE file. A grub-common upgrade replaces it and drops"
+      say "   --unrestricted, which turns the next reboot into a password prompt on a headless"
+      say "   box. Re-check with \`grubpw status\` after any grub-common upgrade."
+      ;;
+
+    set)
+      need_root
+      grubpw_unrestricted_ok || die "REFUSING - --unrestricted is not in $GRUB_10_LINUX.
+       Setting superusers now makes GRUB demand the password to BOOT, not just to edit an
+       entry, and this machine is headless. Run: sudo $0 grubpw prep"
+
+      local n_pw; n_pw="$(grubpw_pw_count)"
+      if [ "$n_pw" -gt 0 ]; then
+        warn "$GRUB_CUSTOM already has $n_pw password_pbkdf2 line(s)."
+        say  "   Re-running would add a second. Remove the existing block first, or leave it."
+        return 1
+      fi
+
+      # READ IT TWICE, SILENTLY, AND NEVER ECHO IT.
+      local P P2
+      read -rsp '  GRUB password (enclave-wide, from the controlled document): ' P; echo
+      read -rsp '  again: ' P2; echo
+      [ -n "$P" ] || die "empty password - refusing"
+      [ "$P" = "$P2" ] || die "the two entries do not match - nothing was changed"
+
+      # PIPED, NOT PROMPTED - its prompts go to stdout and would be captured.
+      local H
+      H="$(printf '%s\n%s\n' "$P" "$P" | grub-mkpasswd-pbkdf2 2>/dev/null \
+            | awk '/PBKDF2 hash/{print $NF}')"
+      P=""; P2=""
+      case "$H" in
+        grub.pbkdf2.sha512.*) ok "hash generated (${#H} chars, not shown)" ;;
+        *) die "grub-mkpasswd-pbkdf2 produced nothing usable - nothing was changed" ;;
+      esac
+
+      backup_file "$GRUB_CUSTOM"
+      # APPEND EXACTLY ONCE AND COUNT. An earlier hand-run of this appended twice and the
+      # second block carried an EMPTY hash, because $H had already been unset - a machine that
+      # would have accepted no password at all. Counting is what caught it.
+      printf 'set superusers="root"\npassword_pbkdf2 root %s\n' "$H" >> "$GRUB_CUSTOM"
+      H=""
+      local su pw; su="$(grubpw_su_count)"; pw="$(grubpw_pw_count)"
+      say "   $GRUB_CUSTOM now: $su superusers line(s), $pw password line(s)"
+      if [ "$su" -ne 1 ] || [ "$pw" -ne 1 ]; then
+        warn "expected exactly one of each - RESTORING"
+        [ -n "${LAST_BACKUP:-}" ] && cp -a "$LAST_BACKUP" "$GRUB_CUSTOM"
+        die "$GRUB_CUSTOM had the wrong line count - restored, nothing applied"
+      fi
+      # An empty hash is the specific failure worth naming.
+      if grep -qE '^password_pbkdf2 root[[:space:]]*$' "$GRUB_CUSTOM"; then
+        [ -n "${LAST_BACKUP:-}" ] && cp -a "$LAST_BACKUP" "$GRUB_CUSTOM"
+        die "the password line has NO HASH - restored. This would accept any password."
+      fi
+
+      local ug_out ug_rc=0
+      ug_out="$(update-grub 2>&1)" || ug_rc=$?
+      printf '%s\n' "$ug_out" | sed 's/^/       /'
+      [ "$ug_rc" -eq 0 ] || die "update-grub failed (exit $ug_rc) - output above"
+
+      # PROVE BOTH HALVES REACHED THE GENERATED CONFIG. superusers without unrestricted is a
+      # machine that will not boot unattended, and that is discovered at the rack.
+      local g_su g_un
+      g_su="$(grep -c 'superusers' /boot/grub/grub.cfg 2>/dev/null || echo 0)"
+      g_un="$(grep -c 'unrestricted' /boot/grub/grub.cfg 2>/dev/null || echo 0)"
+      say "   /boot/grub/grub.cfg: superusers=$g_su  unrestricted=$g_un"
+      if [ "$g_su" -lt 1 ]; then
+        die "superusers did NOT reach grub.cfg - do not reboot, investigate 40_custom"
+      fi
+      if [ "$g_un" -lt 1 ]; then
+        warn "unrestricted did NOT reach grub.cfg. DO NOT REBOOT - this machine would stop"
+        warn "at a password prompt. Revert 40_custom from $LAST_BACKUP and re-run update-grub."
+        return 1
+      fi
+      ok "both present - unattended boot preserved, editor locked"
+      echo
+      warn "REBOOT IS THE TEST, and it is the only test. Confirm the machine comes back with"
+      warn "  no keyboard, then confirm 'e' at the menu asks for a password."
+      warn "  Have the console route open first:  vm-rescue.sh console $me   (from host-4)"
+      ;;
+
+    *) die "usage: $0 grubpw {status|prep|set}" ;;
+  esac
+}
+
 # --------------------------------------------------------------------------------- v1r6
 #
 # THE DISA V1R6 RESIDUAL THAT `usg fix` DOES NOT TOUCH.
@@ -2037,7 +2223,8 @@ case "${1:-}" in
   ufw)      shift; cmd_ufw "$@" ;;
   aide)     shift; cmd_aide "$@" ;;
   v1r6)     shift; cmd_v1r6 "$@" ;;
+  grubpw)   shift; cmd_grubpw "$@" ;;
   audit)    shift; cmd_audit "$@" ;;
   show)     shift; cmd_show "$@" ;;
-  *) printf 'usage: %s {generate|audit|show|preflight|aide {status|exclude [--apply]|init}|v1r6 [--apply|--verify]|fixups [...]|ufw [--apply]|usb {status|enable|disable}}\n' "$0" >&2; exit 2 ;;
+  *) printf 'usage: %s {generate|audit|show|preflight|aide {status|exclude [--apply]|init}|v1r6 [--apply|--verify]|grubpw {status|prep|set}|fixups [...]|ufw [--apply]|usb {status|enable|disable}}\n' "$0" >&2; exit 2 ;;
 esac

@@ -1260,7 +1260,16 @@ cmd_v1r6() {
       else
         ok "   $V1R6_GRUB_DROPIN already carries it"
       fi
-      if update-grub >/dev/null 2>&1; then
+      # THE DROP-IN MUST BE 0644. root's umask is 077 after `usg fix`, so a bare `printf >>`
+      # creates it 0600 - readable by grub-mkconfig (which is root) but inconsistent with
+      # every other file in grub.d and invisible to any later non-root inspection.
+      chmod 0644 "$V1R6_GRUB_DROPIN"
+      # AND DO NOT SWALLOW update-grub. Third time in one night that hiding a command's
+      # output turned a legible error into "FAILED" with no reason attached.
+      local ug_out ug_rc=0
+      ug_out="$(update-grub 2>&1)" || ug_rc=$?
+      printf '%s\n' "$ug_out" | sed 's/^/       /'
+      if [ "$ug_rc" -eq 0 ]; then
         # PROVE IT REACHED THE GENERATED CONFIG - DISA checks that too, and this is the step
         # where a discarded /etc/default/grub edit shows up.
         if grep -q 'audit=1' /boot/grub/grub.cfg 2>/dev/null; then
@@ -1271,7 +1280,8 @@ cmd_v1r6() {
           failed=1
         fi
       else
-        warn "   update-grub FAILED"; failed=1
+        warn "   update-grub FAILED (exit $ug_rc) - output above. NOT rebooting on this."
+        failed=1
       fi
       V1R6_REBOOT_NEEDED=1
     else

@@ -1286,6 +1286,11 @@ v1r6_audit_at_boot() {
     && ! v1r6_audit_default_grub | grep -v 'audit=1' | grep -q 'GRUB_CMDLINE'
 }
 v1r6_journal_dirs()  { stat -c '%a %n' /var/log/journal /run/log/journal 2>/dev/null || true; }
+# CHECKING THE DIRECTORIES WAS NOT ENOUGH. V-270757 is about directory modes and V-270762 is
+# about FILE group ownership, and the fix for the first broke the second. Report both.
+v1r6_journal_badfiles() {
+  find /run/log/journal /var/log/journal -type f ! -group systemd-journal 2>/dev/null || true
+}
 
 cmd_v1r6() {
   local apply=0 verify=0
@@ -1600,21 +1605,59 @@ RULES
   # ---- V-270757  journal directory permissions ------------------------------------------
   printf '\n  V-270757  UBTU-24-700020  journal must not reveal information\n'
   v1r6_journal_dirs | sed 's/^/       /'
-  if v1r6_journal_dirs | awk '{print $1}' | grep -qv '^640$'; then
+  local jbad; jbad="$(v1r6_journal_badfiles)"
+  if [ -n "$jbad" ]; then
+    say "   $(printf '%s\n' "$jbad" | grep -c .) journal FILE(s) not group systemd-journal - that is V-270762,"
+    say "   caused by setting the directory 0640, which strips the setgid bit journald relies on."
+  fi
+  if v1r6_journal_dirs | awk '{print $1}' | grep -qv '^640$' || [ -n "$jbad" ]; then
     n_todo=$((n_todo+1))
     if [ "$apply" -eq 1 ]; then
       # DISA names this exact filename. MEASURED on svc-mgmt-01: it wins over
       # /usr/lib/tmpfiles.d/systemd.conf's `Z ... ~2750` despite sorting later. Reasoning
       # about tmpfiles precedence got this wrong; measuring got it right.
+      # DISA'S FIXTEXT IS FOUR LINES. THE FIRST VERSION WROTE TWO, AND THAT MANUFACTURED A
+      # SECOND FINDING.
+      #
+      # `z <dir> 0640` sets the DIRECTORY and nothing else. Setting a journal directory to
+      # 0640 strips the setgid bit that /usr/lib/tmpfiles.d/systemd.conf's `~2750` carried -
+      # and setgid is what made journald's NEW files inherit group systemd-journal. Without
+      # it they land with the creating process's group, which is root, and that is
+      # UBTU-24-700070 / V-270762 ("files used by the system journal must be group-owned by
+      # systemd-journal").
+      #
+      # Measured on svc-mgmt-01 2026-09-11: every journal file written AFTER the two-line
+      # version was applied had group root; every file before it had systemd-journal. All
+      # four machines were left in that state.
+      #
+      # The `Z ... %m` lines are RECURSIVE and set group ownership, which is what keeps the
+      # files right. They are in DISA's FixText for BOTH controls. Apply it whole, not the
+      # half that happens to satisfy the control you were looking at.
       cat > "$V1R6_JOURNAL_TMPFILES" <<'TMPF'
-# UBTU-24-700020 / V-270757. DISA's FixText names this filename; it overrides
-# /usr/lib/tmpfiles.d/systemd.conf's `Z /var/log/journal ~2750`, measured 2026-09-11.
-z /var/log/journal 0640 root systemd-journal - -
+# UBTU-24-700020 / V-270757 AND UBTU-24-700070 / V-270762 - DISA's FixText for both,
+# complete. This filename is the one DISA names; it overrides
+# /usr/lib/tmpfiles.d/systemd.conf's `Z /var/log/journal ~2750` (measured 2026-09-11).
+#
+# The `z` lines set the top-level directories. The `Z ... %m` lines are RECURSIVE and set
+# group ownership on the journal FILES - without them, 0640 on the directory strips setgid
+# and journald starts writing files owned by group root.
 z /run/log/journal 0640 root systemd-journal - -
+Z /run/log/journal/%m ~0640 root systemd-journal - -
+z /var/log/journal 0640 root systemd-journal - -
+Z /var/log/journal/%m ~0640 root systemd-journal - -
 TMPF
       chmod 0644 "$V1R6_JOURNAL_TMPFILES"
       systemd-tmpfiles --create >/dev/null 2>&1 || true
       v1r6_journal_dirs | sed 's/^/       now: /'
+      local badf; badf="$(v1r6_journal_badfiles)"
+      if [ -n "$badf" ]; then
+        warn "   $(printf '%s\n' "$badf" | grep -c .) journal file(s) still not group systemd-journal:"
+        printf '%s\n' "$badf" | head -5 | sed 's/^/         /'
+        warn "   that is V-270762. The Z lines should have corrected them - investigate."
+        failed=1
+      else
+        ok "   all journal files are group systemd-journal (V-270762)"
+      fi
       systemctl is-active systemd-journald >/dev/null 2>&1 \
         && ok "   journald still active" \
         || { warn "   JOURNALD IS NOT ACTIVE"; failed=1; }

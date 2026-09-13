@@ -203,9 +203,8 @@ cmd_fetch() {
 
   # THE EVIDENCE DIRECTORY BELONGS TO THE OPERATOR, NOT TO root.
   #
-  # The scan runs under sudo but the `| tee` that captures its log does NOT - tee is the
-  # unprivileged half of the pipeline. A root-owned 0755 directory therefore fails the log
-  # write while the scan itself succeeds, which is a confusing way to lose the evidence.
+  # The scan runs under sudo and writes every checklist as root with umask 077, so the CKLB
+  # and CSV land 0600 root:root. The operator then cannot copy them off the machine at all.
   # This is the same friction as /var/lib/usg being root-only (runbook 6.0 step 14); no
   # reason to reproduce it in a directory we create ourselves.
   install -d -m 0755 "$DEST"
@@ -285,11 +284,12 @@ $(find "$TMPD" -maxdepth 2 | head -12 | sed 's/^/       /')
 
   say ""
   ok "ready. Scan with:"
-  say "   cd $DEST/Evaluate-STIG"
-  say "   sudo bash Evaluate-STIG_Bash.sh --NoUpstream \\"
-  say "     --PSPath $DEST/$PWSH_DIR \\"
-  say "     --SelectSTIG Ubuntu24 --Output Summary,CKLB,CombinedCSV \\"
-  say "     --OutputPath $EVIDENCE 2>&1 | tee $EVIDENCE/scan-$me-\$(date +%Y%m%dT%H%M).log"
+  say "   sudo $0 scan"
+  say ""
+  say "   Use that rather than calling Evaluate-STIG_Bash.sh by hand. It auto-detects every"
+  say "   applicable STIG (a bare --SelectSTIG Ubuntu24 assesses the OS and NOTHING else),"
+  say "   does not pipe the output - a pipe hides Write-Progress and the scan looks hung -"
+  say "   cleans up /tmp/.dotnet, and leaves the evidence readable so step 14 can collect it."
   [ -f "$DEST/$(basename "$ANSWERFILE")" ] \
     && say "   ... and add:  --AFPath $DEST" \
     || warn "no Answer File here - from stage-01: sudo ./stig-tools.sh answers $me"
@@ -367,27 +367,42 @@ cmd_scan() {
   [ "$missing" -eq 0 ] || die "prerequisites missing - see above. sudo $0 fetch"
 
   install -d -m 0755 -o "$owner" "$EVIDENCE" 2>/dev/null || install -d -m 0755 "$EVIDENCE"
-  local log; log="$EVIDENCE/scan-$me-$(date +%Y%m%dT%H%M).log"
 
-  say "scanning $me - about 7-11 minutes, printing as it goes"
-  say "log: $log"
+  # SAY WHAT WILL BE ASSESSED, BEFORE SPENDING 15 MINUTES ON IT.
+  #
+  # --ListApplicableProducts runs the same detection the scan uses and prints the result
+  # without scanning. It is how you find out a machine has a second product on it -
+  # svc-mgmt-01's PostgreSQL went unassessed for days because nobody asked this question.
+  say "detecting what applies to $me ..."
+  ( cd "$DEST/Evaluate-STIG" && bash Evaluate-STIG_Bash.sh --NoUpstream \
+      --PSPath "$DEST/$PWSH_DIR" --ListApplicableProducts 2>&1 ) | sed 's/^/       /'
   say ""
-  # `tee`, NEVER `| tail` - tail buffers the whole run and prints at the end, so a ten-minute
-  # scan looks hung. runbook 6.3k.
+
   local sel_arg=()
   if [ -n "$stig" ]; then
     sel_arg=(--SelectSTIG "$stig")
     warn "NARROWED to --SelectSTIG $stig - this assesses that product ONLY."
     warn "  Anything else installed here is not looked at. Drop --stig for the full picture."
   else
-    say "auto-detecting applicable STIGs (no --SelectSTIG)"
+    say "auto-detecting applicable STIGs - everything listed above will be assessed"
   fi
+  say "this takes 7-15 minutes, longer with more than one STIG"
+  say ""
+
+  # DO NOT PIPE THIS. Evaluate-STIG reports progress with Write-Progress, which writes to
+  # PowerShell's PROGRESS STREAM, not stdout. Put a pipe in the way - `| tee`, `| tail`,
+  # anything - and the progress display vanishes: earlier runs printed "STIGs to process - 1"
+  # and then nothing for eleven minutes, which reads as hung.
+  #
+  # tee was never needed. The tool writes its own detailed log to
+  # <OutputPath>/<HOSTNAME>/Evaluate-STIG.log - 150 KB of it - so the record already exists
+  # and is better than a console capture. Let the progress render on the terminal.
   ( cd "$DEST/Evaluate-STIG" && bash Evaluate-STIG_Bash.sh --NoUpstream \
       --PSPath "$DEST/$PWSH_DIR" \
       "${sel_arg[@]}" \
       "${af_arg[@]}" \
       --Output Summary,CKLB,CombinedCSV \
-      --OutputPath "$EVIDENCE" 2>&1 ) | tee "$log"
+      --OutputPath "$EVIDENCE" )
 
   say ""
   # ---- clean up after the tool ----------------------------------------------------------
@@ -445,6 +460,9 @@ if op:
 else:
     print("\n  nothing Open.")
 PY
+  local toollog
+  toollog="$(find "$EVIDENCE" -name 'Evaluate-STIG.log' -newermt '-90 minutes' 2>/dev/null | head -1)"
+  [ -n "$toollog" ] && say "the tool's own log: $toollog ($(du -h "$toollog" | cut -f1))"
   say ""
   ok "scan complete. Copy the evidence off with, FROM stage-01:"
   say "   scp -i ~/.ssh/build01 -r encadmin@<this machine>:$EVIDENCE/$(echo "$me" | tr '[:lower:]' '[:upper:]') ."

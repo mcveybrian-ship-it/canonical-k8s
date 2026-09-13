@@ -2316,12 +2316,14 @@ $(printf '%s\n' "$cand" | sed 's/^/        /')"
 
 ufw_rules() {
 cat <<'EOF'
-svc-repo-01	22/tcp	limit	ssh - safe to rate-limit, and what the rule is really aimed at
-svc-repo-01	80/tcp	allow	nginx 301 redirect only; kept so a plaintext client gets a redirect rather than a timeout
-svc-repo-01	443/tcp	allow	THE MIRROR - 318 GB of apt over TLS, plus /keys /debs /snaps /maas-images. LIMIT here throttles apt for every machine in the enclave
-svc-harbor-01	22/tcp	limit	ssh
-svc-harbor-01	80/tcp	allow	NO-OP under Docker - docker-proxy DNATs this, so ufw INPUT never sees it. Kept for the day Harbor runs host-network. runbook 6.3e
-svc-harbor-01	443/tcp	allow	NO-OP under Docker - same reason. ufw on this host protects ssh and postfix, NOT the registry ports. Say so in the findings register
+svc-repo-01	22/tcp	limit	any	ssh - safe to rate-limit, and what the rule is really aimed at
+svc-repo-01	80/tcp	allow	any	nginx 301 redirect only; kept so a plaintext client gets a redirect rather than a timeout
+svc-repo-01	443/tcp	allow	any	THE MIRROR - 318 GB of apt over TLS, plus /keys /debs /snaps /maas-images. LIMIT here throttles apt for every machine in the enclave
+svc-repo-01	9100/tcp	allow	__SVC_OBS_01__	node-exporter. SOURCE-RESTRICTED to the collector - metrics name every mount, interface, process count and kernel version on the box, and there is no reason for anything but svc-obs-01 to read them
+svc-harbor-01	22/tcp	limit	any	ssh
+svc-harbor-01	80/tcp	allow	any	NO-OP under Docker - docker-proxy DNATs this, so ufw INPUT never sees it. Kept for the day Harbor runs host-network. runbook 6.3e
+svc-harbor-01	443/tcp	allow	any	NO-OP under Docker - same reason. ufw on this host protects ssh and postfix, NOT the registry ports. Say so in the findings register
+svc-harbor-01	9100/tcp	allow	__SVC_OBS_01__	node-exporter, source-restricted to the collector - same reasoning as svc-repo-01
 EOF
 }
 
@@ -2346,7 +2348,19 @@ cmd_ufw() {
       baseline audit has never been taken."
   fi
 
-  local mine; mine="$(ufw_rules | awk -F'\t' -v m="$me" '$1==m')"
+  # __SVC_OBS_01__ resolves from enclave-addresses.env, the single source of truth for who is
+  # at which address. Hardcoding the collector's IP in this table would put the same address in
+  # a second place and guarantee they drift.
+  local obs="${SVC_OBS_01:-}"
+  local mine; mine="$(ufw_rules | sed "s|__SVC_OBS_01__|${obs}|g" | awk -F'\t' -v m="$me" '$1==m')"
+
+  # A SOURCE-RESTRICTED RULE WITH NO SOURCE IS A RULE OPEN TO EVERYTHING. If the address is
+  # unset the substitution leaves an empty field, `ufw allow from  to any port 9100` becomes
+  # `ufw allow 9100`, and a port meant for one host is open to the enclave. Refuse instead.
+  if printf '%s\n' "$mine" | awk -F'\t' '$4=="" {found=1} END {exit !found}'; then
+    die "a rule for $me has an EMPTY source field - SVC_OBS_01 is probably unset in
+       enclave-addresses.env. Refusing: an empty source silently becomes 'from anywhere'."
+  fi
   if [ -z "$mine" ]; then
     die "no ufw rule table for '$me'.
       This machine is deliberately not covered - see the comment above ufw_rules().
@@ -2356,8 +2370,8 @@ cmd_ufw() {
   fi
 
   printf '\n  ufw plan for %s\n\n' "$me"
-  printf '  %-10s %-7s %s\n' PORT ACTION WHY
-  printf '%s\n' "$mine" | awk -F'\t' '{printf "  %-10s %-7s %s\n", $2, $3, $4}'
+  printf '  %-10s %-7s %-14s %s\n' PORT ACTION FROM WHY
+  printf '%s\n' "$mine" | awk -F'\t' '{printf "  %-10s %-7s %-14s %s\n", $2, $3, $4, $5}'
 
   # Anything EXTERNALLY BOUND that the table does not mention is either surface to remove or
   # a rule we forgot. Say which - do not silently firewall a service into the dark.
@@ -2424,11 +2438,21 @@ cmd_ufw() {
   ufw --force reset >/dev/null 2>&1 || true
   ufw default deny incoming >/dev/null   # set_ufw_default_rule
   ufw default allow outgoing >/dev/null
-  local port action why
-  while IFS=$'\t' read -r _ port action why; do
+  local port action src why
+  while IFS=$'\t' read -r _ port action src why; do
     [ -n "${port:-}" ] || continue
-    ufw "$action" "$port" >/dev/null || die "ufw $action $port failed"
-    ok "ufw $action $port   ($why)"
+    if [ "$src" = any ]; then
+      ufw "$action" "$port" >/dev/null || die "ufw $action $port failed"
+      ok "ufw $action $port   ($why)"
+    else
+      # `from <ip> to any port <n>` - ufw's own syntax. The port number must be bare here,
+      # so strip the /tcp and pass the protocol separately.
+      local pnum proto
+      pnum="${port%%/*}"; proto="${port#*/}"
+      ufw "$action" from "$src" to any port "$pnum" proto "$proto" >/dev/null \
+        || die "ufw $action from $src to any port $pnum proto $proto failed"
+      ok "ufw $action $port from $src   ($why)"
+    fi
   done < <(printf '%s\n' "$mine")
 
   ufw --force enable >/dev/null && ok "ufw enabled"

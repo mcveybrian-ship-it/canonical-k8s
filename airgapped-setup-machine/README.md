@@ -93,12 +93,12 @@ runbook §6.3j.
 
 | What | Why it matters |
 |---|---|
-| **AO thread — 10 questions** | **The only item where the clock runs whether you work or not.** Three decide hardware purchases; one (retention) sizes `svc-log-01`'s disk, which decides whether it fits on `host-4` at all; and **does the programme run STIG Manager?** — that one decides whether E6 gets built or replaced by a feed |
+| **AO thread — 12 questions** | **The only item where the clock runs whether you work or not.** Three decide hardware purchases; one (retention) sizes `svc-log-01`'s disk, which decides whether it fits on `host-4` at all; and **does the programme run STIG Manager?** — that one decides whether E6 gets built or replaced by a feed **+2 added 2026-09-13:** does the programme supply a **reference clock** (closes the chrony pair on `host-4` with no client change), and which **PostgreSQL benchmark** applies — now narrowed by HANDOFF §3a to Crunchy 16 vs the Database SRG |
 | **Root-CA: verify on the drive, then `shred -u /srv/ca-backup/*`** | Until the shred **the root key is on a network-attached VM**. Use the one-liner in runbook §2.9b — the `.sha256` holds a BARE hash |
 | **Close the gap** | `gap-state.sh close` + unplug port 4. `stage-01` is multi-homed to the internet AND the enclave right now |
 | `ceph-csi` on deb-deployed Ceph | Untested and load-bearing on the storage design. A lab test, not a paper question |
 | Steps 06–10 | Cluster VMs, k8s bootstrap, storage, validation, day-2 patching — unwritten |
-| ⏰ **2026-09-11 14:00 UTC = 09:00 Central** | Reminder fires: audit-volume 24h delta, the hollow UBTU-24-100450 pass, and the three log questions for the AO. *(Originally set to 09:00 **UTC** — which was 04:00 his time. Schedule in Central, store in UTC.)* |
+| ~~⏰ 2026-09-11 reminder~~ | ✅ fired. The audit-volume sample was **lost to a reboot** (written to `/tmp`); replaced by `audit-volume.sh` with an hourly systemd timer on harbor and repo. ⬜ still owed on `svc-mgmt-01` and `host-4` |
 
 **STAGE-01's build work is DONE. The enclave is currently in STATE A (BUILD), not gapped.**
 

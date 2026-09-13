@@ -333,11 +333,12 @@ $(find "$TMPD" -maxdepth 2 | head -12 | sed 's/^/       /')
 #
 # --stig <shortname> narrows it deliberately when you want a fast re-check of one product.
 cmd_scan() {
-  local me stig=""
+  local me stig="" deprecated=0 failed_scan=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --stig) stig="${2:?--stig needs a shortname, e.g. Ubuntu24}"; shift 2 ;;
       --stig=*) stig="${1#--stig=}"; shift ;;
+      --allow-deprecated) deprecated=1; shift ;;
       *) die "unknown argument: $1" ;;
     esac
   done
@@ -378,6 +379,13 @@ cmd_scan() {
       --PSPath "$DEST/$PWSH_DIR" --ListApplicableProducts 2>&1 ) | sed 's/^/       /'
   say ""
 
+  local dep_arg=()
+  if [ "$deprecated" -eq 1 ]; then
+    dep_arg=(--AllowDeprecated)
+    warn "--AllowDeprecated: SUNSET benchmarks will be assessed."
+    warn "  A sunset STIG is one DISA has RETIRED. Results are evidence of nothing on their"
+    warn "  own - say in the artefact why you ran it and against what."
+  fi
   local sel_arg=()
   if [ -n "$stig" ]; then
     sel_arg=(--SelectSTIG "$stig")
@@ -400,6 +408,7 @@ cmd_scan() {
   ( cd "$DEST/Evaluate-STIG" && bash Evaluate-STIG_Bash.sh --NoUpstream \
       --PSPath "$DEST/$PWSH_DIR" \
       "${sel_arg[@]}" \
+      "${dep_arg[@]}" \
       "${af_arg[@]}" \
       --Output Summary,CKLB,CombinedCSV \
       --OutputPath "$EVIDENCE" )
@@ -424,11 +433,38 @@ cmd_scan() {
   find "$EVIDENCE" -type f -exec chmod u+rw {} + 2>/dev/null || true
   # A MULTI-STIG SCAN PRODUCES A CHECKLIST PER PRODUCT. Say how many, and name them - the
   # whole point of auto-detect is finding products you did not think to look for.
-  local n_ckl
-  n_ckl="$(find "$EVIDENCE" -name '*.cklb' -newermt '-60 minutes' 2>/dev/null | wc -l)"
+  # ONLY Checklist/, NEVER the whole tree. Evaluate-STIG rotates the previous run into
+  # Previous/<timestamp>/, so a recursive find counts a stale checklist from an earlier scan
+  # and reports 2 when the current run produced 1. It did exactly that on svc-mgmt-01.
+  local ckldir n_ckl
+  ckldir="$(find "$EVIDENCE" -maxdepth 2 -type d -name Checklist 2>/dev/null | head -1)"
+  n_ckl="$(find "$ckldir" -maxdepth 1 -name '*.cklb' 2>/dev/null | wc -l)"
   say "checklists produced: $n_ckl"
-  find "$EVIDENCE" -name '*.cklb' -newermt '-60 minutes' 2>/dev/null \
-    | sed 's|.*/||; s/^/       /' | sort
+  find "$ckldir" -maxdepth 1 -name '*.cklb' 2>/dev/null | sed 's|.*/||; s/^/       /' | sort
+
+  # A STIG THAT WAS DETECTED AND THEN SKIPPED IS THE FINDING, NOT A FOOTNOTE.
+  #
+  # svc-mgmt-01 detected PostgreSQL, printed "STIGs to process - 2", produced ONE checklist,
+  # and this wrapper reported success. The tool had logged
+  #     Utilizing Preference: AllowDeprecated false
+  #     Unable to process PgSQL9x - skipping
+  # because DISA has SUNSET the PostgreSQL 9.x STIG. A product that is installed, detected,
+  # and not assessed is precisely the gap --SelectSTIG was hiding - so say it loudly.
+  local tl skipped
+  tl="$(find "$EVIDENCE" -maxdepth 2 -name 'Evaluate-STIG.log' 2>/dev/null | head -1)"
+  if [ -n "$tl" ]; then
+    skipped="$(grep -oE 'Unable to process [A-Za-z0-9_.-]+ - skipping' "$tl" 2>/dev/null \
+                | sed 's/Unable to process //; s/ - skipping//' | sort -u || true)"
+    if [ -n "$skipped" ]; then
+      warn "DETECTED BUT NOT ASSESSED: $(printf '%s' "$skipped" | tr '\n' ' ')"
+      warn "  The tool found the product and refused the benchmark - almost always because"
+      warn "  DISA has SUNSET that STIG. Check the detection list above for DISAStatus."
+      warn "  This is a COVERAGE GAP, not a pass. Options: obtain the current STIG and put"
+      warn "  its xccdf in $DEST/Evaluate-STIG/StigContent/Manual/, or re-run with"
+      warn "  --allow-deprecated and state in the artefact that the benchmark is retired."
+      failed_scan=1
+    fi
+  fi
   local csv
   csv="$(find "$EVIDENCE" -name '*COMBINED*.csv' -newermt '-30 minutes' 2>/dev/null | sort | tail -1)"
   if [ -z "$csv" ]; then
@@ -464,6 +500,13 @@ PY
   toollog="$(find "$EVIDENCE" -name 'Evaluate-STIG.log' -newermt '-90 minutes' 2>/dev/null | head -1)"
   [ -n "$toollog" ] && say "the tool's own log: $toollog ($(du -h "$toollog" | cut -f1))"
   say ""
+  if [ "$failed_scan" -ne 0 ]; then
+    warn "scan finished with a COVERAGE GAP - see DETECTED BUT NOT ASSESSED above."
+    say ""
+    say "   Copy the evidence off with, FROM stage-01:"
+    say "     scp -i ~/.ssh/build01 -r encadmin@<this machine>:$EVIDENCE/$(echo "$me" | tr '[:lower:]' '[:upper:]') ."
+    return 1
+  fi
   ok "scan complete. Copy the evidence off with, FROM stage-01:"
   say "   scp -i ~/.ssh/build01 -r encadmin@<this machine>:$EVIDENCE/$(echo "$me" | tr '[:lower:]' '[:upper:]') ."
 }

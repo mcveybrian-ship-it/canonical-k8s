@@ -8,9 +8,23 @@ this section, this section wins and the other one gets fixed.
 
 Last updated **2026-09-11 02:40 UTC** (2026-09-10 21:40 Central). All timestamps in this repo are **UTC** — every enclave machine runs UTC and the audit logs are UTC, so mixing local time into an auditable procedure is how two records stop lining up.
 
-## 0a. WORKING LIST — priority order as of 2026-09-11 00:50 UTC (2026-09-10 19:50 Central)
+## 0a. WORKING LIST — priority order as of 2026-09-13 20:35 UTC (15:35 Central)
 
 **Read this for "what next". The tables below record state; this records order.**
+
+**ALL FOUR MACHINES ARE HARDENED AND MEASURED BY BOTH SCANNERS — 2026-09-13.**
+
+| machine | USG | V1R6 Open |
+|---|---|---|
+| `host-4` | 210 / 7 | **4** |
+| `svc-harbor-01` | 210 / 7 ⚠️ stale | **5** |
+| `svc-mgmt-01` | 209 / 7 ⚠️ stale | **5** |
+| `svc-repo-01` | **212 / 5** | **4** |
+
+**Five distinct open controls across the whole enclave, all AO decisions:** the smart-card
+family (V-270663 · V-270735 · V-270736 — one missing subsystem, three controls), `ufw` on the
+machines that cannot safely run it (V-270655), and audit offload (V-270817). **Zero actionable
+findings anywhere.** Runbook §10.1.
 
 **Finish what is in flight**
 

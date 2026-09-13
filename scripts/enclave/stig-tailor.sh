@@ -1367,6 +1367,19 @@ v1r6_journal_dirs()  { stat -c '%a %n' /var/log/journal /run/log/journal 2>/dev/
 v1r6_journal_badfiles() {
   find /run/log/journal /var/log/journal -type f ! -group systemd-journal 2>/dev/null || true
 }
+# ACCEPTED vs ACTUALLY WRONG - and the difference is documented, so the check must know it.
+#
+# V-270757 forbids setgid on the journal directories (the scanner's `-perm /7137` catches it),
+# and setgid is what made journald set the group. So files created between tmpfiles runs land
+# root:root 0640. That is STRICTER than the systemd-journal group this control asks for, it is
+# answered in the answer file on exactly that basis, and runbook 10.1 carries the measurement.
+#
+# So `root` at 0640-or-tighter is the accepted state. Anything else - a different group, or
+# group-write, or any world bit - is a real finding and must fail.
+v1r6_journal_reallywrong() {
+  find /run/log/journal /var/log/journal -type f ! -group systemd-journal \
+       \( ! -group root -o -perm /0027 \) 2>/dev/null || true
+}
 
 cmd_v1r6() {
   local apply=0 verify=0
@@ -1681,12 +1694,17 @@ RULES
   # ---- V-270757  journal directory permissions ------------------------------------------
   printf '\n  V-270757  UBTU-24-700020  journal must not reveal information\n'
   v1r6_journal_dirs | sed 's/^/       /'
-  local jbad; jbad="$(v1r6_journal_badfiles)"
+  local jbad jreal; jbad="$(v1r6_journal_badfiles)"; jreal="$(v1r6_journal_reallywrong)"
   if [ -n "$jbad" ]; then
-    say "   $(printf '%s\n' "$jbad" | grep -c .) journal FILE(s) not group systemd-journal - that is V-270762,"
-    say "   caused by setting the directory 0640, which strips the setgid bit journald relies on."
+    say "   $(printf '%s\n' "$jbad" | grep -c .) journal FILE(s) not group systemd-journal - V-270762."
+    if [ -n "$jreal" ]; then
+      say "   AND $(printf '%s\n' "$jreal" | grep -c .) of them are looser than root/0640 - a real finding."
+    else
+      say "   All are root:root 0640, which is STRICTER than the control asks. Accepted and"
+      say "   answered - V-270757 forbids the setgid bit journald needed. runbook 10.1."
+    fi
   fi
-  if v1r6_journal_dirs | awk '{print $1}' | grep -qv '^640$' || [ -n "$jbad" ]; then
+  if v1r6_journal_dirs | awk '{print $1}' | grep -qv '^640$' || [ -n "$jreal" ]; then
     n_todo=$((n_todo+1))
     if [ "$apply" -eq 1 ]; then
       # DISA names this exact filename. MEASURED on svc-mgmt-01: it wins over
@@ -1725,12 +1743,16 @@ TMPF
       chmod 0644 "$V1R6_JOURNAL_TMPFILES"
       systemd-tmpfiles --create >/dev/null 2>&1 || true
       v1r6_journal_dirs | sed 's/^/       now: /'
-      local badf; badf="$(v1r6_journal_badfiles)"
-      if [ -n "$badf" ]; then
-        warn "   $(printf '%s\n' "$badf" | grep -c .) journal file(s) still not group systemd-journal:"
-        printf '%s\n' "$badf" | head -5 | sed 's/^/         /'
-        warn "   that is V-270762. The Z lines should have corrected them - investigate."
+      local badf really; badf="$(v1r6_journal_badfiles)"; really="$(v1r6_journal_reallywrong)"
+      if [ -n "$really" ]; then
+        warn "   journal file(s) neither systemd-journal NOR root/0640 - a REAL V-270762:"
+        printf '%s\n' "$really" | head -5 | sed 's/^/         /'
         failed=1
+      elif [ -n "$badf" ]; then
+        ok "   $(printf '%s\n' "$badf" | grep -c .) journal file(s) are root:root 0640 - ACCEPTED"
+        say "     V-270757 forbids setgid on the directory, which is what made journald set"
+        say "     the group. root at 0640 is STRICTER than systemd-journal at 0640. Answered"
+        say "     in the answer file on that basis - runbook 10.1."
       else
         ok "   all journal files are group systemd-journal (V-270762)"
       fi

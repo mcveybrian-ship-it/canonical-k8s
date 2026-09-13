@@ -318,8 +318,30 @@ $(find "$TMPD" -maxdepth 2 | head -12 | sed 's/^/       /')
 # It also prints the tally, so nobody has to paste a python heredoc at a prompt to find out
 # what the scan said.
 
+# AUTO-DETECT BY DEFAULT. `--SelectSTIG Ubuntu24` ASSESSES THE OS AND NOTHING ELSE.
+#
+# Every scan up to 2026-09-13 passed `--SelectSTIG Ubuntu24`, so four machines were measured
+# against the operating system STIG only. svc-mgmt-01 runs PostgreSQL 16 as MAAS's database and
+# it was never assessed - the bundle ships U_PGS_SQL_9-x_STIG_V2R5 and a real
+# Scan-PostgreSQL9-x_Checks module, so it was assessable the whole time and simply never
+# selected.
+#
+# Evaluate-STIG detects what applies. Test-IsPostgresInstalled requires BOTH a running
+# postgres/postmaster process AND a matching apt package; Test-IsRKE2Installed will matter once
+# the cluster exists. Omitting --SelectSTIG lets it decide, which is the behaviour an assessor
+# expects: "what is on this machine", not "what did you choose to look at".
+#
+# --stig <shortname> narrows it deliberately when you want a fast re-check of one product.
 cmd_scan() {
-  local me; me="$(hostname -s)"
+  local me stig=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --stig) stig="${2:?--stig needs a shortname, e.g. Ubuntu24}"; shift 2 ;;
+      --stig=*) stig="${1#--stig=}"; shift ;;
+      *) die "unknown argument: $1" ;;
+    esac
+  done
+  me="$(hostname -s)"
   case "$me" in
     stage-01|build-01)
       die "scan does not run on $me - it is outside the ATO boundary. Run it ON the machine
@@ -352,9 +374,17 @@ cmd_scan() {
   say ""
   # `tee`, NEVER `| tail` - tail buffers the whole run and prints at the end, so a ten-minute
   # scan looks hung. runbook 6.3k.
+  local sel_arg=()
+  if [ -n "$stig" ]; then
+    sel_arg=(--SelectSTIG "$stig")
+    warn "NARROWED to --SelectSTIG $stig - this assesses that product ONLY."
+    warn "  Anything else installed here is not looked at. Drop --stig for the full picture."
+  else
+    say "auto-detecting applicable STIGs (no --SelectSTIG)"
+  fi
   ( cd "$DEST/Evaluate-STIG" && bash Evaluate-STIG_Bash.sh --NoUpstream \
       --PSPath "$DEST/$PWSH_DIR" \
-      --SelectSTIG Ubuntu24 \
+      "${sel_arg[@]}" \
       "${af_arg[@]}" \
       --Output Summary,CKLB,CombinedCSV \
       --OutputPath "$EVIDENCE" 2>&1 ) | tee "$log"
@@ -377,6 +407,13 @@ cmd_scan() {
   chown -R "$owner" "$EVIDENCE" 2>/dev/null || true
   find "$EVIDENCE" -type d -exec chmod u+rwx {} + 2>/dev/null || true
   find "$EVIDENCE" -type f -exec chmod u+rw {} + 2>/dev/null || true
+  # A MULTI-STIG SCAN PRODUCES A CHECKLIST PER PRODUCT. Say how many, and name them - the
+  # whole point of auto-detect is finding products you did not think to look for.
+  local n_ckl
+  n_ckl="$(find "$EVIDENCE" -name '*.cklb' -newermt '-60 minutes' 2>/dev/null | wc -l)"
+  say "checklists produced: $n_ckl"
+  find "$EVIDENCE" -name '*.cklb' -newermt '-60 minutes' 2>/dev/null \
+    | sed 's|.*/||; s/^/       /' | sort
   local csv
   csv="$(find "$EVIDENCE" -name '*COMBINED*.csv' -newermt '-30 minutes' 2>/dev/null | sort | tail -1)"
   if [ -z "$csv" ]; then

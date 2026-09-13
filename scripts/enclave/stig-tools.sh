@@ -5,6 +5,7 @@
 #     sudo ./stig-tools.sh publish      MACHINE: stage-01. Pushes the tools to the mirror.
 #     sudo ./stig-tools.sh answers      MACHINE: stage-01. Pushes the Answer File, ssh only.
 #     sudo ./stig-tools.sh fetch        MACHINE: any in-gap machine. Pulls from the mirror.
+#     sudo ./stig-tools.sh detect       MACHINE: any in-gap machine. What applies - seconds, no scan.
 #     sudo ./stig-tools.sh scan         MACHINE: the machine being assessed. Scan + clean up.
 #     ./stig-tools.sh status            MACHINE: any. What is here and what is served.
 #
@@ -511,6 +512,35 @@ PY
   say "   scp -i ~/.ssh/build01 -r encadmin@<this machine>:$EVIDENCE/$(echo "$me" | tr '[:lower:]' '[:upper:]') ."
 }
 
+# ---------------------------------------------------------------------------------- detect
+#
+# WHAT WOULD BE ASSESSED HERE - in seconds, without scanning.
+#
+# `scan` runs this first anyway, but a 15-minute scan is the wrong way to ask "what is on this
+# machine". Run `detect` across the enclave to find products nobody thought to look for, then
+# decide where to spend the scan time.
+#
+# READ THE DISAStatus COLUMN. A product listed as `Sunset` is one DISA has RETIRED: the tool
+# will detect it, refuse to score it, and produce no checklist for it. That is a coverage gap,
+# and it is invisible unless you look here - svc-mgmt-01's PostgreSQL 9.x was exactly that.
+cmd_detect() {
+  local me; me="$(hostname -s)"
+  case "$me" in
+    stage-01|build-01)
+      die "detect does not run on $me - it is outside the ATO boundary." ;;
+  esac
+  need_root
+  [ -x "$DEST/$PWSH_DIR/pwsh" ] || die "no pwsh at $DEST/$PWSH_DIR - sudo $0 fetch"
+  printf '\n  applicable STIGs on %s\n' "$me"
+  ( cd "$DEST/Evaluate-STIG" && bash Evaluate-STIG_Bash.sh --NoUpstream \
+      --PSPath "$DEST/$PWSH_DIR" --ListApplicableProducts 2>&1 ) | sed 's/^/     /'
+  printf '\n  Active  = will be assessed by `sudo %s scan`\n' "$0"
+  printf '  Sunset  = DISA RETIRED it. Detected, NOT assessed, no checklist. A coverage gap:\n'
+  printf '            get the current STIG and put its xccdf in\n'
+  printf '            %s/Evaluate-STIG/StigContent/Manual/, or force it with\n' "$DEST"
+  printf '            --allow-deprecated and say so in the artefact.\n\n'
+}
+
 # ---------------------------------------------------------------------------------- status
 cmd_status() {
   local me; me="$(hostname -s)"
@@ -544,6 +574,7 @@ case "${1:-status}" in
   answers) shift; cmd_answers "$@" ;;
   fetch)   shift; cmd_fetch "$@" ;;
   scan)    shift; cmd_scan "$@" ;;
+  detect)  shift; cmd_detect "$@" ;;
   status)  shift; cmd_status "$@" ;;
-  *) printf 'usage: %s {publish|answers <machine>|fetch|scan|status}\n' "$0" >&2; exit 2 ;;
+  *) printf 'usage: %s {publish|answers <machine>|fetch|detect|scan|status}\n' "$0" >&2; exit 2 ;;
 esac

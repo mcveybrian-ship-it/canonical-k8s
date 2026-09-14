@@ -19,6 +19,10 @@
 #
 #     ON any machine needing a certificate:
 #       sudo ./ca.sh request [--profile P] [--wildcard LABEL] [name] [san...]
+#                                         name and name.DOMAIN and this machine's own IP are
+#                                         added AUTOMATICALLY - extra SANs are usually not
+#                                         needed. Give them BARE (no DNS:/IP: prefix); a
+#                                         prefix is stripped if you add one anyway.
 #                                         generate a key HERE and a CSR to send.
 #                                         Profiles live in csr-profiles/ - use one matching
 #                                         the PKI that will sign it (default: internal).
@@ -621,6 +625,11 @@ cmd_issue() {
     warn "if anything reaches this service by IP, the certificate will be rejected"
   fi
   for extra in "$@"; do
+    # TOLERATE A PREFIX. The usage line says [san...] without showing the format, so
+    # `request svc-obs-01 DNS:svc-obs-01 IP:10.2.20.164` is a natural thing to type - and
+    # it produced DNS:DNS:svc-obs-01 and IP:IP:10.2.20.164, which openssl rejected with
+    # 'bad ip address' and no hint that the input had been doubled. Strip it and move on.
+    extra="${extra#DNS:}"; extra="${extra#IP:}"; extra="${extra#dns:}"; extra="${extra#ip:}"
     case "$extra" in
       *[0-9].[0-9]*) sans="$sans,IP:$extra" ;;
       *)             sans="$sans,DNS:$extra" ;;
@@ -754,6 +763,11 @@ cmd_request() {
       say "enclave ips: $ipcount added from enclave-addresses.env"
     fi
     for extra in "$@"; do
+      # TOLERATE A PREFIX. The usage line says [san...] without showing the format, so
+      # `request svc-obs-01 DNS:svc-obs-01 IP:10.2.20.164` is a natural thing to type - and
+      # it produced DNS:DNS:svc-obs-01 and IP:IP:10.2.20.164, which openssl rejected with
+      # 'bad ip address' and no hint that the input had been doubled. Strip it and move on.
+      extra="${extra#DNS:}"; extra="${extra#IP:}"; extra="${extra#dns:}"; extra="${extra#ip:}"
       case "$extra" in
         *[0-9].[0-9]*) sans="$sans,IP:$extra" ;;
         *)             sans="$sans,DNS:$extra" ;;
@@ -769,6 +783,11 @@ cmd_request() {
     sans="DNS:$name.$DOMAIN,DNS:$name"
     [ -n "$ip" ] && sans="$sans,IP:$ip"
     for extra in "$@"; do
+      # TOLERATE A PREFIX. The usage line says [san...] without showing the format, so
+      # `request svc-obs-01 DNS:svc-obs-01 IP:10.2.20.164` is a natural thing to type - and
+      # it produced DNS:DNS:svc-obs-01 and IP:IP:10.2.20.164, which openssl rejected with
+      # 'bad ip address' and no hint that the input had been doubled. Strip it and move on.
+      extra="${extra#DNS:}"; extra="${extra#IP:}"; extra="${extra#dns:}"; extra="${extra#ip:}"
       case "$extra" in
         *[0-9].[0-9]*) sans="$sans,IP:$extra" ;;
         *)             sans="$sans,DNS:$extra" ;;

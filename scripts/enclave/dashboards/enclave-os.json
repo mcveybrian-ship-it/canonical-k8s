@@ -366,8 +366,8 @@
         "uid": "enclave-prometheus"
       },
       "gridPos": {
-        "h": 8,
-        "w": 12,
+        "h": 9,
+        "w": 24,
         "x": 0,
         "y": 6
       },
@@ -388,7 +388,8 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "bottom",
+          "placement": "right",
+          "width": 300,
           "calcs": [
             "lastNotNull",
             "max"
@@ -420,10 +421,10 @@
         "uid": "enclave-prometheus"
       },
       "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 6
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 15
       },
       "fieldConfig": {
         "defaults": {
@@ -442,7 +443,8 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "bottom",
+          "placement": "right",
+          "width": 300,
           "calcs": [
             "lastNotNull",
             "max"
@@ -474,10 +476,10 @@
         "uid": "enclave-prometheus"
       },
       "gridPos": {
-        "h": 7,
-        "w": 12,
+        "h": 9,
+        "w": 24,
         "x": 0,
-        "y": 14
+        "y": 24
       },
       "fieldConfig": {
         "defaults": {
@@ -495,7 +497,8 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "bottom",
+          "placement": "right",
+          "width": 300,
           "calcs": [
             "lastNotNull",
             "max"
@@ -527,10 +530,10 @@
         "uid": "enclave-prometheus"
       },
       "gridPos": {
-        "h": 7,
-        "w": 12,
-        "x": 12,
-        "y": 14
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 33
       },
       "fieldConfig": {
         "defaults": {
@@ -549,7 +552,8 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "bottom",
+          "placement": "right",
+          "width": 300,
           "calcs": [
             "lastNotNull",
             "max"
@@ -580,7 +584,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 21
+        "y": 42
       },
       "panels": []
     },
@@ -593,10 +597,10 @@
         "uid": "enclave-prometheus"
       },
       "gridPos": {
-        "h": 10,
-        "w": 12,
+        "h": 12,
+        "w": 24,
         "x": 0,
-        "y": 22
+        "y": 43
       },
       "fieldConfig": {
         "defaults": {
@@ -698,10 +702,10 @@
         "uid": "enclave-prometheus"
       },
       "gridPos": {
-        "h": 10,
-        "w": 12,
-        "x": 12,
-        "y": 22
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 55
       },
       "fieldConfig": {
         "defaults": {
@@ -720,7 +724,8 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "bottom",
+          "placement": "right",
+          "width": 300,
           "calcs": [
             "lastNotNull",
             "max"
@@ -752,10 +757,10 @@
         "uid": "enclave-prometheus"
       },
       "gridPos": {
-        "h": 7,
-        "w": 12,
+        "h": 9,
+        "w": 24,
         "x": 0,
-        "y": 32
+        "y": 64
       },
       "fieldConfig": {
         "defaults": {
@@ -774,7 +779,8 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "bottom",
+          "placement": "right",
+          "width": 300,
           "calcs": [
             "lastNotNull",
             "max"
@@ -806,10 +812,10 @@
         "uid": "enclave-prometheus"
       },
       "gridPos": {
-        "h": 7,
-        "w": 12,
-        "x": 12,
-        "y": 32
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 73
       },
       "fieldConfig": {
         "defaults": {
@@ -827,7 +833,8 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "bottom",
+          "placement": "right",
+          "width": 300,
           "calcs": [
             "lastNotNull",
             "max"
@@ -867,7 +874,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 39
+        "y": 82
       },
       "panels": []
     },
@@ -880,10 +887,10 @@
         "uid": "enclave-prometheus"
       },
       "gridPos": {
-        "h": 8,
-        "w": 12,
+        "h": 9,
+        "w": 24,
         "x": 0,
-        "y": 40
+        "y": 83
       },
       "fieldConfig": {
         "defaults": {
@@ -902,7 +909,8 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "bottom",
+          "placement": "right",
+          "width": 300,
           "calcs": [
             "lastNotNull",
             "max"
@@ -934,10 +942,10 @@
         "uid": "enclave-prometheus"
       },
       "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 40
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 92
       },
       "fieldConfig": {
         "defaults": {
@@ -956,7 +964,8 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "bottom",
+          "placement": "right",
+          "width": 300,
           "calcs": [
             "lastNotNull",
             "max"
@@ -988,10 +997,10 @@
         "uid": "enclave-prometheus"
       },
       "gridPos": {
-        "h": 7,
-        "w": 12,
+        "h": 9,
+        "w": 24,
         "x": 0,
-        "y": 48
+        "y": 101
       },
       "fieldConfig": {
         "defaults": {
@@ -1009,7 +1018,8 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "bottom",
+          "placement": "right",
+          "width": 300,
           "calcs": [
             "lastNotNull",
             "max"
@@ -1050,10 +1060,10 @@
         "uid": "enclave-prometheus"
       },
       "gridPos": {
-        "h": 7,
-        "w": 12,
-        "x": 12,
-        "y": 48
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 110
       },
       "fieldConfig": {
         "defaults": {
@@ -1071,7 +1081,8 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "bottom",
+          "placement": "right",
+          "width": 300,
           "calcs": [
             "lastNotNull",
             "max"

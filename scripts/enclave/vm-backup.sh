@@ -18,6 +18,7 @@
 #     --dest <path>            override BACKUP_DEST for this run
 #     --accept-unencrypted     proceed when the destination is not on an encrypted device
 #     --allow-non-mount        proceed when the destination is not a mountpoint (DANGEROUS)
+#     --detach                 run under systemd-run instead of this shell, and return
 #
 # WHY A DESTINATION IS A PARAMETER AND NOT A PATH IN A SCRIPT: it is an external drive on the
 # bench and a customer-provided mount, LUN or NFS export in production. Same procedure, one
@@ -65,6 +66,7 @@ LUKS_NAME="${BACKUP_LUKS_NAME:-vmbackup}"
 KEYFILE="${BACKUP_KEYFILE:-/etc/enclave/vmbackup.key}"
 ACCEPT_PLAIN=0
 ALLOW_NONMOUNT=0
+DETACH=0
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 
 # WHO QEMU RUNS AS. The backup target is opened by the QEMU process, NOT by this script,
@@ -596,12 +598,39 @@ while [ $# -gt 0 ]; do
     --dest) DEST="${2:-}"; shift 2 ;;
     --accept-unencrypted) ACCEPT_PLAIN=1; shift ;;
     --allow-non-mount) ALLOW_NONMOUNT=1; shift ;;
+    --detach) DETACH=1; shift ;;
     --at) ARGS+=("${2:-}"); shift 2 ;;
     -h|--help) sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) ARGS+=("$1"); shift ;;
   esac
 done
 set -- "${ARGS[@]:-}"
+
+# A MULTI-HOUR COPY MUST NOT LIVE IN AN INTERACTIVE SHELL ON THIS MACHINE.
+#
+# The STIG sets TMOUT=600 readonly ("per security requirements"), and any dropped session
+# SIGHUPs the foreground job. On 2026-09-14 a full backup died at ~125 GB of svc-repo-01's
+# 331 GB for exactly that reason, leaving a partial set and a checkpoint pointing at a full
+# that never finished - which a later incremental would have happily built on.
+#
+# --detach hands the work to systemd, which owns it instead of the terminal. Output goes to
+# the journal, and it survives logout, TMOUT and a closed laptop lid.
+if [ "$DETACH" -eq 1 ]; then
+  need_root
+  command -v systemd-run >/dev/null 2>&1 || die "systemd-run not available"
+  self="$(readlink -f "$0")"
+  unit="vm-backup-manual-$(date -u +%H%M%S)"
+  systemd-run --unit="$unit" --description="manual VM backup: $*" \
+    --property=Nice=10 --property=IOSchedulingClass=idle \
+    --property=TimeoutStartSec=12h \
+    "$self" "$@" >/dev/null 2>&1 \
+    || die "could not start $unit"
+  ok "running detached as $unit - this shell is free, and logout will not kill it"
+  say "   watch:   journalctl -u $unit -f"
+  say "   status:  systemctl status $unit"
+  say "   stop:    systemctl stop $unit"
+  exit 0
+fi
 
 case "${1:-status}" in
   status)       cmd_status ;;

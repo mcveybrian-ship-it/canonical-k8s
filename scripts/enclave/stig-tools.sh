@@ -677,12 +677,17 @@ PY
   if [ "$failed_scan" -ne 0 ]; then
     warn "scan finished with a COVERAGE GAP - see DETECTED BUT NOT ASSESSED above."
     say ""
-    say "   Copy the evidence off with, FROM stage-01:"
-    say "     scp -i ~/.ssh/build01 -r encadmin@<this machine>:$EVIDENCE/$(echo "$me" | tr '[:lower:]' '[:upper:]') ."
+    say "   Collect the evidence FROM stage-01 with:"
+    say "     ./scripts/enclave/stig-tools.sh collect $me"
     return 1
   fi
-  ok "scan complete. Copy the evidence off with, FROM stage-01:"
-  say "   scp -i ~/.ssh/build01 -r encadmin@<this machine>:$EVIDENCE/$(echo "$me" | tr '[:lower:]' '[:upper:]') ."
+  # POINT AT THE COMMAND, NOT AT A RECIPE. The hand-written scp this used to print also
+  # skipped the root-only USG results, which is half the evidence - and step 14 went
+  # unperformed on all five machines for a week while this line looked like instructions.
+  ok "scan complete. Collect the evidence FROM stage-01 with:"
+  say "   ./scripts/enclave/stig-tools.sh collect $me"
+  say "   (no argument collects every machine; it takes the root-only USG results too,"
+  say "    which the hand-written scp did not)"
 }
 
 # ---------------------------------------------------------------------------------- detect

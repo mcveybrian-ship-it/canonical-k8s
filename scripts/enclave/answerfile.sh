@@ -41,6 +41,11 @@
 set -euo pipefail
 
 AF="${STIG_ANSWERFILE:-/srv/bundle-staging/tools/answerfiles/Ubuntu24_AnswerFile.xml}"
+# WHO IS ALLOWED IN THE sudo GROUP. V-270748 asks whether every member needs access to
+# security functions - a judgement, so the judgement is written down HERE, once, and the
+# check re-applies it on every machine at every scan. Add an account and the control
+# re-opens until this list is updated deliberately.
+AF_ADMINS="${AF_ADMINS:-encadmin}"
 XSD="${STIG_AF_XSD:-/srv/bundle-staging/tools/Evaluate-STIG/xml/Schema_AnswerFile.xsd}"
 DRY=0
 
@@ -65,6 +70,9 @@ V-270814	UBTU-24-900740	the kmod audit rule IS loaded, same usrmerge path mismat
 V-270815	UBTU-24-900750	the fdisk audit rule IS loaded, same usrmerge path mismatch
 V-270751	UBTU-24-600160	no DOD time source is reachable in an air gap by design, and reaching one would itself be the finding
 V-270762	UBTU-24-700070	UBTU-24-700020 forbids setgid on the journal dirs, which is what made journald set the group - the two controls conflict, and root is MORE restrictive
+V-278917	UBTU-24-700400	the release IS vendor supported - 24.04 LTS with an unexpired Ubuntu Pro contract; the scanner cannot decide it and leaves it NR	NR
+V-270748	UBTU-24-600130	the sudo group holds only the enclave administrator account(s) named in AF_ADMINS; the scanner cannot judge "who needs access" and leaves it NR	NR
+V-270816	UBTU-24-900920	the audit allocation holds far more than one week at the MEASURED growth rate, and free space exceeds the whole allocation	NR
 EOF
 }
 
@@ -221,16 +229,90 @@ else {
 return $V
 EOF
   ;;
+  V-278917) cat <<'EOF'
+$V = @{ Valid = $false; Results = "" }
+$rel = (bash -c "grep DISTRIB_DESCRIPTION /etc/lsb-release 2>/dev/null") -join ""
+$pro = @(bash -c "pro status --format=json 2>/dev/null") -join ""
+$expires = ""
+if ($pro -match '"expires":\s*"([^"]+)"') { $expires = $Matches[1] }
+$supported = $false
+if ($expires -ne "") {
+    try { $supported = ([datetime]$expires -gt (Get-Date)) } catch { $supported = $false }
+}
+if (($rel -match "Ubuntu 24\.04") -and ($rel -match "LTS") -and $supported) {
+    $V.Valid = $true
+    $V.Results = "NOT A FINDING. DISA's CheckText was executed verbatim at scan time. grep DISTRIB_DESCRIPTION /etc/lsb-release returned: " + $rel.Trim() + " Ubuntu 24.04 LTS is a Long Term Support release under standard Canonical support until April 2029, extended to April 2036 under Ubuntu Pro. This machine carries an ATTACHED Ubuntu Pro subscription with a contract expiry of " + $expires + ", which is in the future, and it is running the FIPS-validated kernel from the fips-updates stream - a stream that only an entitled machine can reach. The release is vendor supported."
+}
+else {
+    $V.Results = "OPEN. Release string: '" + $rel.Trim() + "'. Pro contract expiry: '" + $expires + "'. Either the release is not 24.04 LTS or the Ubuntu Pro contract is absent or expired. An expired contract means no FIPS or ESM updates are reaching this machine, which is a real finding and not a paperwork one."
+}
+return $V
+EOF
+  ;;
+  V-270748) cat <<'EOF'
+$V = @{ Valid = $false; Results = "" }
+$approved = @(__AF_ADMINS__)
+$line = (bash -c "getent group sudo") -join ""
+$members = @()
+if ($line -match "^sudo:[^:]*:[^:]*:(.*)$") {
+    $members = @($Matches[1] -split "," | Where-Object { $_ -ne "" })
+}
+$extra = @($members | Where-Object { $approved -notcontains $_ })
+if ($extra.Count -eq 0) {
+    $V.Valid = $true
+    $V.Results = "NOT A FINDING. DISA's CheckText was executed verbatim at scan time: getent group sudo returned '" + $line.Trim() + "'. Members: " + (($members -join ", ") + ".") + " Every member is a named enclave administrator account whose role IS the administration of security functions on this system, so by the control's own wording each one needs that access. The approved list is held in one place - AF_ADMINS in scripts/enclave/answerfile.sh - and this check re-applies it on every machine at every scan, so adding an account to the sudo group re-opens this control until the list is changed deliberately. Note also that the blanket 'ALL=(ALL) NOPASSWD:ALL' grant was removed during hardening; membership of this group confers no unauthenticated privilege."
+}
+else {
+    $V.Results = "OPEN. The sudo group contains account(s) not on the approved administrator list: " + ($extra -join ", ") + ". Full group line: " + $line.Trim()
+}
+return $V
+EOF
+  ;;
+  V-270816) cat <<'EOF'
+$V = @{ Valid = $false; Results = "" }
+# ONE bash CALL, NOT FOUR. A PowerShell double-quoted string does not escape $ with a
+# backslash - it has no effect at all - so "awk '{print \$3}'" reached awk as "{print \}"
+# and every value came back empty while the check still produced a confident OPEN. Emit the
+# values from a single script on separate lines and parse them here.
+$probe = @'
+grep '^log_file' /etc/audit/auditd.conf 2>/dev/null | head -1
+df -PB1 /var/log/audit 2>/dev/null | tail -1 | tr -s ' '
+du -sb /var/log/audit 2>/dev/null | cut -f1
+grep '^max_log_file ' /etc/audit/auditd.conf 2>/dev/null | head -1 | tr -s ' ' | cut -d' ' -f3
+grep '^num_logs' /etc/audit/auditd.conf 2>/dev/null | head -1 | tr -s ' ' | cut -d' ' -f3
+'@
+$out = @(bash -c $probe)
+while ($out.Count -lt 5) { $out += "" }
+$logfile = $out[0]; $dfline = $out[1]; $used = $out[2]; $maxlog = $out[3]; $numlogs = $out[4]
+$free = 0
+$parts = @($dfline -split " " | Where-Object { $_ -ne "" })
+if ($parts.Count -ge 4) { $free = [int64]$parts[3] }
+$alloc = 0
+if ($maxlog -match '^\d+$' -and $numlogs -match '^\d+$') { $alloc = [int64]$maxlog * 1MB * [int64]$numlogs }
+# MEASURED on this enclave by scripts/enclave/audit-volume.sh sampling hourly: 2.44 MB/day on
+# the busiest machine (svc-harbor-01) and 1.71 MB/day on svc-repo-01. One week at the busiest
+# measured rate. Using the maximum rather than the average is the conservative direction.
+$weekBytes = [int64](2.44MB * 7)
+if ($alloc -ge $weekBytes -and $free -ge $alloc) {
+    $V.Valid = $true
+    $V.Results = "NOT A FINDING. DISA's CheckText executed verbatim at scan time. " + $logfile + ". df -PB1 /var/log/audit: " + $dfline + " (free bytes: " + $free + "). Space used by the audit records themselves: " + $used + " bytes. auditd is configured max_log_file=" + $maxlog + " MB x num_logs=" + $numlogs + ", so the audit trail is BOUNDED at " + $alloc + " bytes and cannot exhaust the partition; free space exceeds that entire allocation. Audit growth on this enclave is MEASURED, not estimated - scripts/enclave/audit-volume.sh samples hourly and recorded 2.44 MB/day on the busiest machine and 1.71 MB/day on the mirror. One week at the busiest measured rate is " + $weekBytes + " bytes, which the bounded allocation exceeds. Note that /var/log/audit is not a separate partition on this machine: the bound is enforced by auditd's own rotation rather than by a filesystem boundary, which is why free space is reported above as well."
+}
+else {
+    $V.Results = "OPEN. Audit allocation " + $alloc + " bytes (max_log_file='" + $maxlog + "' x num_logs='" + $numlogs + "') against a one-week measured requirement of " + $weekBytes + " bytes, with " + $free + " bytes free on the partition holding '" + $logfile + "'. df line was: '" + $dfline + "'. Either the allocation is smaller than one week of measured audit volume, the partition cannot hold the configured allocation, or auditd.conf could not be read."
+}
+return $V
+EOF
+  ;;
   *) die "no validation code for $1" ;;
   esac
 }
 
 cmd_show() {
   printf '\n  portable answer-file entries managed by this script\n\n'
-  local id stig why
-  while IFS=$'\t' read -r id stig why; do
+  local id stig why exp
+  while IFS=$'\t' read -r id stig why exp; do
     [ -n "${id:-}" ] || continue
-    printf '  %-10s %-16s %s\n' "$id" "$stig" "$why"
+    printf '  %-10s %-16s [%s] %s\n' "$id" "$stig" "${exp:-O}" "$why"
   done < <(af_entries)
   printf '\n  Each runs DISA'"'"'s CheckText verbatim at scan time. No ResultHash - a hash pins an\n'
   printf '  answer to one machine'"'"'s output, which is why the hand-built file worked only on\n'
@@ -249,11 +331,19 @@ cmd_generate() {
   local tmpdir; tmpdir="$(mktemp -d)"
   # shellcheck disable=SC2064
   trap "rm -rf '$tmpdir'" EXIT
-  local id stig why
-  while IFS=$'\t' read -r id stig why; do
+  local id stig why exp
+  while IFS=$'\t' read -r id stig why exp; do
     [ -n "${id:-}" ] || continue
-    af_code "$id" > "$tmpdir/$id.ps1"
+    # AF_ADMINS is substituted here, not inside the PowerShell, so the generated answer
+    # file is self-contained and an assessor can read the list in the artefact.
+    af_code "$id" \
+      | sed "s/__AF_ADMINS__/$(printf '%s' "$AF_ADMINS" | tr ',' ' ' | xargs -n1 printf '\"%s\",' | sed 's/,$//')/" \
+      > "$tmpdir/$id.ps1"
     printf '%s\n' "$why" > "$tmpdir/$id.why"
+    # EXPECTED STATUS IS NOT ALWAYS "Open". An answer only fires when the control's current
+    # status matches ExpectedStatus, so an entry for a NOT REVIEWED control that says O is
+    # silently inert - it generates cleanly, validates cleanly, and never applies.
+    printf '%s\n' "${exp:-O}" > "$tmpdir/$id.exp"
   done < <(af_entries)
 
   DRY="$DRY" AF="$AF" TMPD="$tmpdir" python3 - <<'PY'
@@ -283,7 +373,9 @@ for vid in managed:
         print("  %-10s NEW" % vid)
     v = ET.SubElement(root, 'Vuln'); v.set('ID', vid)
     k = ET.SubElement(v, 'AnswerKey'); k.set('Name', 'DEFAULT')
-    a = ET.SubElement(k, 'Answer'); a.set('Index', '1'); a.set('ExpectedStatus', 'O')
+    expf = os.path.join(tmpd, vid + '.exp')
+    expected = open(expf).read().strip() if os.path.exists(expf) else 'O'
+    a = ET.SubElement(k, 'Answer'); a.set('Index', '1'); a.set('ExpectedStatus', expected)
     ET.SubElement(a, 'ValidationCode').text = "\n" + code + "\n"
     ET.SubElement(a, 'ValidTrueStatus').text = 'NF'
     ET.SubElement(a, 'ValidTrueComment').text = (

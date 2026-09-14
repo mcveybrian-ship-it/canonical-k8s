@@ -14,14 +14,27 @@ Last updated **2026-09-11 02:40 UTC** (2026-09-10 21:40 Central). All timestamps
 
 ### ⏭ NEXT SESSION — start here, in this order
 
+✅ **THE PORTABILITY TEST PASSED — `svc-harbor-01`, 2026-09-14 04:30 UTC.** All five new
+Answer File entries fired on a second, dissimilar machine: V-270682, V-270694, V-270748,
+V-270816 and V-278917 all `NF`. **The no-ResultHash design works.** That was the open
+question the whole Answer File rebuild rested on, and it is now answered with data.
+
+`svc-harbor-01`: **NF=169, Open=5, NR=10, NA=10.** The 5 Open are the enclave set plus
+`V-270655` (ufw — `docker-proxy` DNATs past ufw's INPUT chain here, which is the known
+reason). ⚠️ **NR is 10, not the 9 predicted — and the tenth is not an answer failure.**
+
 | | What | Why now |
 |---|---|---|
-| **1** | **Finish re-scanning the four machines against V1R6 — one at a time.** `sudo ./scripts/enclave/stig-tools.sh scan` on each. 🔄 **`svc-harbor-01` was RUNNING when the session ended 2026-09-14 ~04:15 UTC — read its tally first.** Then `svc-mgmt-01`, `svc-repo-01`, `host-4` | **This is the portability test the whole Answer File design rests on.** `svc-obs-01` went **NR 14 → 9, NF 166 → 171** with the five new entries. If another machine stays at 14, the answers are true only where they were written and that is the finding. Expect NR=9 and five more NF on each |
-| **2** | **Re-audit `svc-harbor-01` and `svc-mgmt-01` on USG** — `sudo stig-tailor.sh generate` then `audit` | Both still show **7** from before their GRUB password work, and both now also need the `file_groupowner_system_journal` deviation. **A stale number in a residual set is worse than no number** |
-| **3** | **`stig-tools.sh collect` after each scan** | Step 14. Evidence only existed on the machines it described until 2026-09-14 |
-| **4** | The four *engineering* Not Reviewed: **V-270651** AIDE config integrity (needs the pristine `aide-common` .deb to compare against), **V-270747** data-at-rest write-up, **V-270719** PPSM, **V-270754** the ufw 443 decision | The other five NR are AO — open-questions **Q25/Q26** |
+| **1** | ⚠️ **`stig-tailor.sh aide --apply` on `svc-harbor-01` and `svc-mgmt-01`, THEN re-scan** | **`V-270650` TIMED OUT at 15 minutes on harbor** and came back `NR`, and the tool printed *"Failed to get full CAT counts for grading. Scoring will be inaccurate."* **Cause: those two machines have NO `/etc/aide/aide.conf.d/90_aide_enclave_exclude`** — checked on all five; `host-4`, `svc-repo-01` and `svc-obs-01` have it, those two do not. They were hardened before the exclusion table existed, so every Harbor image layer under `/var/lib/docker` is in AIDE's scope. **The exclusion rows for both machines are ALREADY in `aide_excludes()`** with written justifications — they have simply never been applied there. **Expect the same timeout on `svc-mgmt-01`** (MAAS boot-resources) if it is scanned first |
+| **2** | **Re-scan `svc-mgmt-01`, `svc-repo-01`, `host-4`** — one at a time, `stig-tools.sh collect` after each | Expect **NR=9** and five more `NF` on each. `svc-obs-01` and `svc-harbor-01` both confirm it |
+| **3** | **Re-audit `svc-harbor-01` and `svc-mgmt-01` on USG** — `stig-tailor.sh generate` then `audit` | Both still show **7** from before their GRUB password work, and both now also need the `file_groupowner_system_journal` deviation. **A stale number in a residual set is worse than no number** |
+| **4** | The four *engineering* Not Reviewed: **V-270651** AIDE config integrity (needs the pristine `aide-common` .deb), **V-270747** data-at-rest write-up, **V-270719** PPSM, **V-270754** the ufw 443 decision | The other five NR are AO — open-questions **Q25/Q26** |
 | **5** | ⚠️ **Rotate the password pasted into chat 2026-09-14.** Scrubbed from two files; **not rotated** | Overdue |
-| **6** | Push to `origin` — **50 commits ahead** | — |
+| **6** | Push to `origin` — **51 commits ahead** | — |
+
+⚠️ **PostgreSQL reappeared as a coverage gap on `svc-harbor-01`** — detected `PgSQL9x V2R5,
+DISAStatus Sunset`, refused, and `scan` correctly named it and returned non-zero. Same gap as
+`svc-mgmt-01`. Closing it needs the Crunchy Data Postgres 16 XCCDF, a CAC-only download.
 
 **Everything from 2026-09-14 is in the tables below.** `svc-obs-01` is fully built, monitored,
 TLS'd, hardened (**211/5**), scanned (**4 Open, 9 NR**) and collecting audit-volume samples.

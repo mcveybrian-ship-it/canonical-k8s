@@ -102,10 +102,24 @@ NGINX
   ok "wrote $REDIR_CONF"
   nginx -t || die "nginx config is invalid - NOT reloading. Undo with: $0 --restore-http"
   systemctl reload nginx
-  local c
-  c=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://localhost/" || true)
-  [ "$c" = "301" ] && ok "http://localhost/ -> 301" || warn "expected 301 on :80, got '$c'"
-  c=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "https://localhost/" -k || true)
+  # RETRY: `nginx -s reload` IS ASYNCHRONOUS. A worker still running the old config can answer
+  # the first request after a successful reload, so a single curl here reports a failure that
+  # never happened - it said "expected 301 on :80, got 200" on svc-obs-01 while the redirect
+  # was in fact working, and three curls a second later all returned 301.
+  # A check that races the thing it is checking is a check that gets ignored.
+  local c i
+  for i in 1 2 3 4 5; do
+    c=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://localhost/" || true)
+    [ "$c" = "301" ] && break
+    sleep 1
+  done
+  [ "$c" = "301" ] && ok "http://localhost/ -> 301" \
+                   || warn "expected 301 on :80, got '$c' after 5 tries - look at $REDIR_CONF"
+  for i in 1 2 3 4 5; do
+    c=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "https://localhost/" -k || true)
+    case "$c" in 2*|3*|4*) break ;; esac
+    sleep 1
+  done
   case "$c" in 2*|3*|4*) ok "https still serving (HTTP $c)" ;; *) warn "https returned '$c'" ;; esac
   exit 0
 }

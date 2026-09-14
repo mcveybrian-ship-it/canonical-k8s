@@ -138,18 +138,43 @@ push() {
 verify() {
   local ip name line var rc=0
   for ip in $(targets); do
-    ssh -i "$KEY" -o BatchMode=yes -o ConnectTimeout=5 "$USER_NAME@$ip" true 2>/dev/null || continue
-    local bad=""
+    ssh -n -i "$KEY" -o BatchMode=yes -o ConnectTimeout=5 "$USER_NAME@$ip" true 2>/dev/null || continue
+    local bad="" shadowed="" checked=0
     while IFS= read -r line; do
       [ -z "$line" ] && continue
       name="${line%%:*}"; var="${line##*:}"
       [ -n "${!var:-}" ] || continue
-      got=$(ssh -i "$KEY" -o BatchMode=yes "$USER_NAME@$ip" \
+      # -n IS LOAD-BEARING. Without it ssh reads stdin - which is the here-string feeding
+      # this while loop - and swallows the ENTIRE remaining table on the first iteration.
+      # The loop then ends after one name and reports "resolves every name" having checked
+      # exactly one. That is how svc-harbor-01 passed verification on 2026-09-14 while its
+      # /etc/hosts had no entry for svc-obs-01 at all. A false pass in the tool whose only
+      # job is catching that.
+      got=$(ssh -n -i "$KEY" -o BatchMode=yes "$USER_NAME@$ip" \
             "getent hosts $name.$ENCLAVE_DOMAIN 2>/dev/null | awk '{print \$1}'" || true)
-      [ "$got" = "${!var}" ] || bad="$bad $name(${got:-none})"
+      checked=$((checked + 1))
+      # getent can return MORE THAN ONE ADDRESS. cloud-init writes "127.0.1.1 <fqdn> <host>"
+      # on every machine, so a machine asked for its OWN name answers 127.0.1.1 first and
+      # the real address second. Comparing the whole multi-line result to one address makes
+      # every machine fail on its own name - and the mangled output ("svc-mgmt-01(127.0.1.1")
+      # is what that looks like. Ask the right question instead: IS the expected address in
+      # the answer.
+      if printf '%s\n' "$got" | command grep -qx "${!var}"; then
+        # Present, but shadowed: a service that binds by name here gets loopback and will
+        # not be reachable from any other machine. Worth saying, not worth failing.
+        [ "$(printf '%s\n' "$got" | head -1)" = "${!var}" ] \
+          || shadowed="$shadowed $name"
+      else
+        bad="$bad $name(${got:-none})"
+      fi
     done <<< "$MAP"
-    if [ -z "$bad" ]; then ok "$ip resolves every name"
-    else warn "$ip mismatched:$bad"; rc=1; fi
+    # PRINT THE COUNT. "resolves every name" is unfalsifiable on its own; "resolves all 15"
+    # goes wrong visibly the moment the loop stops early again.
+    if [ -z "$bad" ]; then ok "$ip resolves all $checked name(s)"
+    else warn "$ip MISSING:$bad"; rc=1; fi
+    # Not a failure. A machine resolving its own name to 127.0.1.1 is cloud-init's doing and
+    # is normal - but it is also why a daemon told to bind "by hostname" ends up on loopback.
+    [ -z "$shadowed" ] || say "       note: 127.0.1.1 answers first for:$shadowed"
   done
   return $rc
 }

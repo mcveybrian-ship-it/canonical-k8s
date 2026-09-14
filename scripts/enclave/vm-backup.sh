@@ -10,6 +10,8 @@
 #     sudo ./vm-backup.sh verify                 check what ARRIVED, not what was sent
 #     sudo ./vm-backup.sh prune                  drop chains beyond BACKUP_KEEP_CHAINS
 #     sudo ./vm-backup.sh restore-plan <vm>      print the restore steps - never automatic
+#     sudo ./vm-backup.sh schedule [--at HH:MM]  install a nightly systemd timer (default 02:00)
+#     sudo ./vm-backup.sh unschedule             remove it
 #
 #     --dest <path>            override BACKUP_DEST for this run
 #     --accept-unencrypted     proceed when the destination is not on an encrypted device
@@ -360,6 +362,93 @@ cmd_prune() {
   ok "prune complete - kept $KEEP set(s) per domain"
 }
 
+# ---------------------------------------------------------------- schedule
+# NIGHTLY BACKUPS ON A MACHINE THAT DELIBERATELY BLOCKS USB STORAGE.
+#
+# The STIG blocks usb-storage on host-4 (kernel_module_usb-storage_disabled, runbook 6.3g).
+# A drive that is mounted right now keeps working because the module is already loaded - but
+# it will NOT come back after a reboot, and a timer would then fail every night without
+# anyone noticing. So the unit checks the destination before it does anything and FAILS
+# LOUDLY rather than skipping, because a backup that quietly stops running is worse than one
+# that was never scheduled.
+#
+# If the destination is a USB drive, either keep the deviation window open and documented,
+# or move the destination to storage that survives a reboot. `status` says which you have.
+SVC_NAME="enclave-vm-backup"
+
+cmd_schedule() {
+  need_root; assert_hypervisor
+  local at="${1:-02:00}"
+  case "$at" in [0-2][0-9]:[0-5][0-9]) : ;; *) die "--at wants HH:MM, got '$at'" ;; esac
+  [ -n "$DEST" ] || die "no destination set - fix BACKUP_DEST in vm-specs.env first"
+  local self; self="$(readlink -f "$0")"
+
+  cat > "/etc/systemd/system/${SVC_NAME}.service" <<EOF
+[Unit]
+Description=Enclave VM backup (libvirt incremental) to ${DEST}
+After=libvirtd.service
+Wants=libvirtd.service
+# If the destination is not mounted, systemd fails the unit instead of running a backup
+# into an empty directory on the root disk.
+RequiresMountsFor=${DEST}
+
+[Service]
+Type=oneshot
+# Nice and idle I/O so a 300 GB copy does not starve the guests it is copying.
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=6h
+ExecStart=${self} incr
+ExecStart=${self} verify
+ExecStart=${self} prune
+EOF
+
+  cat > "/etc/systemd/system/${SVC_NAME}.timer" <<EOF
+[Unit]
+Description=Nightly enclave VM backup at ${at}
+
+[Timer]
+OnCalendar=*-*-* ${at}:00
+# Persistent so a missed run (machine off, drive absent) happens at the next opportunity
+# rather than being skipped in silence.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now "${SVC_NAME}.timer" >/dev/null 2>&1 \
+    || die "could not enable ${SVC_NAME}.timer"
+  ok "scheduled: ${SVC_NAME}.timer at ${at} daily -> ${DEST}"
+  systemctl list-timers "${SVC_NAME}.timer" --no-pager | sed 's/^/       /'
+  printf '\n'
+  say "each run does: incr (falls back to full with no checkpoint), verify, prune"
+  say "watch it with:   journalctl -u ${SVC_NAME}.service -n 50"
+
+  # SAY THE REBOOT PROBLEM OUT LOUD, EVERY TIME, IF IT APPLIES.
+  local src; src="$(findmnt -no SOURCE --target "$DEST" 2>/dev/null)"
+  local disk; disk="$(lsblk -no PKNAME "$src" 2>/dev/null | head -1)"
+  if [ -n "$disk" ] && [ "$(lsblk -no TRAN "/dev/$disk" 2>/dev/null | head -1)" = usb ]; then
+    printf '\n'
+    warn "THE DESTINATION IS A USB DRIVE, AND THIS MACHINE BLOCKS USB STORAGE."
+    warn "  It works now only because the module is already loaded. After a reboot the"
+    warn "  drive will NOT reappear and every run will fail until someone opens the"
+    warn "  window again with:  stig-tailor.sh usb enable"
+    warn "  Either keep that deviation open and documented, or move ${DEST} to storage"
+    warn "  that survives a reboot. The unit fails loudly either way - it will not"
+    warn "  quietly write to the root disk."
+  fi
+}
+
+cmd_unschedule() {
+  need_root
+  systemctl disable --now "${SVC_NAME}.timer" >/dev/null 2>&1 || true
+  rm -f "/etc/systemd/system/${SVC_NAME}.timer" "/etc/systemd/system/${SVC_NAME}.service"
+  systemctl daemon-reload
+  ok "removed ${SVC_NAME}.timer and .service"
+}
+
 # ---------------------------------------------------------------- restore
 # DELIBERATELY NOT AUTOMATIC. Restoring overwrites a running system's disk. It is rare, it is
 # done under pressure, and it is exactly where an unattended script does the most damage.
@@ -409,6 +498,7 @@ while [ $# -gt 0 ]; do
     --dest) DEST="${2:-}"; shift 2 ;;
     --accept-unencrypted) ACCEPT_PLAIN=1; shift ;;
     --allow-non-mount) ALLOW_NONMOUNT=1; shift ;;
+    --at) ARGS+=("${2:-}"); shift 2 ;;
     -h|--help) sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) ARGS+=("$1"); shift ;;
   esac
@@ -421,6 +511,8 @@ case "${1:-status}" in
   incr)         shift || true; cmd_backup incr "${1:-all}" ;;
   verify)       cmd_verify ;;
   prune)        cmd_prune ;;
+  schedule)     shift || true; cmd_schedule "${1:-02:00}" ;;
+  unschedule)   cmd_unschedule ;;
   restore-plan) shift || true; cmd_restore_plan "${1:-}" ;;
-  *) printf 'usage: %s {status|full [vm]|incr [vm]|verify|prune|restore-plan <vm>}\n' "$0" >&2; exit 2 ;;
+  *) printf 'usage: %s {status|full [vm]|incr [vm]|verify|prune|schedule [HH:MM]|unschedule|restore-plan <vm>}\n' "$0" >&2; exit 2 ;;
 esac

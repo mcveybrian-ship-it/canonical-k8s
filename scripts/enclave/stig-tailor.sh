@@ -1288,7 +1288,8 @@ cmd_grubpw() {
 #
 #   V-270675  GRUB password  - interactive by nature, and the hash must never be echoed. 6.3i
 #   V-270663/735/736/722     - the smart-card family. One missing subsystem, an AO decision
-#   V-270817/658             - audit offload. Blocked on svc-log-01 and three AO answers, 6.3d
+#   V-270817/658             - audit offload. A collector VM EXISTS now (svc-obs-01); what is
+#                              still missing is the three AO answers, not the machine. 6.3d
 #   V-270751                 - chrony: unpassable in an air gap by design. Answer File, 10.1d
 #   V-270681, V-270699(dbus) - scanner false positives. Answer File, with the verbatim output
 #
@@ -1777,7 +1778,8 @@ TMPF
   say "   V-270675           GRUB password - interactive. runbook 6.3i"
   say "   V-270663/735/736   smart card / CAC family - one missing subsystem, AO question"
   say "   V-270722/745       DoD PKI + smart-card login - same family"
-  say "   V-270817 / 658     audit offload - svc-log-01, blocked on three AO answers (6.3d)"
+  say "   V-270817 / 658     audit offload - svc-obs-01 can host the collector; the blocker"
+  say "                      is now the three AO answers alone, not the missing VM (6.3d)"
   say "   V-270751           chrony - unpassable in an air gap by design. Answer File (10.1d)"
   say "   V-270681           rsyslog selectors - SCANNER FALSE POSITIVE. DISA's own grep"
   say "                      returns both required lines. Answer File with that output."

@@ -38,6 +38,12 @@ die()  { printf '\n  [x] %s\n\n' "$*" >&2; exit 1; }
 : "${ENCLAVE_DOMAIN:?}"
 
 # name<TAB>variable. Order is the order they appear in /etc/hosts.
+#
+# THIS LIST IS HAND-MAINTAINED AND THAT IS ITS WEAKNESS. svc-obs-01 was built, addressed in
+# enclave-addresses.env, given a certificate and put into the ufw table - and was still absent
+# here, so no machine in the enclave could resolve it. Adding a machine means adding it HERE
+# too, and the symptom of forgetting is not an error, it is a name that quietly does not
+# resolve from anywhere except the machine itself.
 MAP="
 host-1:HOST_1
 host-2:HOST_2
@@ -46,6 +52,7 @@ host-4:HOST_4
 svc-mgmt-01:SVC_MGMT_01
 svc-repo-01:SVC_REPO_01
 svc-harbor-01:SVC_HARBOR_01
+svc-obs-01:SVC_OBS_01
 k8s-api:K8S_API_VIP
 k8s-cp-01:K8S_CP_01
 k8s-cp-02:K8S_CP_02

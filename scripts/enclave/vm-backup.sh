@@ -60,6 +60,17 @@ ACCEPT_PLAIN=0
 ALLOW_NONMOUNT=0
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 
+# WHO QEMU RUNS AS. The backup target is opened by the QEMU process, NOT by this script,
+# and on Ubuntu that process is libvirt-qemu:kvm rather than root. The first version created
+# the destination 0700 root:root and QEMU could not even enter the directory:
+#     unable to execute QEMU command 'blockdev-add': Could not open '...': Permission denied
+# Read it from libvirt's config rather than assuming, because a site that changed it would
+# hit the same wall with no clue why.
+qemu_user()  { awk -F'"' '/^[[:space:]]*user[[:space:]]*=/{print $2}'  /etc/libvirt/qemu.conf 2>/dev/null | tail -1; }
+qemu_group() { awk -F'"' '/^[[:space:]]*group[[:space:]]*=/{print $2}' /etc/libvirt/qemu.conf 2>/dev/null | tail -1; }
+QUSER="$(qemu_user)";  QUSER="${QUSER:-libvirt-qemu}"
+QGROUP="$(qemu_group)"; QGROUP="${QGROUP:-kvm}"
+
 say()  { printf '  %s\n' "$*"; }
 ok()   { printf '  [ok] %s\n' "$*"; }
 warn() { printf '  [!]  %s\n' "$*" >&2; }
@@ -224,7 +235,15 @@ backup_one() {  # <domain> <full|incr>
   local dom="$1" mode="$2"
   local out="$DEST/$dom/$STAMP"
   local prev="" bxml cxml rc=0
-  install -d -m 0700 "$out"
+  # Owned by the QEMU user, because QEMU is what opens the files here. 0700 on that user
+  # keeps them unreadable to everyone else, which is the point on a volume holding an image
+  # of the machine that stores the issuing CA key.
+  install -d -m 0755 -o "$QUSER" -g "$QGROUP" "$DEST/$dom" 2>/dev/null || install -d "$DEST/$dom"
+  install -d -m 0700 -o "$QUSER" -g "$QGROUP" "$out" 2>/dev/null || install -d -m 0700 "$out"
+  if ! sudo -u "$QUSER" test -w "$out" 2>/dev/null; then
+    warn "$dom: $QUSER cannot write $out - QEMU will fail to open its target"
+    warn "  check ownership above, and whether AppArmor confines libvirt to known paths"
+  fi
 
   if [ "$mode" = incr ]; then
     prev="$(virsh checkpoint-list "$dom" --name 2>/dev/null | sed '/^$/d' | tail -1)"

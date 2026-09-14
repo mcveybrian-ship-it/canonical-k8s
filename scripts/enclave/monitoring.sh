@@ -38,6 +38,11 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 NE_DEFAULTS=/etc/default/prometheus-node-exporter
 LV_DEFAULTS=/etc/default/prometheus-libvirt-exporter
 NE_PORT="${NODE_EXPORTER_PORT:-9100}"
+TEXTFILE_DIR="${TEXTFILE_DIR:-/var/lib/node_exporter/textfile}"
+# THE SYSTEMD COLLECTOR IS DELIBERATELY NARROWED. Unrestricted it emits several series for
+# every unit on the box - hundreds of them, most of which nobody will ever look at, on a
+# Prometheus with a 90d retention. Named units only: the ones a machine exists to run.
+SYSTEMD_UNITS="${SYSTEMD_UNITS:-(auditd|chrony|sshd|ssh|ufw|nginx|docker|containerd|grafana-server|prometheus|prometheus-alertmanager|prometheus-node-exporter|prometheus-libvirt-exporter|libvirtd|virtqemud|postgresql.*|maas-.*|named|bind9|dailyaidecheck|vm-backup|enclave-facts)\\.(service|timer)}"
 LV_PORT="${LIBVIRT_EXPORTER_PORT:-9177}"
 
 # THE DATASOURCE UID IS A CONTRACT between the provisioning file and every dashboard JSON.
@@ -91,10 +96,21 @@ cmd_exporter() {
   cp -a "$NE_DEFAULTS" "/var/backups/$(basename "$NE_DEFAULTS").$(date +%Y%m%dT%H%M%S)"
   # SET the existing line, never append. An appended ARGS= works (the file is sourced, last
   # wins) and leaves two lines that disagree - someone edits the first one and nothing changes.
+  # THE TEXTFILE DIRECTORY is what lets anything on this machine publish a metric without
+  # writing an exporter: drop a .prom file in, node-exporter serves it. It is how the
+  # compliance facts (STIG residual, cert expiry, AIDE, auditd) reach Prometheus at all.
+  # root writes, the prometheus user reads - never the other way round.
+  install -d -m 0755 -o root -g prometheus "$TEXTFILE_DIR" 2>/dev/null \
+    || install -d -m 0755 "$TEXTFILE_DIR"
+
+  local ne_args="--web.listen-address=${ip}:${NE_PORT}"
+  ne_args="$ne_args --collector.textfile.directory=$TEXTFILE_DIR"
+  ne_args="$ne_args --collector.systemd --collector.systemd.unit-include=$SYSTEMD_UNITS"
+
   if grep -q '^ARGS=' "$NE_DEFAULTS"; then
-    sed -i "s|^ARGS=.*|ARGS=\"--web.listen-address=${ip}:${NE_PORT}\"|" "$NE_DEFAULTS"
+    sed -i "s|^ARGS=.*|ARGS=\"$ne_args\"|" "$NE_DEFAULTS"
   else
-    printf 'ARGS="--web.listen-address=%s:%s"\n' "$ip" "$NE_PORT" >> "$NE_DEFAULTS"
+    printf 'ARGS="%s"\n' "$ne_args" >> "$NE_DEFAULTS"
   fi
   local n; n="$(grep -c '^ARGS=' "$NE_DEFAULTS")"
   [ "$n" -eq 1 ] || {
@@ -668,6 +684,297 @@ for g in json.load(sys.stdin)["data"]["groups"]:
 # The consequence is worth knowing before someone spends an afternoon in the UI: edits made
 # in Grafana to a provisioned dashboard CANNOT be saved back over it. Change the JSON here,
 # re-run this, and Grafana picks it up.
+# ----------------------------------------------------------------------------- facts
+# COMPLIANCE FACTS AS METRICS.
+#
+# Everything here is already measured somewhere on this machine and then thrown away: the
+# STIG residual sits in an XML nobody opens, certificate expiry lives in a runbook table
+# that goes stale, AIDE mails a report to a mailbox that cannot leave the enclave. This
+# turns each of them into a series so it can be graphed, alerted on, and shown to an
+# assessor as a trend rather than an assertion.
+#
+# THE ONE RULE THAT MATTERS: A MISSING SOURCE MUST NEVER RENDER AS ZERO FINDINGS.
+# A dashboard that reads "0 Open" because a scan was never run looks exactly like a
+# dashboard that reads "0 Open" because the machine is clean. So every family publishes a
+# companion enclave_facts_source_ok{source="..."}, and a family with no source emits NO
+# SAMPLES AT ALL - "No data" on a panel is honest, a zero is a lie.
+cmd_facts() {
+  need_root; guard_in_gap
+  install -d -m 0755 "$TEXTFILE_DIR" 2>/dev/null || true
+  local out="$TEXTFILE_DIR/enclave-compliance.prom" tmp
+  tmp="$(mktemp "$TEXTFILE_DIR/.facts.XXXXXX")" || die "cannot write in $TEXTFILE_DIR"
+
+  LC_ALL=C python3 - > "$tmp" <<'FACTSPY'
+import os, sys, glob, csv, time, subprocess, collections, calendar
+
+OUT = []
+SRC = {}                      # source -> 1 ok / 0 present-but-unreadable ; absent = no entry
+
+def emit(name, value, labels=None, help=None, typ="gauge"):
+    OUT.append((name, labels or {}, value, help, typ))
+
+def run(cmd, timeout=20):
+    """Capture stdout AND say nothing on failure. Swallowed output has cost this project
+    three evenings, so callers must decide what a failure means - never this helper."""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout, r.stderr
+    except Exception as e:
+        return 127, "", str(e)
+
+def utc_epoch(text):
+    """systemd prints 'Mon 2026-09-14 02:05:18 UTC'. %Z round-trips badly, and these
+    machines are all UTC by build (the operator is US Central, the boxes are not), so the
+    weekday and zone are dropped and the rest read as UTC."""
+    try:
+        parts = text.split()
+        if len(parts) >= 3:
+            t = time.strptime(parts[1] + " " + parts[2], "%Y-%m-%d %H:%M:%S")
+            return calendar.timegm(t)
+    except Exception:
+        pass
+    return None
+
+# ---------------------------------------------------------------- FIPS and reboot state
+try:
+    v = int(open("/proc/sys/crypto/fips_enabled").read().strip())
+    emit("enclave_fips_enabled", v, help="1 if the kernel is running in FIPS mode")
+    SRC["fips"] = 1
+except Exception:
+    SRC["fips"] = 0
+
+emit("enclave_reboot_required", 1 if os.path.exists("/var/run/reboot-required") else 0,
+     help="1 if a package update is waiting on a reboot to take effect")
+
+# ---------------------------------------------------------------------- USG / OpenSCAP
+# usg audit writes /var/lib/usg/usg-results-YYYYMMDD.HHMM.xml, 0600 root:root. Newest wins.
+xmls = sorted(glob.glob("/var/lib/usg/usg-results-*.xml"), key=os.path.getmtime)
+if xmls:
+    newest = xmls[-1]
+    try:
+        import xml.etree.ElementTree as ET
+        c = collections.Counter()
+        # iterparse, not parse: these are 8 MB and this runs every 15 minutes.
+        for _, el in ET.iterparse(newest, events=("end",)):
+            if el.tag.endswith("rule-result"):
+                for ch in el:
+                    if ch.tag.endswith("}result") or ch.tag == "result":
+                        c[(ch.text or "unknown").strip()] += 1
+                        break
+                el.clear()
+        for k, n in c.items():
+            emit("enclave_usg_rules", n, {"result": k},
+                 help="XCCDF rule-results from the newest usg audit on this machine")
+        emit("enclave_usg_scan_time_seconds", int(os.path.getmtime(newest)),
+             help="mtime of the newest usg results XML - a green score from a stale scan is not a pass")
+        SRC["usg"] = 1
+    except Exception:
+        SRC["usg"] = 0
+
+# ------------------------------------------------------------- Evaluate-STIG against V1R6
+# NEVER from Previous/. Evaluate-STIG archives each prior run under <MACHINE>/Previous/,
+# and a path sort puts the archive last - which is how a report described a scan 20 minutes
+# older than the one that had just finished (stig-tools.sh has the same guard).
+# AND SCOPED TO THIS MACHINE. /srv/stig-evidence is also the directory stage-01 collects
+# every machine's evidence INTO, so an unscoped glob would happily describe svc-harbor-01
+# on host-4. Evaluate-STIG names the directory after the hostname, uppercased.
+me = os.uname()[1].split(".")[0]
+csvs = [f for f in glob.glob("/srv/stig-evidence/*/Checklist/*COMBINED*.csv") if "/Previous/" not in f]
+mine = [f for f in csvs if ("/%s/" % me.upper()) in f.upper()]
+if csvs and not mine:
+    SRC["estig"] = 0          # evidence is here, but none of it is THIS machine's
+csvs = mine
+if csvs:
+    newest = max(csvs, key=os.path.getmtime)
+    try:
+        rows = list(csv.DictReader(open(newest, encoding="utf-8-sig")))
+        c = collections.Counter(r.get("Status", "?") for r in rows)
+        for k, n in c.items():
+            emit("enclave_stig_controls", n, {"status": k},
+                 help="DISA V1R6 controls by status: NF not a finding, O open, NR not reviewed, NA not applicable")
+        sev = collections.Counter(r.get("Severity", "?") for r in rows if r.get("Status") == "O")
+        for k, n in sev.items():
+            emit("enclave_stig_open_by_severity", n, {"severity": k},
+                 help="Open V1R6 controls by severity")
+        emit("enclave_stig_controls_total", len(rows), help="controls assessed in the newest checklist")
+        emit("enclave_stig_scan_time_seconds", int(os.path.getmtime(newest)),
+             help="mtime of the newest COMBINED checklist")
+        SRC["estig"] = 1
+    except Exception:
+        SRC["estig"] = 0
+
+# ------------------------------------------------------------------ certificate expiry
+# The runbook carries an expiry calendar that is correct on the day it is written. This is
+# the same three dates, measured.
+certs = sorted(set(glob.glob("/etc/ssl/enclave/*.crt")
+                   + glob.glob("/usr/local/share/ca-certificates/*.crt")))
+if certs:
+    ok_any = 0
+    for f in certs:
+        rc, o, _ = run(["openssl", "x509", "-noout", "-enddate", "-subject", "-in", f])
+        if rc != 0:
+            continue
+        end = cn = None
+        for line in o.splitlines():
+            if line.startswith("notAfter="):
+                t = line.split("=", 1)[1].strip()
+                for fmt in ("%b %d %H:%M:%S %Y %Z", "%b %d %H:%M:%S %Y"):
+                    try:
+                        end = calendar.timegm(time.strptime(t.replace(" GMT", ""), fmt.replace(" %Z", "")))
+                        break
+                    except Exception:
+                        continue
+            elif line.startswith("subject="):
+                for part in line.split("CN"):
+                    if part.startswith(" = ") or part.startswith("="):
+                        cn = part.split("=", 1)[1].strip().split(",")[0]
+        if end:
+            emit("enclave_cert_expiry_seconds", end,
+                 {"file": os.path.basename(f), "cn": cn or "unknown"},
+                 help="unix time at which this certificate stops being valid")
+            ok_any = 1
+    SRC["certs"] = ok_any
+
+# ------------------------------------------------------------------------------ auditd
+# lost and backlog are the two numbers that say whether the audit trail is COMPLETE. A
+# machine can pass every audit rule check while silently dropping records.
+rc, o, _ = run(["auditctl", "-s"])
+if rc == 0:
+    SRC["auditd"] = 1
+    for line in o.split("\n"):
+        f = line.split()
+        if len(f) >= 2 and f[0] in ("enabled", "lost", "backlog", "backlog_limit", "failure"):
+            try:
+                emit("enclave_auditd_" + f[0], int(f[1]),
+                     help="auditctl -s: " + f[0] + " (lost > 0 means audit records were DROPPED)")
+            except ValueError:
+                pass
+else:
+    SRC["auditd"] = 0
+
+# -------------------------------------------------------------------------------- AIDE
+# dailyaidecheck.timer is the STIG's file-integrity mechanism on Ubuntu. What matters is
+# not that the timer exists but that the last run finished and when.
+# LoadState IS THE GUARD. `systemctl show` on a unit that does not exist exits 0 and prints
+# defaults, so without this a machine with no AIDE at all published
+# enclave_aide_last_exit_code 0 - a clean bill of health from a check that never ran.
+rc, o, _ = run(["systemctl", "show", "dailyaidecheck.service", "-p", "LoadState",
+                "-p", "ExecMainStartTimestamp", "-p", "ExecMainStatus", "-p", "Result"])
+if rc == 0 and "LoadState=loaded" in o:
+    SRC["aide"] = 1
+    kv = dict(l.split("=", 1) for l in o.strip().splitlines() if "=" in l)
+    ts = utc_epoch(kv.get("ExecMainStartTimestamp", ""))
+    if ts:
+        emit("enclave_aide_last_run_seconds", ts, help="unix time the last AIDE check started")
+    if ts:                    # no start timestamp means it has never run - say nothing
+        try:
+            emit("enclave_aide_last_exit_code", int(kv.get("ExecMainStatus", "") or -1),
+                 help="exit status of the last AIDE check; non-zero means it found changes or failed")
+        except ValueError:
+            pass
+for db in ("/var/lib/aide/aide.db", "/var/lib/aide/aide.db.new"):
+    if os.path.exists(db):
+        emit("enclave_aide_db_age_seconds", int(time.time() - os.path.getmtime(db)),
+             {"db": os.path.basename(db)}, help="age of the AIDE baseline database")
+
+# ------------------------------------------------------------------ accounts and lockout
+# pam_faillock tallies live in /run/faillock, one file per user, on tmpfs. deny=3 and
+# unlock_time=0 here, so a tally that reaches 3 is a PERMANENT lockout until cleared - the
+# thing that locked this operator out of host-4.
+try:
+    n = sum(1 for f in glob.glob("/run/faillock/*") if os.path.getsize(f) > 0)
+    emit("enclave_faillock_users_with_failures", n,
+         help="users with a non-empty pam_faillock tally; deny=3 unlock_time=0 means 3 is permanent")
+    SRC["accounts"] = 1
+except Exception:
+    SRC["accounts"] = 0
+
+rc, o, _ = run(["journalctl", "--since", "-24h", "-t", "sudo", "-o", "cat", "--no-pager"], timeout=60)
+if rc == 0:
+    emit("enclave_failed_sudo_24h", sum(1 for l in o.splitlines() if "authentication failure" in l),
+         help="failed sudo authentications in the last 24h, from the journal")
+    emit("enclave_sudo_invocations_24h", sum(1 for l in o.splitlines() if "COMMAND=" in l),
+         help="total sudo invocations in the last 24h - svc-mgmt-01 runs ~1.7 per SECOND and nobody knows why")
+
+# ------------------------------------------------------------------------- USB storage
+# V-270718 checks modprobe.d and NEVER lsmod, so this reads the same place the control does.
+blocked = 0
+for f in glob.glob("/etc/modprobe.d/*.conf"):
+    try:
+        t = open(f, errors="ignore").read()
+        if "usb-storage" in t and ("install usb-storage /bin/false" in t or "blacklist usb-storage" in t):
+            blocked = 1
+    except Exception:
+        pass
+emit("enclave_usb_storage_blocked", blocked,
+     help="1 if usb-storage is blocked in modprobe.d, which is where V-270718 looks")
+
+# --------------------------------------------------------------------------- producer
+emit("enclave_facts_generated_seconds", int(time.time()),
+     help="unix time this file was written - if it stops moving, every metric above is stale")
+for k, v in sorted(SRC.items()):
+    emit("enclave_facts_source_ok", v, {"source": k},
+         help="1 if this source was readable. ABSENT means the source does not exist on this machine - which is not the same as zero findings")
+
+# ------------------------------------------------------------------------------ output
+seen = set()
+for name, labels, value, help, typ in OUT:
+    if name not in seen:
+        seen.add(name)
+        if help:
+            print("# HELP %s %s" % (name, help))
+        print("# TYPE %s %s" % (name, typ))
+    if labels:
+        ls = ",".join('%s="%s"' % (k, str(v).replace('\\', '').replace('"', ''))
+                      for k, v in sorted(labels.items()))
+        print("%s{%s} %s" % (name, ls, value))
+    else:
+        print("%s %s" % (name, value))
+FACTSPY
+
+  # A PRODUCER THAT WROTE NOTHING MUST NOT REPLACE A GOOD FILE. Truncating the old one
+  # would turn "the script broke" into "this machine has no findings", which is the exact
+  # failure this whole file is written to avoid.
+  if [ ! -s "$tmp" ]; then rm -f "$tmp"; die "facts produced NO output - $out left as it was"; fi
+  chmod 0644 "$tmp"; mv -f "$tmp" "$out"
+  ok "wrote $out"
+  say "   $(grep -vc '^#' "$out") samples, $(grep -c '^# HELP' "$out") metric families"
+  grep '^enclave_facts_source_ok' "$out" | sed 's/^/     /'
+}
+
+# Install the timer that keeps the facts fresh. 15 minutes: these are daily-to-weekly facts,
+# and a scrape interval is not a measurement interval.
+cmd_facts_timer() {
+  need_root; guard_in_gap
+  cat > /etc/systemd/system/enclave-facts.service <<UNIT
+[Unit]
+Description=Publish enclave compliance facts for node-exporter
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=$HERE/monitoring.sh facts
+UNIT
+  cat > /etc/systemd/system/enclave-facts.timer <<'UNIT'
+[Unit]
+Description=Refresh enclave compliance facts every 15 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=15min
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+  systemctl daemon-reload
+  systemctl enable --now enclave-facts.timer >/dev/null 2>&1 || die "could not enable enclave-facts.timer"
+  systemctl start enclave-facts.service || warn "first run failed - journalctl -u enclave-facts"
+  ok "enclave-facts.timer enabled"
+  systemctl list-timers enclave-facts.timer --no-pager 2>/dev/null | sed -n '2p' | sed 's/^/     /'
+}
+
 cmd_dashboards() {
   need_root
   local me; me="$(hostname -s)"
@@ -849,7 +1156,9 @@ case "${1:-status}" in
   libvirt)  shift; cmd_libvirt "$@" ;;
   collector) shift; cmd_collector "$@" ;;
   rules)      shift; cmd_rules "$@" ;;
+  facts)      shift; cmd_facts "$@" ;;
+  facts-timer) shift; cmd_facts_timer "$@" ;;
   dashboards) shift; cmd_dashboards "$@" ;;
   status)   shift; cmd_status "$@" ;;
-  *) printf 'usage: %s {exporter|libvirt|collector|rules|dashboards|status}\n' "$0" >&2; exit 2 ;;
+  *) printf 'usage: %s {exporter|libvirt|collector|rules|facts|facts-timer|dashboards|status}\n' "$0" >&2; exit 2 ;;
 esac

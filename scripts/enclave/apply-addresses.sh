@@ -97,7 +97,12 @@ apply_local() {
   grep -q '^127.0.0.1' "$new" || { rm -f "$new"; die "refusing to write an /etc/hosts with no 127.0.0.1 line"; }
   cp /etc/hosts "/etc/hosts.bak-$(date +%Y%m%d%H%M%S)"
   install -m 0644 "$new" /etc/hosts; rm -f "$new"
-  ok "$(hostname): /etc/hosts updated, $(grep -c "$ENCLAVE_DOMAIN" /etc/hosts) name(s)"
+  # COUNT WHAT WAS WRITTEN, NOT WHAT MATCHES. Counting the domain across the whole file also
+  # counts cloud-init's "127.0.1.1 <host> <host>.<domain>" line, which this script did not
+  # write and does not manage - so `apply` said 17 where `verify` said 16 and neither was
+  # wrong about anything. A number that does not mean what its label says invites exactly
+  # the hunt it just cost.
+  ok "$(hostname): /etc/hosts updated, $(sed -n "/^$BEGIN\$/,/^$END\$/p" /etc/hosts | grep -c "$ENCLAVE_DOMAIN") name(s) in the managed block"
 }
 
 targets() {

@@ -51,6 +51,9 @@ head2() { printf '\n== %s ==\n' "$*"; }
 set -a
 # shellcheck disable=SC1090
 . "$PARAMS"
+
+# The repository to carry on the media. Defaults to the checkout this script lives in.
+REPO_DIR="${REPO_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd -P)}"
 set +a
 
 : "${MIRROR_BASE:?not set in $PARAMS}"
@@ -133,7 +136,13 @@ else
   # refuse to touch anything that is not a plausible staging directory, and delete only
   # the subdirectories this script itself creates - never $STAGING_DIR wholesale.
   if [ -d "$STAGING_DIR" ]; then
-    for sub in keys debs media config scripts snaps tools; do
+    # NOTE tools IS NOT IN THIS LIST, DELIBERATELY. TOOLS_DIR defaults to
+    # $STAGING_DIR/tools - the same directory - and the tools are a STAGED SOURCE that was
+    # put there by hand and by stig-tools.sh, not generated output. Cleaning it deleted
+    # 545 MB of Evaluate-STIG and PowerShell on 2026-09-14 and the copy that followed then
+    # reported "SKIP - no such directory" for every one of them. A clean step that removes
+    # its own source is the worst kind: it reports success having produced nothing.
+    for sub in keys debs media config scripts snaps; do
       [ -d "$STAGING_DIR/$sub" ] && rm -rf -- "${STAGING_DIR:?}/$sub"
     done
     rm -f -- "${STAGING_DIR:?}/MANIFEST.sha256"
@@ -196,13 +205,35 @@ copy_tree() {  # copy_tree <label> <src dir> <dest subdir>
   note "$label: $got file(s)"
 }
 
-copy_tree "Evaluate-STIG"  "$TOOLS_DIR/Evaluate-STIG"     tools
-copy_tree "PowerShell"     "$TOOLS_DIR/powershell-7.4.20" tools
-copy_in   "pwsh tarball"   "$TOOLS_DIR"                   tools 'powershell-*.tar.gz'
-copy_in   "pwsh hashes"    "$TOOLS_DIR"                   tools 'powershell-*.sha256'
-# STIG content the scanner does not ship - product XCCDFs and the SRGs. CAC-only, so if it
-# is not here it cannot be got later from inside.
-copy_in   "STIG content"   "$TOOLS_DIR/stig-content"      tools '*.zip'
+# IS THE SOURCE ALREADY THE DESTINATION? By default the tools are staged at
+# $STAGING_DIR/tools, which IS the bundle's tools directory - so there is nothing to copy
+# and copying would be nonsense. Verify and report instead. A site that stages them
+# elsewhere (TOOLS_DIR set to another path) gets a real copy.
+if [ "$(readlink -f "$TOOLS_DIR" 2>/dev/null)" = "$(readlink -f "$STAGING_DIR/tools" 2>/dev/null)" ]; then
+  head2 "tools (staged in place - verifying, not copying)"
+  for want in Evaluate-STIG powershell-7.4.20; do
+    if [ -d "$TOOLS_DIR/$want" ]; then
+      note "$want: $(find "$TOOLS_DIR/$want" -type f | wc -l) file(s)"
+    else
+      note "MISSING $want - a rebuilt enclave cannot be MEASURED without it"
+    fi
+  done
+  # PRINT THE COUNT EITHER WAY. A line that only appears when the answer is non-zero means
+  # a missing checksum file looks identical to one nobody checked for.
+  for g in 'powershell-*.tar.gz' 'SHA256SUMS' 'powershell-*.sha256'; do
+    n=$(find "$TOOLS_DIR" -maxdepth 1 -name "$g" -type f 2>/dev/null | wc -l)
+    note "$g: $n file(s)"
+  done
+  [ -d "$TOOLS_DIR/stig-content" ] \
+    && note "STIG content: $(find "$TOOLS_DIR/stig-content" -type f | wc -l) file(s)" \
+    || note "no stig-content/ yet - the product XCCDFs are a CAC-only download"
+else
+  copy_tree "Evaluate-STIG"  "$TOOLS_DIR/Evaluate-STIG"     tools
+  copy_tree "PowerShell"     "$TOOLS_DIR/powershell-7.4.20" tools
+  copy_in   "pwsh tarball"   "$TOOLS_DIR"                   tools 'powershell-*.tar.gz'
+  copy_in   "pwsh hashes"    "$TOOLS_DIR"                   tools 'powershell-*.sha256'
+  copy_in   "STIG content"   "$TOOLS_DIR/stig-content"      tools '*.zip'
+fi
 
 # DELIBERATELY NOT CARRIED: the Answer File. It records this enclave's security posture in
 # prose, and it is regenerable - answerfile.sh seeds from the vendor template that ships
@@ -254,6 +285,28 @@ if [ "$DRY" -eq 0 ]; then
   cp -a "$SCRIPT_DIR/restore-mirror.sh" "$STAGING_DIR/scripts/" 2>/dev/null || true
   cp -a "$PARAMS" "$STAGING_DIR/scripts/transfer-params.env" 2>/dev/null || true
   note "restore script + params: copied"
+
+  # THE REPOSITORY ITSELF. Without it the media carries packages, images and the STIG
+  # tooling - and none of the scripts that drive them. Today the scripts reach the enclave
+  # over the network via push-repo-to-host.sh, which works only while the gap is open. On a
+  # from-scratch rebuild there is no network path, so the media has to carry them.
+  #
+  # SAME MECHANISM AS THE PUSH: `git archive HEAD`, which carries TRACKED files only. That
+  # keeps the five private paths off removable media by the same property that keeps them
+  # off the targets, rather than by remembering an --exclude. It also means an uncommitted
+  # edit DOES NOT TRAVEL - commit first, and the warning below says so if you have not.
+  if command -v git >/dev/null 2>&1 && git -C "$REPO_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+    _SHA="$(git -C "$REPO_DIR" rev-parse --short HEAD)"
+    rm -f "$STAGING_DIR/scripts"/canonical-k8s-*.tar.gz
+    git -C "$REPO_DIR" archive --format=tar --prefix="canonical-k8s/" HEAD \
+      | gzip -9 > "$STAGING_DIR/scripts/canonical-k8s-${_SHA}.tar.gz"
+    printf '%s\n' "$_SHA" > "$STAGING_DIR/scripts/canonical-k8s.commit"
+    note "repository: $(tar -tzf "$STAGING_DIR/scripts/canonical-k8s-${_SHA}.tar.gz" | grep -cv '/$') tracked file(s) at $_SHA"
+    git -C "$REPO_DIR" diff --quiet HEAD 2>/dev/null \
+      || note "WARNING: working tree has uncommitted changes - they are NOT on this media"
+  else
+    note "SKIP repository - $REPO_DIR is not a git checkout"
+  fi
 fi
 
 # Every .snap must have its matching .assert. Installing without one needs --dangerous,

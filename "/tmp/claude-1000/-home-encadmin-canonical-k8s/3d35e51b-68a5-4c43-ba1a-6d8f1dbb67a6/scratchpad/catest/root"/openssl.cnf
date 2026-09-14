@@ -1,0 +1,39 @@
+[ ca ]
+default_ca = CA_default
+[ CA_default ]
+dir               = "/tmp/claude-1000/-home-encadmin-canonical-k8s/3d35e51b-68a5-4c43-ba1a-6d8f1dbb67a6/scratchpad/catest/root"
+certs             = $dir/certs
+new_certs_dir     = $dir/newcerts
+database          = $dir/index.txt
+serial            = $dir/serial
+private_key       = $dir/private/root.key
+certificate       = $dir/certs/root.crt
+default_md        = "sha256"
+policy            = policy_loose
+email_in_dn       = no
+rand_serial       = no
+unique_subject    = no
+[ policy_loose ]
+countryName             = optional
+organizationName        = optional
+organizationalUnitName  = optional
+commonName              = supplied
+[ req ]
+default_bits       = "2048"
+distinguished_name = req_dn
+string_mask        = utf8only
+default_md         = "sha256"
+x509_extensions    = v3_root
+[ req_dn ]
+[ v3_root ]
+subjectKeyIdentifier   = hash
+authorityKeyIdentifier = keyid:always,issuer
+basicConstraints       = critical, CA:true
+keyUsage               = critical, digitalSignature, cRLSign, keyCertSign
+[ v3_issuing ]
+subjectKeyIdentifier   = hash
+authorityKeyIdentifier = keyid:always,issuer
+# pathlen:0 - the issuing CA may sign end-entity certificates and NOTHING ELSE. It cannot
+# create a further CA, so a compromise of svc-mgmt-01 cannot mint new authorities.
+basicConstraints       = critical, CA:true, pathlen:0
+keyUsage               = critical, digitalSignature, cRLSign, keyCertSign

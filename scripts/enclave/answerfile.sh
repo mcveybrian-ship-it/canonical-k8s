@@ -369,6 +369,23 @@ cmd_show() {
 }
 
 cmd_generate() {
+  # BOOTSTRAP FROM THE VENDOR TEMPLATE. On a from-scratch rebuild there is no answer file to
+  # modify, and "no answer file at ..." would stop the rebuild at exactly the point where
+  # nobody has one to supply. Evaluate-STIG ships Template_AnswerFile.xml; seed from that.
+  # The template travels on the transfer bundle inside the scanner tree, so this works
+  # inside the gap with no network.
+  if [ ! -f "$AF" ]; then
+    local tpl="${STIG_AF_TEMPLATE:-$(dirname "$XSD")/../AnswerFiles/Template_AnswerFile.xml}"
+    [ -f "$tpl" ] || die "no answer file at $AF, and no vendor template at $tpl
+       Set STIG_ANSWERFILE to an existing file, or STIG_AF_TEMPLATE to the vendor template."
+    install -d "$(dirname "$AF")"
+    install -m 0644 "$tpl" "$AF"
+    warn "NO ANSWER FILE EXISTED - seeded from the vendor template:"
+    say  "     $tpl"
+    say  "     -> $AF"
+    say  "  Entries below are written fresh. Any hand-written entry from a previous build"
+    say  "  is NOT here - it lives outside this repo and has to be restored separately."
+  fi
   [ -f "$AF" ] || die "no answer file at $AF - set STIG_ANSWERFILE"
   local tmpdir; tmpdir="$(mktemp -d)"
   # shellcheck disable=SC2064
@@ -397,6 +414,15 @@ managed = sorted(os.path.basename(p)[:-4] for p in glob.glob(os.path.join(tmpd, 
 
 tree = ET.parse(af)
 root = tree.getroot()
+# THE VENDOR TEMPLATE SHIPS A SAMPLE ENTRY (V-00000). Left in, it travels to every machine
+# as a real-looking answer for a vuln id that does not exist. Drop any placeholder before
+# anything else looks at the file.
+for _v in list(root.findall('Vuln')):
+    _id = (_v.get('ID') or '').upper()
+    if _id in ('V-00000', 'V-XXXXX') or _id.replace('V-', '').strip('0') == '':
+        root.remove(_v)
+        print("  removed the vendor template's placeholder entry: %s" % _id)
+
 existing = {v.get('ID'): v for v in root.findall('Vuln')}
 preserved = [k for k in existing if k not in managed]
 
@@ -454,12 +480,15 @@ cmd_verify() {
     python3 -c "import xml.etree.ElementTree as ET,sys; ET.parse(sys.argv[1]); print('  [ok] well-formed')" "$AF"
   fi
   say "entries: $(grep -c '<Vuln ID=' "$AF")"
-  # A ResultHash left anywhere in the file is the bug this script exists to remove.
-  local pinned; pinned="$(grep -c 'ResultHash=' "$AF" || true)"
+  # A ResultHash left anywhere in the file is the bug this script exists to remove - but
+  # an EMPTY ResultHash="" is not a pin, it is the vendor template's placeholder attribute.
+  # Matching on the attribute name alone reported the seeded template as a violation and
+  # would have had someone hunting a hash that was never there.
+  local pinned; pinned="$(grep -c 'ResultHash="[^"]\+"' "$AF" || true)"
   if [ "${pinned:-0}" -gt 0 ]; then
     warn "$pinned entry(ies) still carry ResultHash - those answer only on the machine they"
     warn "  were built on. Portable entries must not have one."
-    grep -n 'ResultHash=' "$AF" | sed 's/^/       /'
+    grep -n 'ResultHash="[^"]\+"' "$AF" | sed 's/^/       /'
   else
     ok "no ResultHash anywhere - every answer is portable"
   fi

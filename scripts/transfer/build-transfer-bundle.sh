@@ -133,13 +133,13 @@ else
   # refuse to touch anything that is not a plausible staging directory, and delete only
   # the subdirectories this script itself creates - never $STAGING_DIR wholesale.
   if [ -d "$STAGING_DIR" ]; then
-    for sub in keys debs media config scripts snaps; do
+    for sub in keys debs media config scripts snaps tools; do
       [ -d "$STAGING_DIR/$sub" ] && rm -rf -- "${STAGING_DIR:?}/$sub"
     done
     rm -f -- "${STAGING_DIR:?}/MANIFEST.sha256"
     note "cleaned previous staging content"
   fi
-  mkdir -p "$STAGING_DIR"/{keys,debs,media,config,scripts,snaps}
+  mkdir -p "$STAGING_DIR"/{keys,debs,media,config,scripts,snaps,tools}
 fi
 
 # Counts what ARRIVED, not what was found in the source. The earlier version reported
@@ -173,6 +173,41 @@ copy_in "snap asserts" "$MIRROR_BASE/snaps" snaps '*.assert'
 copy_in "install ISOs" "$MEDIA_DIR"        media '*.iso'
 copy_in "cloud images" "$MEDIA_DIR/minimal" media '*.img'
 copy_in "checksums"    "$MEDIA_DIR"        media 'SHA256SUMS*'
+
+# THE STIG TOOLING. Without it a rebuilt enclave can be hardened by usg but cannot be
+# MEASURED against the revision DISA actually assesses - and this is a CAC-only download
+# now (public.cyber.mil redirects to SAML and its download index is a JS portal with no
+# scrapable links, checked 2026-09-13). Whatever is not on this media cannot be fetched
+# from inside the gap later.
+#
+# A TREE, NOT A GLOB. Evaluate-STIG is 390 files across directories and PowerShell is an
+# unpacked runtime, so copy_in's flat-glob shape does not fit. Same discipline though:
+# count what ARRIVED, not what was found in the source.
+copy_tree() {  # copy_tree <label> <src dir> <dest subdir>
+  local label="$1" src="$2" dest="$3" want got
+  if [ ! -d "$src" ]; then note "SKIP $label - no $src"; return 0; fi
+  want=$(find "$src" -type f 2>/dev/null | wc -l)
+  if [ "$want" -eq 0 ]; then note "SKIP $label - $src is empty"; return 0; fi
+  if [ "$DRY" -eq 1 ]; then note "$label: $want file(s) (dry run)"; return 0; fi
+  [ -d "$STAGING_DIR/$dest" ] || die "staging subdir missing: $STAGING_DIR/$dest"
+  cp -a "$src" "$STAGING_DIR/$dest/"
+  got=$(find "$STAGING_DIR/$dest/$(basename "$src")" -type f 2>/dev/null | wc -l)
+  [ "$got" -eq "$want" ] || die "$label: copied $got of $want file(s) into $STAGING_DIR/$dest"
+  note "$label: $got file(s)"
+}
+
+copy_tree "Evaluate-STIG"  "$TOOLS_DIR/Evaluate-STIG"     tools
+copy_tree "PowerShell"     "$TOOLS_DIR/powershell-7.4.20" tools
+copy_in   "pwsh tarball"   "$TOOLS_DIR"                   tools 'powershell-*.tar.gz'
+copy_in   "pwsh hashes"    "$TOOLS_DIR"                   tools 'powershell-*.sha256'
+# STIG content the scanner does not ship - product XCCDFs and the SRGs. CAC-only, so if it
+# is not here it cannot be got later from inside.
+copy_in   "STIG content"   "$TOOLS_DIR/stig-content"      tools '*.zip'
+
+# DELIBERATELY NOT CARRIED: the Answer File. It records this enclave's security posture in
+# prose, and it is regenerable - answerfile.sh seeds from the vendor template that ships
+# inside Evaluate-STIG above and writes every entry from the repo. The generator travels
+# on this media; the artefact does not.
 
 # The contracts-server config. Its absence is a hard stop: without it the enclave can
 # pull packages but has nothing to `pro attach` against, and every FIPS and ESM package

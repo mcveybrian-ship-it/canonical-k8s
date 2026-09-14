@@ -689,9 +689,18 @@ EOF
       sed -i "\#^/var/log/syslog\$#a $d" "$RSYSLOG_LOGROTATE"
       if ! logrotate_config_ok; then
         cp -a "$rsbak" "$RSYSLOG_LOGROTATE"
-        warn "   logrotate rejected adding $d - REVERTED. Its output:"
-        printf '%s\n' "$LOGROTATE_OUT" | sed 's/^/       /'
-        failed=1
+        # A DUPLICATE IS NOT A FAILURE, IT IS AN ANSWER. Another stanza already covers this
+        # file through a GLOB - /etc/logrotate.d/cloud-init carries /var/log/cloud-init*.log
+        # - which a literal grep for the exact path cannot see. logrotate can, and says so.
+        # Treating that as a failure made an already-correct machine report a problem.
+        if printf '%s' "$LOGROTATE_OUT" | command grep -qi "duplicate log entry for $d"; then
+          say "   $d is already covered by a GLOB in another stanza - left alone"
+          missing=$((missing - 1))
+        else
+          warn "   logrotate rejected adding $d - REVERTED. Its output:"
+          printf '%s\n' "$LOGROTATE_OUT" | sed 's/^/       /'
+          failed=1
+        fi
       else
         ok "   NOT ROTATED BY ANYTHING - added $d to $RSYSLOG_LOGROTATE (backup: $rsbak)"
         # Say how big it already is. A number here is the difference between "tidy-up" and

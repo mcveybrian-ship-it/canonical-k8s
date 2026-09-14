@@ -107,8 +107,16 @@ cmd_exporter() {
   ne_args="$ne_args --collector.textfile.directory=$TEXTFILE_DIR"
   ne_args="$ne_args --collector.systemd --collector.systemd.unit-include=$SYSTEMD_UNITS"
 
+  # NOT sed. The value contains '|' (the systemd unit regex) and would need a delimiter no
+  # future value can contain - there is no such character. Replacing the line by filtering
+  # and appending cannot be broken by ANY content, which is the property worth having in a
+  # file that decides whether this machine reports metrics at all.
   if grep -q '^ARGS=' "$NE_DEFAULTS"; then
-    sed -i "s|^ARGS=.*|ARGS=\"$ne_args\"|" "$NE_DEFAULTS"
+    local ne_tmp; ne_tmp="$(mktemp)"
+    grep -v '^ARGS=' "$NE_DEFAULTS" > "$ne_tmp"
+    printf 'ARGS="%s"\n' "$ne_args" >> "$ne_tmp"
+    cat "$ne_tmp" > "$NE_DEFAULTS"      # > not mv: keeps the package's owner and mode
+    rm -f "$ne_tmp"
   else
     printf 'ARGS="%s"\n' "$ne_args" >> "$NE_DEFAULTS"
   fi
@@ -152,8 +160,24 @@ cmd_exporter() {
                     warn "  the package may be ignoring ARGS - check: systemctl cat prometheus-node-exporter"
                     return 1 ;;
   esac
-  curl -sf "http://$ip:$NE_PORT/metrics" >/dev/null 2>&1 \
-    && ok "serving metrics" || { warn "bound but not serving"; return 1; }
+  local page; page="$(curl -sf "http://$ip:$NE_PORT/metrics" 2>/dev/null)" \
+    || { warn "bound but not serving"; return 1; }
+  ok "serving metrics"
+
+  # ASK THE RUNNING EXPORTER WHICH COLLECTORS IT LOADED. A flag it rejects outright stops
+  # the service and the bind check above catches that - but a flag it ACCEPTS and cannot
+  # act on (an unreadable textfile directory, systemd unreachable) leaves it serving
+  # happily with the collector silently absent, and every compliance panel empty.
+  local c
+  for c in textfile systemd; do
+    if printf '%s' "$page" | grep -q "node_scrape_collector_success{collector=\"$c\"} 1"; then
+      ok "collector '$c' loaded and succeeding"
+    else
+      warn "COLLECTOR '$c' IS NOT REPORTING SUCCESS - compliance facts will not arrive."
+      printf '%s' "$page" | grep "node_scrape_collector_success{collector=\"$c\"}" \
+        | sed 's/^/       /' || say "       it is not in /metrics at all"
+    fi
+  done
 
   say ""
   warn "9100 IS NOT FIREWALLED BY THIS SCRIPT, deliberately."

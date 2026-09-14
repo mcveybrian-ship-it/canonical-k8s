@@ -656,22 +656,73 @@ EOF
     fi
   fi
 
-  # A NEW LOG FILE THAT NOTHING ROTATES IS A DISK THAT FILLS. Ubuntu's rsyslog stanza names
-  # its files explicitly, so daemon.log is not covered until it is added.
-  if [ -f "$RSYSLOG_STIG" ] && [ -f "$RSYSLOG_LOGROTATE" ]; then
-    if grep -q "^${DAEMON_LOG}\$" "$RSYSLOG_LOGROTATE"; then
-      say "   $DAEMON_LOG already in $RSYSLOG_LOGROTATE"
-    else
+  # A NEW LOG FILE THAT NOTHING ROTATES IS A DISK THAT FILLS.
+  #
+  # THIS USED TO ONLY COVER OUR OWN DROP-IN, AND THAT WAS THE BUG. The check was gated on
+  # [ -f "$RSYSLOG_STIG" ], so on a machine where a daemon.* selector ALREADY existed we
+  # skipped writing the selector - correctly - and skipped adding rotation with it.
+  #
+  # MEASURED ON svc-mgmt-01, 2026-09-14: `usg fix` writes RED HAT style selectors into the
+  # packaged /etc/rsyslog.d/50-default.conf -
+  #     auth.*,authpriv.*   /var/log/secure
+  #     daemon.*            /var/log/messages
+  # - and adds NO logrotate entry for either. Ubuntu's rsyslog stanza names its files
+  # explicitly (syslog, mail.log, kern.log, auth.log, user.log, cron.log), so neither is
+  # covered. /var/log/messages had reached 7.9 GB and had never rotated once. On a machine
+  # with a 96 GB root that is a disk-full outage with a date on it.
+  #
+  # So: do not ask "did we write a selector". Ask WHAT DOES RSYSLOG WRITE, and is each of
+  # those files rotated by something. That is the question that stays true when the vendor
+  # changes what it remediates.
+  if [ -f "$RSYSLOG_LOGROTATE" ] && command -v rsyslogd >/dev/null 2>&1; then
+    local dests missing=0 d
+    # Destinations from every active rsyslog config line. The leading '-' means async write
+    # and is not part of the path.
+    dests="$(grep -rhE '^[[:space:]]*[^#[:space:]].*[[:space:]]-?/var/log/[^[:space:]]+' \
+               /etc/rsyslog.conf /etc/rsyslog.d/*.conf 2>/dev/null \
+             | grep -oE '[-]?/var/log/[^[:space:]]+' | sed 's/^-//' | sort -u)"
+    for d in $dests; do
+      # Covered if ANY logrotate stanza names it - the vendor's, ours, or a package's.
+      if grep -rqF "$d" /etc/logrotate.conf /etc/logrotate.d/ 2>/dev/null; then continue; fi
+      missing=$((missing + 1))
       backup_file "$RSYSLOG_LOGROTATE"; local rsbak="$LAST_BACKUP"
-      sed -i "\#^/var/log/syslog\$#a $DAEMON_LOG" "$RSYSLOG_LOGROTATE"
+      sed -i "\#^/var/log/syslog\$#a $d" "$RSYSLOG_LOGROTATE"
       if ! logrotate_config_ok; then
         cp -a "$rsbak" "$RSYSLOG_LOGROTATE"
-        warn "   logrotate rejected the rsyslog edit - REVERTED. Its output:"
+        warn "   logrotate rejected adding $d - REVERTED. Its output:"
         printf '%s\n' "$LOGROTATE_OUT" | sed 's/^/       /'
         failed=1
       else
-        ok "   added $DAEMON_LOG to $RSYSLOG_LOGROTATE (backup: $rsbak)"
+        ok "   NOT ROTATED BY ANYTHING - added $d to $RSYSLOG_LOGROTATE (backup: $rsbak)"
+        # Say how big it already is. A number here is the difference between "tidy-up" and
+        # "this machine was going to fill up".
+        [ -f "$d" ] && say "       current size: $(du -h "$d" 2>/dev/null | cut -f1)"
       fi
+    done
+    if [ "$missing" -eq 0 ]; then
+      say "   every rsyslog destination is already rotated by something ($(printf '%s' "$dests" | wc -w) checked)"
+    fi
+
+    # ROTATING WEEKLY IS NOT A BOUND. Ubuntu's stanza is `weekly` + `rotate 4`, so a file is
+    # allowed to grow for seven days before anything happens to it. svc-mgmt-01 produces
+    # ~5 GB/day of syslog, which that policy permits to reach ~140 GB on a 96 GB disk. The
+    # files being listed is necessary and not sufficient.
+    #
+    # `maxsize` rotates on EITHER the time interval or the size, whichever comes first, so
+    # quiet machines keep weekly rotation and noisy ones stop before the disk does.
+    if ! grep -qE '^[[:space:]]*maxsize' "$RSYSLOG_LOGROTATE"; then
+      backup_file "$RSYSLOG_LOGROTATE"; local mbak="$LAST_BACKUP"
+      sed -i '0,/^[[:space:]]*rotate[[:space:]]/s//\tmaxsize 100M\n&/' "$RSYSLOG_LOGROTATE"
+      if ! logrotate_config_ok; then
+        cp -a "$mbak" "$RSYSLOG_LOGROTATE"
+        warn "   logrotate rejected maxsize - REVERTED. Its output:"
+        printf '%s\n' "$LOGROTATE_OUT" | sed 's/^/       /'
+        failed=1
+      else
+        ok "   added 'maxsize 100M' to $RSYSLOG_LOGROTATE - weekly alone is not a bound"
+      fi
+    else
+      say "   $RSYSLOG_LOGROTATE already carries a maxsize"
     fi
   fi
 

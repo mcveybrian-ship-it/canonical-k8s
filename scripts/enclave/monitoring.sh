@@ -769,25 +769,47 @@ PROV
   fi
   ok "grafana is up on 127.0.0.1:3000"
 
-  # VERIFY AGAINST THE RUNNING GRAFANA, not against the files just written. Grafana skips a
-  # dashboard it cannot parse and carries on, so "the file is there" proves nothing.
-  local api="http://127.0.0.1:3000/api/search?type=dash-db"
-  local found; found="$(curl -s --max-time 5 "$api" 2>/dev/null \
-    | python3 -c 'import json,sys
+  # VERIFY AGAINST WHAT GRAFANA LOADED, not against the files just written. Grafana skips a
+  # dashboard it cannot parse and carries on, so "the file is on disk" proves nothing.
+  #
+  # NOT via /api/search: it returns 401 without credentials, and on 2026-09-14 this check
+  # reported "5 dashboards loaded" when one was installed - len() of the 401 error object
+  # {extra,message,messageId,statusCode,traceID} is 5. A verification that counts the keys
+  # of an error message is worse than no verification, because it is believed.
+  #
+  # Grafana's own database answers it with no credentials and no guessing. python3 carries
+  # sqlite3 in the standard library, so this adds no package.
+  local db=/var/lib/grafana/grafana.db
+  say ""
+  if [ -f "$db" ]; then
+    local rows
+    rows="$(python3 - "$db" <<'SQL' 2>&1
+import sqlite3,sys
 try:
-    d=json.load(sys.stdin)
-    print(len(d))
-    for x in d: print("       %s  (%s)" % (x.get("title"), x.get("uid")))
-except Exception:
-    print(0)' 2>/dev/null)"
-  local count; count="$(printf '%s' "$found" | head -1)"
-  if [ "${count:-0}" -gt 0 ]; then
-    ok "grafana has $count dashboard(s) loaded:"
-    printf '%s\n' "$found" | tail -n +2
+    c=sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True)
+    # is_folder is deprecated in newer Grafana and may be gone; fall back rather than
+    # reporting zero, which would read as "nothing loaded".
+    try:
+        r=c.execute("select uid,title from dashboard where is_folder=0 order by title").fetchall()
+    except sqlite3.OperationalError:
+        r=c.execute("select uid,title from dashboard order by title").fetchall()
+    print(len(r))
+    for uid,title in r: print("       %s  (%s)" % (title,uid))
+except Exception as e:
+    print("ERR %s" % e)
+SQL
+)"
+    local count; count="$(printf '%s' "$rows" | head -1)"
+    case "$count" in
+      ERR*|"") warn "could not read $db - $rows" ;;
+      0)       warn "GRAFANA LOADED NO DASHBOARDS. Its own words:"
+               journalctl -u grafana-server -n 200 --no-pager 2>/dev/null \
+                 | grep -i "dashboard" | grep -iE "error|fail|skip" | tail -5 | sed 's/^/       /' ;;
+      *)       ok "grafana loaded $count dashboard(s):"
+               printf '%s\n' "$rows" | tail -n +2 ;;
+    esac
   else
-    warn "GRAFANA REPORTS NO DASHBOARDS."
-    say  "  The API needs auth on some builds, so this may be a false alarm - check by eye."
-    say  "  If they really are missing:  journalctl -u grafana-server -n 40 | grep -i dashboard"
+    warn "no $db - cannot verify what grafana loaded; check the UI by eye"
   fi
   say ""
   say "on this machine:  https://127.0.0.1/          (nginx 443 -> grafana 3000)"

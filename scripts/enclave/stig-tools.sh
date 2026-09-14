@@ -119,18 +119,39 @@ preflight_ssh() {
 
   local ip; ip="$(getent ahostsv4 "$target" 2>/dev/null | awk 'NR==1 {print $1}')"
   [ -n "$ip" ] || { warn "$target: host key not trusted, and the name resolves to nothing"; return 1; }
-  local line; line="$(ssh-keygen -F "$ip" 2>/dev/null | command grep -v '^#' | head -1)"
-  if [ -z "$line" ]; then
+  # EVERY KEY, NOT THE FIRST ONE. A host publishes one key per algorithm, and copying only
+  # the first line gave host-4 an ed25519 entry - which host-4 does not offer, because it is
+  # in FIPS mode and FIPS REMOVES ed25519. ssh then asked for the one algorithm it believed
+  # the host used, got a different one, and reported REMOTE HOST IDENTIFICATION HAS CHANGED:
+  # the loudest possible message for what was actually an incomplete copy. The stale ed25519
+  # lines in known_hosts predate FIPS being enabled; no machine in this enclave offers one.
+  local keys; keys="$(ssh-keygen -F "$ip" 2>/dev/null | command grep -v '^#')"
+  if [ -z "$keys" ]; then
     warn "$target ($ip): host key is not trusted under EITHER the name or the address."
     warn "  That is a new trust decision. Verify the fingerprint out of band, then:"
-    say  "     ssh-keyscan -t ed25519 $ip >> ~/.ssh/known_hosts"
+    say  "     ssh-keyscan -t rsa,ecdsa $ip >> ~/.ssh/known_hosts   # NOT ed25519 - FIPS has no ed25519"
     return 1
   fi
-  say "$target: key already trusted as $ip - recording the same key under the name"
-  printf '%s %s\n' "$target" "${line#* }" >> "$HOME/.ssh/known_hosts"
-  ok "added to ~/.ssh/known_hosts: $target (same key as $ip, no new trust)"
-  ssh -n "${MUX[@]}" -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=8 \
-      "$MIRROR_USER@$target" true 2>/dev/null
+  local n=0
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    # Skip one already recorded under this name, so a re-run does not duplicate lines.
+    printf '%s %s\n' "$target" "${line#* }" > /tmp/.stig-hk.$$
+    if ! command grep -qxFf /tmp/.stig-hk.$$ "$HOME/.ssh/known_hosts" 2>/dev/null; then
+      cat /tmp/.stig-hk.$$ >> "$HOME/.ssh/known_hosts"; n=$((n + 1))
+    fi
+    rm -f /tmp/.stig-hk.$$
+  done <<< "$keys"
+  ok "$target: recorded $n key(s) already trusted as $ip - same keys, no new trust"
+
+  local err2
+  err2="$(ssh -n "${MUX[@]}" -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=8 \
+          "$MIRROR_USER@$target" true 2>&1)" && return 0
+  # PRINT THE RETRY'S REASON. The first version swallowed it with 2>/dev/null, so a failed
+  # retry produced "see the reason above" with nothing above it.
+  warn "$target still refuses after recording the keys. ssh said:"
+  printf '%s\n' "$err2" | sed 's/^/         /'
+  return 1
 }
 
 rsh()    { ssh "${MUX[@]}" -i "$SSH_KEY" -o ConnectTimeout=10 "$@"; }

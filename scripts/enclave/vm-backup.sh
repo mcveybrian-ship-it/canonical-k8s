@@ -37,7 +37,7 @@
 #
 # ON HOST-4, USB STORAGE IS BLOCKED BY THE STIG. /etc/modprobe.d/99-stig-usb-storage.conf
 # is deliberate (kernel_module_usb-storage_disabled, runbook 6.3g). Plugging in a USB drive
-# does nothing until you open that window with `stig-tailor.sh usb --allow`, and you close
+# does nothing until you open that window with `stig-tailor.sh usb enable --minutes <N>`, and you close
 # it afterwards. This script detects the situation and says so rather than reporting an
 # empty destination. A drive on eSATA, SAS or iSCSI is unaffected.
 #
@@ -109,9 +109,9 @@ check_dest() {
       warn "  USB STORAGE IS BLOCKED ON THIS MACHINE by the STIG, deliberately:"
       say  "    /etc/modprobe.d/99-stig-usb-storage.conf  (runbook 6.3g)"
       say  "  A USB drive plugged in now will not appear. To use one:"
-      say  "    sudo $HERE/stig-tailor.sh usb --allow     # opens the window"
+      say  "    sudo $HERE/stig-tailor.sh usb enable --minutes 60     # opens the window"
       say  "    ... mount it, run the backup, unmount ..."
-      say  "    sudo $HERE/stig-tailor.sh usb --block     # closes it again"
+      say  "    sudo $HERE/stig-tailor.sh usb disable     # closes it again"
       say  "  A drive on eSATA, SAS or iSCSI is not affected by this."
     fi
     die "create or mount $DEST first"

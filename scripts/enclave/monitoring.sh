@@ -297,11 +297,27 @@ cmd_collector() {
     ok "grafana already installed"
   fi
 
+  # nginx is REQUIRED - it is what puts Grafana behind TLS. enable-tls.sh checks for it and
+  # dies rather than installing it, so install it here or the collector ends up on plain http.
+  command -v nginx >/dev/null 2>&1 \
+    || DEBIAN_FRONTEND=noninteractive apt-get install -y nginx 2>&1 | tail -2
+
   if dpkg -s grafana >/dev/null 2>&1; then
     local gd=/etc/default/grafana-server
     cp -a "$gd" "/var/backups/grafana-server.$(date +%Y%m%dT%H%M%S)" 2>/dev/null || true
-    local k kv
-    for kv in "GF_SERVER_HTTP_ADDR=$ip" "GF_SERVER_HTTP_PORT=3000"; do
+    # GRAFANA BINDS LOOPBACK AND NOTHING ELSE.
+    #
+    # nginx terminates TLS with an enclave certificate and proxies to it - the same
+    # arrangement svc-mgmt-01 already uses for its contracts server. Grafana on the enclave
+    # address would mean the admin password and every session cookie crossing the enclave in
+    # clear, which is exactly what it did before 2026-09-14.
+    #
+    # GF_SERVER_ROOT_URL is the part that gets missed: Grafana builds absolute URLs for login
+    # redirects from it, and left at the default it sends the browser back to plain http on
+    # the first redirect - the padlock appears, then quietly goes away.
+    local k kv fqdn="${me}.${ENCLAVE_DOMAIN:-enclave.internal}"
+    for kv in "GF_SERVER_HTTP_ADDR=127.0.0.1" "GF_SERVER_HTTP_PORT=3000" \
+              "GF_SERVER_ROOT_URL=https://${fqdn}/"; do
       k="${kv%%=*}"
       grep -q "^$k=" "$gd" 2>/dev/null && sed -i "s|^$k=.*|$kv|" "$gd" || printf '%s\n' "$kv" >> "$gd"
     done
@@ -324,6 +340,23 @@ DS
     systemctl enable --now grafana-server >/dev/null 2>&1 || true
   fi
 
+  # ---- TLS in front of Grafana ----------------------------------------------------------
+  local chain="/etc/ssl/enclave/${me}.fullchain.crt"
+  if [ -f "$chain" ]; then
+    say ""
+    say "certificate present - putting nginx in front of Grafana"
+    "$HERE/enable-tls.sh" "$me" "$chain" --proxy http://127.0.0.1:3000 || \
+      warn "enable-tls.sh failed - Grafana is on loopback only, so it is UNREACHABLE until this is fixed"
+    "$HERE/enable-tls.sh" --redirect-http || warn "--redirect-http failed; :80 will not redirect"
+  else
+    say ""
+    warn "NO CERTIFICATE at $chain - Grafana is bound to loopback and therefore UNREACHABLE."
+    warn "  That is deliberate: it must not be served over plain http. Issue one:"
+    say  "    on $me       : sudo $HERE/ca.sh request $me"
+    say  "    on svc-mgmt-01: sudo $HERE/ca.sh sign-server <the csr>"
+    say  "    back on $me  : put the fullchain at $chain, then re-run: sudo $0 collector"
+  fi
+
   systemctl restart prometheus prometheus-alertmanager prometheus-node-exporter
   sleep 4
 
@@ -339,9 +372,18 @@ DS
     fi
   done
   dpkg -s grafana >/dev/null 2>&1 && {
-    ss -tlnH 2>/dev/null | awk '{print $4}' | grep -qx "${ip}:3000" \
-      && printf '     %-24s ok\n' "${ip}:3000" \
-      || { printf '  [!] %-24s NOT BOUND AS EXPECTED\n' "${ip}:3000"; bad=1; }
+    # Grafana must be on LOOPBACK. If it is on the enclave address it is reachable without
+    # TLS, and the certificate work in front of it is decoration.
+    if ss -tlnH 2>/dev/null | awk '{print $4}' | grep -qx "127.0.0.1:3000"; then
+      printf '     %-24s ok (loopback - nginx fronts it)\n' "127.0.0.1:3000"
+    else
+      printf '  [!] %-24s grafana is NOT on loopback - it may be serving plain http\n' "127.0.0.1:3000"; bad=1
+    fi
+    if [ -f "/etc/ssl/enclave/${me}.fullchain.crt" ]; then
+      ss -tlnH 2>/dev/null | awk '{print $4}' | grep -qE '^(0\.0\.0\.0|\*):443$' \
+        && printf '     %-24s ok (nginx, enclave cert)\n' "0.0.0.0:443" \
+        || { printf '  [!] %-24s nginx is NOT serving 443\n' "0.0.0.0:443"; bad=1; }
+    fi
   }
   if ss -tlnH 2>/dev/null | awk '{print $4}' | grep -qE '^(\*|0\.0\.0\.0|\[::\]):(9090|9093|9094|9100|3000)$'; then
     warn "a monitoring port is on ALL INTERFACES - the postfix shape (6.3e)"; bad=1
@@ -351,7 +393,10 @@ DS
   say ""
   ok "collector up. Targets take one scrape_interval to report:"
   say "   curl -s 'http://127.0.0.1:9090/api/v1/targets?state=any'"
-  say "   grafana: http://${ip}:3000  - set the admin password AT THE BROWSER PROMPT"
+  if [ -f "/etc/ssl/enclave/${me}.fullchain.crt" ]; then
+    say "   grafana: https://${me}.${ENCLAVE_DOMAIN:-enclave.internal}/  - set the admin"
+    say "            password AT THE BROWSER PROMPT, over TLS. Never in a terminal."
+  fi
   warn "retention is ${PROM_RETENTION_TIME} / ${PROM_RETENTION_SIZE} - the TIME is a placeholder"
   warn "  until the AO answers. The SIZE cap is the real protection: it stops a noisy month"
   warn "  filling the disk and taking down the machine you use to find out why."

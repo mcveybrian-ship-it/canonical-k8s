@@ -631,11 +631,35 @@ cmd_scan() {
                 | sed 's/Unable to process //; s/ - skipping//' | sort -u || true)"
     if [ -n "$skipped" ]; then
       warn "DETECTED BUT NOT ASSESSED: $(printf '%s' "$skipped" | tr '\n' ' ')"
-      warn "  The tool found the product and refused the benchmark - almost always because"
-      warn "  DISA has SUNSET that STIG. Check the detection list above for DISAStatus."
-      warn "  This is a COVERAGE GAP, not a pass. Options: obtain the current STIG and put"
-      warn "  its xccdf in $DEST/Evaluate-STIG/StigContent/Manual/, or re-run with"
-      warn "  --allow-deprecated and state in the artefact that the benchmark is retired."
+      # QUOTE THE LOG, DO NOT GUESS THE CAUSE. This block used to say the benchmark was
+      # refused "almost always because DISA has SUNSET that STIG". On svc-harbor-01 on
+      # 2026-09-14 the STIG was indeed sunset AND the real reason in the log was different:
+      # the vendor's PostgreSQL module threw
+      # ParameterArgumentValidationErrorEmptyStringNotAllowed in Get-PostgreSQLInstances.
+      # Two different problems with two different fixes, and a guessed cause sends the
+      # operator after the wrong one.
+      local eslog
+      eslog="$EVIDENCE/$(printf '%s' "$me" | tr '[:lower:]' '[:upper:]')/Evaluate-STIG.log"
+      [ -f "$eslog" ] || eslog="$EVIDENCE/Evaluate-STIG.log"
+      if [ -f "$eslog" ]; then
+        local why
+        why="$(command grep -h -i "Unable to process\|FullyQualified" "$eslog" 2>/dev/null \
+               | sed 's/<!\[LOG\[//; s/\]LOG\]!>.*//; s/[[:space:]]*$//' | sort -u | head -4)"
+        if [ -n "$why" ]; then
+          warn "  what the tool's own log says:"
+          printf '%s\n' "$why" | sed 's/^/           /'
+        fi
+      fi
+      warn "  This is a COVERAGE GAP, not a pass. TWO CAUSES LOOK ALIKE HERE:"
+      warn "    1. DISA SUNSET the benchmark - check DISAStatus in the detection list above."
+      warn "       Fix: obtain the current STIG, put its xccdf in"
+      warn "       $DEST/Evaluate-STIG/StigContent/Manual/, or re-run with --allow-deprecated"
+      warn "       and state in the artefact that the benchmark is retired."
+      warn "    2. The vendor's scan MODULE failed - a PowerShell error in the log above."
+      warn "       A newer benchmark does not fix that; the module has to run."
+      warn "  Note this also makes the tool report \"Failed to get full CAT counts for"
+      warn "  grading. Scoring will be inaccurate.\" - that message is about the SKIPPED"
+      warn "  benchmark, not about the one that completed."
       failed_scan=1
     fi
   fi

@@ -279,9 +279,22 @@ backup_one() {  # <domain> <full|incr>
 
   say "$dom: $mode backup -> $out"
   [ -n "$prev" ] && say "   building on checkpoint $prev"
-  if ! virsh backup-begin "$dom" "$bxml" "$cxml" >/dev/null 2>&1; then
+  # CAPTURE THE OUTPUT ONCE. The first version ran backup-begin, and when that failed ran it
+  # AGAIN purely to show the error - so a failure became two attempts against the same
+  # domain. On 2026-09-14 the second collided with the first and reported "cannot acquire
+  # state change lock", which described the script's own retry rather than the real problem.
+  # A diagnostic must not change what it is diagnosing.
+  local bout
+  if ! bout="$(virsh backup-begin "$dom" "$bxml" "$cxml" 2>&1)"; then
     warn "$dom: backup-begin failed. libvirt said:"
-    virsh backup-begin "$dom" "$bxml" "$cxml" 2>&1 | sed 's/^/       /' || true
+    printf '%s\n' "$bout" | sed 's/^/       /'
+    case "$bout" in
+      *"state change lock"*)
+        warn "  A JOB IS ALREADY HELD ON THIS DOMAIN - usually an interrupted backup."
+        say  "  Clear it, then retry:"
+        say  "     virsh domjobabort $dom"
+        ;;
+    esac
     rm -f "$bxml" "$cxml"
     return 1
   fi

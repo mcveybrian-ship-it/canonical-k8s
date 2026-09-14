@@ -580,17 +580,51 @@ EOF
   fi
   ok "rules valid: $(promtool check rules "$f" 2>&1 | grep -oE '[0-9]+ rules found' || echo 'checked')"
 
-  promtool check config /etc/prometheus/prometheus.yml >/dev/null 2>&1 \
-    || { warn "prometheus.yml does not load the rules directory yet."
-         say  "  re-run 'monitoring.sh collector' to regenerate it, or add by hand:"
-         say  "     rule_files:"
-         say  "       - /etc/prometheus/rules/*.yml"; }
+  # A VALID CONFIG THAT DOES NOT REFERENCE THE RULES IS STILL VALID.
+  #
+  # The first version tested `promtool check config` here and treated a pass as proof the
+  # rules would load. A prometheus.yml with no rule_files section passes that check
+  # perfectly - it is simply a config that loads no rules. So the script printed
+  # "rules valid: 8 rules found", reloaded, and left Prometheus running with ZERO rules,
+  # which reads exactly like success. Ask the RUNNING PROCESS instead, at the end.
+  local cfg=/etc/prometheus/prometheus.yml
+  if ! grep -qE '^rule_files:' "$cfg"; then
+    cp -a "$cfg" "/var/backups/prometheus.yml.$(date +%Y%m%dT%H%M%S)"
+    # Insert after the alerting block, before scrape_configs - order does not matter to
+    # Prometheus, but keeping it above scrape_configs keeps the file readable.
+    if grep -qE '^scrape_configs:' "$cfg"; then
+      sed -i '0,/^scrape_configs:/s||rule_files:\n  - /etc/prometheus/rules/*.yml\n\nscrape_configs:|' "$cfg"
+    else
+      printf '\nrule_files:\n  - /etc/prometheus/rules/*.yml\n' >> "$cfg"
+    fi
+    ok "added rule_files to $cfg"
+  fi
+
+  if ! promtool check config "$cfg" >/dev/null 2>&1; then
+    promtool check config "$cfg" 2>&1 | sed 's/^/       /'
+    die "prometheus.yml is INVALID after the edit - nothing reloaded, see the backup in /var/backups"
+  fi
 
   systemctl reload prometheus 2>/dev/null || systemctl restart prometheus
-  sleep 2
-  local n; n="$(curl -s http://127.0.0.1:9090/api/v1/rules 2>/dev/null | grep -o '"name"' | wc -l)"
-  ok "prometheus reloaded - $f"
-  say "   rules currently loaded: ${n:-unknown}"
+  sleep 3
+
+  # VERIFY AGAINST THE RUNNING PROCESS, NOT AGAINST THE FILE ON DISK.
+  local n
+  n="$(curl -s http://127.0.0.1:9090/api/v1/rules 2>/dev/null \
+       | python3 -c 'import json,sys; print(sum(len(g["rules"]) for g in json.load(sys.stdin)["data"]["groups"]))' 2>/dev/null)"
+  if [ "${n:-0}" -gt 0 ]; then
+    ok "prometheus reloaded - $n rule(s) ACTIVE in the running process"
+    curl -s http://127.0.0.1:9090/api/v1/rules 2>/dev/null \
+      | python3 -c 'import json,sys
+for g in json.load(sys.stdin)["data"]["groups"]:
+    for r in g["rules"]:
+        print("       %-28s %s" % (r["name"], r.get("state","")))' 2>/dev/null
+  else
+    warn "PROMETHEUS IS RUNNING WITH ZERO RULES - the file is valid but is not being read."
+    say  "  check:  grep -A2 '^rule_files:' $cfg"
+    say  "  and:    ls -la /etc/prometheus/rules/"
+    return 1
+  fi
   say "   see them at:  http://127.0.0.1:9090/rules   (tunnel from your desk)"
 }
 

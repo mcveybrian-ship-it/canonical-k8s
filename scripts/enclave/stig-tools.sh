@@ -47,7 +47,17 @@ CA="${STIG_TOOLS_CA:-$HERE/trust-anchors/enclave-root.crt}"
 # BARE SSH FROM stage-01 INTO THE GAP FAILS. The agent key is not authorised there; the key
 # that is, is build01 - the same one push-repo-to-host.sh uses. Defaulting to the agent and
 # hoping is how this script's first run died on "Permission denied (publickey)".
-SSH_KEY="${REPO_PUSH_KEY:-$HOME/.ssh/build01}"
+# THE KEY BELONGS TO THE OPERATOR, NOT TO ROOT. Under sudo, whether $HOME is still
+# /home/encadmin or has become /root depends on `always_set_home` in sudoers - so a default
+# of "$HOME/.ssh/build01" works or fails depending on a setting nobody looks at. Resolve
+# the INVOKING user's home explicitly instead. `answers` needs no root on this end anyway;
+# it scps, and the privileged half runs on the far machine.
+_invoker_home="$HOME"
+if [ -n "${SUDO_USER:-}" ]; then
+  _h="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)"
+  [ -n "$_h" ] && _invoker_home="$_h"
+fi
+SSH_KEY="${REPO_PUSH_KEY:-$_invoker_home/.ssh/build01}"
 
 # TWO KINDS OF REMOTE CALL, AND THE DIFFERENCE IS NOT COSMETIC.
 #
@@ -293,7 +303,7 @@ $(find "$TMPD" -maxdepth 2 | head -12 | sed 's/^/       /')
   say "   cleans up /tmp/.dotnet, and leaves the evidence readable so step 14 can collect it."
   [ -f "$DEST/$(basename "$ANSWERFILE")" ] \
     && say "   ... and add:  --AFPath $DEST" \
-    || warn "no Answer File here - from stage-01: sudo ./stig-tools.sh answers $me"
+    || warn "no Answer File here - from stage-01, WITHOUT sudo: ./stig-tools.sh answers $me"
 }
 
 # ------------------------------------------------------------------------------------ scan

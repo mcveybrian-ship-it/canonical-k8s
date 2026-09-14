@@ -625,7 +625,14 @@ cmd_scan() {
   # because DISA has SUNSET the PostgreSQL 9.x STIG. A product that is installed, detected,
   # and not assessed is precisely the gap --SelectSTIG was hiding - so say it loudly.
   local tl skipped
-  tl="$(find "$EVIDENCE" -maxdepth 2 -name 'Evaluate-STIG.log' 2>/dev/null | head -1)"
+  # NEWEST, AND PREFER THE LIVE DIRECTORY OVER AN ARCHIVED RUN. Evaluate-STIG moves each
+  # prior run under <MACHINE>/Previous/<stamp>/, and `head -1` on an unsorted find took
+  # whichever the filesystem offered first - which on 2026-09-14 was an archived log from a
+  # run 20 minutes earlier. Every conclusion drawn from it would have described that run.
+  tl="$(find "$EVIDENCE" -name 'Evaluate-STIG.log' -not -path '*/Previous/*' \
+         -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2-)"
+  [ -n "$tl" ] || tl="$(find "$EVIDENCE" -name 'Evaluate-STIG.log' \
+         -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2-)"
   if [ -n "$tl" ]; then
     skipped="$(grep -oE 'Unable to process [A-Za-z0-9_.-]+ - skipping' "$tl" 2>/dev/null \
                 | sed 's/Unable to process //; s/ - skipping//' | sort -u || true)"
@@ -664,7 +671,16 @@ cmd_scan() {
     fi
   fi
   local csv
-  csv="$(find "$EVIDENCE" -name '*COMBINED*.csv' -newermt '-30 minutes' 2>/dev/null | sort | tail -1)"
+  # NEWEST BY TIME, AND NEVER FROM Previous/.
+  #
+  # This used to sort by PATH and take the last. Evaluate-STIG archives each prior run under
+  # <MACHINE>/Previous/<stamp>/Checklist/, and "Previous" sorts after "Checklist", so the
+  # archived copy won every time. On svc-mgmt-01 on 2026-09-14 the run reported the tally
+  # from a scan 20 minutes older than the one just finished - the same five Open, while the
+  # scan that had actually just run showed six. A report that quietly describes a different
+  # run is worse than no report.
+  csv="$(find "$EVIDENCE" -name '*COMBINED*.csv' -not -path '*/Previous/*' \
+          -newermt '-30 minutes' -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2-)"
   if [ -z "$csv" ]; then
     warn "no COMBINED csv newer than 30 minutes - did the scan actually finish?"
     return 1

@@ -168,15 +168,30 @@ cmd_exporter() {
   # the service and the bind check above catches that - but a flag it ACCEPTS and cannot
   # act on (an unreadable textfile directory, systemd unreachable) leaves it serving
   # happily with the collector silently absent, and every compliance panel empty.
+  # MATCHED IN BASH, NOT THROUGH A PIPE - and that is not a style preference.
+  #
+  # `printf '%s' "$page" | grep -q PATTERN` is a FALSE NEGATIVE GENERATOR under
+  # `set -o pipefail`, which this script sets. grep -q exits the instant it matches; printf
+  # is then killed by SIGPIPE with status 141; pipefail reports the pipeline as FAILED even
+  # though grep matched. Whether it bites depends on how far into the output the match is:
+  # on 2026-09-14 this reported systemd broken and textfile fine on host-4, both broken on
+  # three other machines, and both fine on svc-repo-01 - from the same working config on
+  # all five. `systemd` sorts before `textfile` in node-exporter's output, so it matched
+  # early with most of a 100 KB page still unwritten.
+  #
+  # A check whose answer depends on where in the output the answer appears is not a check.
   local c
   for c in textfile systemd; do
-    if printf '%s' "$page" | grep -q "node_scrape_collector_success{collector=\"$c\"} 1"; then
-      ok "collector '$c' loaded and succeeding"
-    else
-      warn "COLLECTOR '$c' IS NOT REPORTING SUCCESS - compliance facts will not arrive."
-      printf '%s' "$page" | grep "node_scrape_collector_success{collector=\"$c\"}" \
-        | sed 's/^/       /' || say "       it is not in /metrics at all"
-    fi
+    case "$page" in
+      *"node_scrape_collector_success{collector=\"$c\"} 1"*)
+        ok "collector '$c' loaded and succeeding" ;;
+      *"node_scrape_collector_success{collector=\"$c\"}"*)
+        warn "COLLECTOR '$c' IS PRESENT BUT FAILING - compliance facts will not arrive."
+        warn "  check: journalctl -u prometheus-node-exporter -n 30" ;;
+      *)
+        warn "COLLECTOR '$c' IS NOT IN /metrics AT ALL - the flag was not accepted."
+        warn "  check: systemctl cat prometheus-node-exporter | grep ARGS" ;;
+    esac
   done
 
   say ""

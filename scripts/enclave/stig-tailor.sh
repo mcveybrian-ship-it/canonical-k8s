@@ -1855,6 +1855,8 @@ svc-repo-01	/srv/repo	THE MIRROR - 321 GB, 91,073 files. Every file is covered b
 host-4	/var/lib/libvirt/images	VM DISK IMAGES on a dedicated LUKS volume. qcow2 files change on every guest write, so a running VM guarantees the hash is stale before aide finishes - the check cannot pass and its failure carries no information. Guest integrity is each guest's own AIDE, which runbook 6.0 installs on every one of them
 svc-harbor-01	/var/lib/docker	CONTAINER LAYER STORE - content-addressed by digest, which IS an integrity mechanism, and rewritten by every image push. Harbor's own content trust covers what matters here
 svc-mgmt-01	/var/lib/maas/boot-resources	MAAS BOOT IMAGES - re-downloaded and rotated by MAAS on its own schedule; each is checksummed by MAAS against its own index
+svc-obs-01	/var/lib/prometheus/metrics2	THE METRICS DATABASE - a time-series store rewritten continuously as samples arrive and compacted on its own schedule. A hash is stale before aide finishes computing it, so the check cannot pass and its failure carries no information. Retention is capped at 100GB, so this is also the only path here that can grow large
+svc-obs-01	/var/lib/grafana	GRAFANA'S SQLITE DATABASE - dashboards, users and sessions, written on every login and every dashboard edit. Same reasoning: it changes as part of normal operation. The CONFIGURATION that matters for integrity is /etc/grafana, which is NOT excluded and stays in scope
 EOF
 }
 

@@ -2325,7 +2325,8 @@ svc-harbor-01	80/tcp	allow	any	NO-OP under Docker - docker-proxy DNATs this, so 
 svc-harbor-01	443/tcp	allow	any	NO-OP under Docker - same reason. ufw on this host protects ssh and postfix, NOT the registry ports. Say so in the findings register
 svc-harbor-01	9100/tcp	allow	__SVC_OBS_01__	node-exporter, source-restricted to the collector - same reasoning as svc-repo-01
 svc-obs-01	22/tcp	limit	any	ssh
-svc-obs-01	3000/tcp	allow	__ENCLAVE_CIDR__	GRAFANA UI - the only thing on this machine a human opens. Restricted to the enclave subnet, not the world: the dashboards expose the shape of every host in the boundary
+svc-obs-01	443/tcp	allow	__ENCLAVE_CIDR__	GRAFANA over TLS, via nginx with an enclave certificate. Restricted to the enclave subnet, not the world: the dashboards expose the shape of every host in the boundary. Grafana itself binds 127.0.0.1:3000 and is NOT reachable - the admin password and every session cookie would otherwise cross the enclave in clear
+svc-obs-01	80/tcp	allow	__ENCLAVE_CIDR__	301 to https only, so a plaintext client gets a redirect rather than a timeout. Same arrangement as svc-repo-01
 svc-obs-01	9100/tcp	allow	__SVC_OBS_01__	its own node-exporter, scraped by the Prometheus on this same box. Kept explicit so the rule set reads the same on every machine
 host-4	9100/tcp	allow	__SVC_OBS_01__	node-exporter. NOTE: host-4 has no rule table in practice - see the comment above ufw_rules() - so this row exists for the day it does, and documents the intent meanwhile
 host-4	9177/tcp	allow	__SVC_OBS_01__	prometheus-libvirt-exporter. Per-guest CPU, disk and network for EVERY VM in the enclave - the single most revealing port in the boundary. Source-restricted, always

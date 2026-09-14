@@ -89,6 +89,27 @@ runbook §6.3j.
 | `encrypt_partitions` | Compensating-control write-up — LUKS is under the guest, not in it |
 | `auditd_offload_logs` | Folded into the log-collector thread, §6.3d |
 
+**Monitoring — BUILT 2026-09-14, reproducible from the repo**
+
+`svc-obs-01` (10.2.20.164) is the collector. It subsumes the machine the AO thread calls
+`svc-log-01`: audit offload and metrics on one VM. Runbook **§10a**.
+
+| # | What | State |
+|---|---|---|
+| M1 | Prometheus + Alertmanager + Grafana on `svc-obs-01` | ✅ **7 of 7 targets up.** Prometheus and Alertmanager on loopback, Grafana on `10.2.20.164:3000`, datasource provisioned from a file |
+| M2 | `node-exporter` on all five machines | ✅ each bound to its **own** enclave address. Collector timers kept only where the hardware exists — `host-4` keeps `nvme`/`smartmon`, the VMs keep none |
+| M3 | `libvirt-exporter` on `host-4` | ✅ 86 metrics — per-guest CPU/disk/net **from the hypervisor**, so a sick VM still has metrics |
+| M4 | Source-restricted ufw | ✅ **proven by timing**: collector scrapes `svc-repo-01:9100`, `stage-01` times out at 7 s. Rows for 9100/9177/3000 in `stig-tailor.sh` |
+| M5 | Grafana carried as a verified `.deb` | ✅ on the mirror at `/debs/` **and** on the transfer manifest at `/srv/apt-mirror/debs/`. No third-party signing key in the trust store |
+| M6 | Everything reproducible | ✅ `monitoring.sh {exporter\|libvirt\|collector}`. Scrape config **generated** from `enclave-addresses.env` |
+| M7 | **Harden `svc-obs-01`** | ⬜ **NEXT.** Full §6.0 pass. It is the only machine with no FIPS, no `usg`, no GRUB password — and it holds the audit logs and metrics for everything else |
+| M8 | Dashboards | ⬜ datasource is provisioned; dashboard JSON must be carried in like everything else |
+| M9 | 9100 open to the enclave on 3 machines | ⬜ `ufw` is enabled only on `svc-repo-01`. **Closing the physical gap is what bounds this** |
+
+⏰ **Retention is 90d / 100GB, and the 90d is a PLACEHOLDER** until the AO answers. Measured
+input: **2.44 MB/day** audit on harbor, **1.71 MB/day** on repo — twelve machines is ~11 GB a
+year. The size cap is the real protection.
+
 **Owed, and not blocked by anything**
 
 | What | Why it matters |

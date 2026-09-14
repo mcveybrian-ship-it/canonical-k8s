@@ -93,6 +93,46 @@ resolve_target() {
 # ufw actually enforces - an unmultiplexed run gets refused partway through, and a refusal
 # reads like whatever the caller was measuring. One connection per machine, reused.
 MUX=(-o ControlMaster=auto -o ControlPath="/tmp/.stig-tools-%r@%h:%p" -o ControlPersist=60)
+# REACHABILITY, AND AN HONEST REASON WHEN IT FAILS.
+#
+# The first version reported every failed probe as "check the key and the address". On
+# 2026-09-14 it said that four times in a row when the real cause was HOST KEY VERIFICATION:
+# ~/.ssh/known_hosts held each machine's key under its IP and not under its name, and the
+# names had only just started resolving. Asserting a cause the code has not established is
+# the same defect as a check that reports a pass it did not measure.
+#
+# So: print ssh's own words. And for the host-key case specifically, do the one safe thing -
+# if the address that name resolves to is ALREADY trusted, the key is the same key under a
+# different label, so record the alias and say exactly what was recorded. That is not a new
+# trust decision. If the address is not trusted either, refuse: that IS a new trust decision
+# and it belongs to the operator, not to a script running unattended in an enclave.
+preflight_ssh() {
+  local target="$1" err
+  err="$(ssh -n "${MUX[@]}" -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=8 \
+         "$MIRROR_USER@$target" true 2>&1)" && return 0
+
+  if ! printf '%s' "$err" | command grep -qi 'host key verification failed'; then
+    warn "ssh to $target failed. ssh said:"
+    printf '%s\n' "$err" | sed 's/^/         /'
+    return 1
+  fi
+
+  local ip; ip="$(getent ahostsv4 "$target" 2>/dev/null | awk 'NR==1 {print $1}')"
+  [ -n "$ip" ] || { warn "$target: host key not trusted, and the name resolves to nothing"; return 1; }
+  local line; line="$(ssh-keygen -F "$ip" 2>/dev/null | command grep -v '^#' | head -1)"
+  if [ -z "$line" ]; then
+    warn "$target ($ip): host key is not trusted under EITHER the name or the address."
+    warn "  That is a new trust decision. Verify the fingerprint out of band, then:"
+    say  "     ssh-keyscan -t ed25519 $ip >> ~/.ssh/known_hosts"
+    return 1
+  fi
+  say "$target: key already trusted as $ip - recording the same key under the name"
+  printf '%s %s\n' "$target" "${line#* }" >> "$HOME/.ssh/known_hosts"
+  ok "added to ~/.ssh/known_hosts: $target (same key as $ip, no new trust)"
+  ssh -n "${MUX[@]}" -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=8 \
+      "$MIRROR_USER@$target" true 2>/dev/null
+}
+
 rsh()    { ssh "${MUX[@]}" -i "$SSH_KEY" -o ConnectTimeout=10 "$@"; }
 rsh_t()  { ssh -t "${MUX[@]}" -i "$SSH_KEY" -o ConnectTimeout=10 "$@"; }
 rscp()   { scp -q "${MUX[@]}" -i "$SSH_KEY" -o ConnectTimeout=10 "$@"; }
@@ -208,8 +248,8 @@ cmd_answers() {
   # Say which key, and prove the host answers at all, BEFORE blaming authorisation. The
   # first version reported every scp failure as "is the key authorised?" - including the
   # one that was actually a name that did not resolve.
-  rsh -o BatchMode=yes "$MIRROR_USER@$target" true 2>/dev/null \
-    || die "cannot ssh to $MIRROR_USER@$target with $SSH_KEY - check the key and the address"
+  preflight_ssh "$target" \
+    || die "cannot reach $MIRROR_USER@$target - see the reason above"
   say "sending $(basename "$ANSWERFILE") to $MIRROR_USER@$target:$DEST/"
   say "  $(wc -l < "$ANSWERFILE") lines, $(grep -c '<Vuln ' "$ANSWERFILE" 2>/dev/null || echo '?') vuln entries"
   local BASE; BASE="$(basename "$ANSWERFILE")"
@@ -255,8 +295,7 @@ cmd_collect() {
   local addr host rc=0 got=0
   for addr in "${list[@]}"; do
     addr="$(resolve_target "$addr")"
-    rsh -o BatchMode=yes -o ConnectTimeout=5 -n "$MIRROR_USER@$addr" true 2>/dev/null || {
-      say "-- $addr unreachable - skipped"; continue; }
+    preflight_ssh "$addr" || { say "-- $addr unreachable - skipped"; continue; }
     host="$(rsh -n -o BatchMode=yes "$MIRROR_USER@$addr" 'hostname -s' 2>/dev/null | tr -d '\r')"
     [ -n "$host" ] || { warn "$addr answered but would not say its name - skipped"; rc=1; continue; }
     printf '\n  == %s (%s) ==\n' "$host" "$addr"

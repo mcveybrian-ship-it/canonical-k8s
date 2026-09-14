@@ -91,7 +91,13 @@ alloc_bytes() {  # actual bytes on disk for a domain's disks, not the qcow2 ceil
   local d t s total=0 n
   while IFS=$'\t' read -r t s; do
     [ -n "${s:-}" ] || continue
-    n="$(du -B1 --apparent-size=0 -s "$s" 2>/dev/null | cut -f1)" || n=0
+    # PLAIN `du -sB1` - ALLOCATED blocks, which is what a qcow2 actually occupies.
+    # The first version wrote `du -B1 --apparent-size=0`, and --apparent-size takes NO
+    # value, so du rejected the argument, 2>/dev/null swallowed the error, and every
+    # domain reported 0 bytes. The status page then said "one full backup fits" on the
+    # strength of a total of zero - a false pass produced by a hidden error.
+    n="$(du -sB1 "$s" 2>/dev/null | cut -f1)"
+    case "${n:-}" in ""|*[!0-9]*) n=0 ;; esac
     total=$((total + ${n:-0}))
   done < <(domain_disks "$1")
   printf '%s\n' "$total"
@@ -192,7 +198,18 @@ cmd_status() {
   if [ -n "$DEST" ] && mountpoint -q "$DEST" 2>/dev/null; then
     local avail; avail="$(df -B1 --output=avail "$DEST" | tail -1 | tr -d ' ')"
     say "free at destination              : $(human "$avail")"
-    [ "$avail" -ge "$tot" ] && ok "one full backup fits" || warn "one full backup DOES NOT fit"
+    # A TOTAL OF ZERO WITH DISKS PRESENT IS A MEASUREMENT FAILURE, NOT A TINY ENCLAVE.
+    # Saying "it fits" on the back of a number that is obviously wrong is worse than
+    # saying nothing, because it is the answer the operator was looking for.
+    if [ "$tot" -eq 0 ]; then
+      warn "CANNOT SIZE THIS - every domain measured 0 bytes, which cannot be right."
+      say  "     Check that the disk paths resolve and are readable:"
+      say  "       virsh domblklist <domain> --details"
+    elif [ "$avail" -ge "$tot" ]; then
+      ok "one full backup fits"
+    else
+      warn "one full backup DOES NOT fit"
+    fi
   fi
   printf '\n  existing checkpoints (what an incremental would build on):\n'
   for d in $(domains); do

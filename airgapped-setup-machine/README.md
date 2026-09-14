@@ -12,7 +12,7 @@ Last updated **2026-09-11 02:40 UTC** (2026-09-10 21:40 Central). All timestamps
 
 **Read this for "what next". The tables below record state; this records order.**
 
-**ALL FOUR MACHINES ARE HARDENED AND MEASURED BY BOTH SCANNERS — 2026-09-13.**
+**ALL FIVE MACHINES ARE HARDENED — 2026-09-14.** `svc-obs-01` joined on 2026-09-14.
 
 | machine | USG | V1R6 Open |
 |---|---|---|
@@ -20,6 +20,12 @@ Last updated **2026-09-11 02:40 UTC** (2026-09-10 21:40 Central). All timestamps
 | `svc-harbor-01` | 210 / 7 ⚠️ stale | **5** |
 | `svc-mgmt-01` | 209 / 7 ⚠️ stale | **5** |
 | `svc-repo-01` | **212 / 5** | **4** |
+| `svc-obs-01` | **211 / 5** | ⬜ scan in progress |
+
+`svc-obs-01`'s five are `svc-repo-01`'s five exactly. The one-pass difference between them is
+`file_groupowner_system_journal` moving from `pass` to `notselected` — it is deselected
+enclave-wide because it conflicts with UBTU-24-700020 in the same profile and its result
+depends on when you scan relative to the last `systemd-tmpfiles` run. Runbook §10.1.
 
 **Five distinct open controls across the whole enclave, all AO decisions:** the smart-card
 family (V-270663 · V-270735 · V-270736 — one missing subsystem, three controls), `ufw` on the
@@ -102,7 +108,8 @@ runbook §6.3j.
 | M4 | Source-restricted ufw | ✅ **proven by timing**: collector scrapes `svc-repo-01:9100`, `stage-01` times out at 7 s. Rows for 9100/9177/3000 in `stig-tailor.sh` |
 | M5 | Grafana carried as a verified `.deb` | ✅ on the mirror at `/debs/` **and** on the transfer manifest at `/srv/apt-mirror/debs/`. No third-party signing key in the trust store |
 | M6 | Everything reproducible | ✅ `monitoring.sh {exporter\|libvirt\|collector}`. Scrape config **generated** from `enclave-addresses.env` |
-| M7 | **Harden `svc-obs-01`** | ⬜ **NEXT.** Full §6.0 pass. It is the only machine with no FIPS, no `usg`, no GRUB password — and it holds the audit logs and metrics for everything else |
+| M7 | **Harden `svc-obs-01`** | ✅ **DONE 2026-09-14 — 211 pass / 5 fail**, the same residual set as `svc-repo-01`. FIPS on, GRUB password set, `ufw` genuinely enforcing (second machine in the enclave where it does). Monitoring stack verified working after the pass |
+| M10 | **`svc-obs-01` resolves nowhere but itself** | ⬜ **FUNCTIONAL GAP.** `/etc/hosts` on `host-4`, `svc-mgmt-01`, `svc-repo-01` and `svc-harbor-01` has no entry for it — checked on all four, 2026-09-14. Its TLS certificate is issued for `svc-obs-01.enclave.internal`, a name nothing else can resolve. Fix is `apply-addresses.sh apply` on each (needs sudo per machine; `push` will not work because the enclave has no passwordless sudo by design) |
 | M8 | Dashboards | ⬜ datasource is provisioned; dashboard JSON must be carried in like everything else |
 | M9 | 9100 open to the enclave on 3 machines | ⬜ `ufw` is enabled only on `svc-repo-01`. **Closing the physical gap is what bounds this** |
 

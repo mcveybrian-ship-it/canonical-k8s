@@ -712,6 +712,37 @@ EOF
       say "   every rsyslog destination is already rotated by something ($(printf '%s' "$dests" | wc -w) checked)"
     fi
 
+    # THE HARDENING ITSELF STOPS LOGROTATE, AND IT FAILS SILENTLY.
+    #
+    # Fixup 3 sets /var/log to group `syslog` to satisfy the STIG. logrotate then REFUSES
+    # every file in that directory - "skipping ... because parent directory has insecure
+    # permissions (It's world writable or writable by group which is not root). Set the su
+    # directive" - unless the stanza says which user and group to operate as.
+    #
+    # MEASURED 2026-09-14: all five hardened machines had /var/log group syslog and NO `su`
+    # in the rsyslog stanza, so NOTHING in it had been rotating - syslog, auth.log, kern.log
+    # and the rest, not just the files added above. /var/log/messages had reached 7.9 GB.
+    # The packaged stanzas that DO work (cloud-init, postgresql-common, ubuntu-pro-client)
+    # all ship `su root root`; only rsyslog's does not.
+    #
+    # This is the worst shape a defect can take: hardening a control silently disables an
+    # unrelated subsystem, and the only symptom is a number going up.
+    local vlgroup; vlgroup="$(stat -c %G /var/log 2>/dev/null || echo root)"
+    if [ "$vlgroup" != root ] && ! grep -qE '^[[:space:]]*su[[:space:]]' "$RSYSLOG_LOGROTATE"; then
+      backup_file "$RSYSLOG_LOGROTATE"; local sbak="$LAST_BACKUP"
+      sed -i "0,/^[[:space:]]*rotate[[:space:]]/s//\tsu root $vlgroup\n&/" "$RSYSLOG_LOGROTATE"
+      if ! logrotate_config_ok; then
+        cp -a "$sbak" "$RSYSLOG_LOGROTATE"
+        warn "   logrotate rejected 'su root $vlgroup' - REVERTED. Its output:"
+        printf '%s\n' "$LOGROTATE_OUT" | sed 's/^/       /'
+        failed=1
+      else
+        ok "   added 'su root $vlgroup' to $RSYSLOG_LOGROTATE"
+        say "       /var/log is group '$vlgroup', and WITHOUT this logrotate silently skips"
+        say "       every file in the stanza. Nothing was rotating before this line existed."
+      fi
+    fi
+
     # ROTATING WEEKLY IS NOT A BOUND. Ubuntu's stanza is `weekly` + `rotate 4`, so a file is
     # allowed to grow for seven days before anything happens to it. svc-mgmt-01 produces
     # ~5 GB/day of syslog, which that policy permits to reach ~140 GB on a 96 GB disk. The

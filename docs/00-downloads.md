@@ -87,6 +87,36 @@ Also fetch, from the same directory:
 The `release/` path is the current published release. Prefer it over `daily/` — daily builds
 change under you.
 
+### 3. Grafana 13.2.1 — standalone `.deb`
+
+**Added 2026-09-14, retrospectively.** This was carried into the enclave before it was written
+down here, which meant a rebuild from a fresh download run would have reached
+`monitoring.sh collector` and found nothing to install. It is recorded now so that cannot
+happen again.
+
+| | |
+|---|---|
+| Index | <https://grafana.com/grafana/download?platform=linux> |
+| File | `grafana_13.2.1_33191028959_linux_amd64.deb` (375 MB) |
+| SHA-256 | `b4f088f661c5103746f23cb5cbbe2b2bb2e18ba9870ad68a3c2a90451f511ded` |
+| Staged to | `$MIRROR_BASE/debs/` on `stage-01`, from where `build-transfer-bundle.sh` carries it |
+| Installed to | `/srv/repo/debs/` on `svc-repo-01`, fetched over TLS by `monitoring.sh collector` |
+
+> **Carried as a file, not installed from Grafana's apt repository — deliberately.** Adding
+> `packages.grafana.com` would put a third-party signing key in the trust store of a machine
+> inside the ATO boundary. **The SHA-256 above is the control**, and it is enforced in
+> `scripts/enclave/monitoring.sh` (`GRAFANA_SHA`): the install refuses on a mismatch rather
+> than warning. Verified against the staged copy on 2026-09-14.
+>
+> **The build number in the filename is part of the identity.** `13.2.1` alone does not
+> identify these bytes; `33191028959` does. Same trap as the Minimal image serial above.
+
+Everything else the monitoring stack needs — `prometheus`, `prometheus-alertmanager`,
+`prometheus-node-exporter`, `prometheus-libvirt-exporter`, `nginx` — comes from the apt mirror's
+`universe` component and needs no separate download.
+
+What the stack is and what it measures: [`compliance/dashboards-and-metrics.md`](compliance/dashboards-and-metrics.md).
+
 ## Verification
 
 There are **two independent checks**, and they prove different things:

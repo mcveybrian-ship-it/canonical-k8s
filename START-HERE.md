@@ -27,6 +27,7 @@ and `scripts/install/02-*`. No exceptions.
 | 07 | Bootstrap Kubernetes | not written | **Q8 ANSWERED** — no FIPS channel exists; needs the `core22` FIPS base snap. After 06 |
 | 08 | Storage — **Ceph (debs)** and ceph-csi | not written | After 07. **Not MicroCeph** — runbook §2.5 |
 | 09 | Validation and ATO evidence | [`docs/runbook.md`](docs/runbook.md) §10, **§10.1** | **PARTLY WRITTEN.** **Evaluate-STIG** assessed and in use — DISA **V1R6** content, CKL/CKLB output an assessor actually consumes, and the measured USG-vs-V1R6 delta that answers open question 18. Still to do: Answer Files for our deviations, the USG↔V1R6 correlator (or a STIG Manager feed — ask the AO), and the host-failure rehearsal before go-live |
+| **09a** | Monitoring and compliance dashboards | [`docs/compliance/dashboards-and-metrics.md`](docs/compliance/dashboards-and-metrics.md) + [`docs/runbook.md`](docs/runbook.md) §10a | **DONE 2026-09-14.** Prometheus, Alertmanager and Grafana on `svc-obs-01`; exporters plus the **textfile** and **systemd** collectors on all five in-gap machines; 8 alert rules; compliance facts on a 15-minute timer; two provisioned dashboards. §8 of that document is the exact rebuild sequence. ⬜ **No notification path** — Q26 |
 | 10 | Day-2 patching | not written | Blocked: Q6 — offline bundle size and cadence |
 
 Q-numbers are in [`docs/open-questions.md`](docs/open-questions.md).

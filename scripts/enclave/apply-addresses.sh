@@ -136,44 +136,59 @@ push() {
 }
 
 verify() {
-  local ip name line var rc=0
+  local ip line name var rc=0
+  # ONE SSH CONNECTION PER MACHINE, NOT ONE PER NAME.
+  #
+  # The first version opened a connection for every name - 16 per machine. On the machines
+  # where ufw actually enforces (svc-repo-01 and svc-obs-01, the only two), `ufw limit`
+  # REJECTS after 6 connections in 30 seconds from one source. Connections 5..16 were
+  # refused, `|| true` turned each refusal into an empty string, and an empty string reads
+  # exactly like "this name does not resolve". Both machines were reported as missing their
+  # entire service block while /etc/hosts on them was complete and correct.
+  #
+  # A tool that opens a connection per item WILL be rate-limited by a correctly hardened
+  # machine, and the failure arrives disguised as the thing the tool set out to measure.
+  # Ask once, get everything back.
+  local names="" expect=""
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    name="${line%%:*}"; var="${line##*:}"
+    [ -n "${!var:-}" ] || continue
+    names="$names $name.$ENCLAVE_DOMAIN"
+    expect="$expect$name ${!var}"$'\n'
+  done <<< "$MAP"
+
   for ip in $(targets); do
     ssh -n -i "$KEY" -o BatchMode=yes -o ConnectTimeout=5 "$USER_NAME@$ip" true 2>/dev/null || continue
-    local bad="" shadowed="" checked=0
+    # The remote side prints "<name> <addr> <addr> ..." once per name, in one session.
+    # DEDUPE WITHOUT SORTING. The order getent returns is the order a caller will actually
+    # get, and that is the whole point of the 127.0.1.1 check below - `sort -u` puts
+    # 10.x before 127.x and quietly destroys the only signal being measured.
+    local got
+    got="$(ssh -n -i "$KEY" -o BatchMode=yes "$USER_NAME@$ip" \
+          "for n in$names; do printf '%s ' \"\${n%%.*}\"; getent ahostsv4 \"\$n\" 2>/dev/null | awk '!s[\$1]++ {print \$1}' | tr '\\n' ' '; echo; done" 2>/dev/null)" || true
+    if [ -z "$got" ]; then warn "$ip UNREADABLE - ssh returned nothing"; rc=1; continue; fi
+
+    local bad="" shadowed="" checked=0 want first
     while IFS= read -r line; do
       [ -z "$line" ] && continue
-      name="${line%%:*}"; var="${line##*:}"
-      [ -n "${!var:-}" ] || continue
-      # -n IS LOAD-BEARING. Without it ssh reads stdin - which is the here-string feeding
-      # this while loop - and swallows the ENTIRE remaining table on the first iteration.
-      # The loop then ends after one name and reports "resolves every name" having checked
-      # exactly one. That is how svc-harbor-01 passed verification on 2026-09-14 while its
-      # /etc/hosts had no entry for svc-obs-01 at all. A false pass in the tool whose only
-      # job is catching that.
-      got=$(ssh -n -i "$KEY" -o BatchMode=yes "$USER_NAME@$ip" \
-            "getent hosts $name.$ENCLAVE_DOMAIN 2>/dev/null | awk '{print \$1}'" || true)
+      name="${line%% *}"
+      want="$(printf '%s\n' "$expect" | awk -v n="$name" '$1==n {print $2}')"
+      [ -n "$want" ] || continue
       checked=$((checked + 1))
-      # getent can return MORE THAN ONE ADDRESS. cloud-init writes "127.0.1.1 <fqdn> <host>"
-      # on every machine, so a machine asked for its OWN name answers 127.0.1.1 first and
-      # the real address second. Comparing the whole multi-line result to one address makes
-      # every machine fail on its own name - and the mangled output ("svc-mgmt-01(127.0.1.1")
-      # is what that looks like. Ask the right question instead: IS the expected address in
-      # the answer.
-      if printf '%s\n' "$got" | command grep -qx "${!var}"; then
-        # Present, but shadowed: a service that binds by name here gets loopback and will
-        # not be reachable from any other machine. Worth saying, not worth failing.
-        [ "$(printf '%s\n' "$got" | head -1)" = "${!var}" ] \
-          || shadowed="$shadowed $name"
+      if printf '%s\n' "${line#* }" | tr ' ' '\n' | command grep -qx "$want"; then
+        # Present but shadowed: cloud-init writes "127.0.1.1 <fqdn>" on every machine, so a
+        # machine answers its OWN name with loopback first. Not a failure - but it is why a
+        # daemon told to bind "by hostname" ends up unreachable from everywhere else.
+        first="$(printf '%s\n' "${line#* }" | awk '{print $1}')"
+        [ "$first" = "$want" ] || shadowed="$shadowed $name"
       else
-        bad="$bad $name(${got:-none})"
+        bad="$bad $name(${line#* }none)"
       fi
-    done <<< "$MAP"
-    # PRINT THE COUNT. "resolves every name" is unfalsifiable on its own; "resolves all 15"
-    # goes wrong visibly the moment the loop stops early again.
+    done <<< "$got"
+
     if [ -z "$bad" ]; then ok "$ip resolves all $checked name(s)"
     else warn "$ip MISSING:$bad"; rc=1; fi
-    # Not a failure. A machine resolving its own name to 127.0.1.1 is cloud-init's doing and
-    # is normal - but it is also why a daemon told to bind "by hostname" ends up on loopback.
     [ -z "$shadowed" ] || say "       note: 127.0.1.1 answers first for:$shadowed"
   done
   return $rc

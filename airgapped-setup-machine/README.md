@@ -8,9 +8,23 @@ this section, this section wins and the other one gets fixed.
 
 Last updated **2026-09-11 02:40 UTC** (2026-09-10 21:40 Central). All timestamps in this repo are **UTC** — every enclave machine runs UTC and the audit logs are UTC, so mixing local time into an auditable procedure is how two records stop lining up.
 
-## 0a. WORKING LIST — priority order as of 2026-09-13 20:35 UTC (15:35 Central)
+## 0a. WORKING LIST — priority order as of 2026-09-14 04:15 UTC (2026-09-13 23:15 Central)
 
 **Read this for "what next". The tables below record state; this records order.**
+
+### ⏭ NEXT SESSION — start here, in this order
+
+| | What | Why now |
+|---|---|---|
+| **1** | **Finish re-scanning the four machines against V1R6 — one at a time.** `sudo ./scripts/enclave/stig-tools.sh scan` on each. 🔄 **`svc-harbor-01` was RUNNING when the session ended 2026-09-14 ~04:15 UTC — read its tally first.** Then `svc-mgmt-01`, `svc-repo-01`, `host-4` | **This is the portability test the whole Answer File design rests on.** `svc-obs-01` went **NR 14 → 9, NF 166 → 171** with the five new entries. If another machine stays at 14, the answers are true only where they were written and that is the finding. Expect NR=9 and five more NF on each |
+| **2** | **Re-audit `svc-harbor-01` and `svc-mgmt-01` on USG** — `sudo stig-tailor.sh generate` then `audit` | Both still show **7** from before their GRUB password work, and both now also need the `file_groupowner_system_journal` deviation. **A stale number in a residual set is worse than no number** |
+| **3** | **`stig-tools.sh collect` after each scan** | Step 14. Evidence only existed on the machines it described until 2026-09-14 |
+| **4** | The four *engineering* Not Reviewed: **V-270651** AIDE config integrity (needs the pristine `aide-common` .deb to compare against), **V-270747** data-at-rest write-up, **V-270719** PPSM, **V-270754** the ufw 443 decision | The other five NR are AO — open-questions **Q25/Q26** |
+| **5** | ⚠️ **Rotate the password pasted into chat 2026-09-14.** Scrubbed from two files; **not rotated** | Overdue |
+| **6** | Push to `origin` — **50 commits ahead** | — |
+
+**Everything from 2026-09-14 is in the tables below.** `svc-obs-01` is fully built, monitored,
+TLS'd, hardened (**211/5**), scanned (**4 Open, 9 NR**) and collecting audit-volume samples.
 
 **ALL FIVE MACHINES ARE HARDENED — 2026-09-14.** `svc-obs-01` joined on 2026-09-14.
 

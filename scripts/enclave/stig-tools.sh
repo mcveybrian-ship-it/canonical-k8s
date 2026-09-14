@@ -65,6 +65,29 @@ SSH_KEY="${REPO_PUSH_KEY:-$_invoker_home/.ssh/build01}"
 # prompt with no terminal to type into and hangs or fails. Anything privileged needs -t.
 # Anything unprivileged must NOT use -t, or its output is polluted with the DoD banner and
 # terminal escapes - which is exactly what makes a captured value unusable later.
+# A MACHINE NAME IS NOT AN ADDRESS OUTSIDE THE GAP. `answers svc-obs-01` from stage-01 died
+# on "scp: Connection closed" - the real cause was that stage-01 does not resolve enclave
+# names at all (the enclave DNS lives on svc-mgmt-01, inside the boundary, and stage-01 is
+# outside it by design). The address is already in enclave-addresses.env, so look it up
+# rather than making the operator remember which machine is which octet.
+#
+# Resolution wins if it works - an operator who has a hosts entry or is inside the gap
+# should not be overridden by a table.
+resolve_target() {
+  local name="$1"
+  if getent hosts "$name" >/dev/null 2>&1; then printf '%s\n' "$name"; return 0; fi
+  case "$name" in *[!0-9.]*) : ;; *) printf '%s\n' "$name"; return 0 ;; esac   # already an IP
+  local var; var="$(printf '%s' "$name" | tr 'a-z-' 'A-Z_')"
+  local addr="${!var:-}"
+  [ -n "$addr" ] || die "cannot resolve '$name', and enclave-addresses.env has no $var.
+       Either add it there, or pass the address directly."
+  # TO STDERR, NOT STDOUT. The caller does target="$(resolve_target ...)", so anything this
+  # prints on stdout is captured INTO THE ADDRESS. Caught in a dry-run, which is the only
+  # reason it is not a "connection to '  using 10.2.20.164' failed" two steps from now.
+  printf '  %s\n' "'$name' does not resolve here - using $addr from enclave-addresses.env" >&2
+  printf '%s\n' "$addr"
+}
+
 rsh()    { ssh -i "$SSH_KEY" -o ConnectTimeout=10 "$@"; }
 rsh_t()  { ssh -t -i "$SSH_KEY" -o ConnectTimeout=10 "$@"; }
 rscp()   { scp -q -i "$SSH_KEY" -o ConnectTimeout=10 "$@"; }
@@ -176,6 +199,12 @@ cmd_answers() {
   [ -n "$target" ] || die "usage: sudo $0 answers <address|hostname>
        The Answer File goes point-to-point, to one named machine, over ssh."
   [ -f "$ANSWERFILE" ] || die "no Answer File at $ANSWERFILE"
+  target="$(resolve_target "$target")"
+  # Say which key, and prove the host answers at all, BEFORE blaming authorisation. The
+  # first version reported every scp failure as "is the key authorised?" - including the
+  # one that was actually a name that did not resolve.
+  rsh -o BatchMode=yes "$MIRROR_USER@$target" true 2>/dev/null \
+    || die "cannot ssh to $MIRROR_USER@$target with $SSH_KEY - check the key and the address"
   say "sending $(basename "$ANSWERFILE") to $MIRROR_USER@$target:$DEST/"
   say "  $(wc -l < "$ANSWERFILE") lines, $(grep -c '<Vuln ' "$ANSWERFILE" 2>/dev/null || echo '?') vuln entries"
   local BASE; BASE="$(basename "$ANSWERFILE")"

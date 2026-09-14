@@ -687,8 +687,146 @@ if [ "$DETACH" -eq 1 ]; then
   exit 0
 fi
 
+# ---------------------------------------------------------------- facts
+# PUBLISH THE BACKUP STATE AS METRICS, for node-exporter's textfile collector.
+#
+# This job runs unattended at 02:00 onto a USB disk that is LUKS-encrypted and sits behind a
+# STIG usb-storage block. Every one of those is a way for it to stop working without anyone
+# noticing, and the failure is only discovered when a restore is needed - which is the worst
+# possible moment to discover it.
+#
+# `monitoring.sh facts` calls this; it is not on a timer of its own. vm-backup.sh owns the
+# on-disk layout, so it is the thing that should read it - teaching monitoring.sh where a
+# backup set lives would put that knowledge in two places.
+#
+# MANIFEST.sha256 IS THE COMPLETION MARKER. It is written only after every disk in a set has
+# been copied (see backup_one), so a set directory WITHOUT one is an interrupted run - which
+# is exactly what a TMOUT-killed full backup leaves behind. Counting directories would call
+# that a success.
+TEXTFILE_DIR="${TEXTFILE_DIR:-/var/lib/node_exporter/textfile}"
+
+cmd_facts() {
+  need_root
+  local out="$TEXTFILE_DIR/enclave-backup.prom" tmp
+  [ -d "$TEXTFILE_DIR" ] || { warn "no $TEXTFILE_DIR - run: monitoring.sh exporter"; return 1; }
+  tmp="$(mktemp "$TEXTFILE_DIR/.backup.XXXXXX")" || { warn "cannot write in $TEXTFILE_DIR"; return 1; }
+
+  {
+    printf '# HELP enclave_backup_source_ok 1 if the backup destination could be read\n'
+    printf '# TYPE enclave_backup_source_ok gauge\n'
+    printf '# HELP enclave_backup_dest_mounted 1 if the backup destination is a mounted filesystem\n'
+    printf '# TYPE enclave_backup_dest_mounted gauge\n'
+
+    local mounted=0
+    [ -n "$DEST" ] && mountpoint -q "$DEST" 2>/dev/null && mounted=1
+    printf 'enclave_backup_dest_mounted %s\n' "$mounted"
+
+    # THE TIMER IS A FACT ABOUT THE SCHEDULE, NOT ABOUT THE DISK - report it either way.
+    printf '# HELP enclave_backup_timer_enabled 1 if the nightly backup timer is active\n'
+    printf '# TYPE enclave_backup_timer_enabled gauge\n'
+    printf 'enclave_backup_timer_enabled %s\n' \
+      "$(systemctl is-active "$SVC_NAME.timer" >/dev/null 2>&1 && echo 1 || echo 0)"
+
+    # AN UNMOUNTED DESTINATION MUST NOT REPORT ZERO BACKUPS.
+    # $DEST still exists as an empty directory when the USB volume is not attached, so
+    # counting sets there would publish "0 complete sets" for every domain - identical to a
+    # machine that has never been backed up, and identical to one whose backups were deleted.
+    # Emit nothing per-domain instead; "No data" is the honest answer.
+    if [ "$mounted" -ne 1 ]; then
+      printf 'enclave_backup_source_ok 0\n'
+      printf '# HELP enclave_backup_facts_generated_seconds unix time these facts were written\n'
+      printf '# TYPE enclave_backup_facts_generated_seconds gauge\n'
+      printf 'enclave_backup_facts_generated_seconds %s\n' "$(date +%s)"
+      return 0
+    fi
+    printf 'enclave_backup_source_ok 1\n'
+
+    printf '# HELP enclave_backup_dest_avail_bytes free space at the backup destination\n'
+    printf '# TYPE enclave_backup_dest_avail_bytes gauge\n'
+    printf 'enclave_backup_dest_avail_bytes %s\n' \
+      "$(df -B1 --output=avail "$DEST" 2>/dev/null | tail -1 | tr -d ' ')"
+    printf '# HELP enclave_backup_dest_size_bytes total size of the backup destination\n'
+    printf '# TYPE enclave_backup_dest_size_bytes gauge\n'
+    printf 'enclave_backup_dest_size_bytes %s\n' \
+      "$(df -B1 --output=size "$DEST" 2>/dev/null | tail -1 | tr -d ' ')"
+
+    printf '# HELP enclave_backup_last_success_seconds unix time of the newest COMPLETE backup set\n'
+    printf '# TYPE enclave_backup_last_success_seconds gauge\n'
+    printf '# HELP enclave_backup_last_attempt_seconds unix time of the newest set of any kind\n'
+    printf '# TYPE enclave_backup_last_attempt_seconds gauge\n'
+    printf '# HELP enclave_backup_sets_complete backup sets carrying a MANIFEST.sha256\n'
+    printf '# TYPE enclave_backup_sets_complete gauge\n'
+    printf '# HELP enclave_backup_sets_incomplete set directories with NO manifest - interrupted runs\n'
+    printf '# TYPE enclave_backup_sets_incomplete gauge\n'
+    printf '# HELP enclave_backup_last_set_bytes size of the newest complete set\n'
+    printf '# TYPE enclave_backup_last_set_bytes gauge\n'
+    printf '# HELP enclave_backup_checkpoints libvirt checkpoints - what an incremental builds on\n'
+    printf '# TYPE enclave_backup_checkpoints gauge\n'
+    printf '# HELP enclave_backup_job_active 1 if a backup job is running on this domain right now\n'
+    printf '# TYPE enclave_backup_job_active gauge\n'
+
+    local d dir newest_ok newest_any nc ni sz jt protected=0 defined=0 total=0
+    for d in $(domains); do
+      defined=$((defined + 1))
+
+      # newest COMPLETE: the manifest's own mtime is when the set finished, which is the
+      # number that matters - a set that began yesterday and finished today is today's.
+      newest_ok="$(find "$DEST/$d" -mindepth 2 -maxdepth 2 -name MANIFEST.sha256 \
+                    -printf '%T@\n' 2>/dev/null | sort -n | tail -1 | cut -d. -f1)"
+      newest_any="$(find "$DEST/$d" -mindepth 1 -maxdepth 1 -type d \
+                    -printf '%T@\n' 2>/dev/null | sort -n | tail -1 | cut -d. -f1)"
+      nc="$(find "$DEST/$d" -mindepth 2 -maxdepth 2 -name MANIFEST.sha256 2>/dev/null | wc -l)"
+      ni="$(( $(find "$DEST/$d" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l) - nc ))"
+      [ "$ni" -lt 0 ] && ni=0
+
+      [ -n "$newest_ok" ] && { printf 'enclave_backup_last_success_seconds{domain="%s"} %s\n' "$d" "$newest_ok"; protected=$((protected + 1)); }
+      [ -n "$newest_any" ] && printf 'enclave_backup_last_attempt_seconds{domain="%s"} %s\n' "$d" "$newest_any"
+      printf 'enclave_backup_sets_complete{domain="%s"} %s\n'   "$d" "$nc"
+      printf 'enclave_backup_sets_incomplete{domain="%s"} %s\n' "$d" "$ni"
+
+      # SUM FILE SIZES, DO NOT `du` THE TREE. du walks and stats every block on a USB disk,
+      # every 15 minutes, on a volume holding hundreds of GB. A set holds a handful of qcow2
+      # files, so one stat each is the same answer for none of the cost.
+      dir="$(find "$DEST/$d" -mindepth 2 -maxdepth 2 -name MANIFEST.sha256 \
+              -printf '%T@ %h\n' 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2-)"
+      if [ -n "$dir" ]; then
+        sz="$(find "$dir" -maxdepth 1 -type f -printf '%s\n' 2>/dev/null | awk '{t+=$1} END{print t+0}')"
+        printf 'enclave_backup_last_set_bytes{domain="%s"} %s\n' "$d" "$sz"
+        total=$((total + sz))
+      fi
+
+      printf 'enclave_backup_checkpoints{domain="%s"} %s\n' "$d" \
+        "$(virsh checkpoint-list "$d" --name 2>/dev/null | sed '/^$/d' | wc -l)"
+
+      # `virsh domjobinfo` PADS ITS FIELDS, and matching the line exactly once printed idle
+      # domains as in-progress. Strip whitespace from the value, then compare.
+      jt="$(virsh domjobinfo "$d" 2>/dev/null | awk -F: '/^Job type/{gsub(/[[:space:]]/,"",$2); print $2}')"
+      printf 'enclave_backup_job_active{domain="%s"} %s\n' "$d" \
+        "$([ -n "$jt" ] && [ "$jt" != None ] && echo 1 || echo 0)"
+    done
+
+    printf '# HELP enclave_backup_domains_defined domains libvirt knows about here\n'
+    printf '# TYPE enclave_backup_domains_defined gauge\n'
+    printf 'enclave_backup_domains_defined %s\n' "$defined"
+    printf '# HELP enclave_backup_domains_protected domains with at least one COMPLETE set\n'
+    printf '# TYPE enclave_backup_domains_protected gauge\n'
+    printf 'enclave_backup_domains_protected %s\n' "$protected"
+    printf '# HELP enclave_backup_total_bytes newest complete set summed across all domains\n'
+    printf '# TYPE enclave_backup_total_bytes gauge\n'
+    printf 'enclave_backup_total_bytes %s\n' "$total"
+    printf '# HELP enclave_backup_facts_generated_seconds unix time these facts were written\n'
+    printf '# TYPE enclave_backup_facts_generated_seconds gauge\n'
+    printf 'enclave_backup_facts_generated_seconds %s\n' "$(date +%s)"
+  } > "$tmp"
+
+  if [ ! -s "$tmp" ]; then rm -f "$tmp"; warn "backup facts produced NO output - $out left alone"; return 1; fi
+  chmod 0644 "$tmp"; mv -f "$tmp" "$out"
+  ok "wrote $out ($(grep -vc '^#' "$out") samples)"
+}
+
 case "${1:-status}" in
   status)       cmd_status ;;
+  facts)        cmd_facts ;;
   full)         shift || true; cmd_backup full "${1:-all}" ;;
   incr)         shift || true; cmd_backup incr "${1:-all}" ;;
   progress)     cmd_progress ;;
@@ -699,5 +837,5 @@ case "${1:-status}" in
   schedule)     shift || true; cmd_schedule "${1:-02:00}" ;;
   unschedule)   cmd_unschedule ;;
   restore-plan) shift || true; cmd_restore_plan "${1:-}" ;;
-  *) printf 'usage: %s {status|full [vm]|incr [vm]|progress|verify|prune|keyfile|reattach|schedule [HH:MM]|unschedule|restore-plan <vm>}\n' "$0" >&2; exit 2 ;;
+  *) printf 'usage: %s {status|facts|full [vm]|incr [vm]|progress|verify|prune|keyfile|reattach|schedule [HH:MM]|unschedule|restore-plan <vm>}\n' "$0" >&2; exit 2 ;;
 esac

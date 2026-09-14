@@ -185,6 +185,46 @@ anything about the Answer File.
 
 ---
 
+## 4a. Dashboard: **Enclave hypervisor — host-4 and VM backups** (`uid: enclave-hypervisor`)
+
+24 panels, two rows. Backup state comes from `vm-backup.sh facts`; guest state comes from
+`prometheus-libvirt-exporter` on the hypervisor.
+
+### Row: Backup — did last night's backup actually land on the disk
+
+Six stats — **domains with no complete backup**, oldest successful backup, destination mounted,
+free space, **interrupted sets**, nightly timer — then a per-domain table and five graphs.
+
+Three of those deserve explanation:
+
+- **`MANIFEST.sha256` is the completion marker.** It is written only after every disk in a set
+  has been copied. A set directory *without* one is an interrupted run — which is exactly what
+  the `TMOUT`-killed full backup left behind. **Counting directories would have called that a
+  success**, so complete and incomplete sets are counted separately and interrupted sets get
+  their own stat, red at one.
+- **"Backup job running" should be a narrow block after 02:00, not a plateau.** A job that never
+  clears is the `cannot acquire state change lock` state.
+- **"Time since last successful backup" should draw a sawtooth** — climbing all day, dropping to
+  near zero at 02:00. A line that climbs straight through 26 hours is a job that stopped.
+
+**An unmounted destination publishes nothing per-domain.** `$DEST` still exists as an empty
+directory when the USB volume is not attached, so counting sets there would report "0 complete
+sets" for every domain — indistinguishable from a machine never backed up, and from one whose
+backups were deleted. Instead `enclave_backup_dest_mounted` goes to 0, `source_ok` goes to 0,
+and the per-domain families vanish. After a reboot that is the normal state, for three separate
+reasons: `usb-storage` is STIG-blocked, LUKS is locked, and nothing types the passphrase.
+`vm-backup.sh reattach` is the fix.
+
+### Row: Hypervisor — host-4 and the guests it runs
+
+`libvirt_up`, guests running, host-4 CPU and memory, then per-guest state, vCPU, memory, block
+I/O, network, and **network errors and drops** — which should be flat zero, and where drops on a
+bridged guest network usually mean the host is the bottleneck rather than the guest.
+
+All nineteen `libvirt_*` metric names were read from the running Prometheus rather than assumed.
+
+---
+
 ## 5. Metric reference
 
 Every metric published by `monitoring.sh facts`. All are gauges. All carry `machine` and `role`
@@ -229,6 +269,35 @@ older than the one that had just finished.
 | `enclave_failed_sudo_24h` | — | journal, `-t sudo` | authentication failures |
 | `enclave_sudo_invocations_24h` | — | journal, `-t sudo` | total `COMMAND=` lines |
 | `enclave_usb_storage_blocked` | — | `/etc/modprobe.d/*.conf` | where V-270718 looks |
+
+### Backup facts — hypervisors only, from `vm-backup.sh facts`
+
+Written to `enclave-backup.prom` by `vm-backup.sh`, which is called by `monitoring.sh facts`.
+`vm-backup.sh` owns the on-disk layout, so it is the thing that reads it — teaching
+`monitoring.sh` where a backup set lives would put that knowledge in two files that would drift.
+
+| Metric | Labels | Meaning |
+|---|---|---|
+| `enclave_backup_dest_mounted` | — | 1 = the LUKS volume is unlocked and mounted |
+| `enclave_backup_source_ok` | — | 0 when the destination could not be read |
+| `enclave_backup_timer_enabled` | — | `enclave-vm-backup.timer` active |
+| `enclave_backup_dest_avail_bytes` / `_size_bytes` | — | free and total at the destination |
+| `enclave_backup_last_success_seconds` | `domain` | mtime of the newest `MANIFEST.sha256` |
+| `enclave_backup_last_attempt_seconds` | `domain` | newest set directory of any kind |
+| `enclave_backup_sets_complete` | `domain` | sets carrying a manifest |
+| `enclave_backup_sets_incomplete` | `domain` | set directories with **no** manifest |
+| `enclave_backup_last_set_bytes` | `domain` | size of the newest complete set |
+| `enclave_backup_checkpoints` | `domain` | libvirt checkpoints an incremental can build on |
+| `enclave_backup_job_active` | `domain` | 1 while libvirt reports a job |
+| `enclave_backup_domains_defined` / `_protected` | — | defined, and holding ≥1 complete set |
+| `enclave_backup_total_bytes` | — | newest complete set summed across domains |
+
+Sizes are summed with `stat` over the files in a set, **not** `du` over the tree. A set holds a
+handful of qcow2 files; `du` would walk and stat every block on a USB disk every 15 minutes, on
+a volume holding hundreds of gigabytes, for the same answer.
+
+`virsh domjobinfo` **pads its fields**, and matching the line exactly once printed idle domains
+as in progress. The value is stripped of whitespace before comparison.
 
 ### Producer health — read these before trusting anything above
 
@@ -411,13 +480,8 @@ glob will happily report another machine's checklist as this one's.
   leave an air gap**; Postfix is deliberately `inet_interfaces = loopback-only` because the
   STIG requires it. Alertmanager on a dashboard is a different mechanism from the one the
   control names and needs an AO answer — `docs/open-questions.md` **Q26**.
-- **No role-specific dashboards.** Per-machine dashboards for the mirror, the registry, MAAS
-  and the collector are designed but not built. The systemd and textfile collectors enabled
-  here are the prerequisite for all of them.
-- **No backup facts.** `vm-backup.sh` writes nothing to the textfile directory yet, so the
-  nightly 02:00 job is invisible to this dashboard — the failure mode it most needs.
-- **`libvirt_domains_number`** is used by the Fleet row; the metric names exposed by the
-  packaged `prometheus-libvirt-exporter` have not been audited beyond the panels in use.
+- **No role dashboards for the mirror, the registry, MAAS or the collector.** The collector's
+  own is the cheapest of the four — every series it needs is already scraped.
 
 ---
 

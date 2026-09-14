@@ -979,6 +979,17 @@ FACTSPY
   ok "wrote $out"
   say "   $(grep -vc '^#' "$out") samples, $(grep -c '^# HELP' "$out") metric families"
   grep '^enclave_facts_source_ok' "$out" | sed 's/^/     /'
+
+  # BACKUPS ARE THE HYPERVISOR'S BUSINESS, and vm-backup.sh owns their on-disk layout - so it
+  # is the thing that reads it. Teaching this script where a backup set lives would put that
+  # knowledge in two files that would then drift.
+  #
+  # Not fatal if it fails: a hypervisor with the USB volume detached is a normal state, and
+  # vm-backup.sh publishes enclave_backup_dest_mounted 0 rather than nothing, so the dashboard
+  # can tell "detached" from "this script never ran".
+  if [ -x "$HERE/vm-backup.sh" ] && command -v virsh >/dev/null 2>&1; then
+    "$HERE/vm-backup.sh" facts || warn "vm-backup.sh facts failed - backup panels will be stale"
+  fi
 }
 
 # Install the timer that keeps the facts fresh. 15 minutes: these are daily-to-weekly facts,

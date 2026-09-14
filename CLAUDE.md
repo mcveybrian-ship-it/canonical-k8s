@@ -207,3 +207,25 @@ Written for a consultant briefing a program office. Direct, specific, unhedged w
 evidence supports it and explicitly uncertain where it doesn't. It states verdicts ("on a
 single small enclave, Canonical wins on cost and it isn't close") rather than laying out
 options and retreating. Keep that voice.
+
+## `grep -r` in this repo is blind to exactly the files that matter
+
+**`grep` here is a shell function that wraps `ugrep --ignore-files`, which honours
+`.gitignore`.** So a recursive `grep` **silently skips the five private paths** —
+`HANDOFF.md`, `docs/open-questions.md`, `docs/runbook.md`, `artifact/`, `archive/`.
+
+Those are the documents most often being audited. Found on 2026-09-14 while checking whether
+`svc-obs-01` was documented: `grep -rl svc-obs-01 --include="*.md" .` returned two files and
+claimed the runbook was not among them. The runbook had **sixteen** occurrences.
+
+**A recursive search here returns a clean-looking answer that is wrong**, and nothing about
+the output says a whole class of file was excluded.
+
+**So: use `command grep` for any recursive search whose answer is "is this documented".**
+
+```bash
+command grep -rl "svc-obs-01" --include="*.md" . | grep -v '^\./\.git/'
+```
+
+Single-file greps and explicit paths (`grep -n x docs/runbook.md`) are unaffected — the
+exclusion only applies to directory recursion.

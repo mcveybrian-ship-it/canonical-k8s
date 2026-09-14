@@ -88,9 +88,14 @@ resolve_target() {
   printf '%s\n' "$addr"
 }
 
-rsh()    { ssh -i "$SSH_KEY" -o ConnectTimeout=10 "$@"; }
-rsh_t()  { ssh -t -i "$SSH_KEY" -o ConnectTimeout=10 "$@"; }
-rscp()   { scp -q -i "$SSH_KEY" -o ConnectTimeout=10 "$@"; }
+# MULTIPLEX. `ufw limit 22/tcp` REJECTS a source after 6 connections in 30 seconds, and
+# `collect` makes several per machine. On svc-repo-01 and svc-obs-01 - the two machines where
+# ufw actually enforces - an unmultiplexed run gets refused partway through, and a refusal
+# reads like whatever the caller was measuring. One connection per machine, reused.
+MUX=(-o ControlMaster=auto -o ControlPath="/tmp/.stig-tools-%r@%h:%p" -o ControlPersist=60)
+rsh()    { ssh "${MUX[@]}" -i "$SSH_KEY" -o ConnectTimeout=10 "$@"; }
+rsh_t()  { ssh -t "${MUX[@]}" -i "$SSH_KEY" -o ConnectTimeout=10 "$@"; }
+rscp()   { scp -q "${MUX[@]}" -i "$SSH_KEY" -o ConnectTimeout=10 "$@"; }
 
 say()  { printf '  %s\n' "$*"; }
 ok()   { printf '  [ok] %s\n' "$*"; }
@@ -219,6 +224,75 @@ cmd_answers() {
      && rm -f '/tmp/$BASE'" || die "install on $target failed"
   ok "$DEST/$(basename "$ANSWERFILE") on $target, 0640 root:root"
   say "   use it with:  --AFPath $DEST"
+}
+
+# --------------------------------------------------------------------------------- collect
+# STEP 14. Evidence you cannot collect is evidence you do not have - and on 2026-09-14 every
+# one of the five machines held its own checklist while stage-01 held none. Four of them are
+# VMs that can be rebuilt, which is exactly the case this step exists for.
+#
+# TWO SOURCES, TWO PROBLEMS:
+#   /srv/stig-evidence  Evaluate-STIG output. Already readable - `scan` fixes ownership.
+#   /var/lib/usg        USG's XML and HTML. 0600 root:root, on purpose. Needs one privileged
+#                       call per machine, so the operator types one password per machine and
+#                       the rest is unattended.
+cmd_collect() {
+  local here; here="$(hostname -s)"
+  [ "$here" = stage-01 ] || warn "collecting onto $here, not stage-01 - is that what you meant?"
+  local into="${STIG_COLLECT_DIR:-$EVIDENCE}"
+  install -d -m 0755 "$into" 2>/dev/null || die "cannot create $into - run with sudo, or set STIG_COLLECT_DIR"
+  [ -w "$into" ] || die "$into is not writable by $(id -un)"
+
+  # Default to every machine in the address table that answers. Named machines override.
+  local list=("$@")
+  if [ "${#list[@]}" -eq 0 ]; then
+    local v
+    for v in HOST_1 HOST_2 HOST_3 HOST_4 SVC_MGMT_01 SVC_REPO_01 SVC_HARBOR_01 SVC_OBS_01; do
+      [ -n "${!v:-}" ] && list+=("${!v}")
+    done
+  fi
+
+  local addr host rc=0 got=0
+  for addr in "${list[@]}"; do
+    addr="$(resolve_target "$addr")"
+    rsh -o BatchMode=yes -o ConnectTimeout=5 -n "$MIRROR_USER@$addr" true 2>/dev/null || {
+      say "-- $addr unreachable - skipped"; continue; }
+    host="$(rsh -n -o BatchMode=yes "$MIRROR_USER@$addr" 'hostname -s' 2>/dev/null | tr -d '\r')"
+    [ -n "$host" ] || { warn "$addr answered but would not say its name - skipped"; rc=1; continue; }
+    printf '\n  == %s (%s) ==\n' "$host" "$addr"
+
+    # 1. USG results. Privileged, so one -t call that stages them beside the scanner output
+    #    and hands them to the operator's account. `|| true` on the copy: a machine that has
+    #    never run usg has nothing to stage and that is not an error.
+    # COMPUTE THE DIRECTORY NAME HERE, NOT ON THE FAR SIDE. A nested $(hostname) inside a
+    # quoted sudo sh -c inside an ssh argument is three levels of escaping for a value this
+    # side already knows. Levels of escaping are where these scripts break.
+    local up; up="$(printf '%s' "$host" | tr 'a-z' 'A-Z')"
+    say "  staging USG results (asks for the sudo password on $host):"
+    rsh_t "$MIRROR_USER@$addr" \
+      "sudo install -d -m 0755 -o $MIRROR_USER $EVIDENCE/$up/USG && \
+       sudo cp -p /var/lib/usg/usg-results-*.xml /var/lib/usg/usg-report-*.html $EVIDENCE/$up/USG/ ; \
+       sudo chown -R $MIRROR_USER $EVIDENCE/$up/USG" \
+      || { warn "$host: could not stage USG results"; rc=1; }
+
+    # 2. One recursive pull for everything. Unprivileged by now, by construction.
+    if rscp -r "$MIRROR_USER@$addr:$EVIDENCE/$up" "$into/" 2>/dev/null; then
+      local n; n="$(find "$into/$up" -type f 2>/dev/null | wc -l)"
+      ok "$host: $n file(s) -> $into/$up"
+      got=$((got + 1))
+    else
+      warn "$host: nothing at $EVIDENCE/$up - has it been scanned?"
+      rc=1
+    fi
+  done
+
+  printf '\n'
+  # SAY THE COUNT. "collected" alone reads the same whether it pulled five machines or none.
+  ok "collected from $got machine(s) into $into"
+  find "$into" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort | while read -r d; do
+    say "   $(basename "$d"): $(find "$d" -type f | wc -l) file(s), $(du -sh "$d" 2>/dev/null | cut -f1)"
+  done
+  return $rc
 }
 
 # ----------------------------------------------------------------------------------- fetch
@@ -611,9 +685,10 @@ cmd_status() {
 case "${1:-status}" in
   publish) shift; cmd_publish "$@" ;;
   answers) shift; cmd_answers "$@" ;;
+  collect) shift; cmd_collect "$@" ;;
   fetch)   shift; cmd_fetch "$@" ;;
   scan)    shift; cmd_scan "$@" ;;
   detect)  shift; cmd_detect "$@" ;;
   status)  shift; cmd_status "$@" ;;
-  *) printf 'usage: %s {publish|answers <machine>|fetch|detect|scan|status}\n' "$0" >&2; exit 2 ;;
+  *) printf 'usage: %s {publish|answers <machine>|collect [machine...]|fetch|detect|scan|status}\n' "$0" >&2; exit 2 ;;
 esac

@@ -12,6 +12,8 @@
 #     sudo ./vm-backup.sh restore-plan <vm>      print the restore steps - never automatic
 #     sudo ./vm-backup.sh schedule [--at HH:MM]  install a nightly systemd timer (default 02:00)
 #     sudo ./vm-backup.sh unschedule             remove it
+#     sudo ./vm-backup.sh keyfile                add a keyfile so unlocking needs no human
+#     sudo ./vm-backup.sh reattach               after a reboot: unlock, mount, re-block USB
 #
 #     --dest <path>            override BACKUP_DEST for this run
 #     --accept-unencrypted     proceed when the destination is not on an encrypted device
@@ -58,6 +60,9 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 
 DEST="${VM_BACKUP_DEST:-${BACKUP_DEST:-}}"
 KEEP="${BACKUP_KEEP_CHAINS:-2}"
+LUKS_UUID="${BACKUP_LUKS_UUID:-}"
+LUKS_NAME="${BACKUP_LUKS_NAME:-vmbackup}"
+KEYFILE="${BACKUP_KEYFILE:-/etc/enclave/vmbackup.key}"
 ACCEPT_PLAIN=0
 ALLOW_NONMOUNT=0
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -362,6 +367,99 @@ cmd_prune() {
   ok "prune complete - kept $KEEP set(s) per domain"
 }
 
+# ---------------------------------------------------------------- keyfile / reattach
+# AFTER A REBOOT, THE DESTINATION IS GONE, AND FOR THREE SEPARATE REASONS.
+#   1. usb-storage is blocked by the STIG, so the drive never appears.
+#   2. The LUKS volume is locked, and unlocking wants a passphrase nobody is there to type.
+#   3. Nothing mounts it.
+# `reattach` does all three and then RE-BLOCKS USB immediately, so the deviation window is
+# open for seconds rather than until somebody remembers.
+
+luks_dev() { printf '/dev/disk/by-uuid/%s\n' "$LUKS_UUID"; }
+
+cmd_keyfile() {
+  need_root
+  [ -n "$LUKS_UUID" ] || die "BACKUP_LUKS_UUID is not set in vm-specs.env"
+  local dev; dev="$(luks_dev)"
+  [ -b "$dev" ] || die "no LUKS device at $dev - is the drive attached and unlocked?"
+  if [ -s "$KEYFILE" ]; then
+    warn "$KEYFILE already exists - not overwriting."
+    say  "  to replace it: cryptsetup luksRemoveKey $dev $KEYFILE, delete the file, re-run"
+    return 0
+  fi
+  install -d -m 0700 "$(dirname "$KEYFILE")"
+  # 4096 random bytes. Not a password - nothing ever types this.
+  ( umask 077; head -c 4096 /dev/urandom > "$KEYFILE" )
+  chmod 0400 "$KEYFILE"
+  say "created $KEYFILE (0400 root, on this machine's encrypted root)"
+  say "adding it to the LUKS header - you will be asked for the EXISTING passphrase:"
+  if cryptsetup luksAddKey "$dev" "$KEYFILE"; then
+    ok "keyfile added - reattach and scheduled runs no longer need a human"
+    say "   the passphrase still works, and is still your way in from any other machine"
+  else
+    rm -f "$KEYFILE"
+    die "luksAddKey failed - keyfile removed, nothing changed"
+  fi
+}
+
+cmd_reattach() {
+  need_root; assert_hypervisor
+  [ -n "$DEST" ] || die "no destination set"
+  if mountpoint -q "$DEST"; then ok "$DEST is already mounted - nothing to do"; return 0; fi
+  [ -n "$LUKS_UUID" ] || die "BACKUP_LUKS_UUID is not set in vm-specs.env"
+
+  local tailor; tailor="$(dirname "$(readlink -f "$0")")/stig-tailor.sh"
+  local opened_window=0 dev; dev="$(luks_dev)"
+
+  if [ ! -b "$dev" ]; then
+    if ! lsmod | grep -q "^usb_storage"; then
+      [ -x "$tailor" ] || die "need $tailor to open the USB window"
+      say "USB storage is blocked - opening the window briefly"
+      "$tailor" usb enable >/dev/null 2>&1 || warn "usb enable reported a problem - continuing"
+      opened_window=1
+    fi
+    # The device node and its by-uuid link arrive via udev, not instantly.
+    local i=0
+    while [ ! -b "$dev" ] && [ "$i" -lt 20 ]; do sleep 1; udevadm settle --timeout=2 2>/dev/null; i=$((i+1)); done
+  fi
+
+  # CLOSE THE WINDOW WHATEVER HAPPENS NEXT. modprobe -r will fail once the volume is
+  # mounted, and that is expected and harmless - what matters for the control is that the
+  # block file is back in /etc/modprobe.d.
+  reblock() {
+    [ "$opened_window" -eq 1 ] || return 0
+    [ -x "$tailor" ] && "$tailor" usb disable >/dev/null 2>&1 || true
+    if grep -rqls "usb.storage" /etc/modprobe.d/ 2>/dev/null; then
+      ok "USB re-blocked - the deviation window is closed again"
+    else
+      warn "COULD NOT RE-BLOCK USB - the window is still open. Close it by hand:"
+      warn "    sudo $tailor usb disable"
+    fi
+  }
+  trap reblock EXIT
+
+  [ -b "$dev" ] || die "LUKS device $dev never appeared - is the drive plugged in and powered?"
+  ok "found the encrypted volume: $(readlink -f "$dev")"
+
+  if [ ! -e "/dev/mapper/$LUKS_NAME" ]; then
+    if [ -s "$KEYFILE" ]; then
+      cryptsetup luksOpen --key-file "$KEYFILE" "$dev" "$LUKS_NAME" \
+        || die "luksOpen failed with $KEYFILE - run '$0 keyfile' first, or unlock by hand"
+      ok "unlocked with the keyfile - no passphrase needed"
+    else
+      warn "no keyfile at $KEYFILE - unlock needs a passphrase, so this cannot run unattended"
+      say  "  create one with:  sudo $0 keyfile"
+      cryptsetup luksOpen "$dev" "$LUKS_NAME" || die "luksOpen failed"
+    fi
+  fi
+
+  install -d "$DEST"
+  mount "/dev/mapper/$LUKS_NAME" "$DEST" || die "mount failed"
+  mountpoint -q "$DEST" || die "$DEST still is not a mountpoint"
+  ok "mounted $DEST"
+  df -h "$DEST" | tail -1 | sed 's/^/       /'
+}
+
 # ---------------------------------------------------------------- schedule
 # NIGHTLY BACKUPS ON A MACHINE THAT DELIBERATELY BLOCKS USB STORAGE.
 #
@@ -511,8 +609,10 @@ case "${1:-status}" in
   incr)         shift || true; cmd_backup incr "${1:-all}" ;;
   verify)       cmd_verify ;;
   prune)        cmd_prune ;;
+  keyfile)      cmd_keyfile ;;
+  reattach)     cmd_reattach ;;
   schedule)     shift || true; cmd_schedule "${1:-02:00}" ;;
   unschedule)   cmd_unschedule ;;
   restore-plan) shift || true; cmd_restore_plan "${1:-}" ;;
-  *) printf 'usage: %s {status|full [vm]|incr [vm]|verify|prune|schedule [HH:MM]|unschedule|restore-plan <vm>}\n' "$0" >&2; exit 2 ;;
+  *) printf 'usage: %s {status|full [vm]|incr [vm]|verify|prune|keyfile|reattach|schedule [HH:MM]|unschedule|restore-plan <vm>}\n' "$0" >&2; exit 2 ;;
 esac

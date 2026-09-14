@@ -349,7 +349,9 @@ pager that trains people to ignore it.
 
 | Alert | Fires when | For | Severity |
 |---|---|---|---|
+| **availability** | | | |
 | `InstanceDown` | `up == 0` | 2m | critical |
+| **cpu / memory / filesystems** | | | |
 | `HighCPU` | CPU > 85% | 10m | warning |
 | `MemoryPressure` | MemAvailable < 10% | 10m | warning |
 | `FilesystemFillingWarning` | free < 20% | 15m | warning |
@@ -357,6 +359,47 @@ pager that trains people to ignore it.
 | `AuditFilesystemFilling` | `/var/log/audit` free < 25% | 5m | critical |
 | `FilesystemWillFillSoon` | `predict_linear` over 6h says full within 4h | 30m | warning |
 | `FilesystemReadOnly` | `node_filesystem_readonly == 1` | 1m | critical |
+| **audit trail** | | | |
+| `AuditRecordsLost` | `delta(enclave_auditd_lost[1h]) > 0` | 5m | critical |
+| `AuditdNotRunning` | the unit is not active | 5m | critical |
+| `AuditBacklogNearLimit` | backlog over half `backlog_limit` | 10m | warning |
+| **compliance drift** | | | |
+| `StigOpenControlsIncreased` | more Open than 1 day ago | 15m | warning |
+| `StigScanStale` | checklist older than 30 days | 1h | warning |
+| `FipsModeDisabled` | `enclave_fips_enabled == 0` | 10m | critical |
+| `CertificateExpiringSoon` | inside 30 days | 1h | warning |
+| `AideCheckStale` | no AIDE run in 36h | 1h | warning |
+| `AideDetectedChanges` | last exit non-zero | 10m | warning |
+| `AccountLockoutRisk` | any faillock tally | 5m | warning |
+| `ComplianceFactsStale` | facts older than 1h | 15m | critical |
+| **backups** | | | |
+| `BackupMissed` | no complete set in 26h | 30m | critical |
+| `BackupNeverCompleted` | a domain with no manifest-carrying set | 1h | critical |
+| `BackupInterrupted` | a set with no manifest | 30m | warning |
+| `BackupDestinationDetached` | volume not mounted | 2h | critical |
+| `BackupTimerDisabled` | nightly timer inactive | 1h | warning |
+| `BackupVolumeFilling` | free below 200 GB | 30m | warning |
+| `BackupFactsMissing` | `absent(enclave_backup_dest_mounted)` | 1h | critical |
+
+**Three of these are shaped by a lesson rather than by a threshold.**
+
+**`AuditRecordsLost` uses `delta`, not `> 0`.** auditd's `lost` counter is cumulative since
+boot, so a bare threshold would fire forever on a machine that dropped records once weeks ago —
+and an alert that is always firing trains people to close it without reading. `delta` over an
+hour asks the actionable question: *is it losing records now*. On a reboot the counter resets,
+delta goes negative, and nothing fires, which is correct.
+
+**Nothing alerts on the residual set being non-zero.** It is non-zero by design and every
+finding in it has a written rationale. `StigOpenControlsIncreased` alerts on it *changing*.
+
+**`ComplianceFactsStale` and `BackupFactsMissing` are the meta-alerts, and they carry the
+group.** Every other compliance rule needs its metric to exist before it can fire, so a
+producer that silently stops takes the whole group quiet — and **quiet is indistinguishable
+from healthy**. Those two fire on frozen and on absent respectively.
+
+**Every expression was evaluated against live data before shipping**, and all 26 were quiet —
+which for the six backup rules meant *the metrics did not exist yet*, not that the backups were
+fine. That is the distinction `BackupFactsMissing` exists to make.
 
 Thresholds are the `AL_*` parameters at the top of `monitoring.sh` — nothing is hardcoded.
 
@@ -364,9 +407,9 @@ Thresholds are the `AL_*` parameters at the top of `monitoring.sh` — nothing i
 is not versioned, does not travel on media, and dies with the VM. A rule file is a file in this
 repository.
 
-**No compliance alerts exist yet.** The obvious ones are `enclave_auditd_lost > 0`, CAT I above
-zero, facts going stale, and a certificate inside 30 days. They are not written because
-**notification has no answer yet** — see §11.
+**These fire into Alertmanager on `svc-obs-01` and go no further.** There is still no
+notification path — see §11. Until there is, an alert is something someone has to look at a
+screen to see, which is the whole of Q26.
 
 ---
 
@@ -475,7 +518,6 @@ glob will happily report another machine's checklist as this one's.
 
 ## 11. What this does not cover yet
 
-- **No compliance alert rules.** §7 lists the four that should exist.
 - **No notification path.** V-270818/V-270819 require email notification and **no email can
   leave an air gap**; Postfix is deliberately `inet_interfaces = loopback-only` because the
   STIG requires it. Alertmanager on a dashboard is a different mechanism from the one the

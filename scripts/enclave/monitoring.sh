@@ -274,6 +274,17 @@ AL_AUDIT_PCT="${AL_AUDIT_PCT:-25}"        # TIGHTER for /var/log/audit - see the
 AL_FS_PREDICT_HRS="${AL_FS_PREDICT_HRS:-4}"   # "will be full within N hours" at the current rate
 AL_DOWN_FOR="${AL_DOWN_FOR:-2m}"
 
+# Compliance and backup thresholds. Seconds where the unit is not obvious, because a rule
+# expression cannot carry "26h" - and 26h rather than 24h so a nightly job that runs a little
+# late does not page every morning.
+AL_FACTS_STALE="${AL_FACTS_STALE:-3600}"          # facts older than this: every number is frozen
+AL_SCAN_STALE_DAYS="${AL_SCAN_STALE_DAYS:-30}"    # STIG checklist older than this
+AL_CERT_DAYS="${AL_CERT_DAYS:-30}"                # certificate inside this many days
+AL_AIDE_STALE="${AL_AIDE_STALE:-129600}"          # 36h - dailyaidecheck has missed a day
+AL_BACKUP_STALE="${AL_BACKUP_STALE:-93600}"       # 26h - the nightly backup missed a run
+AL_BACKUP_DETACHED_FOR="${AL_BACKUP_DETACHED_FOR:-2h}"  # detached is normal briefly, not for hours
+AL_BACKUP_FREE_BYTES="${AL_BACKUP_FREE_BYTES:-200000000000}"  # 200 GB left on the backup volume
+
 # Set an ARGS= line, exactly once. Appending works - the file is sourced and the last wins -
 # and leaves two lines that disagree, so someone edits the first and nothing changes.
 set_args() {
@@ -652,6 +663,256 @@ groups:
           action: >-
             'sudo dmesg | tail -40' on {{ \$labels.machine }} and look for I/O errors.
             Do not simply remount read-write - find out why first.
+
+  # ---------------------------------------------------------------- audit trail
+  # THE AUDIT TRAIL IS THE ONE THING THAT CANNOT BE RECONSTRUCTED AFTERWARDS. A gap in it is
+  # not a service outage you notice; it is evidence that was never written.
+  - name: enclave-audit
+    rules:
+      # DELTA, NOT A BARE THRESHOLD. auditd's 'lost' counter is cumulative since boot, so a
+      # bare '> 0' would fire
+      # forever on a machine that dropped records once six weeks ago - and an alert that is
+      # always firing trains people to close it. delta() over an hour asks the question that
+      # is actually actionable: is it losing records NOW. On a reboot the counter resets to
+      # zero, delta goes negative, and nothing fires - which is correct.
+      - alert: AuditRecordsLost
+        expr: delta(enclave_auditd_lost[1h]) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ \$labels.machine }} is DROPPING audit records"
+          description: "The kernel discarded {{ \$value | printf \"%.0f\" }} audit events in the last hour. The trail has holes."
+          action: >-
+            'sudo auditctl -s' on {{ \$labels.machine }}. If backlog is at backlog_limit,
+            raise it in /etc/audit/rules.d and 'sudo augenrules --load'. Persistent loss
+            means the rules are generating more than auditd can write - see runbook 6.3d.
+
+      - alert: AuditdNotRunning
+        expr: node_systemd_unit_state{name="auditd.service",state="active"} == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "auditd is NOT running on {{ \$labels.machine }}"
+          description: "Nothing is recording audit events on this machine."
+          action: >-
+            'sudo systemctl status auditd' on {{ \$labels.machine }}. auditd cannot be
+            restarted with systemctl on some builds - use 'sudo service auditd restart'.
+
+      - alert: AuditBacklogNearLimit
+        expr: enclave_auditd_backlog > 0.5 * enclave_auditd_backlog_limit and enclave_auditd_backlog_limit > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ \$labels.machine }} audit backlog is over half its limit"
+          description: "backlog {{ \$value }} against the configured limit. This is what precedes lost records."
+          action: >-
+            Raise backlog_limit, or reduce what the audit rules capture. This alert exists to
+            arrive BEFORE AuditRecordsLost, not after.
+
+  # ---------------------------------------------------------------- compliance drift
+  # These do not alert on the residual set being non-zero - it is non-zero by design, and
+  # every finding in it has a written rationale. They alert on it CHANGING, on a scan going
+  # stale, and on the controls that are supposed to be permanently true stopping being true.
+  - name: enclave-compliance
+    rules:
+      - alert: StigOpenControlsIncreased
+        expr: enclave_stig_controls{status="O"} > enclave_stig_controls{status="O"} offset 1d
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ \$labels.machine }} has MORE open STIG controls than a day ago"
+          description: "Now {{ \$value }}. The residual set is supposed to be stable across every machine."
+          action: >-
+            Compare the newest checklist against the previous one under
+            /srv/stig-evidence/*/Previous/ on {{ \$labels.machine }}. A rise is either real
+            drift or a check that newly timed out - the scan log says which.
+
+      - alert: StigScanStale
+        expr: (time() - enclave_stig_scan_time_seconds) > ${AL_SCAN_STALE_DAYS} * 86400
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ \$labels.machine }} has not been scanned for ${AL_SCAN_STALE_DAYS} days"
+          description: "Every compliance number shown for this machine is that old."
+          action: >-
+            'sudo ./scripts/enclave/stig-tools.sh scan' on {{ \$labels.machine }}, then
+            'stig-tools.sh collect' from stage-01.
+
+      - alert: FipsModeDisabled
+        expr: enclave_fips_enabled == 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ \$labels.machine }} is NOT running in FIPS mode"
+          description: "fips_enabled is 0. This machine no longer meets the crypto baseline."
+          action: >-
+            'cat /proc/sys/crypto/fips_enabled' and 'uname -r' on {{ \$labels.machine }}.
+            A kernel update that dropped the -fips flavour is the usual cause.
+
+      - alert: CertificateExpiringSoon
+        expr: (enclave_cert_expiry_seconds - time()) < ${AL_CERT_DAYS} * 86400
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ \$labels.cn }} on {{ \$labels.machine }} expires in under ${AL_CERT_DAYS} days"
+          description: "File {{ \$labels.file }}. Nothing renews this automatically - there is no ACME in an air gap."
+          action: >-
+            'sudo ./scripts/enclave/ca.sh request <name>' on the machine, sign it on
+            svc-mgmt-01, install the fullchain, reload nginx.
+
+      - alert: AideCheckStale
+        expr: (time() - enclave_aide_last_run_seconds) > ${AL_AIDE_STALE}
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "AIDE has not run on {{ \$labels.machine }} for over 36 hours"
+          description: "File integrity checking is the control; a timer that is not firing is not a control."
+          action: >-
+            'systemctl status dailyaidecheck.timer' on {{ \$labels.machine }}.
+
+      - alert: AideDetectedChanges
+        expr: enclave_aide_last_exit_code != 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "AIDE exited {{ \$value }} on {{ \$labels.machine }}"
+          description: "Non-zero means it found changes to watched files, or failed to run."
+          action: >-
+            'sudo aide --check' on {{ \$labels.machine }} and read the report. Expected after
+            a deliberate change; unexpected otherwise, and that is the whole point.
+
+      - alert: AccountLockoutRisk
+        expr: enclave_faillock_users_with_failures > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ \$value }} account(s) on {{ \$labels.machine }} carry a faillock tally"
+          description: "deny=3 with unlock_time=0 - at three failures the account is locked PERMANENTLY until cleared."
+          action: >-
+            'sudo faillock' on {{ \$labels.machine }} to see who. Clear with
+            'sudo faillock --user <name> --reset' before it reaches three.
+
+      # THE META-ALERT. Without it, every rule in this group fails silently: a frozen fact
+      # file keeps serving its last values forever, so nothing breaches a threshold and the
+      # dashboards stay green on numbers that stopped being true.
+      - alert: ComplianceFactsStale
+        expr: (time() - enclave_facts_generated_seconds) > ${AL_FACTS_STALE}
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "compliance facts on {{ \$labels.machine }} are stale"
+          description: "enclave-facts.timer last wrote {{ \$value | printf \"%.0f\" }} seconds ago. Every compliance number for this machine is frozen."
+          action: >-
+            'systemctl status enclave-facts.timer' and 'journalctl -u enclave-facts -n 40'
+            on {{ \$labels.machine }}. The unit runs out of the repo checkout, so a moved
+            or renamed repository breaks it.
+
+  # ---------------------------------------------------------------- backups
+  # A backup nobody checks is a restore that fails. Every one of these is a way the nightly
+  # job stops working while everything else looks perfectly healthy.
+  - name: enclave-backup
+    rules:
+      - alert: BackupMissed
+        expr: (time() - enclave_backup_last_success_seconds) > ${AL_BACKUP_STALE}
+        for: 30m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ \$labels.domain }} has no successful backup in over 26 hours"
+          description: "Newest complete set is {{ \$value | printf \"%.0f\" }} seconds old."
+          action: >-
+            'sudo ./scripts/enclave/vm-backup.sh status' on the hypervisor. If the volume is
+            detached, 'vm-backup.sh reattach' first.
+
+      - alert: BackupNeverCompleted
+        expr: (enclave_backup_domains_defined - enclave_backup_domains_protected) > 0
+        for: 1h
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ \$value }} domain(s) on {{ \$labels.machine }} have NO complete backup"
+          description: "Defined in libvirt, but holding no backup set with a manifest."
+          action: >-
+            'sudo ./scripts/enclave/vm-backup.sh status' to see which, then
+            'vm-backup.sh full <domain>'.
+
+      - alert: BackupInterrupted
+        expr: enclave_backup_sets_incomplete > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ \$labels.domain }} has an interrupted backup set"
+          description: "A set directory with no MANIFEST.sha256 - a run that started and never finished."
+          action: >-
+            An interrupted full also leaves a checkpoint pointing at a base that never
+            finished. 'vm-backup.sh status' shows checkpoints; clear the partial set and the
+            stale checkpoint before the next run.
+
+      - alert: BackupDestinationDetached
+        expr: enclave_backup_dest_mounted == 0
+        for: ${AL_BACKUP_DETACHED_FOR}
+        labels:
+          severity: critical
+        annotations:
+          summary: "the backup volume is not mounted on {{ \$labels.machine }}"
+          description: "Normal briefly after a reboot; not for hours. Nothing can be backed up while this is true."
+          action: >-
+            'sudo ./scripts/enclave/vm-backup.sh reattach' on {{ \$labels.machine }}. After a
+            reboot it is detached for three separate reasons - usb-storage is STIG-blocked,
+            LUKS is locked, and nothing types the passphrase.
+
+      - alert: BackupTimerDisabled
+        expr: enclave_backup_timer_enabled == 0
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "the nightly backup timer is not active on {{ \$labels.machine }}"
+          description: "Nothing will run at 02:00. This is silent forever."
+          action: >-
+            'sudo ./scripts/enclave/vm-backup.sh schedule --at 02:00' on {{ \$labels.machine }}.
+
+      # ABSENCE, NOT A THRESHOLD. Every other rule in this group needs the backup metrics to
+      # EXIST before it can fire, so a vm-backup.sh facts that silently stops publishing takes
+      # the whole group quiet - and quiet is indistinguishable from healthy. This is the only
+      # rule here that fires on the metrics being gone.
+      - alert: BackupFactsMissing
+        expr: absent(enclave_backup_dest_mounted)
+        for: 1h
+        labels:
+          severity: critical
+        annotations:
+          summary: "no backup metrics are being published by any hypervisor"
+          description: "Every other backup alert is silent because it has nothing to evaluate."
+          action: >-
+            'sudo ./scripts/enclave/monitoring.sh facts' on the hypervisor and read what it
+            says about vm-backup.sh. If the textfile directory is missing, run
+            'monitoring.sh exporter' first.
+
+      - alert: BackupVolumeFilling
+        expr: enclave_backup_dest_avail_bytes < ${AL_BACKUP_FREE_BYTES}
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "the backup volume on {{ \$labels.machine }} is running out of space"
+          description: "Free space is below the configured floor. The next full backup may not fit."
+          action: >-
+            'sudo ./scripts/enclave/vm-backup.sh prune' keeps BACKUP_KEEP_CHAINS sets per
+            domain. If prune has been running, the volume is simply too small for the chain
+            depth configured.
 EOF
   chmod 0644 "$f"
 

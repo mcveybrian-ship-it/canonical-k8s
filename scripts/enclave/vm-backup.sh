@@ -346,9 +346,13 @@ cmd_progress() {
   local d any=0 jt
   printf '\n  backup progress on %s\n\n' "$(hostname -s)"
   for d in $(domains); do
-    jt="$(virsh domjobinfo "$d" 2>/dev/null | awk -F': *' '/^Job type/{print $2}')"
+    # TRIM THE TRAILING SPACES. virsh pads the value, so "$2" is "None        " and a match
+    # against exactly "None" never fires - which is why a machine with nothing running
+    # printed "svc-mgmt-01 [None        ]" and called it progress.
+    jt="$(virsh domjobinfo "$d" 2>/dev/null \
+          | awk -F': *' '/^Job type/{gsub(/[[:space:]]+$/,"",$2); print $2}')"
     case "${jt:-None}" in
-      None|"") continue ;;
+      None|none|"") continue ;;
     esac
     any=1
     printf '  %s  [%s]\n' "$d" "$jt"

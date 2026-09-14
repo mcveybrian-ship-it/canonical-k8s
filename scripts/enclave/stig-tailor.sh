@@ -1126,13 +1126,23 @@ EOF
       # AND EXPECT A DIFFERENT DEVICE NAME. On host-4 the transfer SSD came back as sda after
       # having been sdb - unloading and reloading the modules re-enumerates. Anything that
       # touches this disk must use LABEL=enclave-xfer, never /dev/sdX.
-      local xfer; xfer="$(lsblk -o NAME,SIZE,LABEL,FSTYPE 2>/dev/null | grep -i 'enclave-xfer' || true)"
-      if [ -n "$xfer" ]; then
-        ok "transfer media present: $xfer"
+      # SHOW EVERY REMOVABLE DISK, NOT ONLY THE ONE WE EXPECTED. This used to report solely
+      # on a volume labelled enclave-xfer - the transfer SSD - so opening the window for any
+      # other disk (a backup drive, for instance) printed "no volume labelled enclave-xfer",
+      # which reads exactly like the window failed to open. Say what actually appeared.
+      local rem; rem="$(lsblk -o NAME,SIZE,LABEL,FSTYPE,MOUNTPOINT,RM,TYPE 2>/dev/null \
+                        | awk 'NR==1 || $6==1')"
+      if [ "$(printf '%s\n' "$rem" | wc -l)" -gt 1 ]; then
+        ok "removable device(s) now visible:"
+        printf '%s\n' "$rem" | sed 's/^/       /'
       else
-        say "no volume labelled enclave-xfer yet - if the disk is attached, give udev a moment"
-        say "   and re-check with:  lsblk -o NAME,SIZE,LABEL,FSTYPE"
+        warn "no removable disk is visible yet."
+        say  "   The modules loaded, so the window IS open - the disk is what is missing."
+        say  "   Give udev a moment, then:  lsblk -o NAME,SIZE,LABEL,FSTYPE,MOUNTPOINT"
+        say  "   and check the cable and the enclosure's own power switch."
       fi
+      local xfer; xfer="$(lsblk -o NAME,SIZE,LABEL,FSTYPE 2>/dev/null | grep -i 'enclave-xfer' || true)"
+      [ -n "$xfer" ] && ok "transfer media present: $xfer"
       warn "USB STORAGE IS NOW ENABLED on $(hostname -s) - this is an OPEN DEVIATION WINDOW"
       say  "   close it as soon as the transfer is done:  sudo $0 usb disable"
       if [ -n "$mins" ]; then

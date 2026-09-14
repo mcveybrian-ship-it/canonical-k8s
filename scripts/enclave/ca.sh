@@ -800,12 +800,28 @@ cmd_request() {
   # svc-mgmt-01 tested for svc-mgmt-01.key, found the machine's own existing key, and refused
   # to issue a wildcard that had nothing to do with it. The error named a real file and a real
   # rule and was still completely wrong about what was happening.
-  [ -e "$d/$name.key" ] && die "a key already exists at $d/$name.key.
-       Reusing it is fine - send $d/$name.csr for signing. Delete both only if you mean to
+  # A KEY WITHOUT A CSR IS A HALF-STATE, NOT A CONFLICT.
+  #
+  # The key is written first and the CSR second, so a CSR failure leaves exactly that: the key
+  # on disk, no CSR. This guard then refused and pointed at "$d/$name.csr" - a file that does
+  # not exist - which reads as "you already did this" when in fact nothing was usable.
+  # Happened on svc-obs-01, 2026-09-14, after openssl rejected doubled SAN prefixes.
+  #
+  # So: refuse only when BOTH exist. With a key and no CSR, regenerate the CSR from the key
+  # the machine already has - which is the correct outcome and needs no deletion of anything.
+  if [ -e "$d/$name.key" ] && [ -e "$d/$name.csr" ]; then
+    die "a key AND a CSR already exist for $name in $d.
+       Reusing them is fine - send $d/$name.csr for signing. Delete both only if you mean to
        invalidate every certificate issued against that key."
+  fi
 
-  openssl genrsa -out "$d/$name.key" "${CSR_KEY_BITS:-${CA_LEAF_KEY_BITS:-3072}}" 2>/dev/null \
-    || die "key generation failed"
+  if [ -e "$d/$name.key" ]; then
+    warn "key exists at $d/$name.key but there is no CSR - regenerating the CSR from it"
+    warn "  (the key is NOT replaced, so any certificate already issued against it stays valid)"
+  else
+    openssl genrsa -out "$d/$name.key" "${CSR_KEY_BITS:-${CA_LEAF_KEY_BITS:-3072}}" 2>/dev/null \
+      || die "key generation failed"
+  fi
   chmod 0640 "$d/$name.key"; chgrp root "$d/$name.key"
   ok "key: $d/$name.key (never leaves this host)"
 

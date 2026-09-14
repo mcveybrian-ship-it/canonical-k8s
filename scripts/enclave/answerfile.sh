@@ -312,35 +312,60 @@ EOF
   ;;
   V-270816) cat <<'EOF'
 $V = @{ Valid = $false; Results = "" }
-# ONE bash CALL, NOT FOUR. A PowerShell double-quoted string does not escape $ with a
-# backslash - it has no effect at all - so "awk '{print \$3}'" reached awk as "{print \}"
-# and every value came back empty while the check still produced a confident OPEN. Emit the
-# values from a single script on separate lines and parse them here.
+# MEASURE THIS MACHINE'S OWN RATE. The first version of this check used the rate measured on
+# svc-harbor-01 - 2.44 MB/day - as a constant. On svc-mgmt-01 the real rate is ~430 MB/day,
+# 176x higher, because MAAS invokes machine-resources through sudo about 1.7 times a SECOND
+# and auditd records every one. The constant would have returned NOT A FINDING on a machine
+# holding roughly 2 HOURS of audit history against a control that requires a week.
+#
+# A number measured on one machine is not a property of the enclave.
 $probe = @'
 grep '^log_file' /etc/audit/auditd.conf 2>/dev/null | head -1
 df -PB1 /var/log/audit 2>/dev/null | tail -1 | tr -s ' '
-du -sb /var/log/audit 2>/dev/null | cut -f1
 grep '^max_log_file ' /etc/audit/auditd.conf 2>/dev/null | head -1 | tr -s ' ' | cut -d' ' -f3
 grep '^num_logs' /etc/audit/auditd.conf 2>/dev/null | head -1 | tr -s ' ' | cut -d' ' -f3
+stat -c '%Y %s %n' /var/log/audit/audit.log* 2>/dev/null | sort -n | tr '\n' ';'
 '@
 $out = @(bash -c $probe)
 while ($out.Count -lt 5) { $out += "" }
-$logfile = $out[0]; $dfline = $out[1]; $used = $out[2]; $maxlog = $out[3]; $numlogs = $out[4]
+$logfile = $out[0]; $dfline = $out[1]; $maxlog = $out[2]; $numlogs = $out[3]
 $free = 0
 $parts = @($dfline -split " " | Where-Object { $_ -ne "" })
 if ($parts.Count -ge 4) { $free = [int64]$parts[3] }
 $alloc = 0
 if ($maxlog -match '^\d+$' -and $numlogs -match '^\d+$') { $alloc = [int64]$maxlog * 1MB * [int64]$numlogs }
-# MEASURED on this enclave by scripts/enclave/audit-volume.sh sampling hourly: 2.44 MB/day on
-# the busiest machine (svc-harbor-01) and 1.71 MB/day on svc-repo-01. One week at the busiest
-# measured rate. Using the maximum rather than the average is the conservative direction.
-$weekBytes = [int64](2.44MB * 7)
-if ($alloc -ge $weekBytes -and $free -ge $alloc) {
+
+# Rate from the rotation history actually on disk: total bytes held, over the span between
+# the oldest and newest audit file. No constant, no assumption about what the machine does.
+$files = @()
+foreach ($rec in ($out[4] -split ';')) {
+    $f = $rec.Trim() -split '\s+', 3
+    if ($f.Count -eq 3) { $files += [pscustomobject]@{ T = [int64]$f[0]; S = [int64]$f[1]; N = $f[2] } }
+}
+$ratePerDay = 0; $spanHours = 0; $held = 0
+if ($files.Count -ge 2) {
+    $held = ($files | Measure-Object -Property S -Sum).Sum
+    $spanSec = ($files[-1].T - $files[0].T)
+    if ($spanSec -gt 0) {
+        $spanHours = [math]::Round($spanSec / 3600, 2)
+        $ratePerDay = [int64]($held / $spanSec * 86400)
+    }
+}
+$retentionDays = 0
+if ($ratePerDay -gt 0) { $retentionDays = [math]::Round($alloc / $ratePerDay, 3) }
+
+if ($ratePerDay -gt 0 -and $retentionDays -ge 7 -and $free -ge $alloc) {
     $V.Valid = $true
-    $V.Results = "NOT A FINDING. DISA's CheckText executed verbatim at scan time. " + $logfile + ". df -PB1 /var/log/audit: " + $dfline + " (free bytes: " + $free + "). Space used by the audit records themselves: " + $used + " bytes. auditd is configured max_log_file=" + $maxlog + " MB x num_logs=" + $numlogs + ", so the audit trail is BOUNDED at " + $alloc + " bytes and cannot exhaust the partition; free space exceeds that entire allocation. Audit growth on this enclave is MEASURED, not estimated - scripts/enclave/audit-volume.sh samples hourly and recorded 2.44 MB/day on the busiest machine and 1.71 MB/day on the mirror. One week at the busiest measured rate is " + $weekBytes + " bytes, which the bounded allocation exceeds. Note that /var/log/audit is not a separate partition on this machine: the bound is enforced by auditd's own rotation rather than by a filesystem boundary, which is why free space is reported above as well."
+    $V.Results = "NOT A FINDING. DISA's CheckText executed verbatim at scan time. " + $logfile + ". df -PB1 /var/log/audit: " + $dfline + " (free bytes: " + $free + "). auditd is configured max_log_file=" + $maxlog + " MB x num_logs=" + $numlogs + ", bounding the trail at " + $alloc + " bytes, and free space exceeds that whole allocation. THE GROWTH RATE WAS MEASURED ON THIS MACHINE, not assumed: " + $files.Count + " audit files holding " + $held + " bytes span " + $spanHours + " hours, which is " + $ratePerDay + " bytes/day. At that rate the bounded allocation holds " + $retentionDays + " days, which meets the one-week requirement."
+}
+elseif ($files.Count -lt 2 -or $alloc -eq 0) {
+    # COULD NOT MEASURE IS NOT THE SAME AS MEASURED AND FAILING. Without this branch the
+    # message below claims records are being overwritten on a machine that has no auditd at
+    # all - a confident statement about something never observed.
+    $V.Results = "OPEN - AND NOT MEASURABLE HERE. auditd configuration or audit files could not be read: " + $files.Count + " audit file(s) found, max_log_file='" + $maxlog + "', num_logs='" + $numlogs + "', log_file line '" + $logfile + "'. Nothing is being asserted about retention on this machine because nothing was observed. If auditd is not installed or not running, that is a larger finding than this control and should be answered first."
 }
 else {
-    $V.Results = "OPEN. Audit allocation " + $alloc + " bytes (max_log_file='" + $maxlog + "' x num_logs='" + $numlogs + "') against a one-week measured requirement of " + $weekBytes + " bytes, with " + $free + " bytes free on the partition holding '" + $logfile + "'. df line was: '" + $dfline + "'. Either the allocation is smaller than one week of measured audit volume, the partition cannot hold the configured allocation, or auditd.conf could not be read."
+    $V.Results = "OPEN. Measured on this machine: " + $files.Count + " audit files holding " + $held + " bytes across " + $spanHours + " hours = " + $ratePerDay + " bytes/day. auditd bounds the trail at " + $alloc + " bytes (max_log_file=" + $maxlog + " x num_logs=" + $numlogs + "), which is only " + $retentionDays + " DAYS of history - the control requires seven. Free space on the partition holding " + $logfile + ": " + $free + " bytes. THIS IS NOT A PAPERWORK FINDING: audit records are being overwritten before a week has passed, so the evidence an investigator would need is already gone. Either raise max_log_file/num_logs, give /var/log/audit its own partition, offload to a collector, or reduce what is generating the records."
 }
 return $V
 EOF

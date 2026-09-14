@@ -2324,6 +2324,9 @@ svc-harbor-01	22/tcp	limit	any	ssh
 svc-harbor-01	80/tcp	allow	any	NO-OP under Docker - docker-proxy DNATs this, so ufw INPUT never sees it. Kept for the day Harbor runs host-network. runbook 6.3e
 svc-harbor-01	443/tcp	allow	any	NO-OP under Docker - same reason. ufw on this host protects ssh and postfix, NOT the registry ports. Say so in the findings register
 svc-harbor-01	9100/tcp	allow	__SVC_OBS_01__	node-exporter, source-restricted to the collector - same reasoning as svc-repo-01
+svc-obs-01	22/tcp	limit	any	ssh
+svc-obs-01	3000/tcp	allow	__ENCLAVE_CIDR__	GRAFANA UI - the only thing on this machine a human opens. Restricted to the enclave subnet, not the world: the dashboards expose the shape of every host in the boundary
+svc-obs-01	9100/tcp	allow	__SVC_OBS_01__	its own node-exporter, scraped by the Prometheus on this same box. Kept explicit so the rule set reads the same on every machine
 EOF
 }
 
@@ -2352,7 +2355,13 @@ cmd_ufw() {
   # at which address. Hardcoding the collector's IP in this table would put the same address in
   # a second place and guarantee they drift.
   local obs="${SVC_OBS_01:-}"
-  local mine; mine="$(ufw_rules | sed "s|__SVC_OBS_01__|${obs}|g" | awk -F'\t' -v m="$me" '$1==m')"
+  # The enclave CIDR is derived from the addresses file rather than written down again - the
+  # third octet is the one thing that changed when the lab moved behind its own router (3.1),
+  # and a hardcoded 10.2.20.0/24 here would be the copy that got missed.
+  local cidr="${ENCLAVE_CIDR:-${SVC_OBS_01%.*}.0/24}"
+  local mine; mine="$(ufw_rules \
+      | sed -e "s|__SVC_OBS_01__|${obs}|g" -e "s|__ENCLAVE_CIDR__|${cidr}|g" \
+      | awk -F'\t' -v m="$me" '$1==m')"
 
   # A SOURCE-RESTRICTED RULE WITH NO SOURCE IS A RULE OPEN TO EVERYTHING. If the address is
   # unset the substitution leaves an empty field, `ufw allow from  to any port 9100` becomes

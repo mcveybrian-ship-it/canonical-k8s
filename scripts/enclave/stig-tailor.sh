@@ -1130,13 +1130,26 @@ EOF
       # on a volume labelled enclave-xfer - the transfer SSD - so opening the window for any
       # other disk (a backup drive, for instance) printed "no volume labelled enclave-xfer",
       # which reads exactly like the window failed to open. Say what actually appeared.
-      local rem; rem="$(lsblk -o NAME,SIZE,LABEL,FSTYPE,MOUNTPOINT,RM,TYPE 2>/dev/null \
-                        | awk 'NR==1 || $6==1')"
-      if [ "$(printf '%s\n' "$rem" | wc -l)" -gt 1 ]; then
-        ok "removable device(s) now visible:"
+      # FILTER ON TRANSPORT, NOT ON THE "REMOVABLE" FLAG. The first version selected RM=1,
+      # and USB HARD DRIVES REPORT RM=0 - only card readers and optical drives set it. So on
+      # 2026-09-14 it printed "no removable disk is visible yet" with a 1 TB SSD and a 5 TB
+      # WD easystore both attached and both visible in dmesg. The kernel had done everything
+      # right; the filter asked the wrong question.
+      local usbdisks rem=""
+      usbdisks="$(lsblk -S -n -o NAME,TRAN 2>/dev/null | awk '$2=="usb" {print "/dev/"$1}')"
+      if [ -n "$usbdisks" ]; then
+        # shellcheck disable=SC2086
+        rem="$(lsblk -o NAME,SIZE,LABEL,FSTYPE,MOUNTPOINT $usbdisks 2>/dev/null)"
+      fi
+      if [ -n "$rem" ]; then
+        ok "USB disk(s) now visible:"
         printf '%s\n' "$rem" | sed 's/^/       /'
+        say ""
+        say "       ADDRESS THESE BY ID, NEVER BY /dev/sdX - reloading the modules"
+        say "       re-enumerates and the letters move:"
+        ls -l /dev/disk/by-id/ 2>/dev/null | awk '/usb-|wwn-/ && !/-part/ {print "         "$9}' | head -6
       else
-        warn "no removable disk is visible yet."
+        warn "no USB disk is visible yet."
         say  "   The modules loaded, so the window IS open - the disk is what is missing."
         say  "   Give udev a moment, then:  lsblk -o NAME,SIZE,LABEL,FSTYPE,MOUNTPOINT"
         say  "   and check the cable and the enclosure's own power switch."

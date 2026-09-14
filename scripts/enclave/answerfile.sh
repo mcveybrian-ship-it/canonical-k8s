@@ -73,6 +73,8 @@ V-270762	UBTU-24-700070	UBTU-24-700020 forbids setgid on the journal dirs, which
 V-278917	UBTU-24-700400	the release IS vendor supported - 24.04 LTS with an unexpired Ubuntu Pro contract; the scanner cannot decide it and leaves it NR	NR
 V-270748	UBTU-24-600130	the sudo group holds only the enclave administrator account(s) named in AF_ADMINS; the scanner cannot judge "who needs access" and leaves it NR	NR
 V-270816	UBTU-24-900920	the audit allocation holds far more than one week at the MEASURED growth rate, and free space exceeds the whole allocation	NR
+V-270694	UBTU-24-200680	/etc/profile.d/ssh_confirm.sh IS present and prompts for acknowledgement; the scanner cannot read a script and decide, so it leaves it NR	NR
+V-270682	UBTU-24-200250	there are NO temporary accounts on any enclave machine - every interactive account is a permanent named administrator	NR
 EOF
 }
 
@@ -264,6 +266,46 @@ if ($extra.Count -eq 0) {
 }
 else {
     $V.Results = "OPEN. The sudo group contains account(s) not on the approved administrator list: " + ($extra -join ", ") + ". Full group line: " + $line.Trim()
+}
+return $V
+EOF
+  ;;
+  V-270694) cat <<'EOF'
+$V = @{ Valid = $false; Results = "" }
+$f = "/etc/profile.d/ssh_confirm.sh"
+$body = (bash -c "cat $f 2>/dev/null") -join "`n"
+$hasSsh    = ($body -match 'SSH_CLIENT' -or $body -match 'SSH_TTY')
+$hasPrompt = ($body -match 'read\s+-p')
+$hasBanner = ($body -match 'U\.S\. Government' -and $body -match 'Information System')
+$hasDeny   = ($body -match 'exit' -or $body -match 'logout')
+if ($body -ne "" -and $hasSsh -and $hasPrompt -and $hasBanner -and $hasDeny) {
+    $V.Valid = $true
+    $V.Results = "NOT A FINDING. DISA's CheckText names " + $f + " and this scan read it verbatim. It is present (" + $body.Length + " bytes), it gates on SSH_CLIENT/SSH_TTY so it fires for interactive SSH logins, it prompts with read -p, the prompt text is the Standard Mandatory DOD Notice and Consent Banner, and a non-acknowledgement terminates the session. The acknowledgement requirement is therefore enforced, separately from the sshd Banner directive which only DISPLAYS the notice. The scanner leaves this Not Reviewed because deciding it means reading a shell script, not matching a value."
+}
+else {
+    $V.Results = "OPEN. " + $f + " is missing or does not enforce acknowledgement. Present: " + ($body -ne "") + ", gates on SSH_CLIENT/SSH_TTY: " + $hasSsh + ", prompts with read -p: " + $hasPrompt + ", carries the DOD notice text: " + $hasBanner + ", terminates on refusal: " + $hasDeny + ". Displaying the banner via sshd's Banner directive is NOT sufficient for this control - it requires acknowledgement."
+}
+return $V
+EOF
+  ;;
+  V-270682) cat <<'EOF'
+$V = @{ Valid = $false; Results = "" }
+$approved = @(__AF_ADMINS__)
+# DISA asks for the expiry on each TEMPORARY account. The prior question is which accounts
+# are temporary at all - so enumerate every interactive account and show the set.
+$probe = @'
+awk -F: '$3>=1000 && $1!="nobody" {print $1}' /etc/passwd
+'@
+$accts = @(bash -c $probe) | Where-Object { $_ -ne "" }
+$unexpected = @($accts | Where-Object { $approved -notcontains $_ })
+if ($unexpected.Count -eq 0) {
+    $rows = @()
+    foreach ($a in $accts) { $rows += ($a + ": " + ((bash -c "chage -l $a 2>/dev/null | grep -i 'account expires'") -join "")) }
+    $V.Valid = $true
+    $V.Results = "NOT APPLICABLE AS WRITTEN - there are no temporary accounts on this system. Every interactive account (UID >= 1000) was enumerated at scan time and the full set is: " + ($accts -join ", ") + ". Each is a permanent, named enclave administrator account on the approved list held in AF_ADMINS, provisioned for the life of the system and not as a temporary or emergency account, so the 72-hour expiry requirement has nothing to apply to. Reported expiry for each, for completeness: " + ($rows -join " | ") + ". This answer re-evaluates on every scan: provisioning any account outside the approved list re-opens the control, at which point that account's expiry must be set within 72 hours or it must be documented."
+}
+else {
+    $V.Results = "OPEN. Interactive account(s) exist that are not on the approved permanent-administrator list: " + ($unexpected -join ", ") + ". Full set of UID >= 1000 accounts: " + ($accts -join ", ") + ". Each unexpected account must either be documented as permanent or carry an expiry within 72 hours."
 }
 return $V
 EOF

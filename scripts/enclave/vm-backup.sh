@@ -7,6 +7,7 @@
 #     sudo ./vm-backup.sh status                 what would happen, changes nothing
 #     sudo ./vm-backup.sh full  [vm|all]         full backup, starts a new chain
 #     sudo ./vm-backup.sh incr  [vm|all]         incremental since the last checkpoint
+#     sudo ./vm-backup.sh progress               how far along a running backup is
 #     sudo ./vm-backup.sh verify                 check what ARRIVED, not what was sent
 #     sudo ./vm-backup.sh prune                  drop chains beyond BACKUP_KEEP_CHAINS
 #     sudo ./vm-backup.sh restore-plan <vm>      print the restore steps - never automatic
@@ -323,6 +324,43 @@ cmd_backup() {  # <full|incr> [domain|all]
   return $rc
 }
 
+# ---------------------------------------------------------------- progress
+# ASK LIBVIRT, NOT THE FILESYSTEM. `df` tells you how many bytes have landed; only
+# domjobinfo knows the TOTAL, so only domjobinfo can tell you how far along you are. A
+# sparse qcow2 also makes the on-disk figure a poor proxy for progress.
+cmd_progress() {
+  assert_hypervisor
+  local d any=0 jt
+  printf '\n  backup progress on %s\n\n' "$(hostname -s)"
+  for d in $(domains); do
+    jt="$(virsh domjobinfo "$d" 2>/dev/null | awk -F': *' '/^Job type/{print $2}')"
+    case "${jt:-None}" in
+      None|"") continue ;;
+    esac
+    any=1
+    printf '  %s  [%s]\n' "$d" "$jt"
+    virsh domjobinfo "$d" 2>/dev/null \
+      | grep -E 'Time elapsed|Data processed|Data remaining|Data total|File processed|File remaining|File total' \
+      | sed 's/^/       /'
+    # Percentage, because "412 GiB processed" means nothing without the total.
+    local proc tot
+    proc="$(virsh domjobinfo "$d" --bytes 2>/dev/null | awk -F': *' '/^Data processed/{print $2+0}')"
+    tot="$(virsh domjobinfo "$d" --bytes 2>/dev/null | awk -F': *' '/^Data total/{print $2+0}')"
+    if [ -n "${tot:-}" ] && [ "${tot:-0}" -gt 0 ]; then
+      printf '       => %s%% complete\n' "$(( proc * 100 / tot ))"
+    fi
+    printf '\n'
+  done
+  [ "$any" -eq 1 ] || say "no backup job is running right now"
+  if [ -n "$DEST" ] && mountpoint -q "$DEST" 2>/dev/null; then
+    say "destination: $(df -h "$DEST" | tail -1 | awk '{print $3" used, "$4" free"}')"
+  fi
+  # Manual detached runs are systemd units; say where to read them.
+  local units; units="$(systemctl list-units --no-legend 'vm-backup-manual-*' 'enclave-vm-backup*' 2>/dev/null | awk '{print $1}' | tr '\n' ' ')"
+  [ -n "$units" ] && say "units: $units" && say "   journalctl -u <unit> -f"
+  printf '\n'
+}
+
 # ---------------------------------------------------------------- verify
 cmd_verify() {
   need_root; check_dest
@@ -636,6 +674,7 @@ case "${1:-status}" in
   status)       cmd_status ;;
   full)         shift || true; cmd_backup full "${1:-all}" ;;
   incr)         shift || true; cmd_backup incr "${1:-all}" ;;
+  progress)     cmd_progress ;;
   verify)       cmd_verify ;;
   prune)        cmd_prune ;;
   keyfile)      cmd_keyfile ;;
@@ -643,5 +682,5 @@ case "${1:-status}" in
   schedule)     shift || true; cmd_schedule "${1:-02:00}" ;;
   unschedule)   cmd_unschedule ;;
   restore-plan) shift || true; cmd_restore_plan "${1:-}" ;;
-  *) printf 'usage: %s {status|full [vm]|incr [vm]|verify|prune|keyfile|reattach|schedule [HH:MM]|unschedule|restore-plan <vm>}\n' "$0" >&2; exit 2 ;;
+  *) printf 'usage: %s {status|full [vm]|incr [vm]|progress|verify|prune|keyfile|reattach|schedule [HH:MM]|unschedule|restore-plan <vm>}\n' "$0" >&2; exit 2 ;;
 esac

@@ -210,6 +210,13 @@ Three of those deserve explanation:
 - **"Time since last successful backup" should draw a sawtooth** — climbing all day, dropping to
   near zero at 02:00. A line that climbs straight through 26 hours is a job that stopped.
 
+**What this caught on its first night, 2026-09-15.** The scheduled run failed in seven seconds
+on all four domains — every guest's `vdb` is a `raw` cloud-init seed ISO, and **a raw file
+cannot hold a persistent dirty bitmap**, so the checkpoint chain referred to something that no
+longer existed. The timer was enabled, the volume was mounted with 4.2 TB free, and every other
+signal was green. `BackupInterrupted` fires on the set directories it left behind; `BackupMissed`
+would have fired at 26 hours. Runbook §10b has the fix.
+
 **An unmounted destination publishes nothing per-domain.** `$DEST` still exists as an empty
 directory when the USB volume is not attached, so counting sets there would report "0 complete
 sets" for every domain — indistinguishable from a machine never backed up, and from one whose

@@ -38,8 +38,11 @@ each machine                         svc-obs-01
 ------------                         ----------
 node-exporter :9100  ──scrape 15s──▶  Prometheus :9090 (loopback)
   ├─ default collectors                 ├─ rules  /etc/prometheus/rules/*.yml
-  ├─ systemd collector                  └─ 90d / 100 GB retention
-  └─ textfile collector                        │
+  ├─ systemd collector                  ├─ 90d / 100 GB retention
+  └─ textfile collector                 └─ also scrapes, on loopback:
+       reads /var/lib/node_exporter/          alertmanager :9093
+       textfile/*.prom                        grafana      :3000
+            ▲                                  │
        reads /var/lib/node_exporter/           ▼
        textfile/*.prom                  Grafana :3000 (loopback)
             ▲                                  │
@@ -222,6 +225,47 @@ I/O, network, and **network errors and drops** — which should be flat zero, an
 bridged guest network usually mean the host is the bottleneck rather than the guest.
 
 All nineteen `libvirt_*` metric names were read from the running Prometheus rather than assumed.
+
+---
+
+## 4b. Dashboard: **Enclave collector** (`uid: enclave-collector`)
+
+30 panels, six rows — the monitoring stack watching itself. **If this is wrong, every other
+dashboard is wrong and says nothing about it.**
+
+**Alertmanager and Grafana were not scraped until 2026-09-14.** Only Prometheus scraped itself.
+Both serve `/metrics` on loopback unauthenticated — 252 and 4704 series — and nobody was
+reading either, which meant nothing in the enclave could answer *"was the alert actually
+delivered"*: the one question the entire alerting stack exists to answer. All three jobs now
+carry `machine` and `role` labels like every other target.
+
+| Row | What it answers |
+|---|---|
+| Is the collector doing its job | targets down, alerts firing, rule failures, series in memory, TSDB on disk, notification failures |
+| Prometheus — ingestion | scrape duration and samples per target, head series, TSDB size, WAL corruptions and failed compactions |
+| Prometheus — rules and notifications | per-group evaluation time against the 15 s interval, failures and **missed iterations**, queue length and drops |
+| Alertmanager | alerts held by state, notification attempts **per integration**, failures, silences |
+| Grafana | provisioned dashboards and datasources, API status codes, users, sqlite connections |
+| The collector's own processes | goroutines and resident memory per component |
+
+Four of these are worth calling out.
+
+- **"Alerts firing" needs `or vector(0)`.** The `ALERTS` series only exists while something is
+  pending or firing — without the fallback the panel reads "No data" precisely when everything
+  is healthy.
+- **Retention is 90 days *or* 100 GB, whichever comes first.** The size limit silently becomes
+  the binding one, and when it does the **oldest** data is dropped — compliance trends are the
+  first thing lost.
+- **Missed rule iterations are invisible everywhere else.** A group that overruns the 15 s
+  evaluation interval does not error; it simply does not run, and an alert that never evaluates
+  never fires.
+- **"Notification attempts per integration" is the Q26 panel.** With no receiver configured,
+  every integration sits at zero forever. Zero failures with zero attempts is not delivery —
+  it is nothing having been tried.
+
+All metric names and every label used in a `by()` clause were read from the running processes
+before the dashboard was written. One I intended to use — `grafana_http_request_duration_seconds_count`
+— does not exist in this build, and `grafana_api_response_status_total` replaced it.
 
 ---
 
@@ -522,8 +566,14 @@ glob will happily report another machine's checklist as this one's.
   leave an air gap**; Postfix is deliberately `inet_interfaces = loopback-only` because the
   STIG requires it. Alertmanager on a dashboard is a different mechanism from the one the
   control names and needs an AO answer — `docs/open-questions.md` **Q26**.
-- **No role dashboards for the mirror, the registry, MAAS or the collector.** The collector's
-  own is the cheapest of the four — every series it needs is already scraped.
+- **No role dashboards for the mirror, the registry or MAAS.** Each needs a small number of
+  new facts: Release-file age and a **pool** URL probe for the mirror, container state and
+  **Trivy database age** for the registry, DHCP pool utilisation for MAAS.
+- **No alerts on the collector itself.** Rule evaluation failures, a growing notification
+  queue and TSDB nearing its retention ceiling are all visible on the collector dashboard and
+  none of them page. There is a limit to how far this can go: **a Prometheus that cannot
+  evaluate rules cannot evaluate the rule that says so.** Genuinely closing it needs something
+  outside the collector watching the collector.
 
 ---
 

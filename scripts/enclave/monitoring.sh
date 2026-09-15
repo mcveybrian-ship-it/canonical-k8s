@@ -370,7 +370,15 @@ cmd_collector() {
     printf 'alerting:\n  alertmanagers:\n    - static_configs:\n        - targets: ['"'"'127.0.0.1:9093'"'"']\n\n'
     printf 'rule_files:\n  - /etc/prometheus/rules/*.yml\n\n'
     printf 'scrape_configs:\n'
-    printf '  - job_name: prometheus\n    static_configs:\n      - targets: ['"'"'127.0.0.1:9090'"'"']\n\n'
+    # ---- THE COLLECTOR'S OWN COMPONENTS ---------------------------------------------
+    # Prometheus scraped itself from the start; Alertmanager and Grafana did NOT, and both
+    # serve /metrics on loopback unauthenticated. That gap meant nothing could answer
+    # "did the alert actually get delivered" - the one question the whole alerting stack
+    # exists to answer. All three carry machine/role labels so panels can group them the
+    # same way as every other target.
+    printf '  - job_name: prometheus\n    static_configs:\n      - targets: ['"'"'127.0.0.1:9090'"'"']\n        labels: {machine: %s, role: observability}\n\n' "$me"
+    printf '  - job_name: alertmanager\n    static_configs:\n      - targets: ['"'"'127.0.0.1:9093'"'"']\n        labels: {machine: %s, role: observability}\n\n' "$me"
+    printf '  - job_name: grafana\n    static_configs:\n      - targets: ['"'"'127.0.0.1:3000'"'"']\n        labels: {machine: %s, role: observability}\n\n' "$me"
     printf '  - job_name: node\n    static_configs:\n'
     local m role a key
     while IFS=$'\t' read -r m role; do

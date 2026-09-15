@@ -172,14 +172,42 @@ anything about the Answer File.
   `machine-resources` via sudo roughly 1.7 times per second on `svc-mgmt-01`. This panel is
   here to establish whether it is constant or bursty.
 
-### Row 5 — Expiry
+### Row 5 — Patch posture
+
+**Nothing in this enclave measured patch state until 2026-09-15.** USG and Evaluate-STIG assess
+*configuration*; neither asks whether an installed package has a known CVE. A machine could land
+on the residual set and still be running something unpatched.
+
+Two kinds of number come out of this and **conflating them would be dishonest**:
+
+- **Exact, never stale** — the installed package inventory by origin, how many packages have no
+  Ubuntu security stream at all, which Pro services are enabled, when the contract ends.
+- **Bounded by mirror age** — pending security updates. *"0 updates"* means nothing newer exists
+  **in our mirror snapshot**, not that nothing newer exists anywhere.
+
+So the two headline stats are deliberately adjacent: **machines with security updates pending**,
+and **oldest apt metadata**. The second qualifies the first, and either alone is misleading. The
+`AptMetadataStale` alert exists for exactly that reason — a reassuring zero is the shape of thing
+that stops people looking.
+
+**Third-party packages** gets its own stat because it is the number an assessor will ask about:
+Docker, the Harbor components, anything carried in as a `.deb`. **Nobody ships security updates
+for these into this enclave**, so each one is accepted risk that should be named rather than
+discovered.
+
+**Pro services per machine** is there because the answer differs by machine — `stage-01` has
+`esm-apps` enabled while `svc-harbor-01` does not, because the in-gap machines attach to the
+local contract server and it grants a different service set. `esm-apps` off means the universe
+packages are uncovered.
+
+### Row 6 — Expiry
 - **Certificates, soonest first** — reported as *time remaining*, not as a date, so it cannot
   quietly go stale the way a runbook table does. Orange at 90 days, red at 30.
 - **USB storage blocked (V-270718)** — 1 means blocked in `modprobe.d`, which is the only place
   the control looks; it never runs `lsmod`. Expected to read 0 on `host-4` while the backup
   window is open.
 
-### Row 6 — Can this dashboard be believed
+### Row 7 — Can this dashboard be believed
 - **Age of the facts on each machine** — if this climbs, every compliance number above it is
   frozen at whatever it was when the producer last succeeded.
 - **Fact sources, per machine** — `1` readable, `0` present but unreadable, **absent entirely**
@@ -408,6 +436,30 @@ a volume holding hundreds of gigabytes, for the same answer.
 `virsh domjobinfo` **pads its fields**, and matching the line exactly once printed idle domains
 as in progress. The value is stripped of whitespace before comparison.
 
+### Patch posture — every in-gap machine
+
+| Metric | Labels | Source | Exact or dated? |
+|---|---|---|---|
+| `enclave_packages_installed` | — | `pro security-status --format json` | exact |
+| `enclave_packages_main` / `_universe` / `_restricted` / `_multiverse` | — | same | exact |
+| `enclave_packages_third_party` | — | same | exact — **no Ubuntu security stream at all** |
+| `enclave_packages_unknown` | — | same | exact |
+| `enclave_updates_security_standard` | — | same | **dated** — as of the mirror snapshot |
+| `enclave_updates_security_esm_infra` / `_esm_apps` | — | same | **dated** |
+| `enclave_updates_pending_total` / `_security` | — | `/usr/lib/update-notifier/apt-check` | **dated** |
+| `enclave_pro_service_enabled` | `service` | `pro status --format json` | exact |
+| `enclave_pro_contract_expiry_seconds` | — | same | exact |
+| `enclave_apt_metadata_date_seconds` | — | newest `Date:` in `/var/lib/apt/lists/*Release` | exact — and it is what qualifies every dated row above |
+
+⚠️ **`apt-check` writes its `total;security` result to STDERR.** A producer capturing stdout
+only gets an empty string and publishes **zero pending updates** — a clean bill of health from a
+check that returned nothing. Both streams are read, and the value is accepted only if it matches
+`^\d+;\d+$`.
+
+The apt metadata date is read from **each machine's own** Release files rather than from
+`svc-repo-01`, so it measures the snapshot as that machine actually sees it — a machine left
+pointing at a stale source shows up as a line climbing away from the others.
+
 ### Harbor and Trivy — the registry only
 
 Emitted by `harbor_facts()` in `monitoring.sh`. **The guard is the JSON, not the HTTP status**:
@@ -514,6 +566,11 @@ pager that trains people to ignore it.
 | `HarborComponentUnhealthy` | any single component unhealthy | 10m | warning |
 | `TrivyDatabaseStale` | vulnerability data over 30 days old | 1h | warning |
 | `TrivyDatabaseMissing` | no database found at all | 1h | critical |
+| **patch posture** | | | |
+| `SecurityUpdatesPending` | any security update available from the mirror | 6h | warning |
+| `AptMetadataStale` | package metadata over 30 days old | 1h | warning |
+| `ProContractExpiring` | contract inside 90 days | 1h | critical |
+| `FipsUpdatesDisabled` | `fips-updates` off on an in-gap machine | 30m | critical |
 
 **Three of these are shaped by a lesson rather than by a threshold.**
 
@@ -656,6 +713,14 @@ glob will happily report another machine's checklist as this one's.
   leave an air gap**; Postfix is deliberately `inet_interfaces = loopback-only` because the
   STIG requires it. Alertmanager on a dashboard is a different mechanism from the one the
   control names and needs an AO answer — `docs/open-questions.md` **Q26**.
+- **Still no CVE-level scanning of the machines.** The patch-posture row above measures how
+  far behind the mirror each machine is, which is a different question from whether an
+  installed package has a known CVE. Closing that needs Trivy pointed at a filesystem, and
+  **there is no Trivy CLI anywhere in the enclave** — it exists only inside Harbor's
+  container. Two routes: run it out of the Harbor image against a bind-mounted host
+  filesystem (possible today, needs the image name and a writable cache dir), or carry a
+  binary in on the next transfer trip. Either way the result is bounded by the same dated
+  database as Q27, so it would tell you CVE exposure *as of 2026-09-08*, not today.
 - **No role dashboards for the mirror or MAAS.** The mirror needs Release-file age,
   `/srv/repo` growth and a **pool** URL probe — `Release` returning 200 while `pool` returns
   401 reads as success. MAAS needs DHCP pool utilisation.

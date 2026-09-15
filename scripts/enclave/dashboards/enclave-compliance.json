@@ -1477,7 +1477,7 @@
     },
     {
       "type": "row",
-      "title": "Expiry - the things that stop working on a date",
+      "title": "Patch posture - what is installed, and how current it can possibly be",
       "collapsed": false,
       "panels": [],
       "gridPos": {
@@ -1485,6 +1485,582 @@
         "w": 24,
         "x": 0,
         "y": 116
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Machines with security updates pending",
+      "description": "Updates already available from the mirror these machines can reach - nothing needs carrying in to apply them.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "enclave-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 117
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 3
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "background",
+        "graphMode": "none"
+      },
+      "targets": [
+        {
+          "expr": "count(enclave_updates_pending_security > 0) or vector(0)",
+          "refId": "A",
+          "instant": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "enclave-prometheus"
+          }
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Oldest apt metadata",
+      "description": "THE NUMBER THAT QUALIFIES THE ONE ON ITS LEFT. '0 updates pending' only means 'nothing newer in our mirror snapshot'. If the snapshot is old, that zero says nothing.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "enclave-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 117
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 2592000
+              },
+              {
+                "color": "red",
+                "value": 7776000
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "background",
+        "graphMode": "none"
+      },
+      "targets": [
+        {
+          "expr": "max(time() - enclave_apt_metadata_date_seconds)",
+          "refId": "A",
+          "instant": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "enclave-prometheus"
+          }
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Third-party packages",
+      "description": "Installed packages with NO Ubuntu security stream at all - Docker, Harbor components, anything carried in as a .deb. Nobody ships security updates for these into this enclave; each one is accepted risk that should be named.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "enclave-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 117
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 20
+              },
+              {
+                "color": "red",
+                "value": 60
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "background",
+        "graphMode": "none"
+      },
+      "targets": [
+        {
+          "expr": "sum(enclave_packages_third_party) or vector(0)",
+          "refId": "A",
+          "instant": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "enclave-prometheus"
+          }
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Pro contract remaining",
+      "description": "When it lapses, FIPS and USG stop receiving updates and the crypto baseline freezes. The replacement token has to be carried in, so this needs lead time.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "enclave-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 117
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 7776000
+              },
+              {
+                "color": "green",
+                "value": 15552000
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "background",
+        "graphMode": "none"
+      },
+      "targets": [
+        {
+          "expr": "min(enclave_pro_contract_expiry_seconds - time())",
+          "refId": "A",
+          "instant": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "enclave-prometheus"
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Security updates pending, per machine",
+      "description": "Security updates are the actionable line. The total includes everything else and is context, not a target - an air-gapped enclave does not chase every package.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "enclave-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 121
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              }
+            ]
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "width": 300,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "enclave_updates_pending_security",
+          "legendFormat": "{{machine}} security",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "enclave-prometheus"
+          }
+        },
+        {
+          "expr": "enclave_updates_pending_total",
+          "legendFormat": "{{machine}} total",
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "enclave-prometheus"
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Age of each machine's package metadata",
+      "description": "A machine climbing away from the others is pointing at a stale source, not at a stale mirror. All of them climbing together means the mirror needs a transfer.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "enclave-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 129
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 2592000
+              },
+              {
+                "color": "red",
+                "value": 7776000
+              }
+            ]
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "width": 300,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "time() - enclave_apt_metadata_date_seconds",
+          "legendFormat": "{{machine}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "enclave-prometheus"
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Package inventory by origin",
+      "description": "Enclave-wide. The bottom two lines are the ones an assessor will ask about: nothing ships security updates for them, so they are accepted risk by definition.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "enclave-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 137
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "width": 300,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(enclave_packages_main)",
+          "legendFormat": "main/restricted - standard support",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "enclave-prometheus"
+          }
+        },
+        {
+          "expr": "sum(enclave_packages_universe)",
+          "legendFormat": "universe - needs esm-apps",
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "enclave-prometheus"
+          }
+        },
+        {
+          "expr": "sum(enclave_packages_third_party)",
+          "legendFormat": "third party - no stream at all",
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "enclave-prometheus"
+          }
+        },
+        {
+          "expr": "sum(enclave_packages_unknown)",
+          "legendFormat": "origin unknown",
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "enclave-prometheus"
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Ubuntu Pro services, per machine",
+      "description": "1 = enabled. Only in-gap machines publish this. fips-updates and usg must be on inside the boundary; esm-apps being off means the universe packages above are uncovered, which may be a decision but should be a visible one.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "enclave-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 145
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "width": 300,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "enclave_pro_service_enabled",
+          "legendFormat": "{{machine}} {{service}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "enclave-prometheus"
+          }
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Expiry - the things that stop working on a date",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 153
       }
     },
     {
@@ -1499,7 +2075,7 @@
         "h": 10,
         "w": 24,
         "x": 0,
-        "y": 117
+        "y": 154
       },
       "fieldConfig": {
         "defaults": {
@@ -1604,7 +2180,7 @@
         "h": 6,
         "w": 24,
         "x": 0,
-        "y": 127
+        "y": 164
       },
       "fieldConfig": {
         "defaults": {
@@ -1670,7 +2246,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 133
+        "y": 170
       }
     },
     {
@@ -1685,7 +2261,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 134
+        "y": 171
       },
       "fieldConfig": {
         "defaults": {
@@ -1758,7 +2334,7 @@
         "h": 10,
         "w": 24,
         "x": 0,
-        "y": 142
+        "y": 179
       },
       "fieldConfig": {
         "defaults": {

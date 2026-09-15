@@ -285,6 +285,8 @@ AL_BACKUP_STALE="${AL_BACKUP_STALE:-93600}"       # 26h - the nightly backup mis
 AL_BACKUP_DETACHED_FOR="${AL_BACKUP_DETACHED_FOR:-2h}"  # detached is normal briefly, not for hours
 AL_BACKUP_FREE_BYTES="${AL_BACKUP_FREE_BYTES:-200000000000}"  # 200 GB left on the backup volume
 AL_TRIVY_DB_STALE="${AL_TRIVY_DB_STALE:-2592000}"       # 30d - Trivy scanning against month-old data
+AL_APT_STALE="${AL_APT_STALE:-2592000}"                 # 30d - the mirror snapshot this machine sees
+AL_PRO_EXPIRY_DAYS="${AL_PRO_EXPIRY_DAYS:-90}"          # warn this far ahead of the Pro contract ending
 
 # Set an ARGS= line, exactly once. Appending works - the file is sourced and the last wins -
 # and leaves two lines that disagree, so someone edits the first and nothing changes.
@@ -976,6 +978,67 @@ groups:
           action: >-
             Check the Harbor trivy-adapter volume for a trivy-db metadata.json. If the
             adapter never received one, every scan result recorded so far is meaningless.
+
+  # ---------------------------------------------------------------- patch posture
+  # NOTHING IN THIS ENCLAVE MEASURED PATCH STATE UNTIL 2026-09-15. USG and Evaluate-STIG
+  # assess configuration; neither asks whether an installed package has a known CVE. These
+  # rules are the first thing that will say a machine is behind.
+  - name: enclave-patch
+    rules:
+      - alert: SecurityUpdatesPending
+        expr: enclave_updates_pending_security > 0
+        for: 6h
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ \$value }} security update(s) pending on {{ \$labels.machine }}"
+          description: "Available from the mirror this machine can already reach - nothing needs to be carried in to apply these."
+          action: >-
+            'sudo apt-get update && sudo apt-get upgrade' on {{ \$labels.machine }}. On the
+            hypervisor, check whether a reboot is implied before scheduling it - rebooting
+            host-4 takes every guest with it.
+
+      # THE COMPANION TO THE ABOVE, AND THE MORE IMPORTANT OF THE TWO.
+      # "0 security updates pending" only means "nothing newer in our mirror snapshot". If
+      # the snapshot is old, that zero is meaningless - and it is exactly the shape of
+      # reassurance that stops people looking. This rule is what keeps the pair honest.
+      - alert: AptMetadataStale
+        expr: (time() - enclave_apt_metadata_date_seconds) > ${AL_APT_STALE}
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ \$labels.machine }} is resolving packages against metadata over 30 days old"
+          description: "Any 'no updates available' result on this machine is only true as of that date."
+          action: >-
+            Refresh the mirror on svc-repo-01 from a transfer bundle, then
+            'sudo apt-get update' here. If the mirror itself is current, this machine's
+            sources.list is pointing somewhere stale.
+
+      - alert: ProContractExpiring
+        expr: (enclave_pro_contract_expiry_seconds - time()) < ${AL_PRO_EXPIRY_DAYS} * 86400
+        for: 1h
+        labels:
+          severity: critical
+        annotations:
+          summary: "the Ubuntu Pro contract expires within ${AL_PRO_EXPIRY_DAYS} days"
+          description: "When it lapses, FIPS and USG stop receiving updates - the crypto and hardening baseline freezes."
+          action: >-
+            Renew before expiry, then re-issue the air-gapped contract token and re-run
+            make-contracts-config.sh. In an air gap the token has to be carried in, so this
+            needs lead time, not a same-day renewal.
+
+      - alert: FipsUpdatesDisabled
+        expr: enclave_pro_service_enabled{service="fips-updates"} == 0
+        for: 30m
+        labels:
+          severity: critical
+        annotations:
+          summary: "fips-updates is NOT enabled on {{ \$labels.machine }}"
+          description: "Only in-gap machines publish this metric, so this is a machine inside the ATO boundary running without the FIPS update stream."
+          action: >-
+            'sudo pro status' on {{ \$labels.machine }}. A machine inside the boundary
+            without fips-updates is a crypto-baseline finding, not a configuration preference.
 EOF
   chmod 0644 "$f"
 
@@ -1172,7 +1235,7 @@ cmd_facts() {
   if harbor_facts > "$hfile" 2>/dev/null; then harbor_ok=1; else : > "$hfile"; fi
 
   LC_ALL=C HARBOR_OK="$harbor_ok" python3 - > "$tmp" <<'FACTSPY'
-import os, sys, glob, csv, time, subprocess, collections, calendar
+import os, sys, glob, csv, time, subprocess, collections, calendar, json, re
 
 OUT = []
 SRC = {}                      # source -> 1 ok / 0 present-but-unreadable ; absent = no entry
@@ -1375,6 +1438,113 @@ for f in glob.glob("/etc/modprobe.d/*.conf"):
         pass
 emit("enclave_usb_storage_blocked", blocked,
      help="1 if usb-storage is blocked in modprobe.d, which is where V-270718 looks")
+
+# ------------------------------------------------------------------ PATCH POSTURE
+# THE ENCLAVE HAD NO MEASUREMENT OF PATCH STATE AT ALL UNTIL 2026-09-15.
+# USG and Evaluate-STIG assess CONFIGURATION. Neither looks at whether an installed package
+# has a known CVE. A machine can land on the enclave's residual set and still be running
+# something unpatched, and nothing anywhere said so.
+#
+# Two kinds of number come out of this, and conflating them would be dishonest:
+#
+#   EXACT, never stale - the installed package inventory by origin, how many packages have
+#   no Ubuntu security stream at all, which Pro services are on, when the contract ends.
+#
+#   BOUNDED BY MIRROR AGE - pending security updates. "0 updates" means nothing newer exists
+#   IN OUR MIRROR SNAPSHOT, not that nothing newer exists anywhere. That is why the apt
+#   metadata date is published beside it: the pair is a defensible statement, either number
+#   on its own is not.
+rc, o, _ = run(["pro", "security-status", "--format", "json"], timeout=60)
+if rc == 0 and o.strip():
+    try:
+        sm = json.loads(o).get("summary", {})
+        for key, name, help in (
+            ("num_installed_packages",        "enclave_packages_installed",         "packages installed"),
+            ("num_main_packages",             "enclave_packages_main",              "from main/restricted - covered by standard security support"),
+            ("num_universe_packages",         "enclave_packages_universe",          "from universe - covered only with esm-apps"),
+            ("num_restricted_packages",       "enclave_packages_restricted",        "from restricted"),
+            ("num_multiverse_packages",       "enclave_packages_multiverse",        "from multiverse"),
+            ("num_third_party_packages",      "enclave_packages_third_party",       "THIRD PARTY - no Ubuntu security stream whatsoever"),
+            ("num_unknown_packages",          "enclave_packages_unknown",           "origin unknown to the Pro client"),
+            ("num_standard_security_updates", "enclave_updates_security_standard",  "security updates from main/restricted, AS OF THE MIRROR SNAPSHOT"),
+            ("num_esm_infra_updates",         "enclave_updates_security_esm_infra", "security updates available via esm-infra"),
+            ("num_esm_apps_updates",          "enclave_updates_security_esm_apps",  "security updates available via esm-apps"),
+        ):
+            if key in sm:
+                try:
+                    emit(name, int(sm[key]), help=help)
+                except (TypeError, ValueError):
+                    pass
+        SRC["patch"] = 1
+    except Exception:
+        SRC["patch"] = 0
+
+# apt-check is the canonical "total;security" counter, and IT WRITES TO STDERR.
+# A producer capturing stdout only gets an empty string and publishes zero pending updates -
+# a clean bill of health from a check that returned nothing. Both streams are read, and the
+# value is accepted only if it matches the expected shape.
+ac = "/usr/lib/update-notifier/apt-check"
+if os.path.exists(ac):
+    rc, o, e = run([ac], timeout=120)
+    got = None
+    for line in (o + "\n" + e).splitlines():
+        line = line.strip()
+        if re.match(r"^\d+;\d+$", line):
+            got = line
+            break
+    if got:
+        total, sec = got.split(";")
+        emit("enclave_updates_pending_total", int(total),
+             help="packages with any update available, as of the mirror snapshot")
+        emit("enclave_updates_pending_security", int(sec),
+             help="packages with a SECURITY update available, as of the mirror snapshot")
+
+# Which Pro services are actually on. esm-apps off means universe packages are uncovered -
+# that can be a decision, but it should be a visible one.
+rc, o, _ = run(["pro", "status", "--format", "json"], timeout=60)
+if rc == 0 and o.strip():
+    try:
+        d = json.loads(o)
+        for svc in d.get("services", []):
+            n = svc.get("name")
+            if n in ("esm-infra", "esm-apps", "livepatch", "fips-updates", "usg", "cc-eal"):
+                emit("enclave_pro_service_enabled",
+                     1 if svc.get("status") == "enabled" else 0, {"service": n},
+                     help="1 if this Ubuntu Pro service is enabled on this machine")
+        exp = d.get("expires")
+        if isinstance(exp, str):
+            t = exp.split(".")[0].replace("Z", "").replace("T", " ").split("+")[0].strip()
+            try:
+                emit("enclave_pro_contract_expiry_seconds",
+                     calendar.timegm(time.strptime(t, "%Y-%m-%d %H:%M:%S")),
+                     help="unix time the Pro contract expires - FIPS and USG stop updating after this")
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+# HOW OLD IS THE PACKAGE METADATA THIS MACHINE IS USING.
+# This is what makes "0 security updates" mean something. Newest Date: across this machine's
+# own apt Release files, so it measures the mirror snapshot as this machine sees it - there is
+# no need to ask svc-repo-01, and a machine left on a stale sources.list shows up here.
+newest = None
+for f in glob.glob("/var/lib/apt/lists/*_Release") + glob.glob("/var/lib/apt/lists/*_InRelease"):
+    try:
+        for line in open(f, errors="ignore"):
+            if line.startswith("Date:"):
+                from email.utils import parsedate_to_datetime
+                try:
+                    v = int(parsedate_to_datetime(line[5:].strip()).timestamp())
+                    if newest is None or v > newest:
+                        newest = v
+                except Exception:
+                    pass
+                break
+    except Exception:
+        pass
+if newest:
+    emit("enclave_apt_metadata_date_seconds", newest,
+         help="newest Date: across this machine's apt Release files - how current its package metadata is")
 
 # --------------------------------------------------------------------------- producer
 # Harbor is probed by the shell (it needs curl and a TLS endpoint), and its result arrives

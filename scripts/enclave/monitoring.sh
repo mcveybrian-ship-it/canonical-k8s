@@ -284,6 +284,7 @@ AL_AIDE_STALE="${AL_AIDE_STALE:-129600}"          # 36h - dailyaidecheck has mis
 AL_BACKUP_STALE="${AL_BACKUP_STALE:-93600}"       # 26h - the nightly backup missed a run
 AL_BACKUP_DETACHED_FOR="${AL_BACKUP_DETACHED_FOR:-2h}"  # detached is normal briefly, not for hours
 AL_BACKUP_FREE_BYTES="${AL_BACKUP_FREE_BYTES:-200000000000}"  # 200 GB left on the backup volume
+AL_TRIVY_DB_STALE="${AL_TRIVY_DB_STALE:-2592000}"       # 30d - Trivy scanning against month-old data
 
 # Set an ARGS= line, exactly once. Appending works - the file is sourced and the last wins -
 # and leaves two lines that disagree, so someone edits the first and nothing changes.
@@ -921,6 +922,60 @@ groups:
             'sudo ./scripts/enclave/vm-backup.sh prune' keeps BACKUP_KEEP_CHAINS sets per
             domain. If prune has been running, the volume is simply too small for the chain
             depth configured.
+
+  # ---------------------------------------------------------------- registry
+  # Harbor keeps answering, keeps accepting pushes, and keeps reporting images clean whatever
+  # state its scanner is in. Every rule here is a way that happens quietly.
+  - name: enclave-registry
+    rules:
+      - alert: HarborUnhealthy
+        expr: enclave_harbor_healthy == 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Harbor reports itself UNHEALTHY on {{ \$labels.machine }}"
+          description: "Its own /api/v2.0/health verdict across all components is not healthy."
+          action: >-
+            'sudo docker ps -a' on {{ \$labels.machine }} and check which container is down,
+            then 'sudo docker compose -f /opt/harbor/docker-compose.yml logs <name>'.
+
+      - alert: HarborComponentUnhealthy
+        expr: enclave_harbor_component_healthy == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Harbor component {{ \$labels.component }} is unhealthy on {{ \$labels.machine }}"
+          description: "The other components may still be serving, which is why this is not caught by an overall health check alone."
+          action: >-
+            If the component is 'trivy', images are being admitted UNSCANNED rather than
+            rejected - treat that as a gate failure, not a monitoring failure.
+
+      - alert: TrivyDatabaseStale
+        expr: (time() - enclave_harbor_trivy_db_updated_seconds) > ${AL_TRIVY_DB_STALE}
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Trivy is scanning against vulnerability data over 30 days old"
+          description: "The database was built {{ \$value | printf \"%.0f\" }} seconds ago. Scans still report clean, against data that is not."
+          action: >-
+            The DB is an OCI artifact and has to be carried in like everything else. Until it
+            is, 'no findings' means 'no findings as of that date' - say so in the ATO package
+            rather than letting a clean scan imply a current one.
+
+      - alert: TrivyDatabaseMissing
+        expr: enclave_harbor_trivy_db_present == 0
+        for: 1h
+        labels:
+          severity: critical
+        annotations:
+          summary: "no Trivy vulnerability database was found on {{ \$labels.machine }}"
+          description: "Scanning with no database reports nothing rather than failing, which is indistinguishable from a clean result."
+          action: >-
+            Check the Harbor trivy-adapter volume for a trivy-db metadata.json. If the
+            adapter never received one, every scan result recorded so far is meaningless.
 EOF
   chmod 0644 "$f"
 
@@ -992,6 +1047,100 @@ for g in json.load(sys.stdin)["data"]["groups"]:
 # The consequence is worth knowing before someone spends an afternoon in the UI: edits made
 # in Grafana to a provisioned dashboard CANNOT be saved back over it. Change the JSON here,
 # re-run this, and Grafana picks it up.
+# ------------------------------------------------------------------------- HARBOR
+# THE REGISTRY, AND THE ONE NUMBER NOBODY CAN SEE: HOW OLD TRIVY'S DATABASE IS.
+#
+# Harbor keeps scanning images and keeps reporting them clean against whatever vulnerability
+# data it had when the gap closed. Nothing anywhere says how old that data is, so "no
+# findings" and "no current data" look identical - and an assessor asking when an image was
+# last assessed against current CVEs has no answer.
+#
+# /api/v2.0/health is UNAUTHENTICATED and returns per-component status including trivy, so
+# this needs no credentials. Everything requiring auth (image counts, scan results) is
+# deliberately left out rather than putting a Harbor password in a metrics producer.
+harbor_facts() {
+  local body
+  body="$(curl -sk --max-time 8 "https://127.0.0.1/api/v2.0/health" 2>/dev/null)" || return 1
+
+  # THE GUARD IS THE JSON, NOT THE HTTP STATUS. svc-repo-01 and svc-obs-01 also answer
+  # https://127.0.0.1 - they run nginx - so a 200 here proves nothing about Harbor. Require
+  # the response to actually be a Harbor health document.
+  case "$body" in *'"components"'*) : ;; *) return 1 ;; esac
+
+  printf '%s' "$body" | python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+print("# HELP enclave_harbor_healthy 1 if Harbor reports itself healthy overall")
+print("# TYPE enclave_harbor_healthy gauge")
+print("enclave_harbor_healthy %d" % (1 if d.get("status") == "healthy" else 0))
+print("# HELP enclave_harbor_component_healthy 1 per Harbor component reporting healthy")
+print("# TYPE enclave_harbor_component_healthy gauge")
+for c in d.get("components", []):
+    print("enclave_harbor_component_healthy{component=\"%s\"} %d"
+          % (c.get("name", "unknown"), 1 if c.get("status") == "healthy" else 0))
+'
+
+  # ---- Trivy database freshness -------------------------------------------------------
+  # trivy-db ships a metadata.json carrying UpdatedAt and NextUpdate. FOUND BY SEARCHING,
+  # not by hardcoding: the path depends on Harbor's data_volume, and a rebuild that moves it
+  # must not silently stop reporting. When nothing is found, say where it looked - absence
+  # here is a real finding, not a blank panel.
+  local meta=""
+  local d
+  for d in /data /var/lib/harbor /opt/harbor; do
+    [ -d "$d" ] || continue
+    meta="$(find "$d" -maxdepth 6 -name metadata.json -path '*trivy*' 2>/dev/null | head -1)"
+    [ -n "$meta" ] && break
+  done
+
+  if [ -n "$meta" ]; then
+    python3 - "$meta" <<'TPY'
+import sys, json, os, calendar, time
+f = sys.argv[1]
+try:
+    d = json.load(open(f))
+except Exception:
+    sys.exit(0)
+
+def epoch(v):
+    if not isinstance(v, str):
+        return None
+    v = v.split(".")[0].replace("Z", "").replace("T", " ")
+    try:
+        return calendar.timegm(time.strptime(v, "%Y-%m-%d %H:%M:%S"))
+    except Exception:
+        return None
+
+# Keys are capitalised in trivy-db, but accept either shape rather than depending on it.
+for key, name, help in (
+    ("UpdatedAt",    "enclave_harbor_trivy_db_updated_seconds",
+     "unix time the Trivy vulnerability DB was last built upstream"),
+    ("NextUpdate",   "enclave_harbor_trivy_db_next_update_seconds",
+     "unix time Trivy considers this DB due for replacement"),
+    ("DownloadedAt", "enclave_harbor_trivy_db_downloaded_seconds",
+     "unix time this enclave last received a Trivy DB"),
+):
+    v = epoch(d.get(key, d.get(key[0].lower() + key[1:])))
+    if v:
+        print("# HELP %s %s" % (name, help))
+        print("# TYPE %s gauge" % name)
+        print("%s %d" % (name, v))
+
+print("# HELP enclave_harbor_trivy_db_present 1 if a Trivy DB metadata file was found")
+print("# TYPE enclave_harbor_trivy_db_present gauge")
+print("enclave_harbor_trivy_db_present 1")
+TPY
+  else
+    printf '# HELP enclave_harbor_trivy_db_present 1 if a Trivy DB metadata file was found\n'
+    printf '# TYPE enclave_harbor_trivy_db_present gauge\n'
+    printf 'enclave_harbor_trivy_db_present 0\n'
+  fi
+  return 0
+}
+
 # ----------------------------------------------------------------------------- facts
 # COMPLIANCE FACTS AS METRICS.
 #
@@ -1012,7 +1161,17 @@ cmd_facts() {
   local out="$TEXTFILE_DIR/enclave-compliance.prom" tmp
   tmp="$(mktemp "$TEXTFILE_DIR/.facts.XXXXXX")" || die "cannot write in $TEXTFILE_DIR"
 
-  LC_ALL=C python3 - > "$tmp" <<'FACTSPY'
+  # HARBOR FIRST, INTO ITS OWN FILE. The exposition format wants all samples of a metric
+  # family together, and enclave_facts_source_ok is emitted at the END of the python below.
+  # Appending a harbor sample of that family afterwards would split it - which the parser
+  # may tolerate and may not, and "may" is not good enough for the file that decides whether
+  # this machine reports anything at all. So the outcome is passed in as a flag instead, and
+  # harbor's own families are concatenated after everything else.
+  local hfile harbor_ok=0
+  hfile="$(mktemp)"
+  if harbor_facts > "$hfile" 2>/dev/null; then harbor_ok=1; else : > "$hfile"; fi
+
+  LC_ALL=C HARBOR_OK="$harbor_ok" python3 - > "$tmp" <<'FACTSPY'
 import os, sys, glob, csv, time, subprocess, collections, calendar
 
 OUT = []
@@ -1218,6 +1377,11 @@ emit("enclave_usb_storage_blocked", blocked,
      help="1 if usb-storage is blocked in modprobe.d, which is where V-270718 looks")
 
 # --------------------------------------------------------------------------- producer
+# Harbor is probed by the shell (it needs curl and a TLS endpoint), and its result arrives
+# as a flag so that source_ok is emitted in one place.
+if os.environ.get("HARBOR_OK") == "1":
+    SRC["harbor"] = 1
+
 emit("enclave_facts_generated_seconds", int(time.time()),
      help="unix time this file was written - if it stops moving, every metric above is stale")
 for k, v in sorted(SRC.items()):
@@ -1239,6 +1403,10 @@ for name, labels, value, help, typ in OUT:
     else:
         print("%s %s" % (name, value))
 FACTSPY
+
+  # Harbor's own families, after everything else - same file, same 15-minute refresh, so a
+  # second producer would only mean a second timer to forget about.
+  cat "$hfile" >> "$tmp"; rm -f "$hfile"
 
   # A PRODUCER THAT WROTE NOTHING MUST NOT REPLACE A GOOD FILE. Truncating the old one
   # would turn "the script broke" into "this machine has no findings", which is the exact

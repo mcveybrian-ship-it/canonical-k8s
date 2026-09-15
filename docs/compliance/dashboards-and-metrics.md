@@ -276,6 +276,64 @@ before the dashboard was written. One I intended to use — `grafana_http_reques
 
 ---
 
+## 4c. Dashboard: **Enclave registry — Harbor and Trivy** (`uid: enclave-registry`)
+
+20 panels, three rows. **Nothing here needs registry credentials.** Harbor's
+`/api/v2.0/health` is unauthenticated and reports all eight components including `trivy`;
+database freshness comes from trivy-db's own `metadata.json` on disk. Image counts and scan
+results were deliberately left out rather than putting a Harbor password in a metrics producer.
+
+### The number this dashboard exists for
+
+**How old Trivy's vulnerability data is.** Harbor keeps scanning, keeps accepting pushes, and
+keeps reporting images clean against whatever data it had when the gap closed. **A stale
+database and a clean image are indistinguishable** — and an assessor asking when an image was
+last assessed against current CVEs currently has no answer.
+
+Two panels measure it: age of the data, and seconds *past* the point Trivy itself considers the
+database due for replacement. In an air gap that second line climbs forever unless a database is
+carried in, so **it measures the transfer process rather than Harbor**.
+
+`enclave_harbor_trivy_db_present` is separate and more serious: scanning with **no** database
+reports nothing rather than failing, which again looks exactly like a clean result.
+
+### Only one Trivy scanner depends on data that goes stale
+
+That distinction is the point, and it is on the dashboard as a text panel so it travels with
+the page:
+
+| Capability | Needs the vulnerability DB? | In an air gap |
+|---|---|---|
+| Vulnerability scanning (OS packages, language deps) | **Yes** | degrades from the day the gap closed |
+| Secret detection (keys, tokens, credentials in layers) | No — rules are in the binary | works identically on day 1 and day 900 |
+| Misconfiguration / IaC checks (Dockerfiles, K8s manifests, Helm) | No — built-in checks | works offline |
+| SBOM generation (CycloneDX, SPDX) and license inventory | No — pure inventory | works offline |
+
+**Two gaps this makes visible, both Trivy jobs, neither being done:**
+
+1. **Nothing scans the machines themselves for vulnerabilities.** USG and Evaluate-STIG assess
+   *configuration*; neither looks at patch state. A machine can land on the enclave's residual
+   set and still run a package with a known CVE — **compliance is not patch state**.
+   `trivy fs` / `trivy rootfs` against a live filesystem would close it.
+2. **The Trivy DB is an OCI artifact, so it can be mirrored into Harbor itself** — the same
+   pattern as the apt mirror — turning unknown staleness into a transfer-bundle item with a
+   measurable age. ⚠️ **The exact configuration knob depends on the deployed Harbor and adapter
+   version and has NOT been verified on this build.** `harbor.yml` carries a `trivy:` section
+   with `skip_update` and `offline_scan`; confirm on the box before this goes in a document.
+
+### Storage, and why it is on this dashboard
+
+`svc-harbor-01` has exactly one real filesystem: `/`, 519 GB. **Image layers, the Postgres
+database and the OS all share it**, so filling it takes the machine down rather than just the
+registry. The free-space thresholds are the same ones the `FilesystemFilling` alerts use, so
+panel and alert cannot drift apart, and a `predict_linear` panel shows when the current rate
+fills the disk — a pull of a large image set moves it fast.
+
+Docker's bridges and veth pairs are excluded from the network panels, or every
+container-to-container byte would be counted twice.
+
+---
+
 ## 5. Metric reference
 
 Every metric published by `monitoring.sh facts`. All are gauges. All carry `machine` and `role`
@@ -349,6 +407,26 @@ a volume holding hundreds of gigabytes, for the same answer.
 
 `virsh domjobinfo` **pads its fields**, and matching the line exactly once printed idle domains
 as in progress. The value is stripped of whitespace before comparison.
+
+### Harbor and Trivy — the registry only
+
+Emitted by `harbor_facts()` in `monitoring.sh`. **The guard is the JSON, not the HTTP status**:
+`svc-repo-01` and `svc-obs-01` also answer `https://127.0.0.1` because they run nginx, so a 200
+proves nothing. The response must actually be a Harbor health document.
+
+| Metric | Labels | Meaning |
+|---|---|---|
+| `enclave_harbor_healthy` | — | Harbor's overall verdict |
+| `enclave_harbor_component_healthy` | `component` | per component: core, database, jobservice, portal, redis, registry, registryctl, **trivy** |
+| `enclave_harbor_trivy_db_present` | — | 0 = no trivy-db `metadata.json` found at all |
+| `enclave_harbor_trivy_db_updated_seconds` | — | when the DB was built upstream |
+| `enclave_harbor_trivy_db_next_update_seconds` | — | when Trivy considers it due for replacement |
+| `enclave_harbor_trivy_db_downloaded_seconds` | — | when this enclave last received one |
+
+The metadata file is located by **searching** `/data`, `/var/lib/harbor` and `/opt/harbor`
+rather than by a hardcoded path — it depends on Harbor's `data_volume`, and a rebuild that moves
+it must not silently stop reporting. When nothing is found, `present` is published as 0 rather
+than the family being omitted: absence here is a finding, not a blank panel.
 
 ### Producer health — read these before trusting anything above
 
@@ -431,6 +509,11 @@ pager that trains people to ignore it.
 | `BackupTimerDisabled` | nightly timer inactive | 1h | warning |
 | `BackupVolumeFilling` | free below 200 GB | 30m | warning |
 | `BackupFactsMissing` | `absent(enclave_backup_dest_mounted)` | 1h | critical |
+| **registry** | | | |
+| `HarborUnhealthy` | Harbor's own verdict is not healthy | 10m | critical |
+| `HarborComponentUnhealthy` | any single component unhealthy | 10m | warning |
+| `TrivyDatabaseStale` | vulnerability data over 30 days old | 1h | warning |
+| `TrivyDatabaseMissing` | no database found at all | 1h | critical |
 
 **Three of these are shaped by a lesson rather than by a threshold.**
 
@@ -448,7 +531,7 @@ group.** Every other compliance rule needs its metric to exist before it can fir
 producer that silently stops takes the whole group quiet — and **quiet is indistinguishable
 from healthy**. Those two fire on frozen and on absent respectively.
 
-**Every expression was evaluated against live data before shipping**, and all 26 were quiet —
+**Every expression is evaluated against live data before shipping.** All 26 were quiet at the time of writing —
 which for the six backup rules meant *the metrics did not exist yet*, not that the backups were
 fine. That is the distinction `BackupFactsMissing` exists to make.
 
@@ -573,9 +656,9 @@ glob will happily report another machine's checklist as this one's.
   leave an air gap**; Postfix is deliberately `inet_interfaces = loopback-only` because the
   STIG requires it. Alertmanager on a dashboard is a different mechanism from the one the
   control names and needs an AO answer — `docs/open-questions.md` **Q26**.
-- **No role dashboards for the mirror, the registry or MAAS.** Each needs a small number of
-  new facts: Release-file age and a **pool** URL probe for the mirror, container state and
-  **Trivy database age** for the registry, DHCP pool utilisation for MAAS.
+- **No role dashboards for the mirror or MAAS.** The mirror needs Release-file age,
+  `/srv/repo` growth and a **pool** URL probe — `Release` returning 200 while `pool` returns
+  401 reads as success. MAAS needs DHCP pool utilisation.
 - **No alerts on the collector itself.** Rule evaluation failures, a growing notification
   queue and TSDB nearing its retention ceiling are all visible on the collector dashboard and
   none of them page. There is a limit to how far this can go: **a Prometheus that cannot

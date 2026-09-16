@@ -68,6 +68,23 @@ my_enclave_ip() {
   printf '%s' "$ip"
 }
 
+# THE NODE-EXPORTER FLAGS, IN ONE PLACE.
+#
+# `collector` used to set node-exporter's ARGS to the listen address ALONE, silently undoing
+# what `exporter` had configured on the same machine. On 2026-09-15 that removed the textfile
+# directory and the systemd unit filter from svc-obs-01 - the only machine where `collector`
+# had been re-run - so it stopped publishing every compliance fact while continuing to look
+# healthy. `node_scrape_collector_success{collector="textfile"}` even reported 1: with no
+# directory configured there is nothing to fail at, so success means "read nothing".
+#
+# Two subcommands writing the same setting differently is the defect. There is now one
+# builder and both call it.
+ne_args() {  # <ip>
+  printf '%s' "--web.listen-address=${1}:${NE_PORT}"
+  printf '%s' " --collector.textfile.directory=$TEXTFILE_DIR"
+  printf '%s' " --collector.systemd --collector.systemd.unit-include=$SYSTEMD_UNITS"
+}
+
 guard_in_gap() {
   local me; me="$(hostname -s)"
   case "$me" in
@@ -103,9 +120,7 @@ cmd_exporter() {
   install -d -m 0755 -o root -g prometheus "$TEXTFILE_DIR" 2>/dev/null \
     || install -d -m 0755 "$TEXTFILE_DIR"
 
-  local ne_args="--web.listen-address=${ip}:${NE_PORT}"
-  ne_args="$ne_args --collector.textfile.directory=$TEXTFILE_DIR"
-  ne_args="$ne_args --collector.systemd --collector.systemd.unit-include=$SYSTEMD_UNITS"
+  local ne_args; ne_args="$(ne_args "$ip")"
 
   # NOT sed. The value contains '|' (the systemd unit regex) and would need a delimiter no
   # future value can contain - there is no such character. Replacing the line by filtering
@@ -180,6 +195,20 @@ cmd_exporter() {
   # early with most of a 100 KB page still unwritten.
   #
   # A check whose answer depends on where in the output the answer appears is not a check.
+  # THE FLAG, BEFORE THE COLLECTOR. `collector_success{collector="textfile"} 1` is true even
+  # when no directory is configured - succeeding at reading nothing. So confirm the running
+  # process was actually given the directory, from its own command line.
+  local cmdline
+  cmdline="$(tr '\0' ' ' < "/proc/$(pgrep -x prometheus-node-exporter | head -1)/cmdline" 2>/dev/null || true)"
+  case "$cmdline" in
+    *"--collector.textfile.directory=$TEXTFILE_DIR"*)
+      ok "textfile directory is on the running command line" ;;
+    *)
+      warn "THE RUNNING EXPORTER HAS NO TEXTFILE DIRECTORY - it will publish no compliance facts,"
+      warn "  and the textfile collector will still report success because it has nothing to read."
+      warn "  running flags: ${cmdline:-<could not read>}" ;;
+  esac
+
   local c
   for c in textfile systemd; do
     case "$page" in
@@ -360,7 +389,9 @@ cmd_collector() {
     "--web.listen-address=127.0.0.1:9090 --storage.tsdb.retention.time=$PROM_RETENTION_TIME --storage.tsdb.retention.size=$PROM_RETENTION_SIZE"
   set_args /etc/default/prometheus-alertmanager \
     "--web.listen-address=127.0.0.1:9093 --cluster.listen-address="
-  set_args /etc/default/prometheus-node-exporter "--web.listen-address=${ip}:${NE_PORT}"
+  # THE SAME FLAGS `exporter` WOULD SET - not just the listen address. Setting only the
+  # address here is what silently disabled the compliance facts on this machine once.
+  set_args /etc/default/prometheus-node-exporter "$(ne_args "$ip")"
 
   # ---- scrape config, generated from enclave-addresses.env -------------------------------
   local cfg=/etc/prometheus/prometheus.yml

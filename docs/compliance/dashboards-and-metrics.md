@@ -689,6 +689,19 @@ into the output the match is — the same working configuration reported `system
 `textfile` fine on one machine, both broken on three others, and both fine on a fifth. Match in
 bash with `case`, or read the whole stream.
 
+**Two subcommands must not write the same setting differently.** `collector` set
+node-exporter's `ARGS` to the listen address alone, silently undoing what `exporter` had
+configured on the same machine. On 2026-09-15 that removed the textfile directory and the
+systemd unit filter from `svc-obs-01` — the only machine where `collector` had been re-run —
+so it **stopped publishing every compliance fact while continuing to look healthy**. There is
+now one `ne_args()` builder and both subcommands call it.
+
+**`node_scrape_collector_success{collector="textfile"} 1` does not mean it read anything.**
+With no directory configured there is nothing to fail at, so success means "read nothing" —
+and the same run reported the systemd collector as succeeding with **970 series** instead of
+the eleven the unit filter allows. The check now reads the running process's own command line
+for `--collector.textfile.directory` before trusting either collector's success flag.
+
 **`sed` cannot carry a value containing its own delimiter.** The systemd unit-include regex is
 full of `|`, and `s|^ARGS=.*|ARGS="..."|` died at character 180. There is no delimiter a future
 value cannot contain. Replace the line by filtering and appending instead.

@@ -516,8 +516,51 @@ cmd_progress() {
 # for a record of something that is still happening.
 VERIFY_STATE="${VERIFY_STATE:-/run/vm-backup-verify.state}"
 
+# THE NEWEST mtime AMONG THE FILES A SET'S INTEGRITY DEPENDS ON.
+# A completed set never changes, so this is a stable fingerprint of "the bytes I verified".
+set_newest_mtime() {  # <setdir>
+  find "$1" -maxdepth 1 -type f \( -name '*.qcow2' -o -name 'MANIFEST.sha256' \) \
+    -printf '%T@\n' 2>/dev/null | cut -d. -f1 | sort -n | tail -1
+}
+
+# HAS THIS SET ALREADY PASSED, UNCHANGED, SINCE THEN?
+#
+# READ THIS BEFORE TRUSTING IT: an mtime cannot detect bit-rot. Silent corruption on the
+# volume does not touch the timestamp, so a skipped set is NOT being re-checked for decay -
+# it is being taken on the word of a previous run. That is the correct trade for the NIGHTLY
+# job, whose question is "did the set we wrote twenty minutes ago arrive intact". It is the
+# wrong trade for the only check that ever runs, which is why `verify --all` exists and why
+# `schedule` installs a weekly timer for it. The two answer different questions and the
+# enclave needs both.
+set_already_verified() {  # <setdir>
+  local st="$1/VERIFIED" rec now
+  [ -f "$st" ] || return 1
+  rec="$(awk -F= '/^newest_mtime=/{print $2+0}' "$st" 2>/dev/null)"
+  [ -n "${rec:-}" ] && [ "${rec:-0}" -gt 0 ] || return 1
+  now="$(set_newest_mtime "$1")"
+  [ -n "${now:-}" ] || return 1
+  [ "$now" -le "$rec" ]
+}
+
+mark_set_verified() {  # <setdir>
+  printf 'verified_utc=%s\nnewest_mtime=%s\nby=%s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(set_newest_mtime "$1")" "$(basename "$0")" \
+    > "$1/VERIFIED" 2>/dev/null || true
+  chmod 0600 "$1/VERIFIED" 2>/dev/null || true
+}
+
 cmd_verify() {
   need_root; check_dest
+  local all=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --all) all=1; shift ;;
+      *) die "unknown argument: $1
+       usage: $0 verify [--all]
+         (default) only sets that changed since they last passed - seconds
+         --all     re-read every byte of every set - catches bit-rot, takes an hour" ;;
+    esac
+  done
 
   # A ONE-HOUR OPERATION THAT PRINTS NOTHING IS INDISTINGUISHABLE FROM A HANG, and on
   # 2026-09-16 that is exactly what happened - the operator asked twice whether it was stuck
@@ -526,8 +569,18 @@ cmd_verify() {
   #
   # Two things fix it: a line per set as it starts, and a state file that `progress` can read
   # from another shell to compute a percentage and an ETA.
-  local total dev base
-  total="$(du -sb "$DEST" 2>/dev/null | awk '{print $1+0}')"
+  #
+  # THE TOTAL COUNTS ONLY WHAT WILL ACTUALLY BE READ. Sizing it from the whole volume made
+  # the ETA meaningless the moment skipping existed.
+  local total=0 dev base dir0 nplan=0 nskip=0
+  while IFS= read -r dir0; do
+    [ -f "$dir0/INFO" ] || continue
+    if [ "$all" -eq 0 ] && set_already_verified "$dir0"; then
+      nskip=$((nskip + 1)); continue
+    fi
+    nplan=$((nplan + 1))
+    total=$(( total + $(du -sb "$dir0" 2>/dev/null | awk '{print $1+0}') ))
+  done < <(find "$DEST" -mindepth 2 -maxdepth 2 -type d | sort)
   dev="$(basename "$(readlink -f "$(findmnt -no SOURCE --target "$DEST" 2>/dev/null)" 2>/dev/null)" 2>/dev/null)"
   base="$(awk -v x="$dev" '$3==x {print $6+0; exit}' /proc/diskstats 2>/dev/null)"
   printf 'start=%s\ntotal=%s\ndev=%s\nbase=%s\n' \
@@ -536,13 +589,26 @@ cmd_verify() {
   # Remove it however this exits, so `progress` never reports a verify that has finished.
   trap 'rm -f "$VERIFY_STATE"' EXIT
 
-  say "verifying $(human "${total:-0}") across $(find "$DEST" -mindepth 2 -maxdepth 2 -type d 2>/dev/null | wc -l) set(s)"
-  say "  this re-reads every byte. Watch it from another shell with:  $0 progress"
+  if [ "$all" -eq 1 ]; then
+    say "DEEP verify: re-reading every byte of $nplan set(s), $(human "$total")"
+    say "  this is the check that catches bit-rot. It takes as long as it takes."
+  else
+    say "verifying $nplan changed set(s), $(human "$total")   ($nskip unchanged, skipped)"
+    say "  skipped sets passed a previous run and have not changed since. Silent decay does"
+    say "  NOT change an mtime, so the weekly '$0 verify --all' is what covers that."
+  fi
+  [ "$nplan" -gt 0 ] && say "  watch from another shell with:  $0 progress"
   say ""
 
   local bad=0 n=0 dir
   while IFS= read -r dir; do
     [ -f "$dir/INFO" ] || continue
+    if [ "$all" -eq 0 ] && set_already_verified "$dir"; then
+      printf '  [-] %-38s %8s skipped (passed %s)\n' \
+        "$(basename "$(dirname "$dir")")/$(basename "$dir")" "" \
+        "$(awk -F= '/^verified_utc=/{print $2}' "$dir/VERIFIED" 2>/dev/null)"
+      continue
+    fi
     n=$((n + 1))
     # THE LINE THAT WAS MISSING. Name the set before spending minutes on it.
     printf '  [%d] %-38s %8s ' "$n" \
@@ -591,6 +657,9 @@ cmd_verify() {
     if [ -f "$dir/MANIFEST.sha256" ]; then
       if ( cd "$dir" && sha256sum -c --quiet MANIFEST.sha256 ) >/dev/null 2>&1; then
         printf 'ok\n'
+        # STAMP ONLY ON A CLEAN PASS, and only if nothing else in this set failed. A set
+        # whose qcow2 header would not parse must not be skipped next time.
+        mark_set_verified "$dir"
       else
         printf 'CHECKSUM MISMATCH\n'; bad=1
       fi
@@ -601,7 +670,12 @@ cmd_verify() {
   printf '\n'
   # SAY THE COUNT. "all backups verified" reads the same whether it checked forty or zero.
   if [ "$bad" -eq 0 ]; then
-    ok "verified $n backup set(s) - every qcow2 header parses and every manifest matches"
+    if [ "$all" -eq 1 ]; then
+      ok "DEEP verify clean: $n set(s) re-read in full, every manifest matches"
+    else
+      ok "verified $n changed set(s) clean; $nskip unchanged set(s) skipped"
+      say "   skipped sets were NOT re-read. Bit-rot is covered by the weekly --all run."
+    fi
     say "   fulls additionally passed qemu-img check. Incrementals are NOT check-ed: they"
     say "   reference the live guest disk, which is locked, so the manifest is the statement."
   else
@@ -734,6 +808,11 @@ cmd_reattach() {
 # If the destination is a USB drive, either keep the deviation window open and documented,
 # or move the destination to storage that survives a reboot. `status` says which you have.
 SVC_NAME="enclave-vm-backup"
+VERIFY_SVC="enclave-vm-verify"
+# WHEN THE DEEP VERIFY RUNS. Weekly, and deliberately not adjacent to the nightly backup:
+# both read the same USB volume and overlapping them halves the throughput of each. Sunday
+# 04:00 leaves the nightly run at 02:00 finished long before. A parameter, not a constant.
+VERIFY_ONCALENDAR="${BACKUP_VERIFY_ONCALENDAR:-Sun *-*-* 04:00}"
 
 cmd_schedule() {
   need_root; assert_hypervisor
@@ -758,6 +837,11 @@ Nice=10
 IOSchedulingClass=idle
 TimeoutStartSec=6h
 ExecStart=${self} incr
+# NO --all HERE, DELIBERATELY. This step's question is "did the set written minutes ago
+# arrive intact", and the answer is in that set alone. Re-reading 400 GB of unchanged sets
+# every night took an hour, put the nightly job under sustained USB load until 03:05, and
+# buried any real failure in an hour of expected disk noise. Bit-rot is the WEEKLY job's
+# question - see ${VERIFY_SVC}.timer, installed alongside this one.
 ExecStart=${self} verify
 ExecStart=${self} prune
 EOF
@@ -776,11 +860,51 @@ Persistent=true
 WantedBy=timers.target
 EOF
 
+  # ---- the weekly DEEP verify -----------------------------------------------------------
+  # The nightly run only checks what changed, which cannot see decay. This is the run that
+  # re-reads every byte, and it is the only thing standing between a rotting USB volume and
+  # a restore that fails when it is needed.
+  cat > "/etc/systemd/system/${VERIFY_SVC}.service" <<EOF
+[Unit]
+Description=Weekly DEEP verify of every enclave VM backup set (re-reads every byte)
+After=libvirtd.service
+RequiresMountsFor=${DEST}
+
+[Service]
+Type=oneshot
+Nice=10
+IOSchedulingClass=idle
+# Sized from measurement: 402 GB at ~82 MB/s is about 80 minutes, and the volume grows.
+TimeoutStartSec=6h
+ExecStart=${self} verify --all
+EOF
+
+  cat > "/etc/systemd/system/${VERIFY_SVC}.timer" <<EOF
+[Unit]
+Description=Weekly deep verify of the VM backup volume
+
+[Timer]
+OnCalendar=${VERIFY_ONCALENDAR}
+# A week is long enough that a missed run matters - catch it up rather than wait another.
+Persistent=true
+RandomizedDelaySec=5min
+
+[Install]
+WantedBy=timers.target
+EOF
+
   systemctl daemon-reload
   systemctl enable --now "${SVC_NAME}.timer" >/dev/null 2>&1 \
     || die "could not enable ${SVC_NAME}.timer"
+  systemctl enable --now "${VERIFY_SVC}.timer" >/dev/null 2>&1 \
+    || warn "could not enable ${VERIFY_SVC}.timer - the nightly backup still works, but"
   ok "scheduled: ${SVC_NAME}.timer at ${at} daily -> ${DEST}"
-  systemctl list-timers "${SVC_NAME}.timer" --no-pager | sed 's/^/       /'
+  ok "scheduled: ${VERIFY_SVC}.timer '${VERIFY_ONCALENDAR}' - deep verify, reads every byte"
+  say ""
+  say "   nightly: incr + verify (changed sets only) + prune   - minutes"
+  say "   weekly : verify --all                                - reads the whole volume"
+  say ""
+  systemctl list-timers "${SVC_NAME}.timer" "${VERIFY_SVC}.timer" --no-pager | sed 's/^/       /'
   printf '\n'
   say "each run does: incr (falls back to full with no checkpoint), verify, prune"
   say "watch it with:   journalctl -u ${SVC_NAME}.service -n 50"
@@ -802,10 +926,16 @@ EOF
 
 cmd_unschedule() {
   need_root
-  systemctl disable --now "${SVC_NAME}.timer" >/dev/null 2>&1 || true
-  rm -f "/etc/systemd/system/${SVC_NAME}.timer" "/etc/systemd/system/${SVC_NAME}.service"
+  # BOTH TIMERS. schedule installs two; an unschedule that removes one leaves a weekly deep
+  # verify running against a volume nothing is backing up any more - which reads for an hour
+  # every Sunday and reports success on data that is going stale.
+  local u
+  for u in "$SVC_NAME" "$VERIFY_SVC"; do
+    systemctl disable --now "${u}.timer" >/dev/null 2>&1 || true
+    rm -f "/etc/systemd/system/${u}.timer" "/etc/systemd/system/${u}.service"
+  done
   systemctl daemon-reload
-  ok "removed ${SVC_NAME}.timer and .service"
+  ok "removed ${SVC_NAME} and ${VERIFY_SVC} (.timer and .service)"
 }
 
 # ---------------------------------------------------------------- restore
@@ -1041,5 +1171,5 @@ case "${1:-status}" in
   schedule)     shift || true; cmd_schedule "${1:-02:00}" ;;
   unschedule)   cmd_unschedule ;;
   restore-plan) shift || true; cmd_restore_plan "${1:-}" ;;
-  *) printf 'usage: %s {status|facts|full [vm]|incr [vm]|progress|verify|prune|keyfile|reattach|schedule [HH:MM]|unschedule|restore-plan <vm>}\n' "$0" >&2; exit 2 ;;
+  *) printf 'usage: %s {status|facts|full [vm]|incr [vm]|progress|verify [--all]|prune|keyfile|reattach|schedule [HH:MM]|unschedule|restore-plan <vm>}\n' "$0" >&2; exit 2 ;;
 esac

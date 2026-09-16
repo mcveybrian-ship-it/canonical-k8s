@@ -2199,9 +2199,37 @@ cmd_aide() {
         warn "SKIPPED $path - the table has it for $me but it is not on the disk right now."
         warn "  if that is a mountpoint, mount it and re-run before hardening."
       done < <(aide_excludes)
+      # ASK THE DATABASE, DO NOT ASSUME. This used to warn "stale until rebuilt" whenever a
+      # database existed at all - true when an exclusion is added for a path the database
+      # already covers, and false when the path did not exist when the database was built.
+      # On host-4, 2026-09-16, it sent the operator at a multi-hour aideinit that would have
+      # achieved nothing: /mnt/vmbackup was created three days AFTER that database, so the
+      # exclusion brought the CHECK into line with the database rather than out of it.
+      #
+      # A rebuild is hours on this machine. A warning that cannot tell the difference between
+      # "you must" and "you need not" is the same failure as an alert that always fires.
       if command -v aide >/dev/null 2>&1 && [ -f "$AIDE_DB" ]; then
-        warn "a database already exists and was built WITHOUT this exclusion."
-        warn "  it is stale until rebuilt:  sudo $0 aide init"
+        local stale=0 n
+        while IFS=$'\t' read -r mach path why; do
+          [ -n "${mach:-}" ] || continue
+          [ "$mach" = '*' ] || [ "$mach" = "$me" ] || continue
+          # The database may be plain or gzipped depending on the aide build; try both and
+          # never let a no-match exit status end the script.
+          n="$(zgrep -c "^${path}/" "$AIDE_DB" 2>/dev/null || true)"
+          [ -n "$n" ] || n="$(grep -c "^${path}/" "$AIDE_DB" 2>/dev/null || true)"
+          case "$n" in ''|*[!0-9]*) n=0 ;; esac
+          if [ "$n" -gt 0 ]; then
+            stale=1
+            warn "  $path: $n entry(ies) ALREADY IN the database"
+          fi
+        done < <(aide_excludes)
+        if [ "$stale" -eq 1 ]; then
+          warn "the database covers a path this exclusion now removes - it is stale."
+          warn "  rebuild it:  sudo $0 aide init      (hours on a large filesystem)"
+        else
+          ok "database holds nothing under the excluded path(s) - NO REBUILD NEEDED"
+          say "     $AIDE_DB, built $(date -r "$AIDE_DB" -Is 2>/dev/null)"
+        fi
       fi
       ;;
 

@@ -361,3 +361,4 @@ written and its blockers are cleared.
 | Step 05 | MAAS boot images — **both** the server stream and the Minimal image | Q9, §11.3 |
 | Step 06 | Node diagnostic toolset for the Minimal nodes | Not yet decided — runbook §2.4 |
 | Step 03 | FIPS and USG packages via the Pro air-gapped path | Q9, Q11, Q12 |
+| Step 09a | **Trivy CLI** — a standalone binary or `.deb`, plus a current `trivy-db` OCI artifact. Discovered 2026-09-15: Trivy exists in this enclave **only inside Harbor's container**, so nothing can scan the machines' own filesystems for vulnerabilities. USG and Evaluate-STIG assess configuration, not patch state. The DB is an OCI artifact and can be mirrored into Harbor like any other image | **Q27** — the AO decision on scanning against data of a known age sets the cadence |

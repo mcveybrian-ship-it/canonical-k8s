@@ -2671,7 +2671,73 @@ cmd_luksenroll() {
   local tv; tv="$(cat /sys/class/tpm/tpm0/tpm_version_major 2>/dev/null || echo '?')"
   [ "$tv" = 2 ] || die "TPM reports version '$tv' - systemd-cryptenroll needs TPM 2.0."
   command -v systemd-cryptenroll >/dev/null 2>&1 || die "systemd-cryptenroll not present"
-  ok "TPM 2.0 present at /dev/tpmrm0, systemd-cryptenroll available"
+
+  # ---- 1b. systemd DLOPENS the TPM2 stack, so a missing library is not a missing feature
+  #
+  # On host-4, 2026-09-16, `systemd-cryptenroll --tpm2-device=list` said "TPM2 support is not
+  # installed" while `systemd-analyze --version` reported `+TPM2` and the TPM was present and
+  # working. Both were true: systemd was built with support, and it loads libtss2 at RUNTIME.
+  # Six of the seven tss2 libraries were installed; **libtss2-rc.so.0 was not**, because
+  # nothing hard-depends on it - systemd only dlopens it. One absent library reports as an
+  # absent feature.
+  #
+  # Check the sonames directly. The error message systemd gives sends you looking at the TPM,
+  # the firmware and the kernel, none of which are the problem.
+  local so missing=""
+  for so in libtss2-esys.so.0 libtss2-mu.so.0 libtss2-rc.so.0 libtss2-tcti-device.so.0; do
+    ldconfig -p 2>/dev/null | awk -v s="$so" '$1==s {found=1} END {exit !found}' \
+      || missing="$missing $so"
+  done
+  if [ -n "$missing" ]; then
+    warn "systemd cannot load the TPM2 stack - these shared libraries are missing:"
+    for so in $missing; do say "     $so"; done
+    say  "  systemd dlopens them, so nothing depends on them and apt never pulled them in."
+    say  ""
+    # INSTALL IT RATHER THAN PRINT INSTRUCTIONS. The operator invoked this subcommand
+    # deliberately; handing them an apt line to retype is a step that can be mistyped at a
+    # rack. Candidate names differ across releases - 24.04 carries the t64 suffix from the
+    # time_t transition - so resolve the name against what this machine can actually see.
+    local want cand pol pkgs=""
+    for want in $missing; do
+      case "$want" in
+        libtss2-rc.so.0)           cand="libtss2-rc0t64 libtss2-rc0" ;;
+        libtss2-esys.so.0)         cand="libtss2-esys-3.0.2-0t64 libtss2-esys-3.0.2-0" ;;
+        libtss2-mu.so.0)           cand="libtss2-mu-4.0.1-0t64 libtss2-mu0" ;;
+        libtss2-tcti-device.so.0)  cand="libtss2-tcti-device0t64 libtss2-tcti-device0" ;;
+        *) cand="" ;;
+      esac
+      local pick=""
+      for c in $cand; do
+        pol="$(apt-cache policy "$c" 2>/dev/null || true)"
+        case "$pol" in *"Candidate: "[0-9]*) pick="$c"; break ;; esac
+      done
+      [ -n "$pick" ] && pkgs="$pkgs $pick" \
+        || warn "  no package on this mirror provides $want - carry one in"
+    done
+    [ -n "$pkgs" ] || die "cannot resolve a package for the missing library - nothing changed"
+    say "installing:$pkgs"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $pkgs 2>&1 | tail -3
+    # RE-CHECK. An install that reports success and still leaves the soname absent is the
+    # case this whole block exists to catch.
+    missing=""
+    for so in libtss2-esys.so.0 libtss2-mu.so.0 libtss2-rc.so.0 libtss2-tcti-device.so.0; do
+      ldconfig -p 2>/dev/null | awk -v t="$so" '$1==t {f=1} END {exit !f}' || missing="$missing $so"
+    done
+    [ -z "$missing" ] || die "still missing:$missing - nothing has been changed"
+    ok "TPM2 libraries installed"
+  fi
+
+  # Ask systemd, not just the linker. This is the test that actually gates enrolment.
+  local tpmlist
+  tpmlist="$(systemd-cryptenroll --tpm2-device=list 2>&1 || true)"
+  case "$tpmlist" in
+    *"not installed"*|*"No TPM2 devices"*)
+      warn "systemd-cryptenroll still will not use the TPM. It said:"
+      printf '%s\n' "$tpmlist" | sed 's/^/       /'
+      die "resolve that before enrolling - nothing has been changed" ;;
+  esac
+  ok "TPM 2.0 present at /dev/tpmrm0 and systemd can use it"
+  printf '%s\n' "$tpmlist" | sed 's/^/     /'
 
   # ---- 2. was this asked for at build time? -------------------------------------------
   # The installer wrote the operator's choice. Honour it rather than guessing, and refuse

@@ -2784,18 +2784,27 @@ cmd_luksenroll() {
        Check: cryptsetup luksDump $dev"
   fi
   ok "$slot_count existing key slot(s) - the passphrase fallback survives this"
-  if cryptsetup luksDump "$dev" 2>/dev/null | grep -qi 'systemd-tpm2'; then
-    ok "a TPM token is ALREADY enrolled on this volume - nothing to do"
-    say "   to re-seal after a firmware change:  systemd-cryptenroll --wipe-slot=tpm2 $dev"
-    return 0
-  fi
+  # ---- 5. enrol, unless it is already done ---------------------------------------------
+  # IDEMPOTENT MEANS CONVERGES, NOT RETURNS. The first version returned here the moment it
+  # saw an existing token - which skipped the crypttab and initramfs steps below, so a
+  # re-run could not repair the exact thing a re-run is for. Enrolment is skipped; nothing
+  # else is.
+  local dump already=0
+  dump="$(cryptsetup luksDump "$dev" 2>/dev/null || true)"
+  case "$dump" in
+    *systemd-tpm2*)
+      already=1
+      ok "a TPM token is already enrolled - skipping enrolment, still checking crypttab and initramfs"
+      say "   to re-seal after a firmware change: systemd-cryptenroll --wipe-slot=tpm2 $dev" ;;
+  esac
 
-  # ---- 5. enrol -----------------------------------------------------------------------
-  say ""
-  say "enrolling against PCR 7 (secure boot state) - you will be asked for the EXISTING"
-  say "passphrase once, to unlock the volume so a new slot can be added:"
-  systemd-cryptenroll --tpm2-device=auto --tpm2-pcrs=7 "$dev" \
-    || die "enrolment failed - nothing changed, the passphrase still works"
+  if [ "$already" -eq 0 ]; then
+    say ""
+    say "enrolling against PCR 7 (secure boot state) - you will be asked for the EXISTING"
+    say "passphrase once, to unlock the volume so a new slot can be added:"
+    systemd-cryptenroll --tpm2-device=auto --tpm2-pcrs=7 "$dev" \
+      || die "enrolment failed - nothing changed, the passphrase still works"
+  fi
 
   # ---- 6. tell crypttab to try the TPM ------------------------------------------------
   cp -a /etc/crypttab "/var/backups/crypttab.$(date +%Y%m%dT%H%M%S)"

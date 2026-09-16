@@ -78,8 +78,21 @@ STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 # hit the same wall with no clue why.
 qemu_user()  { awk -F'"' '/^[[:space:]]*user[[:space:]]*=/{print $2}'  /etc/libvirt/qemu.conf 2>/dev/null | tail -1; }
 qemu_group() { awk -F'"' '/^[[:space:]]*group[[:space:]]*=/{print $2}' /etc/libvirt/qemu.conf 2>/dev/null | tail -1; }
-QUSER="$(qemu_user)";  QUSER="${QUSER:-libvirt-qemu}"
-QGROUP="$(qemu_group)"; QGROUP="${QGROUP:-kvm}"
+# `|| true` IS LOAD-BEARING, AND WITHOUT IT NO UNPRIVILEGED COMMAND IN THIS SCRIPT WORKED.
+#
+# /etc/libvirt/qemu.conf is -rw------- root:root. For any other user awk exits 2. The 2>/dev/null
+# above hides the message but not the status, and `set -o pipefail` propagates awk's 2 through
+# the pipe instead of tail's 0 - so the ASSIGNMENT fails, `set -e` kills the script during
+# initialisation, and the ${...:-default} on the same line never runs.
+#
+# Effect, measured 2026-09-16: `vm-backup.sh progress` exited 2 with NO OUTPUT AT ALL for a
+# non-root user, so `watch` showed a blank screen while a backup was running perfectly. The
+# whole point of `progress` is to be readable from another shell without privilege, and it had
+# never once worked that way.
+#
+# The defaults are correct for this enclave and always were; they just needed to be reachable.
+QUSER="$(qemu_user || true)";  QUSER="${QUSER:-libvirt-qemu}"
+QGROUP="$(qemu_group || true)"; QGROUP="${QGROUP:-kvm}"
 
 say()  { printf '  %s\n' "$*"; }
 ok()   { printf '  [ok] %s\n' "$*"; }
@@ -461,12 +474,42 @@ cmd_progress() {
     virsh domjobinfo "$d" 2>/dev/null \
       | grep -E 'Time elapsed|Data processed|Data remaining|Data total|File processed|File remaining|File total' \
       | sed 's/^/       /'
-    # Percentage, because "412 GiB processed" means nothing without the total.
-    local proc tot
-    proc="$(virsh domjobinfo "$d" --bytes 2>/dev/null | awk -F': *' '/^Data processed/{print $2+0}')"
-    tot="$(virsh domjobinfo "$d" --bytes 2>/dev/null | awk -F': *' '/^Data total/{print $2+0}')"
-    if [ -n "${tot:-}" ] && [ "${tot:-0}" -gt 0 ]; then
-      printf '       => %s%% complete\n' "$(( proc * 100 / tot ))"
+    # THREE INDEPENDENT FAULTS LIVED IN THE FOUR LINES THIS REPLACES, and every one of
+    # them was silent. Measured on host-4, 2026-09-16, while a full backup ran perfectly:
+    #
+    #   1. `--bytes` IS NOT SUPPORTED by this libvirt's domjobinfo:
+    #        error: command 'domjobinfo' doesn't support option --bytes
+    #      2>/dev/null hid it, so the substitution returned empty.
+    #
+    #   2. THE FIELDS ARE NAMED `File *`, NOT `Data *`, for a backup operation. Real output:
+    #        Job type: Unbounded   Operation: Backup
+    #        File processed: 34.947 GiB   File remaining: 989.053 GiB   File total: 1.000 TiB
+    #      Even with --bytes gone, grepping `Data processed` finds nothing here.
+    #
+    #   3. `File total` IS THE VIRTUAL SIZE, not what gets copied. svc-repo-01 reports
+    #      1.000 TiB while only 331 GB is allocated. A percentage against it read 3% when
+    #      the copy was 10% done - worse than printing no number at all.
+    #
+    # So: no --bytes, accept either field name, and divide by the ALLOCATED size from
+    # alloc_bytes() - which is what qemu actually writes. Each fault alone made the
+    # percentage vanish; together they meant this function never once printed one.
+    local jinfo proc_h proc_b alloc
+    jinfo="$(virsh domjobinfo "$d" 2>/dev/null || true)"
+    proc_h="$(printf '%s\n' "$jinfo" \
+      | awk -F: '/^File processed|^Data processed/{gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2; exit}')"
+    proc_b=0
+    if [ -n "${proc_h:-}" ]; then
+      proc_b="$(numfmt --from=iec "$(printf '%s' "$proc_h" | tr -d ' ' | sed 's/iB$//')" 2>/dev/null || echo 0)"
+    fi
+    case "${proc_b:-}" in ''|*[!0-9]*) proc_b=0 ;; esac
+    alloc="$(alloc_bytes "$d")"
+    case "${alloc:-}" in ''|*[!0-9]*) alloc=0 ;; esac
+    if [ "$alloc" -gt 0 ] && [ "$proc_b" -gt 0 ]; then
+      printf '       => %s of %s allocated  (%s%%)\n' \
+        "$(human "$proc_b")" "$(human "$alloc")" "$(( proc_b * 100 / alloc ))"
+    elif [ "$proc_b" -gt 0 ]; then
+      printf '       => %s processed (cannot size this domain to give a percentage)\n' \
+        "$(human "$proc_b")"
     fi
     printf '\n'
   done
@@ -687,19 +730,117 @@ cmd_verify() {
 # ---------------------------------------------------------------- prune
 cmd_prune() {
   need_root; check_dest
-  local dom chains drop d
+  local dry=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dry-run|-n) dry=1; shift ;;
+      *) die "unknown argument: $1
+       usage: $0 prune [--dry-run]" ;;
+    esac
+  done
+
+  # ================================================================================
+  # THIS FUNCTION DESTROYED EVERY FULL BACKUP IN THE ENCLAVE ON 2026-09-16.
+  #
+  # The parameter is called BACKUP_KEEP_CHAINS. The old code counted DIRECTORIES:
+  # it sorted set directories by name, kept the newest KEEP, and deleted the rest.
+  # The oldest directory is always the FULL, so "keep 2" reliably deleted the base
+  # and kept two incrementals that reference it. Logged output from that run:
+  #
+  #     svc-obs-01:  removing 20260914T195447Z (7.2G)    <- the full
+  #     svc-repo-01: removing 20260914T203840Z (331G)    <- the full
+  #     [ok] prune complete - kept 2 set(s) per domain
+  #
+  # The volume went from 402 GB to 11 GB and NO VM HAD A RESTORABLE BACKUP. An
+  # incremental without its base is not a backup; it is a diff against something
+  # that no longer exists.
+  #
+  # A chain is a FULL plus every incremental after it, up to the next full. This
+  # keeps the newest KEEP chains and refuses, hard, to leave a domain with no full.
+  # ================================================================================
+
+  local dom freed=0
   for dom in "$DEST"/*/; do
     [ -d "$dom" ] || continue
-    chains="$(find "$dom" -mindepth 1 -maxdepth 1 -type d | sort)"
-    local total; total="$(printf '%s\n' "$chains" | sed '/^$/d' | wc -l)"
-    [ "$total" -gt "$KEEP" ] || { say "$(basename "$dom"): $total set(s), keeping all"; continue; }
-    drop="$(printf '%s\n' "$chains" | head -n $((total - KEEP)))"
-    for d in $drop; do
-      say "$(basename "$dom"): removing $(basename "$d") ($(du -sh "$d" | cut -f1))"
-      rm -rf -- "$d"
+    local name; name="$(basename "$dom")"
+    [ "$name" = "lost+found" ] && continue
+
+    # Only sets carrying INFO are considered. A directory without one is an
+    # interrupted run - it is not part of any chain and prune does not own it.
+    local sets=() modes=() d
+    while IFS= read -r d; do
+      [ -f "$d/INFO" ] || continue
+      sets+=("$d")
+      modes+=("$(awk -F= '/^mode=/{print $2}' "$d/INFO" 2>/dev/null)")
+    done < <(find "$dom" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort)
+
+    local n=${#sets[@]}
+    if [ "$n" -eq 0 ]; then say "$name: no completed sets - nothing to prune"; continue; fi
+
+    # Which sets are fulls, oldest first.
+    local fulls=() i
+    for ((i=0; i<n; i++)); do
+      [ "${modes[$i]}" = full ] && fulls+=("$i")
     done
+    local nf=${#fulls[@]}
+
+    # ---- GUARD 1: NO FULL AT ALL. Refuse, loudly. --------------------------------
+    # This is the state the old code left the enclave in, and if prune had had this
+    # guard it could not have created it.
+    if [ "$nf" -eq 0 ]; then
+      warn "$name: $n set(s) and NOT ONE FULL - refusing to prune anything here."
+      warn "  every set is an incremental with no base, so none of them can restore."
+      warn "  fix it:  sudo $0 full $name"
+      continue
+    fi
+
+    # ---- GUARD 2: fewer chains than we keep. Nothing to do. ----------------------
+    if [ "$nf" -le "$KEEP" ]; then
+      say "$name: $nf chain(s) / $n set(s), keeping all (KEEP=$KEEP)"
+      continue
+    fi
+
+    # The oldest full we are keeping. Everything BEFORE it belongs to a chain that
+    # is being retired, and that includes its incrementals - they are useless once
+    # their base goes, which is exactly why they go with it and not before it.
+    local cut=${fulls[$((nf - KEEP))]}
+    say "$name: $nf chain(s) / $n set(s) - keeping the newest $KEEP chain(s) from $(basename "${sets[$cut]}")"
+
+    for ((i=0; i<cut; i++)); do
+      local sz; sz="$(du -sb "${sets[$i]}" 2>/dev/null | cut -f1)"
+      case "${sz:-}" in ''|*[!0-9]*) sz=0 ;; esac
+      if [ "$dry" -eq 1 ]; then
+        say "  would remove $(basename "${sets[$i]}") [${modes[$i]}] $(human "$sz")"
+      else
+        say "  removing $(basename "${sets[$i]}") [${modes[$i]}] $(human "$sz")"
+        rm -rf -- "${sets[$i]}"
+        freed=$((freed + sz))
+      fi
+    done
+
+    # ---- GUARD 3: prove a full survived, per domain, after acting. ---------------
+    # Cheap, and it is the check that turns "I believe this is correct" into "this
+    # domain can still be restored".
+    if [ "$dry" -eq 0 ]; then
+      local left=0
+      for d in "$dom"*/; do
+        [ -f "$d/INFO" ] || continue
+        [ "$(awk -F= '/^mode=/{print $2}' "$d/INFO" 2>/dev/null)" = full ] && left=$((left + 1))
+      done
+      if [ "$left" -eq 0 ]; then
+        warn "$name: PRUNE LEFT NO FULL BACKUP. This should be impossible - report it."
+        warn "  take one now:  sudo $0 full $name"
+      else
+        ok "$name: $left full(s) retained"
+      fi
+    fi
   done
-  ok "prune complete - kept $KEEP set(s) per domain"
+
+  if [ "$dry" -eq 1 ]; then
+    ok "dry run - nothing removed"
+  else
+    ok "prune complete - kept $KEEP chain(s) per domain, freed $(human "$freed")"
+  fi
 }
 
 # ---------------------------------------------------------------- keyfile / reattach
@@ -1216,5 +1357,5 @@ case "${1:-status}" in
   schedule)     shift || true; cmd_schedule "${1:-02:00}" ;;
   unschedule)   cmd_unschedule ;;
   restore-plan) shift || true; cmd_restore_plan "${1:-}" ;;
-  *) printf 'usage: %s {status|facts|full [vm]|incr [vm]|progress|verify [--all]|prune|keyfile|reattach|schedule [HH:MM]|unschedule|restore-plan <vm>}\n' "$0" >&2; exit 2 ;;
+  *) printf 'usage: %s {status|facts|full [vm]|incr [vm]|progress|verify [--all]|prune [--dry-run]|keyfile|reattach|schedule [HH:MM]|unschedule|restore-plan <vm>}\n' "$0" >&2; exit 2 ;;
 esac

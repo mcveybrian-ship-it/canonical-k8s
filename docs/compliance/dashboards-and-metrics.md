@@ -559,7 +559,7 @@ pager that trains people to ignore it.
 | `CertificateExpiringSoon` | inside 30 days | 1h | warning |
 | `AideCheckStale` | no AIDE run in 36h | 1h | warning |
 | `AideDetectedChanges` | last exit non-zero | 10m | warning |
-| `AccountLockoutRisk` | any faillock tally | 5m | warning |
+| `AccountLockoutRisk` | any faillock tally | **none** | warning |
 | `ComplianceFactsStale` | facts older than 1h | 15m | critical |
 | **backups** | | | |
 | `BackupMissed` | no complete set in 26h | 30m | critical |
@@ -575,12 +575,26 @@ pager that trains people to ignore it.
 | `TrivyDatabaseStale` | vulnerability data over 30 days old | 1h | warning |
 | `TrivyDatabaseMissing` | no database found at all | 1h | critical |
 | **patch posture** | | | |
-| `SecurityUpdatesPending` | any security update available from the mirror | 6h | warning |
+| `SecurityUpdatesPending` | apt-check **or** esm-apps **or** esm-infra reports one | 6h | warning |
 | `AptMetadataStale` | package metadata over 30 days old | 1h | warning |
 | `ProContractExpiring` | contract inside 90 days | 1h | critical |
 | `FipsUpdatesDisabled` | `fips-updates` off on an in-gap machine | 30m | critical |
 
-**Three of these are shaped by a lesson rather than by a threshold.**
+**Five of these are shaped by a lesson rather than by a threshold.**
+
+**`SecurityUpdatesPending` is a disjunction because `apt-check` cannot see ESM.** Measured
+2026-09-16, minutes after `esm-apps` was enabled: `apt-check` reported `N;0` - *zero security* -
+on **five machines out of five**, while `pro security-status` reported **19** esm-apps security
+updates. The rule fired on apt-check's number alone and would have missed all nineteen. ESM is
+where universe packages get their only coverage, so it is precisely the stream that must not be
+invisible. Each term keeps its own `machine` label, which is why it is a disjunction and not a sum.
+
+**`AccountLockoutRisk` has no `for` hold, deliberately.** `pam_faillock` here is `deny=3` with
+`unlock_time=0`, so the **third** failure locks the account permanently until a tally file is
+truncated by hand. A five-minute hold put the warning after the window in which it was useful -
+on 2026-09-16 the operator hit one failure on the hypervisor and found out from `sudo`, not from
+here. It now fires on the first failure, which is the only warning that arrives in time.
+
 
 **`AuditRecordsLost` uses `delta`, not `> 0`.** auditd's `lost` counter is cumulative since
 boot, so a bare threshold would fire forever on a machine that dropped records once weeks ago —

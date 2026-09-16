@@ -832,9 +832,13 @@ groups:
             'sudo aide --check' on {{ \$labels.machine }} and read the report. Expected after
             a deliberate change; unexpected otherwise, and that is the whole point.
 
+      # NO 'for' HOLD ON THIS ONE, DELIBERATELY. deny=3 with unlock_time=0 means the THIRD failure
+      # locks the account permanently until a tally file is truncated by hand. A five-minute
+      # hold meant the warning arrived after the window in which it was useful - and on
+      # 2026-09-16 the operator hit one failure on the hypervisor and found out from sudo, not
+      # from here. Fires on the first failure, which is the only warning that arrives in time.
       - alert: AccountLockoutRisk
         expr: enclave_faillock_users_with_failures > 0
-        for: 5m
         labels:
           severity: warning
         annotations:
@@ -1016,8 +1020,14 @@ groups:
   # rules are the first thing that will say a machine is behind.
   - name: enclave-patch
     rules:
+      # apt-check's "security" COUNT EXCLUDES ESM. Measured on host-4 2026-09-16: minutes
+      # after esm-apps was enabled, apt-check reported 3;0 - three updates, ZERO security -
+      # while 'pro security-status' reported 3 esm-apps security updates. This rule fired on
+      # apt-check's number alone and would have missed all three. ESM is where the universe
+      # packages get their only coverage, so it is exactly the stream that must not be
+      # invisible. A disjunction rather than a sum: each term keeps its own machine label.
       - alert: SecurityUpdatesPending
-        expr: enclave_updates_pending_security > 0
+        expr: enclave_updates_pending_security > 0 or enclave_updates_security_esm_apps > 0 or enclave_updates_security_esm_infra > 0
         for: 6h
         labels:
           severity: warning

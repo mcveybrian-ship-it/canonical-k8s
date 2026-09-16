@@ -470,7 +470,38 @@ cmd_progress() {
     fi
     printf '\n'
   done
-  [ "$any" -eq 1 ] || say "no backup job is running right now"
+  [ "$any" -eq 1 ] || say "no backup COPY job is running right now"
+
+  # A VERIFY IN PROGRESS IS ALSO PROGRESS. It used to be invisible here, so `progress`
+  # answered "nothing is running" while a 402 GB read was an hour from finishing.
+  if [ -r "$VERIFY_STATE" ]; then
+    local vstart vtotal vdev vbase now cur readb pct rate eta
+    vstart=""; vtotal=""; vdev=""; vbase=""
+    # shellcheck source=/dev/null
+    . "$VERIFY_STATE" 2>/dev/null || true
+    vstart="${start:-0}"; vtotal="${total:-0}"; vdev="${dev:-}"; vbase="${base:-0}"
+    now="$(date +%s)"
+    cur="$(awk -v x="$vdev" '$3==x {print $6+0; exit}' /proc/diskstats 2>/dev/null)"
+    readb=$(( ( ${cur:-0} - vbase ) * 512 ))
+    [ "$readb" -lt 0 ] && readb=0
+    printf '\n  VERIFY in progress\n'
+    printf '     read     %s of %s\n' "$(human "$readb")" "$(human "$vtotal")"
+    if [ "${vtotal:-0}" -gt 0 ]; then
+      pct=$(( readb * 100 / vtotal )); [ "$pct" -gt 100 ] && pct=100
+      printf '     complete %s%%\n' "$pct"
+    fi
+    local elapsed=$(( now - vstart ))
+    if [ "$elapsed" -gt 5 ] && [ "$readb" -gt 0 ]; then
+      rate=$(( readb / elapsed ))
+      printf '     rate     %s/s   elapsed %dm%02ds\n' "$(human "$rate")" $(( elapsed / 60 )) $(( elapsed % 60 ))
+      if [ "$rate" -gt 0 ] && [ "${vtotal:-0}" -gt "$readb" ]; then
+        eta=$(( (vtotal - readb) / rate ))
+        printf '     ETA      ~%dm%02ds  (about %s)\n' $(( eta / 60 )) $(( eta % 60 )) \
+          "$(date -d "+${eta} seconds" +%H:%M 2>/dev/null || echo '?')"
+      fi
+    fi
+    printf '\n'
+  fi
   if [ -n "$DEST" ] && mountpoint -q "$DEST" 2>/dev/null; then
     say "destination: $(df -h "$DEST" | tail -1 | awk '{print $3" used, "$4" free"}')"
   fi
@@ -481,12 +512,42 @@ cmd_progress() {
 }
 
 # ---------------------------------------------------------------- verify
+# WHERE THE PROGRESS STATE LIVES. /run, so it disappears on reboot and can never be mistaken
+# for a record of something that is still happening.
+VERIFY_STATE="${VERIFY_STATE:-/run/vm-backup-verify.state}"
+
 cmd_verify() {
   need_root; check_dest
+
+  # A ONE-HOUR OPERATION THAT PRINTS NOTHING IS INDISTINGUISHABLE FROM A HANG, and on
+  # 2026-09-16 that is exactly what happened - the operator asked twice whether it was stuck
+  # while it was reading 402 GB at 102 MB/s, and interrupted it once. Silence is not a
+  # neutral default; it is a defect in anything that runs longer than a person will wait.
+  #
+  # Two things fix it: a line per set as it starts, and a state file that `progress` can read
+  # from another shell to compute a percentage and an ETA.
+  local total dev base
+  total="$(du -sb "$DEST" 2>/dev/null | awk '{print $1+0}')"
+  dev="$(basename "$(readlink -f "$(findmnt -no SOURCE --target "$DEST" 2>/dev/null)" 2>/dev/null)" 2>/dev/null)"
+  base="$(awk -v x="$dev" '$3==x {print $6+0; exit}' /proc/diskstats 2>/dev/null)"
+  printf 'start=%s\ntotal=%s\ndev=%s\nbase=%s\n' \
+    "$(date +%s)" "${total:-0}" "${dev:-}" "${base:-0}" > "$VERIFY_STATE" 2>/dev/null || true
+  chmod 0644 "$VERIFY_STATE" 2>/dev/null || true
+  # Remove it however this exits, so `progress` never reports a verify that has finished.
+  trap 'rm -f "$VERIFY_STATE"' EXIT
+
+  say "verifying $(human "${total:-0}") across $(find "$DEST" -mindepth 2 -maxdepth 2 -type d 2>/dev/null | wc -l) set(s)"
+  say "  this re-reads every byte. Watch it from another shell with:  $0 progress"
+  say ""
+
   local bad=0 n=0 dir
   while IFS= read -r dir; do
     [ -f "$dir/INFO" ] || continue
     n=$((n + 1))
+    # THE LINE THAT WAS MISSING. Name the set before spending minutes on it.
+    printf '  [%d] %-38s %8s ' "$n" \
+      "$(basename "$(dirname "$dir")")/$(basename "$dir")" \
+      "$(du -sh "$dir" 2>/dev/null | cut -f1)"
     # `qemu-img check` IS THE WRONG TOOL FOR AN INCREMENTAL, and using it here reported every
     # healthy incremental as corrupt.
     #
@@ -528,10 +589,13 @@ cmd_verify() {
       esac
     done
     if [ -f "$dir/MANIFEST.sha256" ]; then
-      ( cd "$dir" && sha256sum -c --quiet MANIFEST.sha256 ) >/dev/null 2>&1 \
-        || { warn "checksum mismatch in $dir"; bad=1; }
+      if ( cd "$dir" && sha256sum -c --quiet MANIFEST.sha256 ) >/dev/null 2>&1; then
+        printf 'ok\n'
+      else
+        printf 'CHECKSUM MISMATCH\n'; bad=1
+      fi
     else
-      warn "no MANIFEST.sha256 in $dir"; bad=1
+      printf 'NO MANIFEST\n'; bad=1
     fi
   done < <(find "$DEST" -mindepth 2 -maxdepth 2 -type d | sort)
   printf '\n'

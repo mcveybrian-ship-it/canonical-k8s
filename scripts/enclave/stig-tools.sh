@@ -262,8 +262,14 @@ cmd_publish() {
 # --------------------------------------------------------------------------------- answers
 cmd_answers() {
   local target="${1:-}"
-  [ -n "$target" ] || die "usage: sudo $0 answers <address|hostname>
-       The Answer File goes point-to-point, to one named machine, over ssh."
+  # NO sudo ON THIS SIDE. The usage said "sudo $0 answers" and that is wrong: this reads the
+  # staged file and scps it as the operator, and the privileged half happens on the FAR side
+  # via ssh -t. Running it under sudo here changes $HOME to /root, so $SSH_KEY - which lives
+  # in the operator's ~/.ssh - is not found. Sent someone to run it on the target machine
+  # instead, 2026-09-16.
+  [ -n "$target" ] || die "usage: $0 answers <address|hostname>          # run this ON stage-01
+       The Answer File goes point-to-point FROM stage-01 TO one named machine, over ssh.
+       No sudo on this side; it asks for the sudo password on the target to install."
   [ -f "$ANSWERFILE" ] || die "no Answer File at $ANSWERFILE"
   target="$(resolve_target "$target")"
   # Say which key, and prove the host answers at all, BEFORE blaming authorisation. The

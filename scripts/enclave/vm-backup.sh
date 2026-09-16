@@ -814,12 +814,57 @@ VERIFY_SVC="enclave-vm-verify"
 # 04:00 leaves the nightly run at 02:00 finished long before. A parameter, not a constant.
 VERIFY_ONCALENDAR="${BACKUP_VERIFY_ONCALENDAR:-Sun *-*-* 04:00}"
 
+# THE SCHEDULE IS IN THE OPERATOR'S TIMEZONE, NOT THE MACHINE'S.
+#
+# Every machine in this enclave runs UTC, deliberately - audit timestamps and doc timestamps
+# are UTC and labelled. But "run the backup at 2am" means 2am where the person who has to
+# deal with it lives, and that is US Central. Writing 02:00 into the unit put the job at
+# 21:00 Central, in the middle of the working evening.
+#
+# The naive fix - write 07:00 UTC - is wrong twice a year. 02:00 Central is 07:00 UTC under
+# CDT and 08:00 UTC under CST, so a hardcoded offset silently moves the job by an hour every
+# March and November. systemd 252+ accepts a timezone IN the calendar spec and does the DST
+# arithmetic itself; verified on systemd 255:
+#
+#   *-*-* 02:00:00 America/Chicago   ->  Thu 2026-09-17 07:00:00 UTC
+#
+# So the spec carries the zone and systemd tracks the change. A parameter, because the next
+# enclave will not be in Central.
+BACKUP_TZ="${BACKUP_TZ:-America/Chicago}"
+
 cmd_schedule() {
   need_root; assert_hypervisor
   local at="${1:-02:00}"
   case "$at" in [0-2][0-9]:[0-5][0-9]) : ;; *) die "--at wants HH:MM, got '$at'" ;; esac
   [ -n "$DEST" ] || die "no destination set - fix BACKUP_DEST in vm-specs.env first"
   local self; self="$(readlink -f "$0")"
+
+  # ---- the schedule, in the operator's timezone, PROVEN BEFORE IT IS INSTALLED ----------
+  # A calendar spec systemd cannot parse produces a timer that never fires and reports no
+  # error at install. Ask systemd to normalise it first and print what it will actually do -
+  # in UTC, because that is what every log on this machine is stamped in.
+  [ -e "/usr/share/zoneinfo/$BACKUP_TZ" ] \
+    || die "BACKUP_TZ='$BACKUP_TZ' is not a zone on this machine.
+       list them with: timedatectl list-timezones"
+  local night_cal="*-*-* ${at}:00 ${BACKUP_TZ}"
+  local weekly_cal="${VERIFY_ONCALENDAR} ${BACKUP_TZ}"
+  case "$VERIFY_ONCALENDAR" in
+    *:*:*) weekly_cal="${VERIFY_ONCALENDAR} ${BACKUP_TZ}" ;;
+    *)     weekly_cal="${VERIFY_ONCALENDAR}:00 ${BACKUP_TZ}" ;;
+  esac
+  local cal out
+  for cal in "$night_cal" "$weekly_cal"; do
+    if ! out="$(systemd-analyze calendar "$cal" 2>&1)"; then
+      printf '%s\n' "$out" | sed 's/^/       /'
+      die "systemd will not accept the calendar spec '$cal' - nothing installed"
+    fi
+  done
+  say "schedule, as systemd reads it:"
+  printf '     nightly  %s\n' "$night_cal"
+  systemd-analyze calendar "$night_cal" 2>/dev/null | sed 's/^/       /'
+  printf '     weekly   %s\n' "$weekly_cal"
+  systemd-analyze calendar "$weekly_cal" 2>/dev/null | sed 's/^/       /'
+  say ""
 
   cat > "/etc/systemd/system/${SVC_NAME}.service" <<EOF
 [Unit]
@@ -848,10 +893,10 @@ EOF
 
   cat > "/etc/systemd/system/${SVC_NAME}.timer" <<EOF
 [Unit]
-Description=Nightly enclave VM backup at ${at}
+Description=Nightly enclave VM backup at ${at} ${BACKUP_TZ}
 
 [Timer]
-OnCalendar=*-*-* ${at}:00
+OnCalendar=${night_cal}
 # Persistent so a missed run (machine off, drive absent) happens at the next opportunity
 # rather than being skipped in silence.
 Persistent=true
@@ -884,7 +929,7 @@ EOF
 Description=Weekly deep verify of the VM backup volume
 
 [Timer]
-OnCalendar=${VERIFY_ONCALENDAR}
+OnCalendar=${weekly_cal}
 # A week is long enough that a missed run matters - catch it up rather than wait another.
 Persistent=true
 RandomizedDelaySec=5min
@@ -898,8 +943,8 @@ EOF
     || die "could not enable ${SVC_NAME}.timer"
   systemctl enable --now "${VERIFY_SVC}.timer" >/dev/null 2>&1 \
     || warn "could not enable ${VERIFY_SVC}.timer - the nightly backup still works, but"
-  ok "scheduled: ${SVC_NAME}.timer at ${at} daily -> ${DEST}"
-  ok "scheduled: ${VERIFY_SVC}.timer '${VERIFY_ONCALENDAR}' - deep verify, reads every byte"
+  ok "scheduled: ${SVC_NAME}.timer at ${at} ${BACKUP_TZ} daily -> ${DEST}"
+  ok "scheduled: ${VERIFY_SVC}.timer '${weekly_cal}' - deep verify, reads every byte"
   say ""
   say "   nightly: incr + verify (changed sets only) + prune   - minutes"
   say "   weekly : verify --all                                - reads the whole volume"

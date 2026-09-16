@@ -28,7 +28,7 @@ reason). ⚠️ **NR is 10, not the 9 predicted — and the tenth is not an answ
 | ~~**1**~~ | ✅ **DONE 2026-09-14.** AIDE exclusions applied on `svc-harbor-01` and `svc-mgmt-01`; both re-scanned clean of the timeout. Harbor: db 145,386 → 116,368 entries, scan 15m40s → 10m33s, **NR 10 → 9** | **And it uncovered something bigger.** Chasing the slow AIDE found that **log rotation had been broken enclave-wide since hardening**: fixup 3 sets `/var/log` to group `syslog`, and logrotate then refuses every file in the stanza without an `su` directive. `/var/log/messages` on `svc-mgmt-01` had reached **7.9 GB, never rotated**. Fixed on all five (`su root syslog`, every unrotated rsyslog destination added, `maxsize 100M`); forced rotation reclaimed **5 GB** immediately. Runbook **§6.3k.1** |
 | **2** | **Re-scan `svc-repo-01` and `host-4`** — one at a time, `stig-tools.sh collect` after each. ✅ `svc-mgmt-01` DONE 2026-09-14 16:59: **NF=169 O=6 NR=9 NA=10** | **NR=9 on three machines now — the answers are portable.** ⚠️ **Watch `V-270816` on each.** It is Open on `svc-mgmt-01` and Not a Finding on the other two, and that difference is REAL, not a scanner artefact: the check measures each machine's own audit growth. `svc-mgmt-01` holds ~2 hours of audit history against a seven-day requirement because MAAS invokes `machine-resources` through sudo ~1.7 times a second. **If `svc-repo-01` or `host-4` also come back Open on it, that is a third finding and not a repeat of the same one** |
 | **2a** | ⚠️ **ROOT CAUSE STILL OPEN: MAAS calls `machine-resources` ~1.7×/second on `svc-mgmt-01`** | 231,159 invocations in a 38-hour window, each one a sudo session and an audit record. It is what produced 5 GB/day of syslog and what makes `V-270816` fail there. All three MAAS services are `active` with **zero restarts**, so nothing is crash-looping — the cause is not yet known. Rotation now bounds the damage; it does not fix it |
-| **3** | **Re-audit `svc-harbor-01` and `svc-mgmt-01` on USG** — `stig-tailor.sh generate` then `audit` | Both still show **7** from before their GRUB password work, and both now also need the `file_groupowner_system_journal` deviation. **A stale number in a residual set is worse than no number** |
+| ~~**3**~~ | ✅ **DONE 2026-09-16.** Both re-audited: **harbor 210/6, mgmt 209/6**, and both land on the **identical six**. The seventh was the journal rule, not GRUB — GRUB was already closed. ⬜ **`host-4` still owes the same re-audit** (its 210/7 predates the deviation) |
 | **4** | The four *engineering* Not Reviewed: **V-270651** AIDE config integrity (needs the pristine `aide-common` .deb), **V-270747** data-at-rest write-up, **V-270719** PPSM, **V-270754** the ufw 443 decision | The other five NR are AO — open-questions **Q25/Q26** |
 | ~~**6**~~ | ✅ **DONE 2026-09-16.** Pushed to `origin` — 33 commits, working tree clean, 0 ahead. The pre-push guard held: none of the five private paths crossed |
 | **9** | **Apply `host-4`'s pending security update** — 1 security, 51 packages total, measured 2026-09-15 | Needs a maintenance window: rebooting the hypervisor takes all four guests. It is the only machine in the enclave with anything pending, and the first patch finding this enclave has produced on its own |
@@ -47,13 +47,38 @@ TLS'd, hardened (**211/5**), scanned (**4 Open, 9 NR**) and collecting audit-vol
 
 **ALL FIVE MACHINES ARE HARDENED — 2026-09-14.** `svc-obs-01` joined on 2026-09-14.
 
-| machine | USG | V1R6 Open |
-|---|---|---|
-| `host-4` | 210 / 7 | **4** |
-| `svc-harbor-01` | 210 / 7 ⚠️ stale | **5** |
-| `svc-mgmt-01` | 209 / 7 ⚠️ stale | **5** |
-| `svc-repo-01` | **212 / 5** | **4** |
-| `svc-obs-01` | **211 / 5** | **4** + 9 NR |
+| machine | USG pass / fail | V1R6 Open | measured |
+|---|---|---|---|
+| `host-4` | 210 / 7 ⚠️ **stale — predates the journal deviation** | **4** ⚠️ stale | 2026-09-11 |
+| `svc-harbor-01` | **210 / 6** | **5** | USG 2026-09-16 |
+| `svc-mgmt-01` | **209 / 6** | **6** | USG 2026-09-16 |
+| `svc-repo-01` | **212 / 5** | **5** | V1R6 2026-09-16 |
+| `svc-obs-01` | **211 / 5** | **4** + 9 NR | 2026-09-14 |
+
+**THE RESIDUAL SET IS SIX, NOT SEVEN — corrected 2026-09-16.** `svc-harbor-01` and
+`svc-mgmt-01` were re-audited and both landed on the **identical six**:
+
+```
+encrypt_partitions   check_ufw_active   ufw_rate_limit
+service_sssd_enabled  sssd_enable_user_cert   auditd_offload_logs
+```
+
+⚠️ **The seventh was never `grub2_uefi_password`.** The working list assumed both machines'
+numbers predated their GRUB work and would drop for that reason. They did drop — but the
+arithmetic says otherwise: **fail fell by one, notselected rose by one, and pass never moved.**
+A rule went `fail → notselected`, which is the `file_groupowner_system_journal` deviation
+being applied. GRUB was already closed on both. **The seventh finding was the journal rule,
+failing.**
+
+So the enclave's USG residual is now:
+
+| | set |
+|---|---|
+| **core five, everywhere** | `encrypt_partitions`, `ufw_rate_limit`, `service_sssd_enabled`, `sssd_enable_user_cert`, `auditd_offload_logs` |
+| **+ `check_ufw_active`** | on the three machines where ufw cannot enforce — `svc-harbor-01` (docker-proxy DNATs past ufw's INPUT chain), `svc-mgmt-01` (no rule table), `host-4` (bridges guest traffic) |
+
+**All five are policy decisions with written rationales. None is a defect.** `host-4` is the
+only machine not yet re-audited against the journal deviation and should land on six.
 
 `svc-obs-01`'s five are `svc-repo-01`'s five exactly. The one-pass difference between them is
 `file_groupowner_system_journal` moving from `pass` to `notselected` — it is deselected

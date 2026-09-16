@@ -1643,14 +1643,26 @@ After=network.target
 Type=oneshot
 ExecStart=$HERE/monitoring.sh facts
 UNIT
+  # CALENDAR, NOT MONOTONIC CHAINING.
+  #
+  # This was OnBootSec=3min + OnUnitActiveSec=15min. On host-4, 2026-09-16, the first reboot
+  # since build left the timer with NO NEXT ELAPSE AT ALL: OnBootSec fired once and
+  # OnUnitActiveSec never re-armed, so the machine silently stopped publishing every
+  # compliance fact while the timer still reported `active`. The other four machines, which
+  # had not rebooted, were chaining normally - so the fault only appears after a reboot,
+  # which is exactly when nobody is looking at the metrics.
+  #
+  # OnCalendar is absolute: it cannot lose its place, a reload or a reboot does not change
+  # when it next runs, and Persistent=true (which is meaningful for calendar timers, unlike
+  # monotonic ones) makes it catch up a run missed while the machine was down.
   cat > /etc/systemd/system/enclave-facts.timer <<'UNIT'
 [Unit]
 Description=Refresh enclave compliance facts every 15 minutes
 
 [Timer]
-OnBootSec=3min
-OnUnitActiveSec=15min
+OnCalendar=*:0/15
 AccuracySec=1min
+RandomizedDelaySec=30
 Persistent=true
 
 [Install]

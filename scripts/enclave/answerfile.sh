@@ -74,7 +74,7 @@ V-278917	UBTU-24-700400	the release IS vendor supported - 24.04 LTS with an unex
 V-270748	UBTU-24-600130	the sudo group holds only the enclave administrator account(s) named in AF_ADMINS; the scanner cannot judge "who needs access" and leaves it NR	NR
 V-270816	UBTU-24-900920	the audit allocation holds far more than one week at the MEASURED growth rate, and free space exceeds the whole allocation	NR
 V-270694	UBTU-24-200680	/etc/profile.d/ssh_confirm.sh IS present and prompts for acknowledgement; the scanner cannot read a script and decide, so it leaves it NR	NR
-V-270682	UBTU-24-200250	there are NO temporary accounts on any enclave machine - every interactive account is a permanent named administrator	NR
+V-270682	UBTU-24-200250	there are NO temporary accounts on any enclave machine - every interactive account, meaning UID >= 1000 with a real login shell, is a permanent named administrator. Service accounts such as libvirt-qemu hold nologin and are not interactive	NR
 EOF
 }
 
@@ -293,8 +293,16 @@ $V = @{ Valid = $false; Results = "" }
 $approved = @(__AF_ADMINS__)
 # DISA asks for the expiry on each TEMPORARY account. The prior question is which accounts
 # are temporary at all - so enumerate every interactive account and show the set.
+# AN INTERACTIVE ACCOUNT IS DEFINED BY ITS LOGIN SHELL, NOT BY ITS UID.
+# The first version tested UID >= 1000 alone. On host-4 that caught `libvirt-qemu`, which
+# Debian allocates UID 64055 with /usr/sbin/nologin - a service account QEMU runs as, and the
+# only machine it exists on is the hypervisor. The control went Open on 2026-09-16 naming it
+# as an unapproved interactive account. It is not an account anybody can log in to.
+#
+# The upper bound excludes nobody (65534) by number rather than by name, so a system that
+# names it differently is still handled.
 $probe = @'
-awk -F: '$3>=1000 && $1!="nobody" {print $1}' /etc/passwd
+awk -F: '$3>=1000 && $3<65534 && $7 !~ /(nologin|false|sync)$/ {print $1}' /etc/passwd
 '@
 $accts = @(bash -c $probe) | Where-Object { $_ -ne "" }
 $unexpected = @($accts | Where-Object { $approved -notcontains $_ })
@@ -302,10 +310,10 @@ if ($unexpected.Count -eq 0) {
     $rows = @()
     foreach ($a in $accts) { $rows += ($a + ": " + ((bash -c "chage -l $a 2>/dev/null | grep -i 'account expires'") -join "")) }
     $V.Valid = $true
-    $V.Results = "NOT APPLICABLE AS WRITTEN - there are no temporary accounts on this system. Every interactive account (UID >= 1000) was enumerated at scan time and the full set is: " + ($accts -join ", ") + ". Each is a permanent, named enclave administrator account on the approved list held in AF_ADMINS, provisioned for the life of the system and not as a temporary or emergency account, so the 72-hour expiry requirement has nothing to apply to. Reported expiry for each, for completeness: " + ($rows -join " | ") + ". This answer re-evaluates on every scan: provisioning any account outside the approved list re-opens the control, at which point that account's expiry must be set within 72 hours or it must be documented."
+    $V.Results = "NOT APPLICABLE AS WRITTEN - there are no temporary accounts on this system. Every interactive account - UID >= 1000, below 65534, and holding a real login shell rather than nologin/false - was enumerated at scan time and the full set is: " + ($accts -join ", ") + ". Each is a permanent, named enclave administrator account on the approved list held in AF_ADMINS, provisioned for the life of the system and not as a temporary or emergency account, so the 72-hour expiry requirement has nothing to apply to. Reported expiry for each, for completeness: " + ($rows -join " | ") + ". This answer re-evaluates on every scan: provisioning any account outside the approved list re-opens the control, at which point that account's expiry must be set within 72 hours or it must be documented."
 }
 else {
-    $V.Results = "OPEN. Interactive account(s) exist that are not on the approved permanent-administrator list: " + ($unexpected -join ", ") + ". Full set of UID >= 1000 accounts: " + ($accts -join ", ") + ". Each unexpected account must either be documented as permanent or carry an expiry within 72 hours."
+    $V.Results = "OPEN. Interactive account(s) exist that are not on the approved permanent-administrator list: " + ($unexpected -join ", ") + ". Full set of interactive accounts (UID >= 1000, below 65534, with a real login shell): " + ($accts -join ", ") + ". Each unexpected account must either be documented as permanent or carry an expiry within 72 hours."
 }
 return $V
 EOF

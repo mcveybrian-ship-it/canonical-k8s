@@ -74,6 +74,7 @@ V-278917	UBTU-24-700400	the release IS vendor supported - 24.04 LTS with an unex
 V-270748	UBTU-24-600130	the sudo group holds only the enclave administrator account(s) named in AF_ADMINS; the scanner cannot judge "who needs access" and leaves it NR	NR
 V-270816	UBTU-24-900920	the audit allocation holds far more than one week at the MEASURED growth rate, and free space exceeds the whole allocation	NR
 V-270694	UBTU-24-200680	/etc/profile.d/ssh_confirm.sh IS present and prompts for acknowledgement; the scanner cannot read a script and decide, so it leaves it NR	NR
+V-270817	UBTU-24-900930	no cron.weekly script offloads the audit trail, because audit offload is not implemented in this enclave yet - the scanner finds man-db in cron.weekly and cannot decide, leaving NR where every other machine is honestly Open	NR
 V-270682	UBTU-24-200250	there are NO temporary accounts on any enclave machine - every interactive account, meaning UID >= 1000 with a real login shell, is a permanent named administrator. Service accounts such as libvirt-qemu hold nologin and are not interactive	NR
 EOF
 }
@@ -284,6 +285,42 @@ if ($body -ne "" -and $hasSsh -and $hasPrompt -and $hasBanner -and $hasDeny) {
 }
 else {
     $V.Results = "OPEN. " + $f + " is missing or does not enforce acknowledgement. Present: " + ($body -ne "") + ", gates on SSH_CLIENT/SSH_TTY: " + $hasSsh + ", prompts with read -p: " + $hasPrompt + ", carries the DOD notice text: " + $hasBanner + ", terminates on refusal: " + $hasDeny + ". Displaying the banner via sshd's Banner directive is NOT sufficient for this control - it requires acknowledgement."
+}
+return $V
+EOF
+  ;;
+  V-270817) cat <<'EOF'
+$V = @{ Valid = $false; Results = "" }
+# THIS ANSWER EXISTS TO TURN "NOBODY LOOKED" INTO "WE LOOKED, AND IT IS OPEN".
+#
+# DISA wants a weekly cron job that off-loads audit records to external media. This enclave
+# does not do that yet - auditd_offload_logs is an open finding on every machine and the
+# destination is an AO decision, not an engineering one. Every machine except host-4 reports
+# this control Open, which is correct. host-4 alone comes back NOT REVIEWED because it has a
+# script in /etc/cron.weekly (man-db) and the scanner cannot tell whether that script offloads
+# audit logs, so it declines to decide.
+#
+# NR is the one status that means nothing. This makes host-4 agree with the rest of the
+# enclave, and the answer re-evaluates: the day a real offload job is installed, the check
+# finds it and the control closes on its own.
+# LABELLED LINES, NOT POSITIONAL ONES. The first version separated the two answers with a
+# bare "|" line and then read $out[1] - which is the separator, not the value. There is no
+# pwsh on stage-01 to run this against, so the parsing has to be right by construction:
+# each line names itself and is selected by its own prefix.
+$probe = @'
+printf 'SCRIPTS:%s\n' "$(ls -1 /etc/cron.weekly/ 2>/dev/null | tr '\n' ' ')"
+printf 'HITS:%s\n' "$(grep -rlE '/var/log/audit|auditd|aureport|ausearch|audisp' /etc/cron.weekly/ /etc/cron.d/ /etc/cron.daily/ 2>/dev/null | tr '\n' ' ')"
+'@
+$out = @(bash -c $probe)
+$scripts = ((($out | Where-Object { $_ -like 'SCRIPTS:*' }) -join '') -replace '^SCRIPTS:','').Trim()
+$hits    = ((($out | Where-Object { $_ -like 'HITS:*' })    -join '') -replace '^HITS:','').Trim()
+
+if ($hits -ne "") {
+    $V.Valid = $true
+    $V.Results = "NOT A FINDING - a scheduled job referencing the audit trail is present: " + $hits + ". Scripts in /etc/cron.weekly at scan time: " + $scripts + ". Verify that this job off-loads records to media outside this system before accepting it as sufficient."
+}
+else {
+    $V.Results = "OPEN, and known. No job under /etc/cron.weekly, /etc/cron.daily or /etc/cron.d references the audit trail. Scripts present in /etc/cron.weekly are: " + $scripts + " - these are stock Ubuntu maintenance jobs (man-db rebuilds the manual page index) and have nothing to do with auditing. THE SCANNER LEFT THIS NOT REVIEWED because it found a script there and could not tell what it does; that is the only reason this machine differed from the rest of the enclave, where the same control is already Open. Audit off-load is not implemented anywhere in this enclave: auditd_offload_logs is open on all five machines and the destination is an outstanding AO decision, not an engineering gap. This answer re-evaluates on every scan and closes the control by itself once a real off-load job exists."
 }
 return $V
 EOF

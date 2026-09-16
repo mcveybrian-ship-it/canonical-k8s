@@ -111,6 +111,14 @@ case "$ENCRYPT_DISKS" in
   *) die "ENCRYPT_DISKS must be true or false, got '$ENCRYPT_DISKS'" ;;
 esac
 
+# HOW the volume unlocks, recorded now and acted on after first boot. Validated here so a
+# typo is caught while building the stick rather than discovered at a console in a rack.
+LUKS_UNLOCK="${LUKS_UNLOCK:-passphrase}"
+case "$LUKS_UNLOCK" in
+  passphrase|tpm2) : ;;
+  *) die "LUKS_UNLOCK must be passphrase or tpm2, got '$LUKS_UNLOCK'" ;;
+esac
+
 if [[ "$ENCRYPT_DISKS" == "true" ]]; then
   [[ -n "${LUKS_PASSPHRASE:-}" ]] || die "ENCRYPT_DISKS=true but LUKS_PASSPHRASE is unset in $PARAMS"
   [[ "$LUKS_PASSPHRASE" != *REPLACE-ME* ]] || die "LUKS_PASSPHRASE still holds a placeholder"
@@ -209,6 +217,7 @@ else
 fi
 content="${content//@@CONSOLE_CMDLINE@@/$CONSOLE_CMDLINE}"
 content="${content//@@KEYFILE_LATECMD@@/$(esc "$KEYFILE_LATECMD")}"
+content="${content//@@LUKS_UNLOCK@@/$LUKS_UNLOCK}"
 content="${content//@@OS_DISK_MATCH@@/$(esc "$OS_DISK_MATCH")}"
 content="${content//@@DATA_DISK_MATCH@@/$(esc "$DATA_DISK_MATCH")}"
 content="${content//@@PREFIX@@/$PREFIX}"

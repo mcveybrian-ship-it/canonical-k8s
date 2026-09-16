@@ -372,6 +372,7 @@ autoinstall:
       gateway=@@GATEWAY_RECORD@@
       built_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
       iso=ubuntu-24.04-live-server-amd64.iso
+      luks_unlock=@@LUKS_UNLOCK@@
       hardened=no
       pro_attached=no
       EOF

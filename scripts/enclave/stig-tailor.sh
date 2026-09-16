@@ -2636,6 +2636,133 @@ cmd_ufw() {
   say "   from off-box is a firewall you are guessing about."
 }
 
+# ------------------------------------------------------------------------- luksenroll
+# ENROL THE TPM SO THE HOST UNLOCKS WITHOUT A HUMAN - keeping the passphrase as a fallback.
+#
+# Why this is a separate step and not part of the install: sealing binds the key to the boot
+# chain's PCR measurements, and curtin runs in the INSTALLER's boot state. Sealing there would
+# bind to a measurement the installed system never reproduces, and the host would never unlock.
+# The installer records the CHOICE in /etc/enclave-build-info; this acts on it after first boot.
+#
+# WHAT THIS IS NOT: it is not a compliance change. Verified 2026-09-16 against the full DISA
+# V1R6 checklist - zero of 194 controls mention TPM, and V-270747 checks only that every
+# persistent partition has a crypttab entry, not how the key is supplied. The volume stays
+# LUKS and every encryption control evaluates identically. This is a RISK decision (Q20):
+# passphrase is two factors, disk AND a human; TPM is one, disk AND this motherboard. It
+# defeats a stolen drive and does not defeat a stolen chassis.
+#
+# PCR 7 ONLY, and that is the load-bearing choice. PCR 11 covers the kernel and initrd and
+# would be stronger, but it CHANGES ON EVERY KERNEL UPDATE - and this enclave takes FIPS
+# kernel updates. Sealing to 11 turns "always needs a human" into "needs a human
+# unpredictably, after a patch, at 02:00", which is worse than what it replaced.
+cmd_luksenroll() {
+  need_root
+  local force=0 dev slot_count
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --force) force=1; shift ;;
+      *) die "unknown argument: $1" ;;
+    esac
+  done
+
+  # ---- 1. a TPM has to exist, and be the right version --------------------------------
+  [ -c /dev/tpmrm0 ] || die "no /dev/tpmrm0 - this machine has no usable TPM.
+       Guests do not have one; this runs on physical hosts only."
+  local tv; tv="$(cat /sys/class/tpm/tpm0/tpm_version_major 2>/dev/null || echo '?')"
+  [ "$tv" = 2 ] || die "TPM reports version '$tv' - systemd-cryptenroll needs TPM 2.0."
+  command -v systemd-cryptenroll >/dev/null 2>&1 || die "systemd-cryptenroll not present"
+  ok "TPM 2.0 present at /dev/tpmrm0, systemd-cryptenroll available"
+
+  # ---- 2. was this asked for at build time? -------------------------------------------
+  # The installer wrote the operator's choice. Honour it rather than guessing, and refuse
+  # to silently change the security posture of a host built to be unlocked by a human.
+  local want; want="$(awk -F= '/^luks_unlock=/{print $2}' /etc/enclave-build-info 2>/dev/null)"
+  case "${want:-}" in
+    tpm2) ok "the build recorded luks_unlock=tpm2" ;;
+    passphrase)
+      if [ "$force" -eq 0 ]; then
+        die "this host was built with luks_unlock=passphrase.
+       Enrolling the TPM changes its security posture from two factors to one - see Q20.
+       If that is a deliberate decision, re-run with --force and record it."
+      fi
+      warn "build recorded 'passphrase'; proceeding because --force was given" ;;
+    "") warn "/etc/enclave-build-info has no luks_unlock line - built before the parameter existed" ;;
+    *)  warn "unrecognised luks_unlock='$want' - treating as unset" ;;
+  esac
+
+  # ---- 3. which device holds the OS volume --------------------------------------------
+  # From crypttab, not from a guess. The name is whatever the installer chose.
+  local cname cuuid
+  while read -r cname cuuid _rest; do
+    case "$cname" in ''|\#*) continue ;; esac
+    case "$cuuid" in
+      UUID=*) : ;;
+      *) continue ;;
+    esac
+    # The OS volume is the one WITHOUT a keyfile - the data volume already has one.
+    local keyfield; keyfield="$(awk -v n="$cname" '$1==n{print $3}' /etc/crypttab)"
+    if [ "$keyfield" = none ]; then dev="/dev/disk/by-uuid/${cuuid#UUID=}"; break; fi
+  done < /etc/crypttab
+  [ -n "${dev:-}" ] || die "no crypttab entry with key 'none' - nothing here prompts for a
+       passphrase, so there is nothing to enrol. Check /etc/crypttab."
+  [ -b "$dev" ] || die "$dev is not a block device"
+  ok "OS volume: $cname -> $(readlink -f "$dev")"
+
+  # ---- 4. REFUSE TO LEAVE NO WAY IN ---------------------------------------------------
+  # This is the guard that makes the whole thing safe to try. cryptenroll adds a slot; the
+  # passphrase slot stays unless someone explicitly wipes it. Confirm a passphrase slot
+  # exists FIRST, so the worst case is "it prompts like it does today" and never "bricked".
+  slot_count="$(cryptsetup luksDump "$dev" 2>/dev/null | grep -cE '^[[:space:]]+[0-9]+: luks2')"
+  if [ "${slot_count:-0}" -lt 1 ]; then
+    die "cannot see a usable key slot on $dev - refusing to touch it.
+       Check: cryptsetup luksDump $dev"
+  fi
+  ok "$slot_count existing key slot(s) - the passphrase fallback survives this"
+  if cryptsetup luksDump "$dev" 2>/dev/null | grep -qi 'systemd-tpm2'; then
+    ok "a TPM token is ALREADY enrolled on this volume - nothing to do"
+    say "   to re-seal after a firmware change:  systemd-cryptenroll --wipe-slot=tpm2 $dev"
+    return 0
+  fi
+
+  # ---- 5. enrol -----------------------------------------------------------------------
+  say ""
+  say "enrolling against PCR 7 (secure boot state) - you will be asked for the EXISTING"
+  say "passphrase once, to unlock the volume so a new slot can be added:"
+  systemd-cryptenroll --tpm2-device=auto --tpm2-pcrs=7 "$dev" \
+    || die "enrolment failed - nothing changed, the passphrase still works"
+
+  # ---- 6. tell crypttab to try the TPM ------------------------------------------------
+  cp -a /etc/crypttab "/var/backups/crypttab.$(date +%Y%m%dT%H%M%S)"
+  if awk -v n="$cname" '$1==n' /etc/crypttab | grep -q 'tpm2-device='; then
+    ok "crypttab already names a tpm2-device for $cname"
+  else
+    # awk, not sed: the options field is comma-separated and the paths contain slashes.
+    local ct; ct="$(mktemp)"
+    awk -v n="$cname" '
+      $1==n {
+        if (NF >= 4) { $4 = $4 ",tpm2-device=auto" } else { $4 = "tpm2-device=auto" }
+        print; next
+      }
+      { print }' /etc/crypttab > "$ct"
+    cat "$ct" > /etc/crypttab; rm -f "$ct"
+    ok "crypttab: $cname now tries tpm2-device=auto first"
+  fi
+  update-initramfs -u >/dev/null 2>&1 && ok "initramfs rebuilt" \
+    || warn "update-initramfs failed - the TPM will not be tried at boot until it succeeds"
+
+  # ---- 7. say what is and is not proven ------------------------------------------------
+  say ""
+  cryptsetup luksDump "$dev" 2>/dev/null | grep -iE 'tokens|systemd-tpm2|tpm2-pcrs' | sed 's/^/     /'
+  say ""
+  warn "A REBOOT IS THE ONLY REAL TEST, and nothing here proves it yet."
+  say  "  If the seal is wrong the host falls back to prompting for the passphrase - the"
+  say  "  behaviour it had before this ran - so the failure mode is the status quo."
+  say  "  On a hypervisor, schedule it: rebooting takes every guest with it."
+  say ""
+  say  "  to undo:  sudo systemd-cryptenroll --wipe-slot=tpm2 $dev"
+  say  "            then remove tpm2-device=auto from /etc/crypttab and update-initramfs -u"
+}
+
 case "${1:-}" in
   generate) shift; cmd_generate "$@" ;;
   fixups)   shift; cmd_fixups "$@" ;;
@@ -2645,7 +2772,8 @@ case "${1:-}" in
   aide)     shift; cmd_aide "$@" ;;
   v1r6)     shift; cmd_v1r6 "$@" ;;
   grubpw)   shift; cmd_grubpw "$@" ;;
+  luksenroll) shift; cmd_luksenroll "$@" ;;
   audit)    shift; cmd_audit "$@" ;;
   show)     shift; cmd_show "$@" ;;
-  *) printf 'usage: %s {generate|audit|show|preflight|aide {status|exclude [--apply]|init}|v1r6 [--apply|--verify]|grubpw {status|prep|set}|fixups [...]|ufw [--apply]|usb {status|enable|disable}}\n' "$0" >&2; exit 2 ;;
+  *) printf 'usage: %s {generate|audit|show|preflight|aide {status|exclude [--apply]|init}|v1r6 [--apply|--verify]|grubpw {status|prep|set}|luksenroll [--force]|fixups [...]|ufw [--apply]|usb {status|enable|disable}}\n' "$0" >&2; exit 2 ;;
 esac

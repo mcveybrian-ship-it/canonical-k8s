@@ -2813,8 +2813,45 @@ cmd_luksenroll() {
     cat "$ct" > /etc/crypttab; rm -f "$ct"
     ok "crypttab: $cname now tries tpm2-device=auto first"
   fi
-  update-initramfs -u >/dev/null 2>&1 && ok "initramfs rebuilt" \
-    || warn "update-initramfs failed - the TPM will not be tried at boot until it succeeds"
+  # NAME THE KERNEL. `update-initramfs -u` targets the NEWEST initramfs, which is not
+  # necessarily the one this machine is running - on a host carrying both a generic and a
+  # -fips kernel it can rebuild the wrong one, report success, and leave the running kernel's
+  # initrd untouched. Measured on host-4 2026-09-16: the script said "initramfs rebuilt" while
+  # /boot/initrd.img-6.8.0-138-fips was still hours old.
+  local kver; kver="$(uname -r)"
+  local initrd="/boot/initrd.img-$kver"
+  local before; before="$(stat -c %Y "$initrd" 2>/dev/null || echo 0)"
+  if update-initramfs -u -k "$kver" >/dev/null 2>&1; then
+    local after; after="$(stat -c %Y "$initrd" 2>/dev/null || echo 0)"
+    if [ "$after" -gt "$before" ]; then
+      ok "initramfs rebuilt for $kver"
+    else
+      warn "update-initramfs reported success but $initrd DID NOT CHANGE."
+      warn "  the TPM will not be tried at boot. Check: update-initramfs -u -k $kver"
+    fi
+  else
+    warn "update-initramfs failed - the TPM will not be tried at boot until it succeeds"
+  fi
+
+  # AND CONFIRM THE STACK IS ACTUALLY IN THERE. The unlock happens in the initramfs, not in
+  # the booted system - the library installed above is of no use to the boot path unless the
+  # initramfs carries it too. A rebuild that omits it succeeds silently and the host simply
+  # falls back to the passphrase, which looks like a wrong PCR seal and is not.
+  if command -v lsinitramfs >/dev/null 2>&1; then
+    local inside; inside="$(lsinitramfs "$initrd" 2>/dev/null | grep -cE 'libtss2-(rc|esys|mu)' || true)"
+    case "$inside" in ''|*[!0-9]*) inside=0 ;; esac
+    if [ "$inside" -gt 0 ]; then
+      ok "initramfs carries the TPM2 libraries ($inside file(s))"
+    else
+      warn "THE INITRAMFS DOES NOT CARRY THE TPM2 LIBRARIES - the boot unlock cannot work."
+      warn "  The host will fall back to the passphrase, which is safe but is NOT the TPM"
+      warn "  failing a PCR check. Ubuntu's cryptsetup initramfs hook includes them only when"
+      warn "  it sees a tpm2-device= entry in /etc/crypttab at build time, so the order is:"
+      warn "  crypttab first, THEN update-initramfs. Re-run this subcommand."
+    fi
+  else
+    warn "lsinitramfs not present - cannot confirm the initramfs carries the TPM2 stack"
+  fi
 
   # ---- 7. say what is and is not proven ------------------------------------------------
   say ""

@@ -487,12 +487,45 @@ cmd_verify() {
   while IFS= read -r dir; do
     [ -f "$dir/INFO" ] || continue
     n=$((n + 1))
-    local f
+    # `qemu-img check` IS THE WRONG TOOL FOR AN INCREMENTAL, and using it here reported every
+    # healthy incremental as corrupt.
+    #
+    # A push-mode incremental qcow2 carries a BACKING FILE reference to the LIVE guest disk.
+    # `check` opens the whole chain, the running VM holds a lock on that disk, and the open
+    # fails - so the check fails for a reason that has nothing to do with the backup:
+    #
+    #   Could not open backing file: Failed to get shared "write" lock
+    #   Is another process using the image [/var/lib/libvirt/images/svc-harbor-01.qcow2]?
+    #
+    # Measured 2026-09-16: BOTH of svc-harbor-01's incrementals failed identically while
+    # their manifests verified clean. An alert that fires on every healthy run is worse than
+    # no alert, because it is the run where something IS wrong that gets ignored.
+    #
+    # So: `qemu-img info` on everything - it reads the header without opening the backing
+    # chain, which is exactly the structural question worth asking. `qemu-img check` only
+    # where there is no backing file to open, which means fulls. And the MANIFEST is the
+    # real integrity statement either way: it hashes the bytes that actually arrived.
+    local f info
     for f in "$dir"/*.qcow2; do
       [ -e "$f" ] || continue
-      if qemu-img check -q "$f" >/dev/null 2>&1; then :; else
-        warn "CORRUPT or unreadable: $f"; bad=1
+      if ! info="$(qemu-img info "$f" 2>&1)"; then
+        warn "UNREADABLE (qcow2 header will not parse): $f"
+        printf '%s\n' "$info" | sed 's/^/       /'
+        bad=1
+        continue
       fi
+      case "$info" in
+        *"backing file:"*)
+          # An incremental. Its structure parsed; the manifest below is the integrity check.
+          : ;;
+        *)
+          # A full, with no chain to open - check is meaningful and cheap here.
+          if ! qemu-img check -q "$f" >/dev/null 2>&1; then
+            warn "CORRUPT: $f"
+            qemu-img check "$f" 2>&1 | head -4 | sed 's/^/       /'
+            bad=1
+          fi ;;
+      esac
     done
     if [ -f "$dir/MANIFEST.sha256" ]; then
       ( cd "$dir" && sha256sum -c --quiet MANIFEST.sha256 ) >/dev/null 2>&1 \
@@ -503,8 +536,13 @@ cmd_verify() {
   done < <(find "$DEST" -mindepth 2 -maxdepth 2 -type d | sort)
   printf '\n'
   # SAY THE COUNT. "all backups verified" reads the same whether it checked forty or zero.
-  [ "$bad" -eq 0 ] && ok "verified $n backup set(s) - images readable, checksums match" \
-                   || warn "verified $n set(s), PROBLEMS FOUND - see above"
+  if [ "$bad" -eq 0 ]; then
+    ok "verified $n backup set(s) - every qcow2 header parses and every manifest matches"
+    say "   fulls additionally passed qemu-img check. Incrementals are NOT check-ed: they"
+    say "   reference the live guest disk, which is locked, so the manifest is the statement."
+  else
+    warn "verified $n set(s), PROBLEMS FOUND - see above"
+  fi
   return "$bad"
 }
 

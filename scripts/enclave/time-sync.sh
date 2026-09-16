@@ -80,6 +80,41 @@ install_chrony() {
   install -d -m 0755 /etc/chrony/conf.d
   grep -q '^confdir\|^include /etc/chrony/conf.d' "$CONF" 2>/dev/null \
     || echo 'confdir /etc/chrony/conf.d' >> "$CONF"
+
+  # THE STOCK PUBLIC POOLS CAN NEVER RESOLVE IN HERE, AND LEAVING THEM IS NOT HARMLESS.
+  #
+  # Ubuntu ships chrony.conf with `pool ntp.ubuntu.com` and three `*.ubuntu.pool.ntp.org`
+  # entries. Inside the boundary they are dead - no DNS, no route - so they contribute
+  # nothing. What they DO is misrepresent the machine: a config naming four public internet
+  # time servers is the first thing an assessor asks about on an air-gapped host, and on the
+  # time master (which has no other server line at all) they are the only directives present,
+  # so the machine looks configured to sync from the internet while actually serving from its
+  # own clock.
+  #
+  # Commented, not deleted - the original stays visible and the change is self-describing.
+  # Only $CONF is touched; the enclave's own directives live in conf.d and are never matched.
+  local n
+  n="$(grep -cE '^[[:space:]]*(server|pool)[[:space:]]' "$CONF" 2>/dev/null || echo 0)"
+  if [ "${n:-0}" -gt 0 ]; then
+    cp -a "$CONF" "/var/backups/chrony.conf.$(date +%Y%m%dT%H%M%S)"
+    # awk, NOT sed. The pattern contains '|' and every sed delimiter worth using appears
+    # either in the pattern or in the replacement text - the same trap that broke the
+    # node-exporter ARGS line on 2026-09-15. awk has no delimiter to collide with.
+    # NEVER COMMENT A LINE THAT NAMES THE ENCLAVE'S OWN TIME MASTER. The enclave directives
+    # live in conf.d today, so nothing here should match one - but a client with
+    # `server <master>` written into chrony.conf by hand would otherwise be silently cut off
+    # from time, and a script that can do that is not one to leave unguarded.
+    local ct; ct="$(mktemp)"
+    awk -v m="$MASTER" -v mn="$MASTER_NAME" '
+      {
+        if ($0 ~ /^[[:space:]]*(server|pool)[[:space:]]/ \
+            && index($0, m) == 0 && (mn == "" || index($0, mn) == 0))
+          print "# disabled by time-sync.sh - unreachable inside the boundary: " $0
+        else print $0
+      }' "$CONF" > "$ct"
+    cat "$ct" > "$CONF"; rm -f "$ct"
+    ok "commented out $n stock time source(s) in $CONF - they cannot resolve in the gap"
+  fi
 }
 
 # ---------------------------------------------------------------------------- master

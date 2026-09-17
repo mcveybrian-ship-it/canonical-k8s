@@ -1430,7 +1430,7 @@ EOF
 
 # ------------------------------------------------------------------------------- radio
 #
-# V-270755 / UBTU-24-600310 - "must disable all wireless network adapters", AND the Bluetooth
+# V-270755 / UBTU-24-600230 - "must disable all wireless network adapters", AND the Bluetooth
 # radio that the benchmark never mentions at all.
 #
 # THESE MACHINES HAVE RADIOS. Measured 2026-09-17, all four:
@@ -1479,6 +1479,61 @@ EOF
 # no network and no remote console - a drive to the rack. So every module backing an interface
 # that holds an address or feeds a bridge is PROTECTED, and if discovery ever lands on one of
 # those, this refuses and changes nothing rather than guessing.
+# ONE IMPLEMENTATION OF "REBUILD THE INITRAMFS, AND PROVE IT".
+#
+# `update-initramfs -u` targets the NEWEST initramfs by version sort. On these FIPS hosts that
+# is the **-generic** kernel they do not boot, so it rebuilds the wrong one, reports success,
+# and leaves the running kernel's initrd untouched. Measured TWICE:
+#
+#   2026-09-16  cmd_luksenroll, host-4 - "initramfs rebuilt" while initrd.img-6.8.0-138-fips
+#               was still hours old. Fixed there by naming the kernel.
+#   2026-09-17  `radio disable`, ALL FOUR hosts - 99-stig-radio.conf landed in
+#               initrd.img-6.8.0-138-generic (mtime 23:21:55) while the running -fips initrd
+#               stayed at 22:00:16. The same bug, rewritten from scratch in new code because
+#               the lesson lived in one function instead of one helper.
+#
+# `-k all` rather than just the running kernel: a module blacklist has to hold whichever
+# kernel the machine comes up on, and the generic fallback is in the GRUB menu.
+#
+# Returns non-zero on any of: the command failed, the RUNNING kernel's initrd did not change,
+# or the file we care about is not inside it. An mtime bump says a rebuild happened - not that
+# it included what we needed.
+rebuild_initramfs() {
+  local want="${1:-}"                       # path INSIDE the initramfs, no leading slash
+  local kver; kver="$(uname -r)"
+  local initrd="/boot/initrd.img-$kver"
+  local before; before="$(stat -c %Y "$initrd" 2>/dev/null || echo 0)"
+  local iout; iout="$(mktemp)"
+  if ! update-initramfs -u -k all >"$iout" 2>&1; then
+    warn "update-initramfs FAILED - output follows:"
+    sed 's/^/       /' "$iout" >&2
+    rm -f "$iout"
+    warn "DO NOT REBOOT THIS MACHINE until it succeeds. This root is LUKS-encrypted and"
+    warn "  these machines have no BMC - a broken initramfs stops at a passphrase prompt"
+    warn "  on a console nobody can reach."
+    return 1
+  fi
+  grep -iE 'warning|error' "$iout" | sed 's/^/       /' || true
+  rm -f "$iout"
+  local after; after="$(stat -c %Y "$initrd" 2>/dev/null || echo 0)"
+  if [ "$after" -le "$before" ]; then
+    warn "update-initramfs reported success but $initrd DID NOT CHANGE."
+    warn "  the RUNNING kernel's initramfs does not carry this change. Check:"
+    warn "    sudo update-initramfs -u -k $kver"
+    return 1
+  fi
+  ok "initramfs rebuilt for every installed kernel (running: $kver)"
+  if [ -n "$want" ] && command -v lsinitramfs >/dev/null 2>&1; then
+    if lsinitramfs "$initrd" 2>/dev/null | grep -q "$want"; then
+      ok "verified: $want is inside $initrd"
+    else
+      warn "$want is NOT inside $initrd - the rebuild did not pick it up"
+      return 1
+    fi
+  fi
+  return 0
+}
+
 RADIO_BLOCK=/etc/modprobe.d/99-stig-radio.conf
 RADIO_LOG=/var/log/stig-radio.log
 # Bluetooth has no STIG rule to name its modules, so the family is a parameter. btusb is the
@@ -1638,7 +1693,7 @@ cmd_radio() {
 
       local tmp; tmp="$(mktemp)"
       { printf '# Written by stig-tailor.sh radio disable on %s\n' "$(date -Is)"
-        printf '# V-270755 / UBTU-24-600310, plus the Bluetooth radio the benchmark omits.\n'
+        printf '# V-270755 / UBTU-24-600230, plus the Bluetooth radio the benchmark omits.\n'
         printf '# DISA FixText form is "install <module> /bin/true"; blacklist is added so an\n'
         printf '# explicit modprobe by name is refused too, not only autoload.\n'
         for m in $mods; do printf 'install %s /bin/true\nblacklist %s\n' "$m" "$m"; done
@@ -1660,17 +1715,8 @@ cmd_radio() {
         # if it fails, and say plainly that the machine must not be rebooted until it is
         # fixed. `>/dev/null 2>&1` here would turn that into a silent brick.
         say "  rebuilding initramfs so the block applies before root is mounted"
-        local iout; iout="$(mktemp)"
-        if update-initramfs -u >"$iout" 2>&1; then
-          ok "initramfs rebuilt"
-          grep -iE 'warn|error' "$iout" | sed 's/^/       /' || true
-        else
-          warn "update-initramfs FAILED - output follows:"
-          sed 's/^/       /' "$iout" >&2
-          warn "DO NOT REBOOT THIS MACHINE until update-initramfs succeeds. The root"
-          warn "  filesystem is LUKS-encrypted and a broken initramfs will not unlock it."
-        fi
-        rm -f "$iout"
+        rebuild_initramfs "${RADIO_BLOCK#/}" \
+          || warn "the block is live in /etc but NOT in the running kernel's initramfs"
       fi
 
       # Unload. Two passes: the vendor helpers hold references until btusb goes, and
@@ -1700,9 +1746,7 @@ cmd_radio() {
       [ -f "$RADIO_BLOCK" ] || { warn "no $RADIO_BLOCK - nothing of ours to remove"; return 0; }
       backup_file "$RADIO_BLOCK"
       rm -f "$RADIO_BLOCK"
-      local iout; iout="$(mktemp)"
-      update-initramfs -u >"$iout" 2>&1 || { warn "update-initramfs FAILED:"; sed 's/^/       /' "$iout" >&2; }
-      rm -f "$iout"
+      rebuild_initramfs || warn "initramfs not rebuilt - the block may still be in it"
       radio_log ENABLE "removed $RADIO_BLOCK - V-270755 is now OPEN on this machine"
       warn "radio block REMOVED. V-270755 is a finding until 'radio disable' is run again."
       say "  other files may still block: $(radio_block_files | tr '\n' ' ')"

@@ -91,8 +91,39 @@ need_reboot() {
   say "$why"
   say ""
   say "  This host has no BMC and its LUKS root prompts at a physical console, so the"
-  say "  reboot needs somebody at the machine with the passphrase."
+  say "  machine will NOT come back on its own - somebody has to be at it with the"
+  say "  passphrase. That is why this asks instead of just doing it: an automatic reboot"
+  say "  on a machine nobody is standing at is not automation, it is a host sitting at a"
+  say "  prompt until someone notices."
   say ""
+
+  # OFFER rather than assume. At the console this is one keystroke; away from it, declining
+  # costs nothing and the state file means `run` resumes exactly here afterwards.
+  #
+  # NOT a default of yes. The whole reason for asking is that the operator's PHYSICAL
+  # LOCATION is the thing the machine cannot discover, and a default that guesses wrong
+  # leaves the enclave down.
+  if [ -t 0 ]; then
+    printf '  Are you at the console and ready to type the LUKS passphrase? reboot now? [y/N] '
+    local a=""; read -r a || true
+    case "$a" in
+      y|Y)
+        say ""
+        ok "rebooting. When it is back:  sudo $0 run"
+        say "  (it resumes from this exact point - nothing is repeated)"
+        say ""
+        sync
+        # A short delay so the operator actually sees the two lines above before the
+        # connection drops, and so the log write lands.
+        ( sleep 3; systemctl reboot ) >/dev/null 2>&1 &
+        exit 0 ;;
+    esac
+  else
+    say "  (not a terminal - not offering to reboot)"
+  fi
+
+  say ""
+  say "  When you are ready:"
   say "    sudo reboot"
   say ""
   say "  Then run this again and it continues from here:"

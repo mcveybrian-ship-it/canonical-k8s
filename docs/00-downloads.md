@@ -345,6 +345,60 @@ both, so that is handled.
 
 When step 00 is verified, go to [`01-pathfinder.md`](01-pathfinder.md).
 
+## STIG and SRG content to collect from cyber.mil — the CAC trip
+
+**One trip, one list.** Everything below comes from <https://public.cyber.mil/stigs/downloads/>
+and **requires a CAC** — the anonymous download path is gone. Give this to whoever holds the
+card.
+
+**Two formats, and they are not interchangeable:**
+
+- **SCAP benchmark** (`*_STIG_SCAP_*-xccdf.xml` inside a zip) — machine-readable, drives an
+  automated scan. Only some products have one.
+- **STIG zip** (`U_*_STIG_V#R#_Manual-xccdf.xml`) — the manual XCCDF. **Take this for every row
+  below, even where a SCAP benchmark also exists.** `StigContent/Manual/` consumes it and
+  `answerfile.sh` writes portable `ValidationCode` against it, so the manual XCCDF is what this
+  enclave actually assesses from.
+
+> ⚠️ **Do not trust any version number written in this repository.** DISA re-releases
+> frequently and the revision recorded here is the one that was current when the line was
+> typed. **Take whatever is current on the day**, then record what was actually taken in
+> `HANDOFF.md` §3. The version numbers below are stated only so a wrong file is obvious.
+
+### The list, ordered by what it unblocks
+
+| # | Target | What to download | Why we need it | Blocks |
+|---|---|---|---|---|
+| 1 | **Kubernetes** | **Kubernetes STIG** — manual XCCDF | Canonical maps it to **91 guidelines**: 62 Default, 13 Bootstrap, 10 Post-Deployment, 6 N/A. **The 13 Bootstrap guidelines must be correct AT CLUSTER CREATION** and cannot be retrofitted | 🔴 **Step 06/07.** Getting it wrong means rebuilding the cluster. Highest priority on this list |
+| 2 | **PostgreSQL 16** | **Crunchy Data PostgreSQL 16 STIG** (covers 13–16) | The pg HA guests and `svc-mgmt-01`'s MAAS database. Without it the database layer has an OS STIG and **no application STIG** | 🔴 **Step 06a.** Already owed since 2026-09-14 |
+| 3 | **nginx** | **Web Server SRG** | No nginx STIG exists. `svc-repo-01` serves the mirror over nginx and Harbor fronts itself with it | Assessment of two machines already built |
+| 4 | **Docker CE** | **Container Platform SRG** | The Docker Enterprise 2.x STIG **does not apply to CE**. `svc-harbor-01` runs Docker CE | Assessment of `svc-harbor-01` |
+| 5 | **PostgreSQL 18.3** | **Database SRG** | Harbor's bundled Postgres is 18.3 and **no STIG covers 18**. The version is not ours to choose — it ships inside `goharbor/harbor-db:v2.15.2` | Written rationale for an appliance-internal database |
+| 6 | **KVM / libvirt / QEMU** | **General Purpose Operating System SRG** | Needed to **cite** the position, not to scan. No hypervisor STIG or SRG exists; `host-4` is governed through the OS STIG. §3a: *"cite the absence of hypervisor guidance, do not report a gap"* | The SSP's hypervisor paragraph |
+| 6a | **The 800-53 mapping itself** | **CCI List** (Control Correlation Identifiers) | 🔴 **This is how STIG results become 800-53 evidence, mechanically.** Every CKL/CKLB Evaluate-STIG has produced already carries `CCI_REF` per finding; the CCI List is the translation table from those to 800-53 controls. Without it, five machines of assessed evidence has to be mapped by hand | The entire 800-53 control-mapping effort — see [`compliance/nist-800-53-plan.md`](compliance/nist-800-53-plan.md) |
+| 7 | **Ubuntu 24.04** | **Ubuntu 24.04 LTS STIG** — ✅ **already in hand at V1R6** via Evaluate-STIG | Take the standalone zip anyway, so the accreditation package cites a file rather than a tool's bundled copy | Nothing — completeness of the package |
+
+### Three more to ask the AO about before buying a trip for them
+
+Not on the list above because **whether they apply is a boundary question, not a technical
+one** — and guessing wrong either wastes the trip or leaves a gap:
+
+| | Question for the AO |
+|---|---|
+| **Network device STIGs** (router / switch / firewall) | The enclave sits behind its own router (§3.1). **Is that router inside the accreditation boundary?** If yes, its STIG applies and it is a gap today. If it is programme-managed infrastructure, it is inherited. |
+| **Traditional Security Checklist** | Physical and environmental security is commonly required in a DoD package. Ask whether it is expected here or inherited from the facility's existing ATO. |
+| **Application Security and Development STIG** | Likely **N/A** — this enclave runs no locally-developed application; the shell scripts are build automation, not a fielded system. Confirm rather than assume, because "we decided it was N/A" needs to be someone's decision on the record. |
+
+### When the files arrive
+
+1. **Record what was actually taken** — product, version, revision, release date, and the SHA-256
+   of each zip — into `HANDOFF.md` §3. The package has to cite a specific benchmark, not "the
+   current STIG".
+2. Place the manual XCCDFs under `StigContent/Manual/` (runbook §10.1).
+3. **Re-run the coverage matrix in `HANDOFF.md` §3a** and change every ⬜ that is now satisfied.
+4. The Kubernetes STIG gets **read before step 06 runs**, not after — that is the whole point of
+   it being first on the list.
+
 ## Not downloaded yet
 
 Listed so nothing is forgotten. Do not fetch these until the step that consumes them is

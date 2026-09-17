@@ -1,5 +1,10 @@
 # Compliance and OS dashboards — what they measure, and what they do not
 
+> **Accreditation companions, added 2026-09-17:**
+> [`ssp-inputs.md`](ssp-inputs.md) — the statements, with evidence ·
+> [`ato-package.md`](ato-package.md) — the artifact set and what we already have ·
+> [`nist-800-53-plan.md`](nist-800-53-plan.md) — the control plan, family by family
+>
 > **Companion document: [`ssp-inputs.md`](ssp-inputs.md)** — the register of statements this
 > build has already decided it must make in the accreditation package, each with its evidence.
 > Started 2026-09-17 after finding twenty-two places in the docs that said *"state this in the

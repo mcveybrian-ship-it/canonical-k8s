@@ -1498,6 +1498,15 @@ EOF
 # Returns non-zero on any of: the command failed, the RUNNING kernel's initrd did not change,
 # or the file we care about is not inside it. An mtime bump says a rebuild happened - not that
 # it included what we needed.
+# Is a path already inside the RUNNING kernel's initramfs? Returns 2 when it CANNOT TELL,
+# so "could not verify" never reads as "verified".
+initramfs_has() {
+  local want="$1" initrd="/boot/initrd.img-$(uname -r)"
+  [ -r "$initrd" ] || return 2
+  command -v lsinitramfs >/dev/null 2>&1 || return 2
+  lsinitramfs "$initrd" 2>/dev/null | grep -q "$want"
+}
+
 rebuild_initramfs() {
   local want="${1:-}"                       # path INSIDE the initramfs, no leading slash
   local kver; kver="$(uname -r)"
@@ -1542,6 +1551,12 @@ RADIO_LOG=/var/log/stig-radio.log
 RADIO_BT_MODULES="${RADIO_BT_MODULES:-btusb btrtl btintel btbcm btmtk bluetooth}"
 # Anything the operator wants blocked that discovery cannot see. Empty by design.
 RADIO_EXTRA_MODULES="${RADIO_EXTRA_MODULES:-}"
+
+# The whole 802.11 / Bluetooth module family, for UNLOADING only - never for blacklisting.
+# Spells the bt* members out rather than using ^bt, which would also match btrfs, and cannot
+# match r8169, the ethernet driver every one of these hosts depends on.
+RADIO_FAMILY_RE='^(rtw[0-9]*_|rtw[0-9]+|mt7[0-9]|mt76|iwlwifi|iwl[dm]vm|ath[0-9]+k?|brcmfmac|bt(usb|rtl|intel|bcm|mtk)|bluetooth|mac80211|cfg80211|libarc4)'
+radio_family_resident() { lsmod 2>/dev/null | cut -d' ' -f1 | grep -E "$RADIO_FAMILY_RE" || true; }
 
 # Modules backing a network interface that is actually carrying traffic: anything with a
 # global address, plus bridge slaves (host-4's enp42s0 has no address of its own - br0 holds
@@ -1604,9 +1619,16 @@ radio_bt_present() {
 }
 
 radio_target_modules() {
+  # `radio_bt_present && printf ...` as the last command of this group made the WHOLE
+  # pipeline exit 1 on a machine with no Bluetooth (pipefail), and `mods="$(...)"` under
+  # set -e then killed the caller - so `radio status` printed nothing and exited 1 on every
+  # machine with no radio. That is all seven VMs, and step_radio in 05-harden-host.sh runs
+  # `radio status` first, so it would have aborted the hardening run. `if` leaves no
+  # non-zero status behind; the explicit return says the emptiness is an answer, not a fault.
   { radio_wifi_modules
-    radio_bt_present && printf '%s\n' $RADIO_BT_MODULES
+    if radio_bt_present; then printf '%s\n' $RADIO_BT_MODULES; fi
   } | sed '/^$/d' | sort -u
+  return 0
 }
 
 radio_loaded() { lsmod 2>/dev/null | awk '{print $1}' | grep -qx "$1"; }
@@ -1644,29 +1666,75 @@ cmd_radio() {
         && ok "  no wireless or Bluetooth hardware found - this control is genuinely N/A here"
       say ""
       # Show BOTH checks side by side. The gap between them is the whole point.
-      disa="$(ls -L -d /sys/class/net/*/wireless 2>/dev/null | xargs -r -n1 dirname | xargs -r -n1 basename | tr '\n' ' ')"
+      # `ls` exits 2 when nothing matches, pipefail carries that out of the pipeline, and the
+      # assignment then kills the whole command under set -e. Measured on stage-01
+      # 2026-09-17: `radio status` printed two lines and exited 2 on every machine WITHOUT a
+      # radio - the machines where the answer is "nothing to do". Emptiness is an answer here.
+      disa="$(ls -L -d /sys/class/net/*/wireless 2>/dev/null | xargs -r -n1 dirname | xargs -r -n1 basename | tr '\n' ' ' || true)"
       say "  DISA CheckText (ls /sys/class/net/*/wireless) : ${disa:-<nothing - WEXT is obsolete>}"
       say "  live 802.11 interfaces (phy80211)             : $(radio_wifi_ifaces | tr '\n' ' ')"
-      [ -n "$(radio_wifi_ifaces)" ] && [ -z "$disa" ] && \
+      if [ -n "$(radio_wifi_ifaces || true)" ] && [ -z "$disa" ]; then
         warn "  the checklist check finds NOTHING while a live 802.11 interface exists"
+      fi
       for i in $(radio_wifi_ifaces); do
         say "       $i  state=$(cat "/sys/class/net/$i/operstate" 2>/dev/null)  addr=$(ip -br -4 a show "$i" 2>/dev/null | awk '{$1=$2="";print}')"
       done
       say ""
-      say "  modules to block : ${mods:-<none>}"
+      # $mods is newline-separated (sort -u); print it on one line or the table is unreadable.
+      say "  modules to block : $(printf '%s' "${mods:-<none>}" | tr '\n' ' ')"
       say "  protected (carrying this machine's network, never blocked): ${prot:-<none>}"
       say ""
-      if [ -n "$(radio_block_files)" ]; then
-        ok "  BLOCKED by:"; radio_block_files | sed 's/^/       /'
+      # NOTHING TO BLOCK IS NOT A FINDING. On a machine with no radio - all seven VMs - the
+      # blocked/initramfs questions have no subject, and warning about them there trains the
+      # reader to ignore the warning on the machines where it means something.
+      if [ -z "$mods" ]; then
+        ok "  nothing to block on this machine"
+        say ""
+        return 0
+      fi
+      local blockers; blockers="$(radio_block_files || true)"
+      if [ -n "$blockers" ]; then
+        ok "  BLOCKED by:"
+        printf '%s\n' "$blockers" | sed 's/^/       /'
       else
         warn "  NOT BLOCKED - nothing in modprobe.d blocks these modules"
       fi
+
+      # SAY WHAT THE BOOT PATH CARRIES, not only what /etc says. A correct file in /etc with a
+      # running initramfs that does not contain it is exactly the state all four hosts were
+      # left in on 2026-09-17, and nothing in this output would have shown it.
+      # `|| src=$?` and not a bare call: initramfs_has returns 2 when it cannot tell, and a
+      # bare non-zero command is fatal under set -e before `case` ever runs.
+      local src=0; initramfs_has "${RADIO_BLOCK#/}" || src=$?
+      case "$src" in
+        0) ok "  and it is inside the RUNNING kernel's initramfs ($(uname -r))" ;;
+        2) say "  (cannot read /boot/initrd.img-$(uname -r) to check - run this as root)" ;;
+        *) warn "  it is NOT in the running kernel's initramfs ($(uname -r))"
+           say  "     fix: sudo $0 radio disable   (rebuilds for every installed kernel)" ;;
+      esac
       left=""
-      for m in $mods; do radio_loaded "$m" && left="$left $m"; done
-      if [ -n "$left" ]; then warn "  still LOADED:$left"
-        say "     fix: sudo $0 radio disable"
-      else ok "  no radio module loaded"; fi
-      [ -r "$RADIO_LOG" ] && { say ""; say "  last 5 events:"; tail -5 "$RADIO_LOG" | sed 's/^/    /'; }
+      for m in $mods; do
+        if radio_loaded "$m"; then left="$left $m"; fi
+      done
+      if [ -n "$left" ]; then
+        warn "  still LOADED:$left"
+        say  "     fix: sudo $0 radio disable"
+      else
+        ok "  no blocked radio module is loaded"
+      fi
+      # REPORT THE LIBRARY CHAIN TOO. `left` only covers the modules we blacklist - the
+      # driver. Saying "no radio module loaded" while rtw88_core, mac80211 and cfg80211 are
+      # resident is the kind of half-true green result this project keeps getting burned by.
+      local residue; residue="$(radio_family_resident | tr '\n' ' ' || true)"
+      if [ -n "$residue" ]; then
+        say "  library modules still resident: $residue"
+        say "     harmless with no device bound and the driver blocked; cleared by a reboot,"
+        say "     or by re-running: sudo $0 radio disable"
+      fi
+      if [ -r "$RADIO_LOG" ]; then
+        say ""; say "  last 5 events:"
+        tail -5 "$RADIO_LOG" | sed 's/^/    /'
+      fi
       say ""
       ;;
 
@@ -1706,28 +1774,59 @@ cmd_radio() {
         install -m 0644 -o root -g root "$tmp" "$RADIO_BLOCK"
         rm -f "$tmp"
         ok "wrote $RADIO_BLOCK"
-        # The blacklist has to reach the initramfs too, or a module packed into it loads
-        # before /etc is even mounted and the file is decoration.
-        # REBUILD THE INITRAMFS, AND DO NOT HIDE WHAT IT SAYS. A blacklist that is not in
-        # the initramfs is decoration for any module packed into it - but every host here is
-        # LUKS-encrypted, and a broken initramfs is a machine that stops at a passphrase
-        # prompt that never appears, on hardware with no BMC. Capture the output, print it
-        # if it fails, and say plainly that the machine must not be rebooted until it is
-        # fixed. `>/dev/null 2>&1` here would turn that into a silent brick.
-        say "  rebuilding initramfs so the block applies before root is mounted"
-        rebuild_initramfs "${RADIO_BLOCK#/}" \
-          || warn "the block is live in /etc but NOT in the running kernel's initramfs"
       fi
 
-      # Unload. Two passes: the vendor helpers hold references until btusb goes, and
-      # mac80211/cfg80211 only release once the driver is out.
-      for _ in 1 2; do
-        for m in $mods mac80211 cfg80211; do
-          radio_loaded "$m" && modprobe -r "$m" 2>/dev/null || true
+      # THE INITRAMFS CHECK IS DRIVEN BY STATE, NOT BY WHETHER THE FILE CHANGED.
+      #
+      # The blacklist has to reach the initramfs as well as /etc, or a module packed into the
+      # initramfs loads before /etc is even mounted and the file is decoration. And every host
+      # here is LUKS-encrypted with no BMC, so rebuild_initramfs prints what update-initramfs
+      # said and refuses to call a rebuild successful unless the RUNNING kernel's initrd moved.
+      #
+      # An earlier version rebuilt only when it had just written the file, which left this
+      # command unable to repair itself. On 2026-09-17 all four hosts ended with a correct
+      # /etc/modprobe.d/99-stig-radio.conf and a running initramfs that did not contain it,
+      # because the rebuild had gone to the -generic kernel. Re-running took the "already
+      # correct" branch and skipped the rebuild, so a second run CONFIRMED the bug instead of
+      # fixing it. A remediation that cannot repair a half-applied state is not a remediation.
+      local irc=0; initramfs_has "${RADIO_BLOCK#/}" || irc=$?
+      case "$irc" in
+        0) ok "block is already inside the running kernel's initramfs" ;;
+        2) warn "cannot read the running kernel's initramfs to check - rebuilding anyway"
+           rebuild_initramfs "${RADIO_BLOCK#/}" \
+             || warn "the block is live in /etc but NOT verified in the running initramfs" ;;
+        *) say "  the running kernel's initramfs does not carry the block - rebuilding"
+           rebuild_initramfs "${RADIO_BLOCK#/}" \
+             || warn "the block is live in /etc but NOT in the running kernel's initramfs" ;;
+      esac
+
+      # UNLOAD THE WHOLE CHAIN, NOT JUST THE TOP MODULE.
+      #
+      # Discovery names the DRIVER - rtw88_8821ce, mt7921e. The library modules underneath it
+      # are not in $mods, so nothing removed them. Measured 2026-09-17: after `disable` the
+      # device was unbound and wlp2s0 gone, but rtw88_core, mac80211 and cfg80211 stayed
+      # resident on host-1/2/3 and six modules on host-4. Harmless with no device bound and
+      # the driver blacklisted, but "wireless modules still loaded" in a checklist is an
+      # argument nobody needs to have.
+      #
+      # Remove by REFCOUNT, not in a fixed order: the vendor bt* helpers hold references
+      # until btusb goes and mac80211/cfg80211 only release once the driver is out. Take
+      # anything in the family whose refcnt is 0, repeat until a pass removes nothing, and
+      # never touch a PROTECTED module whatever the regex says.
+      local pass removed m2
+      for pass in 1 2 3 4 5; do
+        removed=0
+        for m2 in $(radio_family_resident); do
+          case " $prot " in *" $m2 "*) continue ;; esac
+          [ "$(cat "/sys/module/$m2/refcnt" 2>/dev/null || echo 1)" = 0 ] || continue
+          if modprobe -r "$m2" 2>/dev/null; then removed=1; fi
         done
+        [ "$removed" -eq 1 ] || break
       done
       left=""
-      for m in $mods; do radio_loaded "$m" && left="$left $m"; done
+      for m in $mods; do
+        if radio_loaded "$m"; then left="$left $m"; fi
+      done
       if [ -n "$left" ]; then
         warn "still loaded after unload:$left - they will not load on next boot, but say so"
         warn "  in the evidence rather than claiming the radio is off right now"

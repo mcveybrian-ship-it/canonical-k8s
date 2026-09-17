@@ -33,6 +33,13 @@ and `scripts/install/02-*`. No exceptions.
 
 Q-numbers are in [`docs/open-questions.md`](docs/open-questions.md).
 
+**There is no SSP yet, and [`docs/compliance/ssp-inputs.md`](docs/compliance/ssp-inputs.md) is why that
+is survivable.** Twenty-two places in the documents said *"state this in the SSP"* — every one a fact
+somebody judged important enough for the accreditation package, written in an aside with nothing
+collecting it. That file is the register: the statement, the evidence, and where it came from. **The
+SSP's template is the AO's call; the content is ours, and the content is what was at risk of being
+lost.**
+
 ## What step 01 is for
 
 It answers one question that can invalidate the OS decision: **can a FIPS stream be enabled on

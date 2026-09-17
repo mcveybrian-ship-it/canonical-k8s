@@ -558,7 +558,16 @@ cmd_fixups() {
       continue
     fi
     if systemctl disable --now "$svc" >/dev/null 2>&1; then
-      ok "$svc disabled - $cond"
+      # RESET THE RECORDED FAILURE TOO. `disable --now` stops the unit and prevents it
+      # starting again, but the LAST FAILURE stays recorded - so `systemctl --failed` keeps
+      # listing it until someone reboots. Measured on host-1 2026-09-17: sssd reported
+      # "disabled" and still appeared in --failed on the very next line.
+      #
+      # That matters more than it looks. The whole reason for disabling these is that a
+      # permanently listed failure trains the operator to ignore `systemctl --failed`, which
+      # is the one place a real failure shows up. Leaving the stale entry defeats the fix.
+      systemctl reset-failed "$svc" >/dev/null 2>&1 || true
+      ok "$svc disabled and its failed state cleared - $cond"
       say "     the package stays installed, so the STIG rule that wants it still passes"
     else
       warn "could not disable $svc - it will keep appearing in systemctl --failed"

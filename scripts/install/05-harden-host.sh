@@ -377,6 +377,26 @@ step_tailor() {
   mark_step tailor
 }
 
+step_radio() {
+  done_step radio && return 0
+  hdr "8a. radios - WiFi and Bluetooth"
+  # V-270755 / UBTU-24-600230. THIS IS NOT A PAPERWORK CONTROL IN AN AIR GAP: a radio is the
+  # one component that can cross the boundary without anybody moving a cable. Measured
+  # 2026-09-17, every host in this lab shipped with one - Realtek RTL8821CE on host-1/2/3,
+  # MediaTek MT7922 on host-4, and a USB Bluetooth radio on all four.
+  #
+  # The checklist does not reliably catch it. Where no driver is bound there is no interface,
+  # DISA's check finds nothing, and the rule scores NOT APPLICABLE on a machine with a radio
+  # physically in it. So this runs unconditionally rather than on the scan result.
+  #
+  # It is safe to run on a machine with no radio - it discovers nothing and does nothing - and
+  # it REFUSES rather than guessing if discovery ever lands on a module carrying the network.
+  "$ENC/stig-tailor.sh" radio status
+  "$ENC/stig-tailor.sh" radio disable || warn "radio disable reported a problem - see above"
+  "$ENC/stig-tailor.sh" radio status
+  mark_step radio
+}
+
 step_grub() {
   done_step grub && return 0
   hdr "9. GRUB password"
@@ -495,7 +515,7 @@ cmd_status() {
   assert_enclave_host
   printf '\n  hardening state on %s\n\n' "$(hostname -s)"
   local s
-  for s in preflight hostprep pro fips patch usg baseline prechecks usgfix tailor grub v1r6 verify final_audit evalstig; do
+  for s in preflight hostprep pro fips patch usg baseline prechecks usgfix tailor radio grub v1r6 verify final_audit evalstig; do
     printf '  %s %s\n' "$(done_step "$s" && echo '[x]' || echo '[ ]')" "$s"
   done
   printf '\n  state file: %s\n' "$STATE"

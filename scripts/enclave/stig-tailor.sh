@@ -11,6 +11,8 @@
 #     sudo ./stig-tailor.sh fixups --apply    # ... and apply it
 #     ./stig-tailor.sh aide status            # what AIDE would hash here - RUN BEFORE usg fix
 #     sudo ./stig-tailor.sh aide exclude --apply
+#     sudo ./stig-tailor.sh radio status      # what radios this machine has
+#     sudo ./stig-tailor.sh radio disable     # ... and block them
 #
 # TWO JOBS, DELIBERATELY IN ONE PLACE:
 #
@@ -1423,6 +1425,273 @@ EOF
       ;;
 
     *) die "usage: $0 usb {status|enable [--minutes N]|disable}" ;;
+  esac
+}
+
+# ------------------------------------------------------------------------------- radio
+#
+# V-270755 / UBTU-24-600310 - "must disable all wireless network adapters", AND the Bluetooth
+# radio that the benchmark never mentions at all.
+#
+# THESE MACHINES HAVE RADIOS. Measured 2026-09-17, all four:
+#     host-1/2/3   Realtek RTL8821CE 802.11ac  -> live interface wlp2s0, module rtw88_8821ce
+#     host-4       MediaTek MT7922 802.11ax    -> no interface, the driver simply never loaded
+#     all four     a USB Bluetooth radio, btusb resident
+#
+# In an air-gapped enclave a radio is not a compliance line item, it is the one piece of
+# hardware that can cross the gap without anybody unplugging anything.
+#
+# WHY THE CHECKLIST DOES NOT CATCH IT EVERYWHERE. DISA's CheckText is:
+#
+#     ls -L -d /sys/class/net/*/wireless
+#
+# MEASURED 2026-09-17, and it behaves differently on the two kinds of machine here:
+#
+#   host-1/2/3  the glob DOES match wlp2s0 - rtw88 still creates the legacy WEXT directory -
+#               so the rule is correctly raised, and lands on NOT REVIEWED because DISA's
+#               check ends in a human judgement: "if a wireless interface is configured and
+#               has not been documented and approved by the ISSO, this is a finding."
+#
+#   host-4      the glob matches NOTHING. The mt76 driver never loaded, so there is no
+#               interface to find. The scanner then applies the CheckText's opening note -
+#               "not applicable for systems that do not have physical wireless network
+#               radios" - and scores it NOT APPLICABLE. host-4 has an MT7922 in it. The NA
+#               is FALSE, and re-running the checklist will never say so, because an
+#               unbound radio is invisible to a check that looks at interfaces.
+#
+# So this command tests the HARDWARE - PCI class 0x0280 - which is what that N/A note
+# actually turns on, as well as the interface. `phy80211` is used for the live-interface
+# test rather than the WEXT directory because it is what modern cfg80211 drivers are
+# guaranteed to expose; DISA's glob is printed beside it so the difference between the two
+# is visible rather than argued about.
+#
+# WHY THE FIXTEXT'S OWN INSTRUCTION DOES NOT WORK HERE. DISA says to find the module with:
+#
+#     basename $(readlink -f /sys/class/net/<if>/device/driver)
+#
+# On host-1 that returns `rtw_8821ce` - the PCI DRIVER name. The MODULE is `rtw88_8821ce`.
+# `install rtw_8821ce /bin/true` blocks nothing, because no module is called that, and the
+# card keeps working while the file looks like a remediation. Read `device/driver/module`
+# instead, which is a symlink to the real module, and the two names stop disagreeing.
+#
+# THE SAFETY PROPERTY THAT MATTERS MORE THAN THE CONTROL: these are budget test machines with
+# NO BMC (operator, 2026-09-16). Blacklisting the wrong module means a host that comes up with
+# no network and no remote console - a drive to the rack. So every module backing an interface
+# that holds an address or feeds a bridge is PROTECTED, and if discovery ever lands on one of
+# those, this refuses and changes nothing rather than guessing.
+RADIO_BLOCK=/etc/modprobe.d/99-stig-radio.conf
+RADIO_LOG=/var/log/stig-radio.log
+# Bluetooth has no STIG rule to name its modules, so the family is a parameter. btusb is the
+# transport, bluetooth is the core, the bt*{rtl,intel,bcm,mtk} pieces are vendor firmware
+# loaders that btusb pulls in.
+RADIO_BT_MODULES="${RADIO_BT_MODULES:-btusb btrtl btintel btbcm btmtk bluetooth}"
+# Anything the operator wants blocked that discovery cannot see. Empty by design.
+RADIO_EXTRA_MODULES="${RADIO_EXTRA_MODULES:-}"
+
+# Modules backing a network interface that is actually carrying traffic: anything with a
+# global address, plus bridge slaves (host-4's enp42s0 has no address of its own - br0 holds
+# it - and blacklisting it would take every VM off the network with it).
+radio_protected_modules() {
+  local i m
+  { ip -o -4 addr show scope global 2>/dev/null | awk '{print $2}'
+    ip -o -6 addr show scope global 2>/dev/null | awk '{print $2}'
+    ip -o link show type bridge_slave 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1
+  } | sort -u | while read -r i; do
+    [ -n "$i" ] || continue
+    m="$(basename "$(readlink -f "/sys/class/net/$i/device/driver/module" 2>/dev/null)" 2>/dev/null)"
+    case "$m" in ''|.|/) continue ;; esac
+    printf '%s\n' "$m"
+  done | sort -u
+}
+
+# Live 802.11 interfaces, by the marker modern drivers actually create.
+radio_wifi_ifaces() {
+  local d
+  for d in /sys/class/net/*/phy80211; do
+    [ -e "$d" ] || continue
+    basename "$(dirname "$d")"
+  done
+}
+
+radio_wifi_modules() {
+  local i m c dev
+  # (a) from live interfaces - device/driver/module, NOT device/driver (see the header).
+  for i in $(radio_wifi_ifaces); do
+    m="$(basename "$(readlink -f "/sys/class/net/$i/device/driver/module" 2>/dev/null)" 2>/dev/null)"
+    case "$m" in ''|.|/) continue ;; esac
+    printf '%s\n' "$m"
+  done
+  # (b) from the hardware, whether or not a driver ever bound to it. PCI class 0x0280 is
+  #     "Network controller / other", which is what every 802.11 card reports; ethernet is
+  #     0x0200 and is deliberately not matched. modprobe -R resolves the modalias to the
+  #     module name without loading anything, so this sees host-4's MT7922 too.
+  for c in /sys/bus/pci/devices/*/class; do
+    case "$(cat "$c" 2>/dev/null)" in
+      0x0280*) dev="$(dirname "$c")"
+               [ -r "$dev/modalias" ] && modprobe -R "$(cat "$dev/modalias")" 2>/dev/null ;;
+    esac
+  done
+  printf '%s\n' $RADIO_EXTRA_MODULES
+}
+
+# Is there a Bluetooth radio in this machine at all? USB class e0 is "wireless controller";
+# PCI 0x0d11 is the bus-attached equivalent.
+radio_bt_present() {
+  local f c
+  for f in /sys/bus/usb/devices/*/bDeviceClass; do
+    [ "$(cat "$f" 2>/dev/null)" = "e0" ] && return 0
+  done
+  for c in /sys/bus/pci/devices/*/class; do
+    case "$(cat "$c" 2>/dev/null)" in 0x0d11*) return 0 ;; esac
+  done
+  lsmod 2>/dev/null | awk '{print $1}' | grep -qx btusb && return 0
+  return 1
+}
+
+radio_target_modules() {
+  { radio_wifi_modules
+    radio_bt_present && printf '%s\n' $RADIO_BT_MODULES
+  } | sed '/^$/d' | sort -u
+}
+
+radio_loaded() { lsmod 2>/dev/null | awk '{print $1}' | grep -qx "$1"; }
+
+# Every file that blocks, not just ours - the lesson `usb` already learned the hard way.
+radio_block_files() {
+  local mods; mods="$(radio_target_modules | tr '\n' '|' | sed 's/|$//')"
+  [ -n "$mods" ] || return 0
+  grep -rlE "^[[:space:]]*(install|blacklist)[[:space:]]+($mods)([[:space:]]|\$)" \
+    /etc/modprobe.d /run/modprobe.d /usr/lib/modprobe.d 2>/dev/null | sort -u
+}
+
+radio_log() {
+  printf '%s  %-8s by=%s  %s\n' "$(date -Is)" "$1" "${SUDO_USER:-$(id -un)}" "${2:-}" \
+    >> "$RADIO_LOG" 2>/dev/null \
+    || warn "could not write $RADIO_LOG - this change is UNRECORDED"
+  chmod 0640 "$RADIO_LOG" 2>/dev/null || true
+}
+
+cmd_radio() {
+  local action="${1:-status}"
+  local mods prot clash m i disa left
+
+  mods="$(radio_target_modules)"
+  prot="$(radio_protected_modules)"
+
+  case "$action" in
+    status)
+      printf '\n  Radios on %s\n\n' "$(hostname -s)"
+      say "  hardware:"
+      lspci 2>/dev/null | grep -iE 'network controller|wireless' | sed 's/^/       PCI  /' || true
+      lsusb 2>/dev/null | grep -iE 'bluetooth|wireless' | sed 's/^/       USB  /' || true
+      [ -z "$(lspci 2>/dev/null | grep -iE 'network controller|wireless')" ] \
+        && [ -z "$(lsusb 2>/dev/null | grep -iE 'bluetooth|wireless')" ] \
+        && ok "  no wireless or Bluetooth hardware found - this control is genuinely N/A here"
+      say ""
+      # Show BOTH checks side by side. The gap between them is the whole point.
+      disa="$(ls -L -d /sys/class/net/*/wireless 2>/dev/null | xargs -r -n1 dirname | xargs -r -n1 basename | tr '\n' ' ')"
+      say "  DISA CheckText (ls /sys/class/net/*/wireless) : ${disa:-<nothing - WEXT is obsolete>}"
+      say "  live 802.11 interfaces (phy80211)             : $(radio_wifi_ifaces | tr '\n' ' ')"
+      [ -n "$(radio_wifi_ifaces)" ] && [ -z "$disa" ] && \
+        warn "  the checklist check finds NOTHING while a live 802.11 interface exists"
+      for i in $(radio_wifi_ifaces); do
+        say "       $i  state=$(cat "/sys/class/net/$i/operstate" 2>/dev/null)  addr=$(ip -br -4 a show "$i" 2>/dev/null | awk '{$1=$2="";print}')"
+      done
+      say ""
+      say "  modules to block : ${mods:-<none>}"
+      say "  protected (carrying this machine's network, never blocked): ${prot:-<none>}"
+      say ""
+      if [ -n "$(radio_block_files)" ]; then
+        ok "  BLOCKED by:"; radio_block_files | sed 's/^/       /'
+      else
+        warn "  NOT BLOCKED - nothing in modprobe.d blocks these modules"
+      fi
+      left=""
+      for m in $mods; do radio_loaded "$m" && left="$left $m"; done
+      if [ -n "$left" ]; then warn "  still LOADED:$left"
+        say "     fix: sudo $0 radio disable"
+      else ok "  no radio module loaded"; fi
+      [ -r "$RADIO_LOG" ] && { say ""; say "  last 5 events:"; tail -5 "$RADIO_LOG" | sed 's/^/    /'; }
+      say ""
+      ;;
+
+    disable)
+      need_root
+      [ -n "$mods" ] || { ok "no radio hardware on $(hostname -s) - nothing to do"; return 0; }
+
+      # REFUSE ON AMBIGUITY. If discovery has landed on a module that is carrying the
+      # network, something is wrong with the assumption, not with the machine - and the
+      # cost of being wrong here is a host with no network and no BMC.
+      clash=""
+      for m in $mods; do
+        case " $prot " in *" $m "*) clash="$clash $m" ;; esac
+      done
+      [ -n "$clash" ] && die "REFUSING:$clash back(s) a live network interface on $(hostname -s).
+       Blocking it would take this host off the network, and these machines have no BMC.
+       Check 'ip -br a' and '$0 radio status', then set RADIO_EXTRA_MODULES deliberately."
+
+      say "  modules: $mods"
+      for i in $(radio_wifi_ifaces); do
+        say "  bringing $i down"
+        ip link set "$i" down 2>/dev/null || warn "  could not down $i"
+      done
+
+      local tmp; tmp="$(mktemp)"
+      { printf '# Written by stig-tailor.sh radio disable on %s\n' "$(date -Is)"
+        printf '# V-270755 / UBTU-24-600310, plus the Bluetooth radio the benchmark omits.\n'
+        printf '# DISA FixText form is "install <module> /bin/true"; blacklist is added so an\n'
+        printf '# explicit modprobe by name is refused too, not only autoload.\n'
+        for m in $mods; do printf 'install %s /bin/true\nblacklist %s\n' "$m" "$m"; done
+      } > "$tmp"
+      if [ -f "$RADIO_BLOCK" ] && cmp -s "$tmp" "$RADIO_BLOCK"; then
+        ok "$RADIO_BLOCK already correct"
+        rm -f "$tmp"
+      else
+        [ -f "$RADIO_BLOCK" ] && backup_file "$RADIO_BLOCK"
+        install -m 0644 -o root -g root "$tmp" "$RADIO_BLOCK"
+        rm -f "$tmp"
+        ok "wrote $RADIO_BLOCK"
+        # The blacklist has to reach the initramfs too, or a module packed into it loads
+        # before /etc is even mounted and the file is decoration.
+        say "  rebuilding initramfs so the block applies before root is mounted"
+        update-initramfs -u >/dev/null 2>&1 && ok "initramfs rebuilt" || warn "update-initramfs failed"
+      fi
+
+      # Unload. Two passes: the vendor helpers hold references until btusb goes, and
+      # mac80211/cfg80211 only release once the driver is out.
+      for _ in 1 2; do
+        for m in $mods mac80211 cfg80211; do
+          radio_loaded "$m" && modprobe -r "$m" 2>/dev/null || true
+        done
+      done
+      left=""
+      for m in $mods; do radio_loaded "$m" && left="$left $m"; done
+      if [ -n "$left" ]; then
+        warn "still loaded after unload:$left - they will not load on next boot, but say so"
+        warn "  in the evidence rather than claiming the radio is off right now"
+        radio_log DISABLE "blocked: $mods; still resident:$left"
+      else
+        ok "all radio modules unloaded"
+        radio_log DISABLE "blocked and unloaded: $mods"
+      fi
+      say ""
+      say "  verify with:  sudo $0 radio status"
+      say ""
+      ;;
+
+    enable)
+      need_root
+      [ -f "$RADIO_BLOCK" ] || { warn "no $RADIO_BLOCK - nothing of ours to remove"; return 0; }
+      backup_file "$RADIO_BLOCK"
+      rm -f "$RADIO_BLOCK"
+      update-initramfs -u >/dev/null 2>&1 || warn "update-initramfs failed"
+      radio_log ENABLE "removed $RADIO_BLOCK - V-270755 is now OPEN on this machine"
+      warn "radio block REMOVED. V-270755 is a finding until 'radio disable' is run again."
+      say "  other files may still block: $(radio_block_files | tr '\n' ' ')"
+      say ""
+      ;;
+
+    *) die "usage: $0 radio {status|disable|enable}" ;;
   esac
 }
 
@@ -3187,6 +3456,7 @@ case "${1:-}" in
   fixups)   shift; cmd_fixups "$@" ;;
   preflight) shift; cmd_preflight "$@" ;;
   usb)      shift; cmd_usb "$@" ;;
+  radio)    shift; cmd_radio "$@" ;;
   ufw)      shift; cmd_ufw "$@" ;;
   aide)     shift; cmd_aide "$@" ;;
   v1r6)     shift; cmd_v1r6 "$@" ;;
@@ -3194,5 +3464,5 @@ case "${1:-}" in
   luksenroll) shift; cmd_luksenroll "$@" ;;
   audit)    shift; cmd_audit "$@" ;;
   show)     shift; cmd_show "$@" ;;
-  *) printf 'usage: %s {generate|audit|show|preflight|aide {status|exclude [--apply]|init}|v1r6 [--apply|--verify]|grubpw {status|prep|set}|luksenroll [--force]|fixups [...]|ufw [--apply]|usb {status|enable|disable}}\n' "$0" >&2; exit 2 ;;
+  *) printf 'usage: %s {generate|audit|show|preflight|aide {status|exclude [--apply]|init}|v1r6 [--apply|--verify]|grubpw {status|prep|set}|luksenroll [--force]|fixups [...]|ufw [--apply]|usb {status|enable|disable}|radio {status|disable|enable}}\n' "$0" >&2; exit 2 ;;
 esac

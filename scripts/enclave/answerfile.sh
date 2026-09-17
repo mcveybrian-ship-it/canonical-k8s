@@ -76,6 +76,7 @@ V-270816	UBTU-24-900920	the audit allocation holds far more than one week at the
 V-270694	UBTU-24-200680	/etc/profile.d/ssh_confirm.sh IS present and prompts for acknowledgement; the scanner cannot read a script and decide, so it leaves it NR	NR
 V-270817	UBTU-24-900930	no cron.weekly script offloads the audit trail, because audit offload is not implemented in this enclave yet - the scanner finds man-db in cron.weekly and cannot decide, leaving NR where every other machine is honestly Open	NR
 V-270682	UBTU-24-200250	there are NO temporary accounts on any enclave machine - every interactive account, meaning UID >= 1000 with a real login shell, is a permanent named administrator. Service accounts such as libvirt-qemu hold nologin and are not interactive	NR
+V-270755	UBTU-24-600230	the machine HAS a radio, so the scanner's NOT APPLICABLE is false whenever no driver happens to be bound; this answers NF only when a modprobe block is actually in place, and leaves it OPEN when the radio is merely unbound	NA
 EOF
 }
 
@@ -248,6 +249,45 @@ if (($rel -match "Ubuntu 24\.04") -and ($rel -match "LTS") -and $supported) {
 }
 else {
     $V.Results = "OPEN. Release string: '" + $rel.Trim() + "'. Pro contract expiry: '" + $expires + "'. Either the release is not 24.04 LTS or the Ubuntu Pro contract is absent or expired. An expired contract means no FIPS or ESM updates are reaching this machine, which is a real finding and not a paperwork one."
+}
+return $V
+EOF
+  ;;
+  V-270755) cat <<'EOF'
+$V = @{ Valid = $false; Results = "" }
+$c_disa = @'
+ls -L -d /sys/class/net/*/wireless 2>/dev/null | xargs -r -n1 dirname | xargs -r -n1 basename
+'@
+$c_live = @'
+for d in /sys/class/net/*/phy80211; do [ -e "$d" ] || continue; basename $(dirname "$d"); done
+'@
+$c_hw = @'
+for c in /sys/bus/pci/devices/*/class; do case "$(cat $c 2>/dev/null)" in 0x0280*) d=$(basename $(dirname $c)); lspci -s "${d#0000:}" 2>/dev/null || cat $(dirname $c)/modalias 2>/dev/null ;; esac; done
+'@
+$c_blk = @'
+grep -rhE "^[[:space:]]*(install|blacklist)[[:space:]]" /etc/modprobe.d/99-stig-radio.conf 2>/dev/null
+'@
+$c_load = @'
+lsmod | cut -d" " -f1 | grep -E "^(rtw[0-9]*_|rtw[0-9]+|mt7[0-9]|mt76|iwlwifi|iwl[dm]vm|ath[0-9]+|brcmfmac|bt(usb|rtl|intel|bcm|mtk)|bluetooth|mac80211|cfg80211)"
+'@
+$disa = @(bash -c $c_disa) | Where-Object { $_ -ne "" }
+$live = @(bash -c $c_live) | Where-Object { $_ -ne "" }
+$hw   = @(bash -c $c_hw)   | Where-Object { $_ -ne "" }
+$blk  = @(bash -c $c_blk)  | Where-Object { $_ -ne "" }
+$load = @(bash -c $c_load) | Where-Object { $_ -ne "" }
+if ($hw.Count -eq 0 -and $live.Count -eq 0 -and $load.Count -eq 0) {
+    $V.Valid = $true
+    $V.Results = "NOT A FINDING - THERE IS NO RADIO IN THIS MACHINE. DISA's CheckText was executed verbatim and returned nothing; no interface exposes phy80211; no PCI device reports class 0x0280 (network controller, other), which is what an 802.11 adapter reports; and no wireless or Bluetooth module is resident. This is a virtual guest with no physical radio, so the CheckText's own note - 'not applicable for systems that do not have physical wireless network radios' - is satisfied ON THE HARDWARE, not merely on the absence of a bound driver."
+}
+elseif ($live.Count -eq 0 -and $blk.Count -gt 0) {
+    $V.Valid = $true
+    $V.Results = "NOT A FINDING - THE RADIO IS PRESENT AND DELIBERATELY DISABLED. Physical radio(s) detected: " + ($hw -join '; ') + ". DISA's CheckText returns " + $(if ($disa.Count -eq 0) { "nothing" } else { $disa -join '; ' }) + " and no interface exposes phy80211, so no wireless interface is configured. That state is ENFORCED rather than incidental: /etc/modprobe.d/99-stig-radio.conf carries " + ($blk -join '; ') + ", written by scripts/enclave/stig-tailor.sh radio disable and applied to the initramfs as well as to /etc, so the driver cannot bind at boot. Residual modules still resident from before the block, if any: " + $(if ($load.Count -eq 0) { "none" } else { $load -join '; ' }) + ". The enclave is air-gapped and a radio is the one component that can cross that gap without a cable being moved, so this is disabled at the kernel rather than documented as an accepted interface."
+}
+elseif ($live.Count -eq 0) {
+    $V.Results = "OPEN - A RADIO IS PRESENT AND NOTHING IS BLOCKING IT. Physical radio(s): " + ($hw -join '; ') + ". No interface exposes phy80211 and DISA's glob returns nothing, which is why a scanner scores this NOT APPLICABLE - but that is an accident of no driver being bound, not a control. Nothing in /etc/modprobe.d/99-stig-radio.conf blocks the driver, so a kernel update, a firmware package or a manual modprobe brings the adapter up. Remediate with: sudo ./scripts/enclave/stig-tailor.sh radio disable"
+}
+else {
+    $V.Results = "OPEN. Live 802.11 interface(s) configured: " + ($live -join '; ') + ". DISA's CheckText returns: " + $(if ($disa.Count -eq 0) { "nothing - the WEXT directory is absent, but the interface is real" } else { $disa -join '; ' }) + ". Physical radio(s): " + ($hw -join '; ') + ". Modules resident: " + ($load -join '; ') + "."
 }
 return $V
 EOF

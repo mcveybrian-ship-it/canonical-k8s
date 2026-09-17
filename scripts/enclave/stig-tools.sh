@@ -342,14 +342,39 @@ cmd_collect() {
       || { warn "$host: could not stage USG results"; rc=1; }
 
     # 2. One recursive pull for everything. Unprivileged by now, by construction.
-    if rscp -r "$MIRROR_USER@$addr:$EVIDENCE/$up" "$into/" 2>/dev/null; then
+    #
+    # DO NOT SWALLOW scp's STDERR. The earlier version ended `2>/dev/null`, so a failure
+    # arrived as the guess "nothing at ... - has it been scanned?" no matter what actually
+    # went wrong - a refused key, a full disk, an unreadable file. Capture it and print it.
+    local scperr; scperr="$(mktemp)"
+    if rscp -r "$MIRROR_USER@$addr:$EVIDENCE/$up" "$into/" 2>"$scperr"; then
+      # COUNT WITH THE SAME PRIVILEGE THAT WROTE. Under sudo the tree lands root:root 0700,
+      # and a later unprivileged `find` reports 0 files while the evidence sits right there.
       local n; n="$(find "$into/$up" -type f 2>/dev/null | wc -l)"
-      ok "$host: $n file(s) -> $into/$up"
-      got=$((got + 1))
+      if [ "$n" -eq 0 ]; then
+        warn "$host: the pull reported success but $into/$up holds no files"
+        warn "  check permissions on it - $(stat -c '%U:%G %A' "$into/$up" 2>/dev/null || echo 'cannot stat')"
+        rc=1
+      else
+        ok "$host: $n file(s) -> $into/$up"
+        got=$((got + 1))
+      fi
+      # HAND THE EVIDENCE BACK TO THE OPERATOR. Collected under sudo it is root:root 0700,
+      # so the NEXT collect - run without sudo, as this command normally is - cannot write
+      # into it, and every report that reads the evidence sees an empty directory. Measured
+      # on stage-01 2026-09-17: HOST-1/2/3 were root-owned from a sudo run while HOST-4 and
+      # the four VMs were not, and nothing said so.
+      if [ -n "${SUDO_UID:-}" ] && [ -n "${SUDO_GID:-}" ]; then
+        chown -R "$SUDO_UID:$SUDO_GID" "$into/$up" 2>/dev/null \
+          && say "  ownership handed to ${SUDO_USER:-$SUDO_UID}" \
+          || warn "  could not chown $into/$up - a later unprivileged collect will fail"
+      fi
     else
-      warn "$host: nothing at $EVIDENCE/$up - has it been scanned?"
+      warn "$host: pull from $EVIDENCE/$up failed - scp said:"
+      sed 's/^/       /' "$scperr" >&2
       rc=1
     fi
+    rm -f "$scperr"
   done
 
   printf '\n'

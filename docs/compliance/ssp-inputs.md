@@ -216,6 +216,29 @@ reboot. **A non-USB backup target — iSCSI or NFS — removes this exception en
 worth more to the SSP than the throughput is.** Source: runbook §6.3g · suggested controls MP-7,
 AC-19.
 
+### 4.1a ⚠️ Every host has a WiFi and a Bluetooth radio, and the checklist does not prove it
+
+> **All four hosts ship with an 802.11 adapter and a USB Bluetooth radio. The radios are
+> disabled at the kernel — `install <module> /bin/true` plus `blacklist`, applied to the
+> initramfs as well as `/etc` — not merely left unconfigured.**
+
+This is the one boundary statement an assessor cannot take from the checklist, because **V-270755
+scores Not Applicable on a machine that has a radio.** DISA's check lists wireless *interfaces*;
+where no driver happens to be bound there is no interface, so the scanner applies the rule's own
+"no physical wireless network radios" note. Measured 2026-09-17: host-4 scored `not_applicable`
+while carrying a MediaTek MT7922. host-1/2/3 scored Not Reviewed with a live `wlp2s0` on a
+Realtek RTL8821CE.
+
+**Bluetooth is not in the Ubuntu 24.04 V1R6 benchmark at all** — no rule, at any severity. A
+machine can hold a live Bluetooth radio and score a clean checklist, so the control here is a
+deliberate addition rather than an implementation of a requirement.
+
+The claim is evidenced rather than asserted: the answer-file entry for V-270755 re-runs the
+hardware test at every scan and returns **Open** if the block is ever removed or a radio appears
+that nothing is blocking — so this statement self-invalidates rather than going stale. Source:
+runbook §6.3g.1 · `scripts/enclave/stig-tailor.sh radio` · suggested controls **AC-18**
+(wireless access), SC-40, CM-7.
+
 ### 4.2 ⬜ Third-party packages no subscription tier covers
 
 > **Between 24 and 46 packages per machine are covered by no subscription at any tier.**

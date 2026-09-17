@@ -148,6 +148,47 @@ load_params() {
       ok "resolves $MIRROR_HOST"
       ;;
   esac
+  # ---- DISCOVER THE NIC AND ADDRESS RATHER THAN BE TOLD ---------------------------------
+  #
+  # THIS EXISTS BECAUSE THE FINAL INSTALL HAS TO BE AUTOMATED, AND THERE IS NO AI INSIDE THE
+  # AIR GAP. Every per-host value a human has to look up and paste is a step that cannot be
+  # automated and a place a wrong value gets typed. host-1 and host-2 carry `enp1s0` and
+  # host-3 carries `eno1`; hand-editing that per machine is exactly the kind of difference
+  # that silently installs the wrong thing.
+  #
+  # The machine already knows. The NIC holding this host's own global IPv4 address is the one
+  # the bridge must be built on, by definition - it is the interface the enclave reaches it
+  # through.
+  #
+  # Precedence: an explicitly SET value always wins, so a host with an unusual topology can
+  # still be told. Empty or unset means discover. Ambiguity is REFUSED rather than guessed -
+  # two candidate NICs is a question for a person, not a coin toss.
+  if [ -z "${BRIDGE_NIC:-}" ] || [ -z "${BRIDGE_ADDRESS:-}" ]; then
+    local _cand _n _found_nic="" _found_addr="" _count=0
+    while read -r _n _cand; do
+      [ "$_n" = lo ] && continue
+      _count=$((_count + 1)); _found_nic="$_n"; _found_addr="$_cand"
+    done < <(ip -4 -o addr show scope global 2>/dev/null | awk '{print $2, $4}')
+
+    if [ "$_count" -eq 0 ]; then
+      die "no global IPv4 address on any interface - cannot discover BRIDGE_NIC.
+       Set BRIDGE_NIC and BRIDGE_ADDRESS in $PARAMS explicitly."
+    elif [ "$_count" -gt 1 ]; then
+      die "$_count interfaces carry a global IPv4 address, so the bridge NIC is ambiguous:
+       $(ip -4 -o addr show scope global | awk '$2!="lo"{printf "%s %s  ", $2, $4}')
+       This is a question for a person. Set BRIDGE_NIC and BRIDGE_ADDRESS explicitly."
+    fi
+    [ -n "${BRIDGE_NIC:-}" ]     || { BRIDGE_NIC="$_found_nic";      ok "discovered BRIDGE_NIC=$BRIDGE_NIC"; }
+    [ -n "${BRIDGE_ADDRESS:-}" ] || { BRIDGE_ADDRESS="$_found_addr"; ok "discovered BRIDGE_ADDRESS=$BRIDGE_ADDRESS"; }
+  else
+    # Both were given. Say so if they disagree with the machine - a params file copied from
+    # another host is the likeliest cause, and it is better caught here than at the bridge.
+    local _real; _real="$(ip -4 -o addr show scope global 2>/dev/null | awk -v n="$BRIDGE_NIC" '$2==n{print $4}')"
+    if [ -n "$_real" ] && [ "$_real" != "$BRIDGE_ADDRESS" ]; then
+      warn "params say $BRIDGE_NIC has $BRIDGE_ADDRESS; it actually has $_real"
+    fi
+  fi
+
   : "${BRIDGE_NAME:?}" "${BRIDGE_NIC:?}" "${BRIDGE_ADDRESS:?}"
   : "${DATA_VG:?}" "${DATA_LVS:?}" "${DATA_FSTYPE:?}"
   : "${POOL_NAME:?}" "${POOL_PATH:?}"

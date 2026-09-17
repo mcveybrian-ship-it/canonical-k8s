@@ -2607,6 +2607,12 @@ svc-obs-01	80/tcp	allow	__ENCLAVE_CIDR__	301 to https only, so a plaintext clien
 svc-obs-01	9100/tcp	allow	__SVC_OBS_01__	its own node-exporter, scraped by the Prometheus on this same box. Kept explicit so the rule set reads the same on every machine
 host-4	9100/tcp	allow	__SVC_OBS_01__	node-exporter. NOTE: host-4 has no rule table in practice - see the comment above ufw_rules() - so this row exists for the day it does, and documents the intent meanwhile
 host-4	9177/tcp	allow	__SVC_OBS_01__	prometheus-libvirt-exporter. Per-guest CPU, disk and network for EVERY VM in the enclave - the single most revealing port in the boundary. Source-restricted, always
+host-1	22/tcp	limit	any	ssh - the ONLY management path into this machine. No BMC, no serial console, and the LUKS root prompts at a physical console, so losing ssh means a drive to the rack. `limit` not `deny`: rate-limiting is what the STIG rule is aimed at
+host-1	9100/tcp	allow	__SVC_OBS_01__	node-exporter, source-restricted to the collector. Not listening yet - monitoring has not been extended to the bare-metal hosts - but the rule is written now so enabling the exporter is not also a firewall change
+host-2	22/tcp	limit	any	ssh - same reasoning as host-1
+host-2	9100/tcp	allow	__SVC_OBS_01__	node-exporter, source-restricted to the collector
+host-3	22/tcp	limit	any	ssh - same reasoning as host-1
+host-3	9100/tcp	allow	__SVC_OBS_01__	node-exporter, source-restricted to the collector
 svc-mgmt-01	9100/tcp	allow	__SVC_OBS_01__	node-exporter. Same caveat as host-4: no rule table yet, the MAAS port list is unconfirmed
 EOF
 }
@@ -2643,6 +2649,20 @@ cmd_ufw() {
   local mine; mine="$(ufw_rules \
       | sed -e "s|__SVC_OBS_01__|${obs}|g" -e "s|__ENCLAVE_CIDR__|${cidr}|g" \
       | awk -F'\t' -v m="$me" '$1==m')"
+
+  # NO TABLE AT ALL IS CHECKED FIRST, and the order is load-bearing. `printf '%s\n' ""`
+  # emits ONE EMPTY LINE, so awk sees a record whose $4 is empty and the source check below
+  # fires - reporting "SVC_OBS_01 is probably unset" on a machine where it is set perfectly
+  # well. Measured on host-1 2026-09-17: it sent the operator to inspect the address file
+  # while the real answer was that host-1 simply had no rows yet. A diagnostic that names the
+  # wrong cause is worse than no diagnostic.
+  if [ -z "$mine" ]; then
+    die "no ufw rule table for '$me'.
+       Every bare-metal host and service VM needs its own rows in ufw_rules() - there is no
+       default, deliberately, because a firewall built from a guess is worse than none.
+       A new hypervisor needs at least: 22/tcp limit, and 9100/tcp restricted to the
+       collector once monitoring reaches it."
+  fi
 
   # A SOURCE-RESTRICTED RULE WITH NO SOURCE IS A RULE OPEN TO EVERYTHING. If the address is
   # unset the substitution leaves an empty field, `ufw allow from  to any port 9100` becomes

@@ -389,6 +389,108 @@ one** — and guessing wrong either wastes the trip or leaves a gap:
 | **Traditional Security Checklist** | Physical and environmental security is commonly required in a DoD package. Ask whether it is expected here or inherited from the facility's existing ATO. |
 | **Application Security and Development STIG** | Likely **N/A** — this enclave runs no locally-developed application; the shell scripts are build automation, not a fielded system. Confirm rather than assume, because "we decided it was N/A" needs to be someone's decision on the record. |
 
+### Hand this to the CAC holder — copy-paste email
+
+**The strategy is one download, not eight.** DISA publishes a **"SRG/STIG Library
+Compilation"** — a single quarterly archive containing every STIG and every SRG. For someone
+who does not know this material, hunting eight individual files is how you get seven of them
+and a second trip. Take the whole library, and we extract what we need on our side.
+
+**The CCI List is NOT inside the compilation** and has to be taken separately. That is the one
+item most likely to be forgotten, and it is the one that makes STIG results into 800-53
+evidence.
+
+```text
+Subject: DoD cyber.mil downloads needed - one trip, ~4 items
+
+Hi -
+
+I need some files from DISA's public cyber.mil site. You'll need your CAC and a
+card reader on whatever machine you use. Everything here is unclassified and
+publicly releasable; the CAC is just how they gate the download now.
+
+Please DON'T unzip anything. Bring the .zip files exactly as downloaded - we
+verify them by checksum on our side and unzipping breaks that.
+
+--------------------------------------------------------------------
+ITEM 1 - THE BIG ONE (this is the whole job in one file)
+--------------------------------------------------------------------
+Go to:  https://public.cyber.mil/stigs/downloads/
+
+Look for an entry called:
+    "SRG/STIG Library Compilation"
+(it may read "Compilation", "Library Compilation", or show a quarter and year,
+e.g. "... Compilation - January 2026")
+
+Download the most recent one. It is large - expect somewhere between several
+hundred MB and a few GB - and it contains every STIG and every SRG in one
+archive. That is deliberate: it means you don't have to find individual files.
+
+If you see BOTH a "SCAP" compilation and a non-SCAP one, TAKE BOTH.
+
+--------------------------------------------------------------------
+ITEM 2 - THE CCI LIST (separate, and easy to miss)
+--------------------------------------------------------------------
+This is NOT in the compilation above. It's its own download.
+
+On the same site, find:  "Control Correlation Identifier" or "CCI"
+Direct page, if it still works:  https://public.cyber.mil/stigs/cci/
+
+The file is usually named something like:  U_CCI_List.zip
+
+Please make sure you get this one. It's small and it's the piece everything
+else depends on.
+
+--------------------------------------------------------------------
+ITEM 3 - DoD CERTIFICATE BUNDLE (only if the site warns you)
+--------------------------------------------------------------------
+If your browser complains about certificates on cyber.mil, there's a package
+called "DoD Certificates" or "PKI CA Certificate Bundles" on the same site.
+Grab it. If you get no warnings, skip this.
+
+--------------------------------------------------------------------
+ITEM 4 - IF, AND ONLY IF, ITEM 1 IS UNAVAILABLE
+--------------------------------------------------------------------
+If there's no compilation archive, download these individually. Search the
+downloads page for each name. Take the NEWEST version of each - the version
+numbers look like "V1R6" and higher R numbers are newer.
+
+  1. Kubernetes STIG                     <- most important, don't miss it
+  2. Crunchy Data PostgreSQL 16 STIG     (may be listed under "Crunchy Data")
+  3. Web Server SRG
+  4. Application Server SRG              (take it if you see it, cheap insurance)
+  5. Container Platform SRG
+  6. Database SRG
+  7. General Purpose Operating System SRG
+  8. Canonical Ubuntu 24.04 LTS STIG
+
+For each one, if the page offers both a "STIG" zip and a "SCAP Benchmark" zip,
+TAKE BOTH.
+
+--------------------------------------------------------------------
+WHEN YOU'RE DONE - two things that save us a second trip
+--------------------------------------------------------------------
+1) Send me the exact filename of every file you downloaded. Copy-paste the
+   list; don't retype it. The version numbers matter to us.
+
+2) Generate a checksum for each file so we can confirm nothing corrupted in
+   transit. On Windows, open Command Prompt in the download folder and run:
+
+       certutil -hashfile "FILENAME.zip" SHA256
+
+   Do that for each file and paste me the output.
+
+Put everything on a USB drive or external disk - don't email the files, some
+are too big.
+
+Thanks -
+```
+
+**Why "take both" appears twice:** a product page often offers a manual STIG zip *and* a SCAP
+benchmark zip, and they contain different things. The manual XCCDF is what `StigContent/Manual/`
+consumes; the SCAP benchmark is what drives an automated scan. Asking for both costs nothing and
+removes the most likely reason for a second trip.
+
 ### When the files arrive
 
 1. **Record what was actually taken** — product, version, revision, release date, and the SHA-256

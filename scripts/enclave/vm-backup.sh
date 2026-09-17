@@ -884,8 +884,24 @@ cmd_reattach() {
   if mountpoint -q "$DEST"; then ok "$DEST is already mounted - nothing to do"; return 0; fi
   [ -n "$LUKS_UUID" ] || die "BACKUP_LUKS_UUID is not set in vm-specs.env"
 
-  local tailor; tailor="$(dirname "$(readlink -f "$0")")/stig-tailor.sh"
-  local opened_window=0 dev; dev="$(luks_dev)"
+  # NOT `local`, AND THAT IS THE POINT. `reblock` below runs from an EXIT trap, which fires
+  # after this function has already returned - so a `local` is out of scope by the time the
+  # trap reads it. Under `set -u` that produced:
+  #
+  #     vm-backup.sh: line 906: opened_window: unbound variable
+  #
+  # on EVERY successful reattach, with a non-zero exit after a completely successful mount.
+  # Found 2026-09-17 during the SSD swap; pre-existing, not introduced by the TRIM change.
+  #
+  # The tempting fix - ${opened_window:-0} - IS WRONG AND WOULD BE WORSE THAN THE BUG. It
+  # makes the trap read 0 even when a window WAS opened, so the USB block would silently
+  # never be restored and kernel_module_usb-storage_disabled would start failing with nothing
+  # to say why. A cosmetic error traded for a security regression.
+  #
+  # Script scope is what the trap actually needs. Neither name is used anywhere else.
+  tailor="$(dirname "$(readlink -f "$0")")/stig-tailor.sh"
+  opened_window=0
+  local dev; dev="$(luks_dev)"
 
   if [ ! -b "$dev" ]; then
     if ! lsmod | grep -q "^usb_storage"; then

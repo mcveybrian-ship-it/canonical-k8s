@@ -550,6 +550,57 @@ cmd_fixups() {
     esac
   fi
 
+  # ---- 0d. THE JOURNAL'S PER-MACHINE-ID DIRECTORY, which journald resets ---------------
+  #
+  # MEASURED 2026-09-17. `dir_permissions_system_journal` (UBTU-24-700020) failed on host-1
+  # and host-2 and PASSED on host-3, with identical file permissions on all three. The
+  # difference was one directory nobody was looking at:
+  #
+  #   host-1  /var/log/journal/<machine-id>  2755   <- journald's default, setgid back
+  #   host-3  /var/log/journal/<machine-id>  640
+  #
+  # journald recreates that subdirectory with its own default after a systemd upgrade and
+  # restart. The declared fix already exists - `Z /var/log/journal/%m ~0640` in the tmpfiles
+  # config v1r6 writes - so the remedy is to RE-APPLY THE DECLARATION rather than chmod by
+  # hand. systemd-tmpfiles is idempotent and is the mechanism that owns this path.
+  #
+  # AND NOTE WHY IT WENT UNNOTICED: `v1r6 --verify` checks /var/log/journal and
+  # /run/log/journal and reported 0640 on both - correctly - while never looking at the %m
+  # subdirectory that the rule evaluates. A verify that misses the object under test reads
+  # exactly like a pass.
+  local jdir bad_jdir=0
+  for jdir in /var/log/journal/* /run/log/journal/*; do
+    [ -d "$jdir" ] || continue
+    case "$(stat -c %a "$jdir" 2>/dev/null)" in
+      640|600|0640|0600) : ;;
+      *) bad_jdir=1 ;;
+    esac
+  done
+  if [ "$bad_jdir" -eq 1 ]; then
+    if systemd-tmpfiles --create >/dev/null 2>&1; then
+      local still=0
+      for jdir in /var/log/journal/* /run/log/journal/*; do
+        [ -d "$jdir" ] || continue
+        case "$(stat -c %a "$jdir" 2>/dev/null)" in 640|600|0640|0600) : ;; *) still=1 ;; esac
+      done
+      if [ "$still" -eq 0 ]; then
+        ok "journal machine-id directories re-tightened to 0640 via systemd-tmpfiles"
+        say "     journald resets these to 2755 after a systemd upgrade. UBTU-24-700020."
+      else
+        warn "systemd-tmpfiles ran but a journal directory is still more permissive than 0640:"
+        for jdir in /var/log/journal/* /run/log/journal/*; do
+          [ -d "$jdir" ] && printf '       %s %s\n' "$jdir" "$(stat -c %a "$jdir")" >&2
+        done
+        warn "  is the 'Z /var/log/journal/%m ~0640' line present in /etc/tmpfiles.d? v1r6 --apply writes it"
+        failed=$((failed+1))
+      fi
+    else
+      warn "systemd-tmpfiles --create failed"; failed=$((failed+1))
+    fi
+  else
+    ok "journal machine-id directories are 0640 or stricter"
+  fi
+
   # ---- 0b. SERVICES usg fix LEAVES PERMANENTLY FAILED ---------------------------------
   #
   # FOUND 2026-09-17 on host-1, then measured on ALL FIVE existing machines: every hardened
@@ -2070,7 +2121,30 @@ TMPF
       say "      impossible. Confirm that on THIS machine before believing it."
     fi
   else
-    ok "   both directories are 0640"
+    # WIDENED 2026-09-17. This used to stop here and say "both directories are 0640", which
+    # was TRUE and still missed the finding: UBTU-24-700020 also evaluates the PER-MACHINE-ID
+    # subdirectory, /var/log/journal/<machine-id>, and journald resets that to 2755 after a
+    # systemd upgrade. host-1 and host-2 failed the rule while this check reported a pass;
+    # host-3 passed. Identical file permissions on all three - the only difference was the
+    # one directory nothing looked at.
+    #
+    # A verify that does not inspect the object the rule inspects reads exactly like a pass.
+    local sub subbad=""
+    for sub in /var/log/journal/*/ /run/log/journal/*/; do
+      [ -d "$sub" ] || continue
+      case "$(stat -c %a "$sub" 2>/dev/null)" in
+        640|600|0640|0600) : ;;
+        *) subbad="$subbad $sub($(stat -c %a "$sub"))" ;;
+      esac
+    done
+    if [ -n "$subbad" ]; then
+      warn "   parent directories are 0640 but a MACHINE-ID SUBDIRECTORY is not:$subbad"
+      say  "      journald resets these after a systemd upgrade. UBTU-24-700020 checks them."
+      say  "      fix: sudo $0 fixups --apply   (re-applies the declared tmpfiles rule)"
+      failed=1
+    else
+      ok "   both directories AND every machine-id subdirectory are 0640"
+    fi
   fi
 
   # ---- what is left, and who has to decide it -------------------------------------------

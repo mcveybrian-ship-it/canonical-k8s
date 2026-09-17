@@ -527,10 +527,21 @@ cmd_fixups() {
       *[0-7][0-7])
         # Non-root must not be able to run it. 0750 keeps root and the owning group.
         case "$jcmode" in
-          750|700|740|700) ok "journalctl is $jcmode - non-root cannot read the journal" ;;
+          740) ok "journalctl is 740 - UBTU-24-700030 satisfied" ;;
           *)
-            if chmod 0750 "$jc"; then
-              ok "journalctl was $jcmode, now 0750 - file_permissions_journalctl"
+            # DISA'S OWN REMEDIATION, VERBATIM, NOT A NUMBER SOMEBODY DERIVED.
+            #
+            # UBTU-24-700030's CheckText is explicit: "Verify that the journalctl command has
+            # a permission set of 740 ... If journalctl is not set to 740, this is a finding."
+            # Its fix is `chmod u-s,g-xws,o-xwrt`, which takes 755 to exactly 740.
+            #
+            # The first version of this used 0750 because it looked reasonable. It is wrong by
+            # one bit - group execute - and the rule kept failing on two machines while the
+            # output claimed success. Reading the rule took one command; guessing at it took
+            # three rounds. Use the vendor's expression so the intent survives even if the
+            # numeric target ever changes.
+            if chmod u-s,g-xws,o-xwrt "$jc"; then
+              ok "journalctl was $jcmode, now $(stat -c %a "$jc") - UBTU-24-700030 (DISA's own chmod)"
               say "     a systemd upgrade restores this to 755 EVERY TIME. This runs after every patch."
             else
               warn "could not chmod $jc"; failed=$((failed+1))

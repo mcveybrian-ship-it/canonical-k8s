@@ -1653,8 +1653,24 @@ cmd_radio() {
         ok "wrote $RADIO_BLOCK"
         # The blacklist has to reach the initramfs too, or a module packed into it loads
         # before /etc is even mounted and the file is decoration.
+        # REBUILD THE INITRAMFS, AND DO NOT HIDE WHAT IT SAYS. A blacklist that is not in
+        # the initramfs is decoration for any module packed into it - but every host here is
+        # LUKS-encrypted, and a broken initramfs is a machine that stops at a passphrase
+        # prompt that never appears, on hardware with no BMC. Capture the output, print it
+        # if it fails, and say plainly that the machine must not be rebooted until it is
+        # fixed. `>/dev/null 2>&1` here would turn that into a silent brick.
         say "  rebuilding initramfs so the block applies before root is mounted"
-        update-initramfs -u >/dev/null 2>&1 && ok "initramfs rebuilt" || warn "update-initramfs failed"
+        local iout; iout="$(mktemp)"
+        if update-initramfs -u >"$iout" 2>&1; then
+          ok "initramfs rebuilt"
+          grep -iE 'warn|error' "$iout" | sed 's/^/       /' || true
+        else
+          warn "update-initramfs FAILED - output follows:"
+          sed 's/^/       /' "$iout" >&2
+          warn "DO NOT REBOOT THIS MACHINE until update-initramfs succeeds. The root"
+          warn "  filesystem is LUKS-encrypted and a broken initramfs will not unlock it."
+        fi
+        rm -f "$iout"
       fi
 
       # Unload. Two passes: the vendor helpers hold references until btusb goes, and
@@ -1684,7 +1700,9 @@ cmd_radio() {
       [ -f "$RADIO_BLOCK" ] || { warn "no $RADIO_BLOCK - nothing of ours to remove"; return 0; }
       backup_file "$RADIO_BLOCK"
       rm -f "$RADIO_BLOCK"
-      update-initramfs -u >/dev/null 2>&1 || warn "update-initramfs failed"
+      local iout; iout="$(mktemp)"
+      update-initramfs -u >"$iout" 2>&1 || { warn "update-initramfs FAILED:"; sed 's/^/       /' "$iout" >&2; }
+      rm -f "$iout"
       radio_log ENABLE "removed $RADIO_BLOCK - V-270755 is now OPEN on this machine"
       warn "radio block REMOVED. V-270755 is a finding until 'radio disable' is run again."
       say "  other files may still block: $(radio_block_files | tr '\n' ' ')"

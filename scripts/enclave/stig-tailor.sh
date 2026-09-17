@@ -505,6 +505,40 @@ cmd_fixups() {
   # unrelated ones down with it.
   local failed=0
 
+  # ---- 0c. CONTROLS A PACKAGE UPGRADE REVERTS, THAT ONLY `usg fix` EVER SET -------------
+  #
+  # MEASURED ON host-1, 2026-09-17: a 185-package upgrade took a fully hardened machine from
+  # 213 pass / 3 fail back to 211/5. `/usr/bin/journalctl` was 755 with the PACKAGE's July
+  # mtime - dpkg had replaced it and restored the archive's file, discarding the mode that
+  # `usg fix` set during hardening.
+  #
+  # THE REAL PROBLEM IS NOT THE MODE, IT IS THAT NOTHING COULD PUT IT BACK. `usg fix` is the
+  # only thing that ever set it, and runbook §6.0 step 9 says explicitly do NOT re-run `fix`.
+  # So a routine patch cycle silently un-hardened the machine and the only documented remedy
+  # was one the procedure forbids. A control that can only be applied once is not a control,
+  # it is a coincidence that held for a while.
+  #
+  # So `fixups` owns it now: idempotent, re-assertable after every patch, and part of the
+  # post-patch sequence rather than a one-time act during the build.
+  local jc=/usr/bin/journalctl
+  if [ -x "$jc" ]; then
+    local jcmode; jcmode="$(stat -c %a "$jc" 2>/dev/null)"
+    case "$jcmode" in
+      *[0-7][0-7])
+        # Non-root must not be able to run it. 0750 keeps root and the owning group.
+        case "$jcmode" in
+          750|700|740|700) ok "journalctl is $jcmode - non-root cannot read the journal" ;;
+          *)
+            if chmod 0750 "$jc"; then
+              ok "journalctl was $jcmode, now 0750 - file_permissions_journalctl"
+              say "     a systemd upgrade restores this to 755 EVERY TIME. This runs after every patch."
+            else
+              warn "could not chmod $jc"; failed=$((failed+1))
+            fi ;;
+        esac ;;
+    esac
+  fi
+
   # ---- 0b. SERVICES usg fix LEAVES PERMANENTLY FAILED ---------------------------------
   #
   # FOUND 2026-09-17 on host-1, then measured on ALL FIVE existing machines: every hardened

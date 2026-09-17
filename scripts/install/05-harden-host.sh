@@ -34,9 +34,10 @@
 #     at a console and pretending otherwise would hang the script forever.
 #   - It will not install the Evaluate-STIG Answer File. That is pushed FROM stage-01 and
 #     cannot be done from the target; the script tells you when it is needed.
-#   - It will not patch. 185 pending upgrades on a freshly hardened host is normal, and a
-#     `grub-common` upgrade DROPS `--unrestricted` and turns the next boot into a password
-#     prompt. Patch as a deliberate step afterwards, then re-run `grubpw status`.
+#   - It DOES patch, at step 3b - after FIPS and BEFORE hardening. That ordering is
+#     deliberate: the scan then describes the machine that exists, and a `grub-common`
+#     upgrade cannot drop the `--unrestricted` that `grubpw prep` adds later. Every
+#     FUTURE patch cycle still needs `grubpw status` and `fixups --verify` afterwards.
 #
 # Runbook §6.0 is the reference. This is the execution.
 # =========================================================================================
@@ -225,6 +226,66 @@ step_fips() {
 
   pro enable fips-updates --assume-yes
   need_reboot "FIPS is enabled but the FIPS kernel is not running yet."
+}
+
+step_patch() {
+  done_step patch && return 0
+  hdr "3b. PATCH - before hardening, deliberately"
+
+  # WHY HERE AND NOT AT THE END. Brian asked the right question on 2026-09-17: patch first so
+  # the scan describes the machine that exists.
+  #
+  #   1. EVIDENCE. Scanning an unpatched host and then patching means the CKLs document a
+  #      state that is already gone. An assessor is shown a machine nobody has.
+  #   2. IT DEFUSES grub-common. /etc/grub.d/10_linux is a PACKAGE file: upgrading it DROPS
+  #      the --unrestricted that `grubpw prep` adds, which turns the next boot into a GRUB
+  #      password prompt on a box with no console. Patch BEFORE prep and the upgrade cannot
+  #      take it away afterwards.
+  #   3. ONE FEWER REBOOT. The patch reboot folds into the sequence instead of being a fourth
+  #      trip to the rack.
+  #
+  # AND WHY AFTER FIPS, NOT BEFORE: `pro enable fips-updates` moves this host onto the FIPS
+  # kernel line. Patching the generic kernel first is work thrown away.
+  #
+  # THIS DOES NOT REMOVE THE DAY-2 OBLIGATION. Every future patch cycle still has to be
+  # followed by `grubpw status` and `fixups --verify`, because the same package can drop the
+  # same setting again. Doing it here only means the BUILD ends in a consistent state.
+
+  apt-get update >/dev/null 2>&1 || warn "apt-get update reported a problem"
+
+  # MEASURE IT FIRST. The count and download size are the only real data anyone has for Q6 -
+  # the offline patch-bundle size and cadence question open since August - and they are free
+  # to capture here. A simulated run changes nothing.
+  local sim n bytes
+  sim="$(apt-get -s full-upgrade 2>/dev/null)"
+  n="$(printf '%s\n' "$sim" | awk '/^[0-9]+ upgraded/{print $1; exit}')"
+  bytes="$(printf '%s\n' "$sim" | awk -F'[ /]' '/Need to get/{print $4, $5; exit}')"
+  n="${n:-0}"
+  if [ "$n" -eq 0 ]; then
+    ok "nothing to upgrade - already at the mirror's level"
+    mark_step patch; return 0
+  fi
+  say "$n package(s) to upgrade${bytes:+, $bytes to download}"
+  printf 'patch %s packages %s\n' "$n" "${bytes:-?}" >> "$LOG"
+  say ""
+  say "  NOTE FOR THE SSP: this brings the host to THE MIRROR'S level, not to upstream"
+  say "  current. The mirror has a sync date, and AptMetadataStale exists to say when it is"
+  say "  drifting. \"Fully patched\" here means \"matches the mirror\"."
+  say ""
+
+  DEBIAN_FRONTEND=noninteractive apt-get -y \
+    -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold \
+    full-upgrade || die "full-upgrade failed - resolve it before hardening a half-patched host"
+
+  apt-get -y autoremove >/dev/null 2>&1 || true
+  ok "upgraded $n package(s)"
+  mark_step patch
+
+  if [ -f /var/run/reboot-required ]; then
+    need_reboot "The upgrade installed something that needs a reboot$(
+      [ -r /var/run/reboot-required.pkgs ] && printf ' (%s)' "$(tr '\n' ' ' < /var/run/reboot-required.pkgs)")."
+  fi
+  ok "no reboot required by the upgrade"
 }
 
 step_usg() {
@@ -430,7 +491,7 @@ cmd_status() {
   assert_enclave_host
   printf '\n  hardening state on %s\n\n' "$(hostname -s)"
   local s
-  for s in preflight hostprep pro fips usg baseline prechecks usgfix tailor grub v1r6 verify final_audit evalstig; do
+  for s in preflight hostprep pro fips patch usg baseline prechecks usgfix tailor grub v1r6 verify final_audit evalstig; do
     printf '  %s %s\n' "$(done_step "$s" && echo '[x]' || echo '[ ]')" "$s"
   done
   printf '\n  state file: %s\n' "$STATE"
@@ -441,7 +502,7 @@ cmd_status() {
 cmd_run() {
   need_root; assert_enclave_host
   install -d -m 0755 "$STATE_DIR"; touch "$STATE" "$LOG"
-  step_preflight; step_hostprep; step_pro; step_fips; step_usg; step_baseline
+  step_preflight; step_hostprep; step_pro; step_fips; step_patch; step_usg; step_baseline
   step_prechecks; step_usgfix; step_tailor; step_grub; step_v1r6
   step_verify; step_final_audit; step_evalstig; step_done
 }

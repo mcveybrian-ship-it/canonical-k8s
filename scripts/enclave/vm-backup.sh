@@ -837,9 +837,17 @@ cmd_prune() {
   done
 
   if [ "$dry" -eq 1 ]; then
-    ok "dry run - nothing removed"
+    ok "DRY RUN - nothing was removed"
   else
-    ok "prune complete - kept $KEEP chain(s) per domain, freed $(human "$freed")"
+    # REPORT WHAT WAS KEPT, NOT WHAT THE POLICY SAYS. This line used to read
+    # "kept $KEEP chain(s) per domain", which printed the POLICY (KEEP=2) regardless of what
+    # was actually on the volume - so it announced "kept 2 chain(s)" when there was 1.
+    #
+    # That is the same substitution that caused the 2026-09-16 catastrophe in this very
+    # function: a statement about the intended policy, presented as a statement about the
+    # data. An operator reading "kept 2" has no reason to look further, which is exactly when
+    # they should.
+    ok "prune complete - freed $(human "$freed"), retained chains per domain listed above"
   fi
 }
 
@@ -1403,8 +1411,21 @@ case "${1:-status}" in
   full)         shift || true; cmd_backup full "${1:-all}" ;;
   incr)         shift || true; cmd_backup incr "${1:-all}" ;;
   progress)     cmd_progress ;;
-  verify)       cmd_verify ;;
-  prune)        cmd_prune ;;
+  # `shift || true; ... "$@"` IS LOAD-BEARING, NOT STYLE. Both of these read `verify)
+  # cmd_verify ;;` until 2026-09-17, so the flags never reached the functions that parse
+  # them - and because the functions only `die` on an argument they do not recognise, an
+  # argument that never arrives is silent. Two live consequences, both found by running them:
+  #
+  #   verify --all   re-read NOTHING, ever. It skipped every set on its stamps and finished in
+  #                  0.277s. The weekly deep verify - the ONLY thing that can catch silent
+  #                  decay, because decay does not change an mtime - had never read a byte.
+  #   prune --dry-run  WAS NOT A DRY RUN. It was a live prune. It freed 0B only because
+  #                  nothing needed pruning; on a different chain state this is the same
+  #                  function that has already deleted every full backup in this enclave once.
+  #
+  # If a subcommand takes arguments, forward them. If it takes none, do not add a shift.
+  verify)       shift || true; cmd_verify "$@" ;;
+  prune)        shift || true; cmd_prune "$@" ;;
   keyfile)      cmd_keyfile ;;
   reattach)     cmd_reattach ;;
   schedule)     shift || true; cmd_schedule "${1:-02:00}" ;;

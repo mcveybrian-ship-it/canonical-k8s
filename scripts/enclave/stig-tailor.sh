@@ -511,8 +511,9 @@ cmd_fixups() {
   # machine in this enclave has been carrying TWO permanently failed units since the day it
   # was hardened, and nothing reported it.
   #
-  #   sssd.service     "SSSD couldn't load the configuration database: No domain is enabled"
-  #   openipmi.service  no IPMI device to talk to
+  #   sssd.service          "SSSD couldn't load the configuration database: No domain is enabled"
+  #   openipmi.service      no IPMI device to talk to
+  #   fwupd-refresh.service firmware metadata from the internet, with no default route
   #
   # Neither is a defect in the machine - they are services with nothing to serve. `usg fix`
   # installs and enables them because the STIG wants the PACKAGES present (pam_sss, nss_sss),
@@ -528,7 +529,7 @@ cmd_fixups() {
   # exists. A site WITH a directory or a BMC must keep them, so this can never be a blanket
   # disable. Packages stay installed, so the STIG rules that want them still pass.
   local svc cond
-  for svc in sssd openipmi; do
+  for svc in sssd openipmi fwupd-refresh; do
     case "$(systemctl is-enabled "$svc" 2>/dev/null)" in
       enabled|enabled-runtime|static) : ;;
       *) continue ;;
@@ -551,6 +552,18 @@ cmd_fixups() {
       openipmi)
         if [ ! -e /dev/ipmi0 ] && [ ! -e /dev/ipmi/0 ] && [ ! -e /dev/ipmidev/0 ]; then
           cond="no IPMI device present - this hardware has no BMC"
+        fi ;;
+      fwupd-refresh)
+        # It downloads firmware metadata from the internet. THE ENCLAVE HAS NO DEFAULT ROUTE,
+        # by design (enclave-addresses.env: MAAS hands out no `option routers`), so this is
+        # not a service that is failing - it is a service that cannot possibly succeed.
+        #
+        # Found on host-1 and host-2 2026-09-17. host-3 showed zero failed units only because
+        # its timer had not fired yet; it would have joined them. That is the shape of every
+        # one of these: a unit that fails on a schedule looks fine until the schedule comes
+        # round, and by then nobody is watching that machine any more.
+        if [ -z "$(ip route show default 2>/dev/null)" ]; then
+          cond="no default route - firmware metadata cannot be fetched from an air gap"
         fi ;;
     esac
     if [ -z "$cond" ]; then

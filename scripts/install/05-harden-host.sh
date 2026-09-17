@@ -381,7 +381,18 @@ step_evalstig() {
 
   # The Answer File is pushed FROM stage-01 and cannot be fetched from here. Without it the
   # scan reports every documented deviation as Open/NR and the whole thing has to be re-run.
-  if ! ls /srv/stig-tools/Evaluate-STIG/AnswerFiles/*.xml >/dev/null 2>&1; then
+  # CHECK THE EXACT FILE, NOT A GLOB IN A DIRECTORY WE DO NOT OWN.
+  #
+  # The first version globbed /srv/stig-tools/Evaluate-STIG/AnswerFiles/*.xml and reported
+  # "Answer File present" on host-2 while stig-tools.sh said "NO ANSWER FILE" on the very
+  # next line - because the Evaluate-STIG tarball SHIPS ITS OWN AnswerFiles/ directory full
+  # of vendor samples. The glob matched those. A 15-minute scan then ran without our answers,
+  # which re-opens every documented deviation as a finding, and had to be killed and redone.
+  #
+  # Ours is one named file, put there by `stig-tools.sh answers <host>`, and that script is
+  # the authority on the path - so derive it the same way rather than writing it twice.
+  ANSWERS="/srv/stig-tools/Ubuntu24_AnswerFile.xml"
+  if [ ! -f "$ANSWERS" ]; then
     hdr "ANSWER FILE NEEDED - from stage-01, WITHOUT sudo"
     say "  cd ~/canonical-k8s && ./scripts/enclave/stig-tools.sh answers $(hostname -s)"
     say ""
@@ -391,7 +402,7 @@ step_evalstig() {
     say "  Then:  sudo $0 run"
     exit 0
   fi
-  ok "Answer File present"
+  ok "Answer File present: $ANSWERS ($(grep -c '<Vuln ' "$ANSWERS" 2>/dev/null || echo '?') entries)"
   say "scanning - 7 to 15 minutes, and it prints progress"
   "$ENC/stig-tools.sh" scan || warn "scan returned non-zero - read the output"
   mark_step evalstig

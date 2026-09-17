@@ -99,6 +99,46 @@ for v in NIC_MATCH PREFIX PASSWORD_HASH; do
   [[ -n "${!v:-}" ]] || die "$v is unset in $PARAMS"
 done
 
+# ---- DRIFT CHECK: your params file vs the example ---------------------------------------
+# WHY THIS EXISTS. host-params.env is gitignored, because it holds the LUKS passphrase and the
+# password hash. So every parameter added to host-params.env.example afterwards is ABSENT from
+# the real file, and the script quietly falls back to a default that may be wrong for this
+# host. Nothing compares the two.
+#
+# On 2026-09-17 that cost a build: DATA_VG_SIZE had been added to the example that morning and
+# was missing from the live file. Its default is -1, meaning "the whole data disk becomes
+# vg-data" - which on host-1..3 would have consumed the 1 TB that must be SPLIT, leaving
+# nothing raw for the Ceph OSD. Partitioning is install-time and not retrofittable: the cost
+# of that default being silently wrong is rebuilding the host, and later the OSD with it.
+#
+# So: REFUSE on a missing parameter that changes the disk layout or the security posture, WARN
+# on the rest. A default is only safe when it is also correct.
+_example="$HERE/02-host-autoinstall/host-params.env.example"
+if [[ -r "$_example" ]]; then
+  # Keys only - never values. This file holds secrets and nothing here may print one.
+  _missing="$(comm -23 \
+      <(grep -oE '^[A-Z_][A-Z0-9_]*=' "$_example" | tr -d '=' | sort -u) \
+      <(grep -oE '^[A-Z_][A-Z0-9_]*=' "$PARAMS"   | tr -d '=' | sort -u))"
+  if [[ -n "$_missing" ]]; then
+    # Anything here silently changes the disk layout or the crypto posture when defaulted.
+    _critical="DATA_VG_SIZE ENCRYPT_DISKS LUKS_UNLOCK OS_DISK_MATCH DATA_DISK_MATCH"
+    _blocking=""
+    for _k in $_missing; do
+      case " $_critical " in *" $_k "*) _blocking="$_blocking $_k" ;; esac
+    done
+    printf '\n  [!]  %s is missing parameters that %s has:\n' "$(basename "$PARAMS")" "$(basename "$_example")" >&2
+    for _k in $_missing; do printf '         %s\n' "$_k" >&2; done
+    if [[ -n "$_blocking" ]]; then
+      die "refusing to build a seed with these defaulted:$_blocking
+
+       Each one silently changes the disk layout or the crypto posture, and both are
+       INSTALL-TIME - a wrong default here means rebuilding the host, not editing a file.
+       Add them to $PARAMS. The example explains what each value means and why."
+    fi
+    printf '         none of these change the disk layout - defaults will be used\n\n' >&2
+  fi
+fi
+
 USERNAME="${USERNAME:-encadmin}"
 LV_ROOT="${LV_ROOT:-40G}"; LV_HOME="${LV_HOME:-10G}"; LV_VAR="${LV_VAR:-30G}"
 LV_VARLOG="${LV_VARLOG:-20G}"; LV_VARLOGAUDIT="${LV_VARLOGAUDIT:-20G}"; LV_TMP="${LV_TMP:-10G}"

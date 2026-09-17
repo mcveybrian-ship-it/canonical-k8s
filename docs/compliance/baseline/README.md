@@ -26,6 +26,11 @@ grep -rn '«' docs/compliance/baseline/
 blank is safer than this lab's value silently standing in, because a wrong-but-plausible value
 carried into a second engagement is worse than an obvious gap.
 
+**A placeholder never contains a pipe**, because most of them land inside a markdown table
+cell where a raw `|` ends the cell — and escaping it in the document makes the string stop
+matching the string in `facility-profile.env`, so a find-and-replace pass misses it silently.
+Write alternatives as *A or B*. The reasoning is kept beside the convention in that file.
+
 ## Where the content comes from
 
 These documents are not written from nothing. Three weeks of build work already produced the
@@ -45,14 +50,14 @@ substance:
 | Artifact | File | State |
 |---|---|---|
 | **System Security Plan** | `ssp.md` | ⬜ Not started. Content is in `../ssp-inputs.md`; needs the control baseline to know its own size |
-| **POA&M** | `poam.md` | ⬜ **Next.** Inputs complete; highest value per hour in the set |
+| **POA&M** | [`poam.md`](poam.md) | ✅ **Written 2026-09-17.** 3 groups by who can close a row — ENG / AO / CUST — plus 15 closed-with-evidence rows. Every row cites a file, a command or a dated measurement |
 | Security Assessment Plan | `sap.md` | ⬜ Procedure exists (runbook §6.0, §10.1); needs assessor independence and a schedule |
 | Security Assessment Report | `sar.md` | ⬜ Should be **generated** from the CKLs, not written |
-| Contingency Plan | `contingency-plan.md` | ⬜ Mechanism exists and is verified; the plan and the RTO/RPO commitment do not |
-| Configuration Management Plan | `cm-plan.md` | ⬜ Unusually strong — mostly points at the runbook and the parameter files |
+| Contingency Plan | [`contingency-plan.md`](contingency-plan.md) | ✅ **Written 2026-09-17.** Mechanism documented as verified; **RTO and RPO deliberately left as placeholders** because they are commitments nobody has made, and **CP-4 is written as having no evidence** because no test has been run |
+| Configuration Management Plan | [`cm-plan.md`](cm-plan.md) | ✅ **Written 2026-09-17.** Points at the runbook, the parameter files, git history, AIDE and `apply-addresses.sh` rather than restating them. One caveat carried prominently: the GRUB `--unrestricted` state is package-managed and can revert silently |
 | Incident Response Plan | `ir-plan.md` | ⬜ Write for the inherited case by default; a system-specific IR plan for a one-operator air-gapped enclave is often inappropriate |
 | Risk Assessment Report | `rar.md` | ⬜ Raw material is good: recovery-path analysis, the TPM trade, replica-3 self-healing |
-| ISCM Strategy | `iscm-strategy.md` | ⬜ Already running (step 09a). One real gap: no notification path (Q26) |
+| ISCM Strategy | [`iscm-strategy.md`](iscm-strategy.md) | ✅ **Written 2026-09-17.** Step 09a as built — 34 rules in 9 groups, facts every 15 min on five machines — with the notification gap (Q26) as its own section, and a section on the six false passes the stack produced while being built |
 | Hardware / Software Inventory | — | ⬜ **Generate, do not write.** A hand-written inventory drifts from the day it is written |
 | Boundary description + diagram | `boundary.md` | ⬜ Text exists in runbook §1.2/§3.1. The diagram is not mine to draw |
 

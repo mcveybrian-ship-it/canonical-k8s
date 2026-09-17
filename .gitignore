@@ -40,7 +40,13 @@ seed-*.iso
 scripts/install/02-host-autoinstall/user-data.h*
 host-params.env
 */host-params.env
-scripts/install/*/host-params.env
+# EVERY host-params variant, not just the exact name. Found 2026-09-17: a per-host copy
+# named host-params-host4.env appeared holding LUKS_PASSPHRASE and PASSWORD_HASH, and the
+# old exact-match pattern did not cover it. origin is PUBLIC - one `git add -A` would have
+# published a LUKS passphrase. The negation keeps the .example tracked, which is the only
+# one that may ever be public.
+scripts/install/*/host-params*
+!scripts/install/*/host-params.env.example
 
 # Live step-03 params. No secret in the shipped example, but it names live addresses and is
 # the obvious place someone adds a token. Only the .example is tracked.

@@ -620,7 +620,9 @@ group.** Every other compliance rule needs its metric to exist before it can fir
 producer that silently stops takes the whole group quiet — and **quiet is indistinguishable
 from healthy**. Those two fire on frozen and on absent respectively.
 
-**Every expression is evaluated against live data before shipping.** All 26 were quiet at the time of writing —
+**Every expression is evaluated against live data before shipping.** All **34** were quiet at the time of writing — this said 26, which was the count before the
+rule set grew, while the heading above already said thirty-four (corrected 2026-09-17; measured
+`grep -c '^ *- alert:'` = 34, `- name: enclave-*` = 9) —
 which for the six backup rules meant *the metrics did not exist yet*, not that the backups were
 fine. That is the distinction `BackupFactsMissing` exists to make.
 

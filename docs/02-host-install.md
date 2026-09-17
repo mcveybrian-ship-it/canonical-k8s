@@ -245,7 +245,126 @@ guessing from capacity.
 work and none can be done afterwards from a shell: set UEFI boot, **clear the TPM** (these were
 Windows machines and BitLocker may still own it), and settle Secure Boot. Runbook §6.3i.1.
 
+## 4c-REVIEW. ⬜ THIS CHECKLIST NEEDS A REVIEW PASS BEFORE host-2 AND host-3
+
+**Flagged 2026-09-17 by the operator, on the first machine it was used on, and it is a fair
+hit.** The list below was written in one pass without being walked at a real firmware screen.
+Do not take it to host-2 until the items here are resolved.
+
+**What went wrong on `host-1`:**
+
+| | |
+|---|---|
+| 🔴 **"put network boot first in the boot order"** was actively harmful advice. MAAS cannot serve a boot config (§9b), so the machine PXE'd to a dead server on every boot and had to be corrected at the firmware screen a second time. **The checklist should say: enable the network stack, leave PXE boot DISABLED, and use the one-time boot menu.** Better still — until §9b is resolved, PXE has no use here at all |
+| **Items were not ordered by dependency in a way that survived contact.** CSM-before-Secure-Boot was right; PXE-before-knowing-MAAS-worked was not. Every item needs a "why now" that is still true at the time it is read |
+| **Nothing in it verified itself.** The operator set nine things from a list and had no way to confirm any of them took until the machine was booted. **Each item needs a post-boot check beside it** — `grep -c svm /proc/cpuinfo`, `mokutil --sb-state`, `ls /dev/nvme*`, `tpm_version_major` — so the visit can be validated rather than trusted |
+| **Item 3 (IOMMU) could not be found** and was not needed. It should be marked optional rather than sitting in a numbered list of nine as though all nine matter equally |
+| **The install path was never stated.** The list ends at "network boot enabled" with no statement that `host-1..3` install from a **seed stick** (§4a), which is what made the PXE item look reasonable |
+
+**Rewrite it as: required-and-verifiable / required-but-unverifiable / optional** — with the
+verification command beside each item in the first group, and the `host-1` experience as the
+worked example. **Do that before `host-2`**, while the memory of what actually happened at the
+screen is fresh.
+
+## 4c. The firmware visit — do ALL of this in one pass, per host
+
+**Written 2026-09-17, when `host-1..3` were powered on for the first time.** Every item below
+is firmware-screen work that **cannot be done later from a shell**, and several cannot be done
+after the OS is installed without a rebuild. Three machines, one visit each. Take this list to
+the rack.
+
+| | Setting | Why, and what breaks if you skip it |
+|---|---|---|
+| 1 | **Boot mode: UEFI** (disable Legacy/CSM) | `vm-specs.env` explains the reasoning for guests, and the same applies here: the autoinstall and the ESP layout assume UEFI |
+| 2 | 🔴 **Virtualisation extensions ON** — VT-x / AMD-V, sometimes *"SVM Mode"* or *"Intel Virtualization Technology"* | **These hosts each run a control-plane VM, a worker, and a PostgreSQL guest.** With this off, KVM will not start a single guest and the failure is late and confusing. Easiest item on the list to forget |
+| 3 | **IOMMU ON** — VT-d / AMD-Vi | Not strictly required today (the Ceph OSD is a partition handed to a guest, not a PCI passthrough) but standard, harmless, and needed if passthrough is ever wanted |
+| 4 | 🔴 **CLEAR TPM** | These were **Windows machines and BitLocker may still own the TPM**. `systemd-cryptenroll` against a still-owned TPM fails or behaves unpredictably. Clearing destroys whatever Windows sealed, which is irrelevant — the disk is being wiped. **Cannot be done remotely afterwards** |
+| 5 | **Note the TPM version** | Win11 required TPM 2.0, so an ex-Win11 box is safe evidence. An ex-Win10 box may be 1.2 or disabled. `luksenroll` refuses anything but 2.0, so it self-checks — but find out now, not mid-install |
+| 6 | **Secure Boot — decide and record it.** See the recommendation below | PCR 7 measures the Secure Boot *policy*, and enabling it later **changes PCR 7 and breaks every existing TPM seal.** §6.3i.1 |
+| 7 | **Network boot / PXE enabled** | MAAS commissioning needs it. Either put it first in the boot order, or note the one-time boot-menu key — the one-time menu is cleaner, since you do not want it netbooting forever |
+| 8 | ~~Look for a management port~~ — **ANSWERED 2026-09-17: `host-1..3` have NO BMC.** Budget test machines | So MAAS uses power type **`manual`** — it enlists and commissions normally and *prompts you* to power-cycle instead of doing it. Slower, needs a person, works. **See the production consequence below** |
+| 9 | **Write down the disk models and sizes** the firmware reports | A free cross-check against the `by-id` paths commissioning returns. §4b needs the 256 GB M.2 as `OS_DISK_MATCH` and the 1 TB M.2 as `DATA_DISK_MATCH`, and confusing them is not retrofittable |
+
+### 🔴 No BMC is a LAB limitation that must not follow the design into production
+
+`host-1..3` are budget test machines with no out-of-band management. Fine for a bench. **In
+production it compounds into something an AO should be told about explicitly**, because it
+combines with a limitation that is already recorded:
+
+| | |
+|---|---|
+| The LUKS root **prompts for a passphrase at the console** | §6.3i.1, measured on `host-4` 2026-09-17 |
+| There is **no console to reach remotely** | no BMC |
+| ⟹ | **A power event, a kernel panic or a failed reboot requires a human physically at the machine, with no way to even see why.** |
+
+Not merely inconvenient — it means the enclave has **no remote recovery path of any kind.**
+Acceptable on a bench with the operator in the room. In a facility somebody has to be escorted
+into, it is the difference between a ten-minute fix and a scheduled visit.
+
+> **Two BOM requirements follow, and they are cheap at purchase and expensive to retrofit:**
+>
+> 1. **Production hosts MUST have a BMC** with IPMI or Redfish and serial-over-LAN. It is how
+>    you see a boot failure at all, and it is what lets MAAS deliver the redeploy-after-failure
+>    capability that justifies its place in the boundary (§4a).
+> 2. **Settle unattended unlock before the hardware is specified, not after.** TPM 2.0
+>    measured-boot unlock is the mechanism that removes the console passphrase — and per
+>    §6.3i.1 it requires Secure Boot, which is why item 6 above is not a deferrable nicety.
+>
+> Both belong in `docs/compliance/ssp-inputs.md` §2.1 as stated limitations of the lab, and in
+> the production BOM as requirements.
+
+### Secure Boot: enable it, and make `host-1` the pathfinder
+
+**Recommendation: ON.** Three reasons:
+
+- It is a **STIG expectation** that has been deferred since the guests were composed.
+- It is the **prerequisite for TPM unlock being a real control** rather than a convenience —
+  §6.3i.1 proves a PCR 7 seal with Secure Boot off hands the key to any attacker-supplied
+  initramfs.
+- **It does not break MAAS.** Confirmed 2026-09-17: `grub-efi-signed/uefi` for `amd64` is
+  synced in MAAS's boot resources, so the signed shim needed to PXE boot under Secure Boot is
+  already in the enclave.
+
+**But it is untested on bare metal here** — `host-4` runs with it disabled, and the FIPS kernel
+plus shim chain has never been booted under it on this hardware. So:
+
+> **Do `host-1` first and confirm it boots all the way to the installer. Only then set 2 and 3.**
+> If it fails, it is reversible at the same screen you are already standing at — which is exactly
+> why this is the moment to find out rather than after three machines are built.
+
+**And record the decision in the build**, so the seal and the firmware never disagree: the
+`LUKS_UNLOCK` parameter and §6.3i.1 assume a known Secure Boot state, and *"I think we turned it
+on"* is not a state.
+
 ## 5. Per host — no file editing
+
+> 🔴 **`stage-01` CANNOT WRITE THE STICK. It is a Hyper-V guest with no practical USB
+> passthrough.** It owns the repo, so it is where the seed is *generated* — but the two files
+> then travel to media written somewhere else. The Windows Hyper-V host is the stick writer
+> (`airgapped-setup-machine/README.md` §0 roster).
+>
+> **So the command for every host is `-o <dir>`, never `-d /dev/sdX`:**
+>
+> ```bash
+> ### MACHINE: stage-01 ###
+> ./scripts/install/02-build-seed.sh -H host-1 -a 10.2.20.155 -o ~/seed-host-1
+> ```
+>
+> That writes `user-data` and `meta-data` into the directory. Then, **on a machine that has
+> USB**: `sudo mkfs.vfat -F 32 -n CIDATA /dev/sdX1` and copy both files to its root.
+>
+> **Verify line endings after copying** — `file user-data` must not say CRLF. Files pick up
+> CRLF routing through Windows, and CRLF breaks cloud-init parsing silently
+> (`docs/airgap-media.md`).
+>
+> **`user-data` contains the LUKS passphrase in plaintext. The stick is a credential — wipe it
+> when the build is done.**
+>
+> This was documented from the start, but only inside `host-4`'s build history further down this
+> file, where nobody following §5 would find it. Promoted here 2026-09-17 after it sent the
+> operator a `-d /mnt` command for a machine with no USB.
+
+### The examples below use `-d`, which only applies on a machine that HAS usb
 
 **There is nothing to copy or customise.** One template, one stick, rewritten per host.
 Hostname and address are arguments; everything else comes from `host-params.env`.

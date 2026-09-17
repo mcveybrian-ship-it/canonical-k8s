@@ -86,6 +86,28 @@ from a power event, a kernel update or a hardware fault without a human physical
 Acceptable for a lab with one operator on site. A materially different proposition for
 production hardware in a facility somebody has to be escorted into.
 
+### 2.1a 🔴 There is no remote recovery path of any kind
+
+> **A console LUKS passphrase combined with no out-of-band management means a power event,
+> kernel panic or failed reboot requires a human physically at the machine — with no way to see
+> why from anywhere else.**
+
+| | |
+|---|---|
+| Evidence | `host-1..3` have **no BMC** (confirmed 2026-09-17 — budget test hardware, no management port). `host-4`'s LUKS root prompted at the console on 2026-09-17 and the enclave stayed down until somebody typed it |
+| Why it is one finding and not two | Either alone is survivable. **Together they remove remote recovery entirely** — you cannot unlock it and you cannot even watch it fail |
+| Lab vs production | Acceptable on a bench with the operator in the room. In a facility requiring an escort it is the difference between a ten-minute fix and a scheduled visit |
+| Source | `docs/02-host-install.md` §4c · runbook §6.3i.1 · suggested controls CP-10, MA-4 |
+
+**Two BOM requirements follow, cheap at purchase and expensive to retrofit:** production hosts
+need a **BMC with IPMI/Redfish and serial-over-LAN** — it is also what lets MAAS deliver the
+redeploy-after-failure capability that justifies its place in the boundary — and **unattended
+unlock must be settled before the hardware is specified**, which per §6.3i.1 means Secure Boot
+is a prerequisite rather than a deferrable nicety.
+
+*(MA-4 note: "no nonlocal maintenance capability" is simultaneously a strong control statement
+and this risk. State both — an assessor who reads only the favourable half will find the other.)*
+
 ### 2.2 pbkdf2 was chosen explicitly over the LUKS2 default
 
 > **Key derivation is pbkdf2, not argon2id.**
@@ -96,15 +118,17 @@ header than the one it replaced, with nothing to flag it. Caught 2026-09-17 duri
 drive swap by dumping the old header before creating the new one. Source: runbook §10b.1 ·
 suggested control SC-13.
 
-### 2.3 ⬜ TRIM on the backup volume reveals how full it is
+### 2.3 ✅ TRIM on the backup volume reveals how full it is — DECIDED 2026-09-17
 
 > **The backup volume is mounted with `discard`. This reveals which blocks are unused — and
 > therefore approximately how full the volume is — to anyone holding the drive. The contents
 > remain encrypted; the shape of the usage does not.**
 
 Accepted because it is a backup volume that is already a second copy, and because an SSD
-backup target with nightly churn loses sustained write speed without it. Controlled by
-`BACKUP_TRIM` in `vm-specs.env`, **default false** so that enabling it is an explicit act.
+backup target with nightly churn loses sustained write speed without it. Controlled by `BACKUP_TRIM` in `vm-specs.env`, **default false so that enabling it is an explicit
+act — and it WAS explicitly enabled** for the Crucial SSD on 2026-09-17, after `reattach` measured
+`discard granularity 4K` and confirmed the bridge actually passes TRIM. So this is a decision taken,
+not a decision pending; the ⬜ here previously made it read as undecided.
 Source: runbook §10b.1 · suggested control SC-28.
 
 ### 2.4 Ceph OSD encryption moves key management into the cluster

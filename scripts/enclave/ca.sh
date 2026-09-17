@@ -956,15 +956,27 @@ cmd_sign_server() {
   # certificate is signed successfully and then rejected by every browser that sees it.
   # Supplying the SANs at signing time is the only fix that does not involve begging the
   # appliance vendor for a better CSR form.
-  local csr="" sans_override=""
+  # --peer: MUTUAL TLS. THIS is the path etcd uses, not `issue`.
+  #
+  # `issue` generates the private key on the machine running it, so it is only correct for a
+  # service on the CA host itself. pg-01's etcd key must never leave pg-01, so the flow is
+  # `request` on the pg node and `sign-server --peer` HERE. Adding --peer only to `issue`
+  # would have shipped the flag on the one path the database nodes cannot use.
+  local csr="" sans_override="" peer_eku="serverAuth"
   while [ $# -gt 0 ]; do
     case "$1" in
+      --peer|--client) peer_eku="serverAuth, clientAuth"; shift ;;
       --san)   sans_override="$2"; shift 2 ;;
       --san=*) sans_override="${1#--san=}"; shift ;;
+      -*)      die "unknown option: $1" ;;
       *)       csr="$1"; shift ;;
     esac
   done
-  [ -r "$csr" ] || die "usage: sudo $0 sign-server <name.csr> [--san DNS:a,DNS:b,IP:1.2.3.4]
+  [ -r "$csr" ] || die "usage: sudo $0 sign-server <name.csr> [--peer] [--san DNS:a,DNS:b,IP:1.2.3.4]
+      --peer adds clientAuth alongside serverAuth, for mutual TLS. etcd needs it: every
+      member is a server to its peers and a client to them at the same time. Do not use it
+      for an ordinary web service - a blanket clientAuth lets that service's key
+      authenticate AS a client elsewhere.
       --san supplies subjectAltName for a CSR that has none - common with firewall and
       appliance UIs, which frequently emit a CN and nothing else.
       It REPLACES rather than merges: list every name the certificate needs."
@@ -1010,7 +1022,7 @@ cmd_sign_server() {
     echo "[ v3_server ]"
     echo "basicConstraints       = critical, CA:false"
     echo "keyUsage               = critical, digitalSignature, keyEncipherment"
-    echo "extendedKeyUsage       = serverAuth"
+    echo "extendedKeyUsage       = $peer_eku"
     echo "subjectKeyIdentifier   = hash"
     echo "authorityKeyIdentifier = keyid,issuer"
     [ -n "${CA_CRL_URL:-}" ]  && echo "crlDistributionPoints  = URI:$CA_CRL_URL"

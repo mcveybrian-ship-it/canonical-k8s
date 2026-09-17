@@ -577,15 +577,32 @@ cmd_fixups() {
     esac
   done
   if [ "$bad_jdir" -eq 1 ]; then
-    if systemd-tmpfiles --create >/dev/null 2>&1; then
+    # TARGET OUR OWN FILE, NOT A GLOBAL --create. MEASURED on host-1 2026-09-17:
+    #
+    #   systemd-tmpfiles --create                          -> directory stays 2755
+    #   systemd-tmpfiles --create <our stig conf>          -> directory becomes 640
+    #
+    # The vendor config is the reason: /usr/lib/tmpfiles.d/systemd.conf carries
+    # `z /var/log/journal/%m 2755 root systemd-journal`, which directly contradicts our
+    # `Z /var/log/journal/%m ~0640`. Basename ordering says ours should run last and win
+    # (systemd.conf < zzz-...), and on a global run it does not. I am not going to assert a
+    # mechanism I have not proven - the targeted call demonstrably works and the global one
+    # demonstrably does not, and that is enough to make the fix correct.
+    local jtf; jtf="$(ls /etc/tmpfiles.d/*stig*.conf 2>/dev/null | head -1)"
+    if [ -z "$jtf" ]; then
+      warn "no stig tmpfiles config in /etc/tmpfiles.d - run 'v1r6 --apply' first, it writes it"
+      failed=$((failed+1))
+    elif systemd-tmpfiles --create "$jtf" >/dev/null 2>&1; then
       local still=0
       for jdir in /var/log/journal/* /run/log/journal/*; do
         [ -d "$jdir" ] || continue
         case "$(stat -c %a "$jdir" 2>/dev/null)" in 640|600|0640|0600) : ;; *) still=1 ;; esac
       done
       if [ "$still" -eq 0 ]; then
-        ok "journal machine-id directories re-tightened to 0640 via systemd-tmpfiles"
-        say "     journald resets these to 2755 after a systemd upgrade. UBTU-24-700020."
+        ok "journal machine-id directories re-tightened to 0640 via $jtf"
+        say "     journald and the systemd package both reset these to 2755. UBTU-24-700020."
+        say "     A GLOBAL 'systemd-tmpfiles --create' does NOT fix it - the vendor config"
+        say "     contradicts ours. The file has to be named explicitly."
       else
         warn "systemd-tmpfiles ran but a journal directory is still more permissive than 0640:"
         for jdir in /var/log/journal/* /run/log/journal/*; do

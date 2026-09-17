@@ -10,6 +10,12 @@
 #       sudo ./ca.sh init-issuing         create the issuing key and its CSR
 #       sudo ./ca.sh install-issuing <crt>  install the signed certificate
 #       sudo ./ca.sh issue <name> [san...]  issue a cert for a service ON THIS machine
+#       sudo ./ca.sh issue --peer <name>    MUTUAL TLS - serverAuth AND clientAuth in one
+#                                           certificate. etcd needs this: every member is a
+#                                           server to its peers and a client to them at the
+#                                           same time. A flag, not the default, because a
+#                                           blanket clientAuth would let any service's key
+#                                           authenticate AS a client to any other.
 #       sudo ./ca.sh sign-server <csr> [--san DNS:a,IP:b]
 #                                         sign a CSR from another machine. --san
 #                                         supplies SANs for an appliance CSR that
@@ -596,8 +602,32 @@ cmd_install_issuing() {
 cmd_issue() {
   [ "$(id -u)" -eq 0 ] || die "run with sudo"
   require_issuing_host
+  # --peer: MUTUAL TLS, not a variant of a server certificate.
+  #
+  # etcd is the reason this exists. Every etcd member is a SERVER to its peers and a CLIENT to
+  # them at the same time, so one certificate has to carry both serverAuth AND clientAuth. A
+  # serverAuth-only certificate fails etcd's peer handshake with a TLS error that names the
+  # cipher, not the EKU, and sends you looking at the wrong thing for an afternoon.
+  #
+  # It is a FLAG rather than the default because widening the EKU on every certificate in the
+  # enclave would let any service's key authenticate AS a client to any other - which is the
+  # opposite of what a mutual-TLS design is for. Ask for it where it is needed.
+  local ekus="serverAuth" want_peer=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --peer|--client) want_peer=1; shift ;;
+      --) shift; break ;;
+      -*) die "unknown option: $1
+       usage: sudo $0 issue [--peer] <hostname> [extra-SAN ...]" ;;
+      *) break ;;
+    esac
+  done
+  if [ "$want_peer" -eq 1 ]; then
+    ekus="serverAuth, clientAuth"
+  fi
+
   local name="${1:-}"; shift || true
-  [ -n "$name" ] || die "usage: sudo $0 issue <hostname> [extra-SAN ...]"
+  [ -n "$name" ] || die "usage: sudo $0 issue [--peer] <hostname> [extra-SAN ...]"
   local d="$CA_ISSUING_DIR"
   [ -r "$d/private/issuing.key" ] || die "no issuing CA at $d"
   [ -r "$d/certs/issuing.crt" ]   || die "issuing CA is not signed yet - see install-issuing"
@@ -646,12 +676,50 @@ cmd_issue() {
     -subj "$(subj "$name.$DOMAIN")" \
     -addext "subjectAltName=$sans" \
     -addext "keyUsage=critical,digitalSignature,keyEncipherment" \
-    -addext "extendedKeyUsage=serverAuth" \
+    -addext "extendedKeyUsage=$ekus" \
     -out "$out.csr" || die "CSR creation failed"
 
-  openssl ca -config "$d/openssl.cnf" -extensions v3_server \
-    -days "${CA_LEAF_DAYS:-365}" -notext -md "$CA_DIGEST" \
-    -in "$out.csr" -out "$out.crt" -batch || die "signing failed"
+  # The stored openssl.cnf was written when the issuing CA was created and has only
+  # [ v3_server ] in it. Passing -extensions v3_peer would fail on every CA already in
+  # service, so the profile is generated here and passed with -extfile - which means --peer
+  # works on an existing CA with no reinitialisation.
+  local pex=""
+  if [ "$want_peer" -eq 1 ]; then
+    pex=$(mktemp)
+    # shellcheck disable=SC2064
+    trap "rm -f '$pex'" RETURN
+    {
+      echo "[ v3_peer ]"
+      echo "basicConstraints       = critical, CA:false"
+      echo "keyUsage               = critical, digitalSignature, keyEncipherment"
+      echo "extendedKeyUsage       = serverAuth, clientAuth"
+      # NO subjectAltName LINE HERE, DELIBERATELY - copy_extensions=copy carries the CSR's
+      # SANs, exactly as [ v3_server ] relies on. Setting it here as well makes the extfile a
+      # SECOND source of truth for the name, and the extfile WINS.
+      #
+      # Measured against a scratch CA 2026-09-17: signing pg-02's CSR with an extfile that
+      # named pg-01 produced a valid, correctly-signed certificate FOR pg-01 - no error, no
+      # warning. A wrong-host certificate that passes every check and fails at a handshake
+      # months later. One source of truth for the name; that source is the CSR.
+      echo "subjectKeyIdentifier   = hash"
+      echo "authorityKeyIdentifier = keyid,issuer"
+      # Same permanence rule as everywhere else in this file: a CRL distribution point cannot
+      # be added to a certificate that already exists, because it is inside the signature.
+      [ -n "${CA_CRL_URL:-}" ]  && echo "crlDistributionPoints  = URI:$CA_CRL_URL"
+      [ -n "${CA_OCSP_URL:-}" ] && echo "authorityInfoAccess    = OCSP;URI:$CA_OCSP_URL"
+      true
+    } > "$pex"
+  fi
+
+  if [ "$want_peer" -eq 1 ]; then
+    openssl ca -config "$d/openssl.cnf" -extfile "$pex" -extensions v3_peer \
+      -days "${CA_LEAF_DAYS:-365}" -notext -md "$CA_DIGEST" \
+      -in "$out.csr" -out "$out.crt" -batch || die "signing failed"
+  else
+    openssl ca -config "$d/openssl.cnf" -extensions v3_server \
+      -days "${CA_LEAF_DAYS:-365}" -notext -md "$CA_DIGEST" \
+      -in "$out.csr" -out "$out.crt" -batch || die "signing failed"
+  fi
   chmod 0444 "$out.crt"
   # Servers need leaf + issuing so a client holding only the root can build the chain.
   cat "$out.crt" "$d/certs/issuing.crt" > "$out.fullchain.crt"

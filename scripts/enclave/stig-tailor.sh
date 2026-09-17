@@ -505,6 +505,59 @@ cmd_fixups() {
   # unrelated ones down with it.
   local failed=0
 
+  # ---- 0b. SERVICES usg fix LEAVES PERMANENTLY FAILED ---------------------------------
+  #
+  # FOUND 2026-09-17 on host-1, then measured on ALL FIVE existing machines: every hardened
+  # machine in this enclave has been carrying TWO permanently failed units since the day it
+  # was hardened, and nothing reported it.
+  #
+  #   sssd.service     "SSSD couldn't load the configuration database: No domain is enabled"
+  #   openipmi.service  no IPMI device to talk to
+  #
+  # Neither is a defect in the machine - they are services with nothing to serve. `usg fix`
+  # installs and enables them because the STIG wants the PACKAGES present (pam_sss, nss_sss),
+  # and a package being present is not the same as a daemon having a job. An air-gapped
+  # enclave has no directory service, and none of this hardware has a BMC.
+  #
+  # A permanently failed unit is not cosmetic. It trains the operator to ignore
+  # `systemctl --failed`, which is the one place a REAL failure would show up - and it is the
+  # exact reason MAAS sat broken for seven days while `is-active` said healthy.
+  #
+  # DISABLE ONLY WHERE THERE IS GENUINELY NOTHING TO SERVE, and prove it each time rather
+  # than assuming: sssd only when no domain is configured, openipmi only when no ipmi device
+  # exists. A site WITH a directory or a BMC must keep them, so this can never be a blanket
+  # disable. Packages stay installed, so the STIG rules that want them still pass.
+  local svc cond
+  for svc in sssd openipmi; do
+    case "$(systemctl is-enabled "$svc" 2>/dev/null)" in
+      enabled|enabled-runtime|static) : ;;
+      *) continue ;;
+    esac
+    cond=""
+    case "$svc" in
+      sssd)
+        # A domain is a [domain/<name>] section. No section, no work for the daemon.
+        if ! grep -rqs '^\[domain/' /etc/sssd/sssd.conf /etc/sssd/conf.d/ 2>/dev/null; then
+          cond="no [domain/...] configured in /etc/sssd - nothing for it to authenticate against"
+        fi ;;
+      openipmi)
+        if [ ! -e /dev/ipmi0 ] && [ ! -e /dev/ipmi/0 ] && [ ! -e /dev/ipmidev/0 ]; then
+          cond="no IPMI device present - this hardware has no BMC"
+        fi ;;
+    esac
+    if [ -z "$cond" ]; then
+      ok "$svc has something to serve - leaving it enabled"
+      continue
+    fi
+    if systemctl disable --now "$svc" >/dev/null 2>&1; then
+      ok "$svc disabled - $cond"
+      say "     the package stays installed, so the STIG rule that wants it still passes"
+    else
+      warn "could not disable $svc - it will keep appearing in systemctl --failed"
+      failed=$((failed+1))
+    fi
+  done
+
   # ---- 0a. REPAIR THE SSH CLIENT that `usg fix` breaks ---------------------------------
   #
   # FOUND 2026-09-17 ON host-4, latent since its hardening on 09-11. `ssh` as any non-root

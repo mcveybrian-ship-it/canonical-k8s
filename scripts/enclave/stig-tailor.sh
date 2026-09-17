@@ -536,9 +536,17 @@ cmd_fixups() {
     cond=""
     case "$svc" in
       sssd)
-        # A domain is a [domain/<name>] section. No section, no work for the daemon.
-        if ! grep -rqs '^\[domain/' /etc/sssd/sssd.conf /etc/sssd/conf.d/ 2>/dev/null; then
-          cond="no [domain/...] configured in /etc/sssd - nothing for it to authenticate against"
+        # TEST WHAT SSSD ITSELF TESTS. The first version of this checked for a
+        # [domain/<name>] SECTION and therefore reported "has something to serve" on host-1
+        # while sssd was still failing with "No domain is enabled" - because `usg fix` writes
+        # the section and never lists it. A section that is not named in `domains=` is inert,
+        # which is exactly what sssd's own error message says.
+        #
+        # So the condition is a NON-EMPTY `domains=` under [sssd]. That is the thing that
+        # enables a domain, and matching sssd's own wording is why this is now correct.
+        if ! grep -rqsE '^[[:space:]]*domains[[:space:]]*=[[:space:]]*[^[:space:]]' \
+               /etc/sssd/sssd.conf /etc/sssd/conf.d/ 2>/dev/null; then
+          cond="no non-empty 'domains=' in /etc/sssd - a [domain/...] section alone is inert, which is what sssd means by 'No domain is enabled'"
         fi ;;
       openipmi)
         if [ ! -e /dev/ipmi0 ] && [ ! -e /dev/ipmi/0 ] && [ ! -e /dev/ipmidev/0 ]; then

@@ -177,6 +177,22 @@ connect to, and being locked out of a half-built machine on a rack costs more th
 on a lab network. Step 03 hardening sets it `false`, which is what the STIG requires. The
 console password is set either way and is the last-resort way in.
 
+## 4a. ⬜ Two install paths exist for `host-1..3` and neither has been chosen
+
+**Raised 2026-09-17, unresolved.** §5 below builds a seed stick per host. **MAAS is also running
+on `svc-mgmt-01` with DHCP, TFTP and HTTP boot** (runbook §4, §3055ff), and the runbook calls PXE
+"how `host-1..3` get built". Both are documented; neither is the decision.
+
+For three machines PXE is the cheaper path and exercises MAAS, which has to work anyway. The
+seed stick is proven — it is exactly how `host-4` was built — and needs nothing from MAAS.
+**Pick one before the install, and record it here.**
+
+The addresses and hostnames in §5 were corrected 2026-09-17: they had said `h1/h2/h3` on
+`10.0.20.11-13`, which is the **pre-renumber** subnet and the wrong naming convention. The
+enclave moved to `10.2.20.x` on 2026-09-03 (runbook §3.1) and the hosts are `host-1..3`, per
+`scripts/enclave/enclave-addresses.env` — which is the single source of truth. `host-4`'s build
+record further down keeps its original `10.0.20.158` because it is history, not instruction.
+
 ## 5. Per host — no file editing
 
 **There is nothing to copy or customise.** One template, one stick, rewritten per host.
@@ -185,17 +201,17 @@ Hostname and address are arguments; everything else comes from `host-params.env`
 **From Windows**
 
 ```powershell
-.\scripts\install\02-build-seed.ps1 -HostName h1 -Address 10.0.20.11 -DriveLetter F
-.\scripts\install\02-build-seed.ps1 -HostName h2 -Address 10.0.20.12 -DriveLetter F
-.\scripts\install\02-build-seed.ps1 -HostName h3 -Address 10.0.20.13 -DriveLetter F
+.\scripts\install\02-build-seed.ps1 -HostName host-1 -Address 10.2.20.155 -DriveLetter F
+.\scripts\install\02-build-seed.ps1 -HostName host-2 -Address 10.2.20.156 -DriveLetter F
+.\scripts\install\02-build-seed.ps1 -HostName host-3 -Address 10.2.20.157 -DriveLetter F
 ```
 
 **From Linux**
 
 ```bash
-./scripts/install/02-build-seed.sh -H h1 -a 10.0.20.11 -d /mnt
-./scripts/install/02-build-seed.sh -H h2 -a 10.0.20.12 -d /mnt
-./scripts/install/02-build-seed.sh -H h3 -a 10.0.20.13 -d /mnt
+./scripts/install/02-build-seed.sh -H host-1 -a 10.2.20.155 -d /mnt
+./scripts/install/02-build-seed.sh -H host-2 -a 10.2.20.156 -d /mnt
+./scripts/install/02-build-seed.sh -H host-3 -a 10.2.20.157 -d /mnt
 ```
 
 Same stick each time — write it, install that host, rewrite it for the next.
@@ -227,14 +243,14 @@ Check the resolved values first — this catches a typo before the stick is writ
 after the install:
 
 ```powershell
-.\scripts\install\02-build-seed.ps1 -HostName h1 -Address 10.0.20.11 -DryRun
+.\scripts\install\02-build-seed.ps1 -HostName host-1 -Address 10.2.20.155 -DryRun
 ```
 
 **Windows**
 
 ```powershell
 Format-Volume -DriveLetter F -FileSystem FAT32 -NewFileSystemLabel CIDATA
-.\scripts\install\02-build-seed.ps1 -HostName h1 -Address 10.0.20.11 -DriveLetter F
+.\scripts\install\02-build-seed.ps1 -HostName host-1 -Address 10.2.20.155 -DriveLetter F
 ```
 
 **Linux**
@@ -243,7 +259,7 @@ Format-Volume -DriveLetter F -FileSystem FAT32 -NewFileSystemLabel CIDATA
 lsblk -o NAME,SIZE,TRAN,RM,LABEL,FSTYPE          # confirm TRAN=usb, RM=1
 sudo mkfs.vfat -F 32 -n CIDATA /dev/sdX1         # CHECK THE DEVICE
 sudo mount /dev/sdX1 /mnt
-./scripts/install/02-build-seed.sh -H h1 -a 10.0.20.11 -d /mnt
+./scripts/install/02-build-seed.sh -H host-1 -a 10.2.20.155 -d /mnt
 sudo umount /mnt
 ```
 

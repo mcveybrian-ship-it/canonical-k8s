@@ -58,11 +58,22 @@ ADDRESS="${!KEY_NAME:-}"
 SPEC_VAR="VM_$KEY_NAME"; SPEC="${!SPEC_VAR:-}"
 [ -n "$ADDRESS" ] || die "$VM has no address. Add $KEY_NAME to enclave-addresses.env."
 [ -n "$SPEC" ]    || die "$VM has no spec. Add $SPEC_VAR to vm-specs.env."
-IFS=: read -r VCPUS RAM_MB DISK_GB <<< "$SPEC"
+# vcpus:ram_mb:disk_gb[:data_gb] - the 4th field is OPTIONAL and reads as empty when absent,
+# so every spec written before 2026-09-16 behaves exactly as it did.
+IFS=: read -r VCPUS RAM_MB DISK_GB DATA_GB <<< "$SPEC"
 
 POOL="${VM_POOL:?}"; BRIDGE="${VM_BRIDGE:?}"; DOMAIN="${ENCLAVE_DOMAIN:?}"
 DISK="$POOL/$VM.qcow2"
 SEED="$POOL/seed/$VM-seed.iso"
+
+# A SECOND disk, on a DIFFERENT PHYSICAL DEVICE. Only pg-01..03 use it today: their data and
+# WAL belong on the 1 TB M.2, not on the 256 GB M.2 that already carries the host OS and
+# k8s-cp-0N - two databases fsyncing through one device is how you get spurious leader
+# elections in both etcd clusters at once. VM_POOL_DATA is where; unset means no data disk,
+# and asking for one without it is refused rather than silently landed on the OS device.
+DATA_POOL="${VM_POOL_DATA:-}"
+DATA_DISK=""
+if [ -n "${DATA_GB:-}" ] && [ -n "$DATA_POOL" ]; then DATA_DISK="$DATA_POOL/$VM-data.qcow2"; fi
 
 # ---- destroy ----------------------------------------------------------------------------
 if [ "$DESTROY" -eq 1 ]; then
@@ -70,7 +81,7 @@ if [ "$DESTROY" -eq 1 ]; then
   say "this DESTROYS $VM and $DISK"
   run virsh destroy "$VM" 2>/dev/null || true
   run virsh undefine "$VM" --nvram 2>/dev/null || true
-  run rm -f "$DISK" "$SEED"
+  run rm -f "$DISK" "$SEED" ${DATA_DISK:+"$DATA_DISK"}
   ok "$VM removed"; exit 0
 fi
 
@@ -142,6 +153,23 @@ run install -d -m 0755 "$LOGDIR"
 run qemu-img convert -f qcow2 -O qcow2 "$VM_BASE_IMAGE" "$DISK"
 run qemu-img resize "$DISK" "${DISK_GB}G"
 ok "disk    : $DISK (independent copy, sparse, grown to ${DISK_GB}G)"
+
+if [ -n "${DATA_GB:-}" ]; then
+  [ -n "$DATA_POOL" ] || die "$VM asks for a ${DATA_GB}G data disk but VM_POOL_DATA is unset.
+      A data disk on the OS device is not a data disk - the point of asking for one is that it
+      is a different spindle. Set VM_POOL_DATA in vm-specs.env to a path on the data device."
+  run install -d -m 0711 "$DATA_POOL"
+  # CREATE, not convert - a data disk is blank, there is no base image for it.
+  [ -e "$DATA_DISK" ] || run qemu-img create -f qcow2 -o preallocation=metadata \
+      "$DATA_DISK" "${DATA_GB}G"
+  ok "data    : $DATA_DISK (${DATA_GB}G, sparse, metadata preallocated)"
+  # IT LANDS AT vdc, BEHIND THE READ-ONLY SEED - AND THAT IS NOT STABLE. The seed disk is
+  # only needed for the first boot; detach it later and the data disk moves vdc -> vdb.
+  # So MOUNT IT BY UUID OR LABEL, NEVER BY /dev/vdX. An fstab entry naming vdc is a machine
+  # that boots fine today and comes up with no database directory after the seed is removed.
+  say "        mount it by UUID or LABEL - it is vdc now and would become vdb if the"
+  say "        seed disk is ever detached. Never put /dev/vdX in its fstab."
+fi
 
 # ---- cloud-init --------------------------------------------------------------------------
 # The hosts block comes from apply-addresses.sh so there is exactly one renderer. A VM that
@@ -374,6 +402,11 @@ ok "seed    : $SEED"
 # produces no error and no output - the VM boots to a stock 'ubuntu' login with no address,
 # looking alive and being useless. NoCloud matches on the filesystem label, not on the device
 # being a cdrom, so a read-only virtio disk works and is visible to the trimmed initramfs.
+DATA_DISK_ARGS=()
+if [ -n "$DATA_DISK" ]; then
+  DATA_DISK_ARGS=(--disk "path=$DATA_DISK,format=qcow2,bus=virtio,cache=none,io=native,discard=unmap")
+fi
+
 virt-install \
   --name "$VM" \
   --memory "$RAM_MB" --vcpus "$VCPUS" \
@@ -382,6 +415,7 @@ virt-install \
   "${FIRMWARE_ARGS[@]}" \
   --disk "path=$DISK,format=qcow2,bus=virtio" \
   --disk "path=$SEED,device=disk,bus=virtio,format=raw,readonly=on" \
+  "${DATA_DISK_ARGS[@]}" \
   --network "bridge=$BRIDGE,model=virtio" \
   --graphics none \
   --console pty,target_type=serial \

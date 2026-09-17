@@ -53,6 +53,9 @@ svc-mgmt-01:SVC_MGMT_01
 svc-repo-01:SVC_REPO_01
 svc-harbor-01:SVC_HARBOR_01
 svc-obs-01:SVC_OBS_01
+pg-01:PG_01
+pg-02:PG_02
+pg-03:PG_03
 k8s-api:K8S_API_VIP
 k8s-cp-01:K8S_CP_01
 k8s-cp-02:K8S_CP_02

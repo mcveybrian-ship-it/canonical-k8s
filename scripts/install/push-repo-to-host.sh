@@ -46,6 +46,22 @@ done
 
 cd "$(git rev-parse --show-toplevel)" || die "not inside a git repository"
 
+# ---- REFUSE TO PUSH TO YOURSELF ---------------------------------------------------------
+# The header says this runs on stage-01 and NOT on the target, and a header refuses nothing -
+# proven on 2026-09-17 when 03-host-services.sh was run on stage-01 because its own header
+# said not to. Pasted on the target, this would git-archive that machine's repo over itself
+# WHILE something from it may be executing. That is the failure that invalidated a 58-minute
+# verify run on host-4: the code changed underneath a running script and the result could not
+# be trusted.
+_mine="$(ip -4 -o addr show scope global 2>/dev/null | awk '{split($4,a,"/"); print a[1]}' | tr '\n' ' ')"
+case " $_mine " in
+  *" $TARGET "*)
+    die "REFUSING: $TARGET is THIS machine ($(hostname -s)).
+       This pushes the repository FROM the machine that owns it TO an enclave host. Run it on
+       stage-01 and name the host you want it sent to:
+         ./scripts/install/push-repo-to-host.sh <host address>" ;;
+esac
+
 # ---- prove the archive is clean BEFORE sending it ---------------------------------------
 # These are the five paths git cannot carry (CLAUDE.md), plus any live params file. If the
 # gitignore is ever loosened, this stops the leak instead of discovering it on the target.

@@ -27,6 +27,54 @@
 set -euo pipefail
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ---- THE GUARD. A LABEL IS NOT A GUARD, AND THE HEADER ABOVE PROVED IT ------------------
+#
+# The header has said "Never on stage-01" since this file was written, and on 2026-09-17
+# `hosts` and `trustca` were both run on stage-01 anyway - because a comment cannot refuse
+# anything. `trustca` put the enclave root CA into the trust store of a machine that sits
+# OUTSIDE the ATO boundary, and `apt` would have repointed stage-01's package sources at the
+# in-gap mirror. Neither did harm that time. That was luck.
+#
+# NOT A HOSTNAME LIST. The test is whether one of THIS machine's own addresses is one of the
+# bare-metal host addresses in enclave-addresses.env - the same file everything else in this
+# repo treats as the single source of truth. Renumber there and this keeps working; rename a
+# machine and it cannot be fooled.
+_assert_enclave_host() {
+  local af="$SELF/../enclave/enclave-addresses.env"
+  [ -r "$af" ] || die "cannot read $af - refusing to guess whether this is an enclave host"
+  # shellcheck disable=SC1090
+  local HOST_1 HOST_2 HOST_3 HOST_4 STAGE_01 BUILD_01
+  eval "$(awk -F= '/^(HOST_[0-9]|STAGE_01|BUILD_01)=/{print $1"="$2}' "$af")"
+
+  # SPACE-separated, deliberately. awk emits one address per LINE, and a `case` pattern of
+  # *" $h "* cannot match across a newline - so the first version of this guard refused
+  # every machine including the correct ones. A guard that always says no is as broken as a
+  # guard that always says yes; it just fails in the direction that looks safe.
+  local mine; mine="$(ip -4 -o addr show scope global 2>/dev/null \
+      | awk '{split($4,a,"/"); print a[1]}' | tr '\n' ' ')"
+  local h ok=0
+  for h in "$HOST_1" "$HOST_2" "$HOST_3" "$HOST_4"; do
+    [ -n "${h:-}" ] || continue
+    case " $mine " in *" $h "*) ok=1 ;; esac
+  done
+  [ "$ok" -eq 1 ] && return 0
+
+  printf '\n  [x] WRONG MACHINE: %s (%s)\n\n' "$(hostname -s)" "${mine% }" >&2
+  for h in "${STAGE_01:-}" "${BUILD_01:-}"; do
+    [ -n "$h" ] || continue
+    case " $mine " in *" $h "*)
+      printf '      This is a STAGING machine, OUTSIDE the ATO boundary. It prepares the\n' >&2
+      printf '      enclave; it is not part of it. `trustca` would add the enclave CA to its\n' >&2
+      printf '      trust store and `apt` would repoint its packages at the in-gap mirror.\n\n' >&2
+    ;; esac
+  done
+  printf '      03-host-services.sh runs ON the bare-metal host being prepared - one of:\n' >&2
+  printf '        %s  %s  %s  %s\n\n' "${HOST_1:-?}" "${HOST_2:-?}" "${HOST_3:-?}" "${HOST_4:-?}" >&2
+  printf '      Push the repo there and run it locally:\n' >&2
+  printf '        ./scripts/install/push-repo-to-host.sh <host address>\n\n' >&2
+  exit 1
+}
 PARAMS="${PARAMS:-$SELF/03-host-services/services-params.env}"
 
 say()  { printf '  %s\n' "$*"; }
@@ -587,16 +635,16 @@ cmd_verify() {
 
 # =========================================================================================
 case "${1:-}" in
-  apt)     cmd_apt ;;
-  libvirt) cmd_libvirt ;;
-  datavg)  cmd_datavg ;;
-  bridge)  cmd_bridge ;;
-  pool)    cmd_pool ;;
+  apt)     _assert_enclave_host; cmd_apt ;;
+  libvirt) _assert_enclave_host; cmd_libvirt ;;
+  datavg)  _assert_enclave_host; cmd_datavg ;;
+  bridge)  _assert_enclave_host; cmd_bridge ;;
+  pool)    _assert_enclave_host; cmd_pool ;;
   tmux)    cmd_tmux ;;
-  hosts)   cmd_hosts ;;
-  trustca) cmd_trustca ;;
-  keyonly) cmd_keyonly ;;
+  hosts)   _assert_enclave_host; cmd_hosts ;;
+  trustca) _assert_enclave_host; cmd_trustca ;;
+  keyonly) _assert_enclave_host; cmd_keyonly ;;
   verify)  cmd_verify ;;
-  all)     cmd_hosts; cmd_trustca; cmd_apt; cmd_libvirt; cmd_datavg; cmd_pool; cmd_tmux; cmd_verify ;;
+  all)     _assert_enclave_host; cmd_hosts; cmd_trustca; cmd_apt; cmd_libvirt; cmd_datavg; cmd_pool; cmd_tmux; cmd_verify ;;
   *)       sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

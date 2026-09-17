@@ -133,6 +133,20 @@ for _m in "$OS_DISK_MATCH" "$DATA_DISK_MATCH"; do
     ""|"*") die "disk match '$_m' is too broad - it would match every disk on the host" ;;
   esac
 done
+# HOW MUCH OF THE DATA DISK BECOMES vg-data. -1 is the whole disk (host-4); a sized value
+# leaves the remainder UNPARTITIONED for Ceph to own (host-1..3). Validated here rather than
+# discovered by subiquity: a storage error surfaces 40 seconds into an unattended install,
+# on a console that on these machines does not exist remotely.
+DATA_VG_SIZE="${DATA_VG_SIZE:--1}"
+case "$DATA_VG_SIZE" in
+  -1) : ;;
+  *[0-9][KMGTkmgt]) : ;;
+  *[0-9]) die "DATA_VG_SIZE='$DATA_VG_SIZE' has no unit suffix. subiquity reads a bare number
+       as BYTES, so '500' is 500 bytes and the install fails in a way that does not say so.
+       Write it as 500G, or -1 for the whole disk." ;;
+  *) die "DATA_VG_SIZE must be -1 or a size with a K/M/G/T suffix, got '$DATA_VG_SIZE'" ;;
+esac
+
 [ "$OS_DISK_MATCH" != "$DATA_DISK_MATCH" ] ||   die "OS_DISK_MATCH and DATA_DISK_MATCH are identical ('$OS_DISK_MATCH') - they would both
        resolve to the same disk. On an all-NVMe host, disambiguate by PCI address:
          ls -l /dev/disk/by-path/ | grep -v part"
@@ -220,6 +234,7 @@ content="${content//@@KEYFILE_LATECMD@@/$(esc "$KEYFILE_LATECMD")}"
 content="${content//@@LUKS_UNLOCK@@/$LUKS_UNLOCK}"
 content="${content//@@OS_DISK_MATCH@@/$(esc "$OS_DISK_MATCH")}"
 content="${content//@@DATA_DISK_MATCH@@/$(esc "$DATA_DISK_MATCH")}"
+content="${content//@@DATA_VG_SIZE@@/$DATA_VG_SIZE}"
 content="${content//@@PREFIX@@/$PREFIX}"
 # An air-gapped host declares no default route at all. Empty GATEWAY means the routes block
 # is omitted entirely, so the host reaches its own subnet and has no path off it - not a

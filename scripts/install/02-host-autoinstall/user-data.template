@@ -288,10 +288,25 @@ autoinstall:
         preserve: false
         grub_device: false
 
+      # SIZE IS A PARAMETER, and on host-1..3 it MUST NOT be the whole disk.
+      #
+      # host-4:      DATA_VG_SIZE=-1   the whole disk becomes vg-data (the libvirt image pool)
+      # host-1..3:   DATA_VG_SIZE=500G half the 1 TB M.2 becomes vg-data for the pg guest's
+      #                                data disk; THE REMAINDER IS LEFT UNPARTITIONED AND
+      #                                UNTOUCHED, because it becomes k8s-wk-0N's Ceph OSD and
+      #                                Ceph must own its own device (runbook 2.5, 9a.2).
+      #
+      # Two partitions rather than two LVs in one LUKS container is deliberate: a host LUKS
+      # with Ceph's --dmcrypt layered on top encrypts every OSD write TWICE, on the host with
+      # two of eight threads uncommitted.
+      #
+      # THIS IS NOT RETROFITTABLE. Partitioning and LUKS are install-time. Getting it wrong
+      # means rebuilding the host, and once an OSD exists, rebuilding the OSD as well with
+      # data movement across four slow nodes.
       - id: p-data
         type: partition
         device: disk-data
-        size: -1
+        size: @@DATA_VG_SIZE@@
 @@CRYPT_DATA@@
       - id: vg-data
         type: lvm_volgroup

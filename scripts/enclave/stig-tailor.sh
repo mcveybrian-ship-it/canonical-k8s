@@ -505,6 +505,53 @@ cmd_fixups() {
   # unrelated ones down with it.
   local failed=0
 
+  # ---- 0a. REPAIR THE SSH CLIENT that `usg fix` breaks ---------------------------------
+  #
+  # FOUND 2026-09-17 ON host-4, latent since its hardening on 09-11. `ssh` as any non-root
+  # user died before connecting:
+  #
+  #   Can't open user config file /etc/ssh/ssh_config.d/00-cipher-list.conf: Permission denied
+  #   /etc/ssh/ssh_config: terminating, 1 bad configuration options
+  #
+  # TWO STIG CONTROLS COLLIDING, and neither is wrong alone. The SSG remediation for the ssh
+  # client cipher and MAC lists creates drop-ins in /etc/ssh/ssh_config.d/ and never chmods
+  # them - so under the `umask 077` the STIG itself mandates, they land 0600 root:root. The
+  # tell is that /etc/ssh/ssh_config beside them is 0644, shipped that way by openssh-client.
+  #
+  # sshd is unaffected: it runs as root and reads sshd_config, which SHOULD be 0600. Only the
+  # CLIENT breaks, and only for unprivileged users - so nothing fails on the way in and the
+  # machine looks fine. It stays broken until somebody tries to ssh OUT as themselves.
+  #
+  # No SSG rule wants these restricted. 0644 is correct: the content is a public algorithm
+  # list and every user who runs ssh must read it.
+  local sshcfg n_sshfix=0
+  for sshcfg in /etc/ssh/ssh_config.d/*.conf; do
+    [ -e "$sshcfg" ] || continue
+    local mode; mode="$(stat -c %a "$sshcfg" 2>/dev/null || echo '')"
+    case "$mode" in
+      *4|*5|*6|*7) : ;;                      # already world-readable
+      '') : ;;
+      *) if chmod 0644 "$sshcfg"; then
+           ok "ssh client config readable again: $sshcfg was $mode, now 0644"
+           n_sshfix=$((n_sshfix+1))
+         else
+           warn "could not chmod $sshcfg"; failed=$((failed+1))
+         fi ;;
+    esac
+  done
+  if [ "$n_sshfix" -gt 0 ]; then
+    # PROVE IT. A chmod that reports success and leaves the client broken is the case this
+    # exists to catch - and `ssh -G` parses the whole config without connecting anywhere.
+    if su -s /bin/sh -c 'ssh -G localhost >/dev/null 2>&1' "${SUDO_USER:-nobody}" 2>/dev/null; then
+      ok "verified: the ssh client parses its configuration as ${SUDO_USER:-an unprivileged user}"
+    else
+      warn "chmod applied but the ssh client still will not parse. Run as a normal user:"
+      warn "  ssh -G localhost"
+    fi
+  else
+    ok "ssh client configs already readable - nothing to repair"
+  fi
+
   # ---- 0. evict anything in /etc/logrotate.d that is not configuration ----------------
   # Runs FIRST, because every later validation reads the whole directory and will fail on a
   # stray file regardless of what we just edited.
@@ -2853,10 +2900,30 @@ cmd_luksenroll() {
       ok "initramfs carries the TPM2 libraries ($inside file(s))"
     else
       warn "THE INITRAMFS DOES NOT CARRY THE TPM2 LIBRARIES - the boot unlock cannot work."
-      warn "  The host will fall back to the passphrase, which is safe but is NOT the TPM"
-      warn "  failing a PCR check. Ubuntu's cryptsetup initramfs hook includes them only when"
-      warn "  it sees a tpm2-device= entry in /etc/crypttab at build time, so the order is:"
-      warn "  crypttab first, THEN update-initramfs. Re-run this subcommand."
+      warn "  The host falls back to the passphrase, which is safe but is NOT the TPM failing"
+      warn "  a PCR check."
+      warn ""
+      warn "  DO NOT RE-RUN THIS EXPECTING IT TO FIX ITSELF. An earlier version of this"
+      warn "  message said to put tpm2-device= in crypttab and rebuild - that advice was"
+      warn "  WRONG and it loops forever. PROVEN ON host-4 2026-09-17: crypttab carried"
+      warn "  'crypt-os none luks,tpm2-device=auto', the LUKS header carried a systemd-tpm2"
+      warn "  token sealed to PCR 7, the initramfs had been rebuilt for the running kernel -"
+      warn "  and the host still prompted."
+      warn ""
+      warn "  The reason: tpm2-device= is a SYSTEMD-CRYPTSETUP option, and this initramfs"
+      warn "  contains only Debian's own cryptroot scripts (scripts/local-top/cryptroot,"
+      warn "  usr/bin/cryptroot-unlock). There is no systemd-cryptsetup in the boot path, so"
+      warn "  nothing ever reads the option. No rebuild order changes that."
+      warn ""
+      warn "  The working mechanism on Ubuntu 24.04 server is CLEVIS (clevis-luks,"
+      warn "  clevis-tpm2, clevis-initramfs - all present in the enclave mirror), which"
+      warn "  ships its own initramfs hook. See runbook 6.3i.1."
+      warn ""
+      warn "  AND BEFORE YOU DO: check Secure Boot. Sealing to PCR 7 with Secure Boot"
+      warn "  DISABLED is not a security control - PCR 7 measures the Secure Boot policy, so"
+      warn "  with it off any media boots on this machine and the TPM releases the key to"
+      warn "  whatever initramfs asks. Enable Secure Boot FIRST; doing it afterwards changes"
+      warn "  PCR 7 and breaks every seal."
     fi
   else
     warn "lsinitramfs not present - cannot confirm the initramfs carries the TPM2 stack"

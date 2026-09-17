@@ -40,21 +40,34 @@ Options, in order of preference:
 **Recommend A.** One rebuild is cheap; a contested STIG baseline is not. Decide before you
 start, because it determines which host you build first and where `svc-01` lands.
 
-## 1a. Not yet satisfied — decide before building production hosts
+## 1a. Encryption is IN the template. The GRUB password is NOT — and neither blocks the install
 
-This template does **not** configure disk encryption or a GRUB password. Both are STIG items
-and both are install-time decisions that cannot be retrofitted without a rebuild.
+**Rewritten 2026-09-17.** This section used to say the template configured neither disk
+encryption nor a GRUB password, and used to tell you to settle Q19, Q20 and Q21 before running
+step 02 on real hardware. **Two of those three are now answered and the encryption claim is
+simply out of date** — `host-4` was built with LUKS on 2 of 3 NVMe on 2026-09-01.
 
 | | Status |
 |---|---|
-| **GRUB password** — `UBTU-24-102000` (V-270675) | Confirmed requirement. Not in the template |
-| **Data-at-rest encryption** — LUKS | Requirement is conditional on the data's protection level; exact 24.04 rule ID must be pulled from <https://public.cyber.mil/stigs/downloads/>. No `dm_crypt` in the template |
+| **Data-at-rest encryption** — LUKS | ✅ **IN THE TEMPLATE.** `ENCRYPT_DISKS=true` puts a dm_crypt layer under **both** volume groups; `LUKS_PASSPHRASE` and `LUKS_UNLOCK` are parameters. **Q19 answered** — required at IL5. Proven on `host-4` |
+| **Unattended unlock** | ✅ **Q20 answered.** TPM 2.0 is the recommended production posture, passphrase is supported, both parameterised as `LUKS_UNLOCK`. ⚠️ **The TPM path does not work yet** — runbook §6.3i.1 proves why, and it is blocked on Secure Boot, not on the installer. **Build with `passphrase`; TPM is enrolled afterwards** |
+| **GRUB password** — `UBTU-24-102000` (V-270675) | ⬜ Confirmed requirement, still **not in the template**. Applied by `stig-tailor.sh grubpw` during **step 05 hardening**, not at install |
+| **Q21** — does `usg fix` set it with `--unrestricted`? | ⬜ **Still open, still untested.** *"Test, do not ask."* |
 
-Applied naively, both stop three headless racked hosts from rebooting unattended — which
-breaks every patch window. The GRUB password needs `--unrestricted` on normal boot entries;
-LUKS needs TPM 2.0 or Tang/Clevis rather than a console passphrase.
+### What this means for running step 02 today — and it is the opposite of what this said
 
-**Open questions 19, 20 and 21 cover this.** Settle them before step 02 runs on real hardware.
+> **Neither remaining item blocks the install.** The GRUB password is applied during hardening,
+> and TPM unlock is enrolled after the host exists. **Q21 gates unattended REBOOTS on a
+> hardened host, not the build of an unhardened one.**
+
+The original warning still holds for day-2 and belongs in the SSP: applied naively, a GRUB
+password and a console LUKS passphrase together stop three headless racked hosts from rebooting
+unattended, which breaks every patch window. **`host-4` demonstrates the LUKS half of that
+already** — it prompted at the console on 2026-09-17 and took the whole enclave down until
+somebody typed it.
+
+So build the hosts, then settle Q21 and Secure Boot before anyone calls the enclave
+operable without a human at the rack.
 
 ## 2. What this produces
 
@@ -177,21 +190,60 @@ connect to, and being locked out of a half-built machine on a rack costs more th
 on a lab network. Step 03 hardening sets it `false`, which is what the STIG requires. The
 console password is set either way and is the last-resort way in.
 
-## 4a. ⬜ Two install paths exist for `host-1..3` and neither has been chosen
+## 4a. The seed stick builds them; MAAS redeploys them. Settled.
 
-**Raised 2026-09-17, unresolved.** §5 below builds a seed stick per host. **MAAS is also running
-on `svc-mgmt-01` with DHCP, TFTP and HTTP boot** (runbook §4, §3055ff), and the runbook calls PXE
-"how `host-1..3` get built". Both are documented; neither is the decision.
+**Raised as an open question 2026-09-17 and closed the same night — it was already answered.**
+Runbook §4 states it directly: *"The answer is lifecycle, not initial build. Composing a VM
+once from a script and being able to rebuild a failed host at 3am are different problems."*
+MAAS's justification in this enclave is **commission / deploy / redeploy after failure**, not
+the first install.
 
-For three machines PXE is the cheaper path and exercises MAAS, which has to work anyway. The
-seed stick is proven — it is exactly how `host-4` was built — and needs nothing from MAAS.
-**Pick one before the install, and record it here.**
+The evidence settles it beyond the stated intent:
+
+| | seed stick (§5 below) | MAAS PXE |
+|---|---|---|
+| STIG partition layout — separate `/home`, `/var`, `/var/log`, `/var/log/audit`, `/tmp` | ✅ in `user-data.template` | would need re-expressing in MAAS's storage model |
+| LUKS under **both** volume groups | ✅ `ENCRYPT_DISKS` | same |
+| **`DATA_VG_SIZE`** — the 500/500 split for Ceph | ✅ built 2026-09-17 | same |
+| No default route, console strategy, `PASSWORD_HASH` quoting, disk-match patterns | ✅ debugged across two pathfinder passes **and host-4's real build** | not carried over |
+| `curtin` / MAAS storage layout documented anywhere in this repo | — | **mentioned once, unrelated** |
+
+> **Partitioning and LUKS are install-time and not retrofittable.** Learning MAAS's storage
+> model on the first install of a machine whose layout cannot be changed afterwards is the
+> wrong place to take that risk. Build the three the proven way; prove a MAAS deploy later, on
+> a host you can afford to rebuild.
+
+**One consequence to carry into the SSP.** If MAAS never deploys anything, it is a VM with
+~30 open ports doing nothing, and an assessor will ask what it is for. Its answer is
+redeploy-after-failure — which means **a MAAS deploy has to be rehearsed at least once** before
+that claim is honest. Pair it with the host-failure rehearsal in runbook §10.
 
 The addresses and hostnames in §5 were corrected 2026-09-17: they had said `h1/h2/h3` on
 `10.0.20.11-13`, which is the **pre-renumber** subnet and the wrong naming convention. The
 enclave moved to `10.2.20.x` on 2026-09-03 (runbook §3.1) and the hosts are `host-1..3`, per
-`scripts/enclave/enclave-addresses.env` — which is the single source of truth. `host-4`'s build
-record further down keeps its original `10.0.20.158` because it is history, not instruction.
+`scripts/enclave/enclave-addresses.env` — the single source of truth. `host-4`'s build record
+further down keeps its original `10.0.20.158` because it is history, not instruction.
+
+## 4b. What differs per host in `host-params.env`
+
+Most of the file is identical across all four hosts. These are the values that are **not**:
+
+| | `host-4` (built) | `host-1..3` |
+|---|---|---|
+| `DATA_VG_SIZE` | `-1` — the whole data disk is the libvirt image pool | **`500G`** — half the 1 TB M.2; the rest is left raw for `k8s-wk-0N`'s Ceph OSD |
+| `OS_DISK_MATCH` | its own 1 TB PCIe NVMe | **the 256 GB M.2** — probe it, do not assume |
+| `DATA_DISK_MATCH` | the 2 TB M.2 | **the 1 TB M.2** |
+| `LUKS_UNLOCK` | `passphrase` | `passphrase` for now — TPM is blocked on Secure Boot, §6.3i.1 |
+
+**`OS_DISK_MATCH` and `DATA_DISK_MATCH` cannot be written until the hardware is probed.**
+`01-hw-inventory.sh` on each host produces the `id_path` values. `02-build-seed.sh` refuses if
+the two patterns are identical, because both volume groups would land on one disk — but it
+cannot tell you that a pattern matched the *wrong* disk, so read the inventory rather than
+guessing from capacity.
+
+**Before the first install, at each machine's firmware screen** — all three are physical-access
+work and none can be done afterwards from a shell: set UEFI boot, **clear the TPM** (these were
+Windows machines and BitLocker may still own it), and settle Secure Boot. Runbook §6.3i.1.
 
 ## 5. Per host — no file editing
 
@@ -335,12 +387,16 @@ No Ubuntu Pro attach. No FIPS. No STIG remediation. No LXD.
 
 That is a sequencing decision, not an omission:
 
-- **Pro attach needs infrastructure that does not exist yet.** In a disconnected enclave,
-  attachment goes through the air-gapped contract server, which lives on `svc-01`, which does
-  not exist during the first host's install.
-- **FIPS and STIG are blocked on open questions 11 and 12.** Whether `pro enable
-  fips-preview` and `usg fix disa_stig` even work on 24.04 is unanswered. Writing them into
-  the autoinstall now means writing it twice.
+- **Pro attach needs infrastructure that already exists now, and still should not be here.**
+  Attachment goes through the air-gapped contract server on `svc-mgmt-01` — which was written
+  as "does not exist yet" and **has been running since 2026-09-04**. The sequencing argument
+  survives the correction: an autoinstall that attaches to Pro couples every future host build
+  to a VM being up, and `host-4` has to be installable when nothing else in the enclave is.
+- **~~FIPS and STIG are blocked on open questions 11 and 12~~ — BOTH ANSWERED** in step 01
+  pass 1, and the procedure is no longer hypothetical: **five machines have been hardened**
+  through runbook §6.0, landing on the same six-finding residual set. Keeping it out of the
+  autoinstall is now a deliberate choice rather than a wait — `usg fix` needs a fresh system,
+  a reboot, and captured pre/post audits as evidence, which is the next point.
 - **`usg fix` must run on a fresh system** and requires a reboot afterwards. It belongs in a
   separate, deliberate, evidence-producing step where the pre- and post-audit reports are
   captured — not buried in `late-commands` where nothing is recorded.

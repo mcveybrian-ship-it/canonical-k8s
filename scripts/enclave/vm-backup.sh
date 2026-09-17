@@ -917,20 +917,57 @@ cmd_reattach() {
   [ -b "$dev" ] || die "LUKS device $dev never appeared - is the drive plugged in and powered?"
   ok "found the encrypted volume: $(readlink -f "$dev")"
 
+  # TRIM. OFF BY DEFAULT AND THAT IS DELIBERATE - it is a posture decision, not a tuning knob.
+  #
+  # An SSD backup target with nightly churn loses sustained write speed without discard, and
+  # dm-crypt DROPS TRIM unless it is opened with --allow-discards. The cost is a documented
+  # information leak: someone holding the drive can see which blocks are unused, so roughly
+  # how full the filesystem is. The contents stay encrypted; the shape of the usage does not.
+  #
+  # Defensible on a backup volume. It belongs in the SSP as a STATED CHOICE rather than being
+  # found in a config file later, which is why the default is off and turning it on is explicit.
+  # Meaningless on a spinning disk - leave it off for the WD.
+  local disc=""
+  case "${BACKUP_TRIM:-false}" in
+    true|yes|1)
+      disc="--allow-discards"
+      say "TRIM enabled (BACKUP_TRIM) - dm-crypt will pass discards to the device."
+      say "  SSP: this reveals which blocks are unused, i.e. approximately how full the"
+      say "  volume is, to anyone holding the drive. Contents remain encrypted." ;;
+    false|no|0|'') : ;;
+    *) die "BACKUP_TRIM must be true or false, got '${BACKUP_TRIM}'" ;;
+  esac
+
   if [ ! -e "/dev/mapper/$LUKS_NAME" ]; then
     if [ -s "$KEYFILE" ]; then
-      cryptsetup luksOpen --key-file "$KEYFILE" "$dev" "$LUKS_NAME" \
+      cryptsetup luksOpen $disc --key-file "$KEYFILE" "$dev" "$LUKS_NAME" \
         || die "luksOpen failed with $KEYFILE - run '$0 keyfile' first, or unlock by hand"
       ok "unlocked with the keyfile - no passphrase needed"
     else
       warn "no keyfile at $KEYFILE - unlock needs a passphrase, so this cannot run unattended"
       say  "  create one with:  sudo $0 keyfile"
-      cryptsetup luksOpen "$dev" "$LUKS_NAME" || die "luksOpen failed"
+      cryptsetup luksOpen $disc "$dev" "$LUKS_NAME" || die "luksOpen failed"
     fi
   fi
 
   install -d "$DEST"
-  mount "/dev/mapper/$LUKS_NAME" "$DEST" || die "mount failed"
+  # discard in the mount options too - the dm-crypt layer allowing TRIM is necessary but not
+  # sufficient; ext4 has to actually issue it.
+  local mopts="defaults"
+  [ -n "$disc" ] && mopts="defaults,discard"
+  mount -o "$mopts" "/dev/mapper/$LUKS_NAME" "$DEST" || die "mount failed"
+
+  # PROVE IT RATHER THAN ASSUME IT. A volume opened with --allow-discards on a bridge that
+  # does not pass TRIM reports nothing and silently behaves as if discard were off.
+  if [ -n "$disc" ]; then
+    local dg; dg="$(lsblk -dno DISC-GRAN "$(readlink -f "$dev")" 2>/dev/null | tr -d ' ')"
+    case "${dg:-0B}" in
+      0B|0|'') warn "the device reports DISC-GRAN 0 - THIS BRIDGE DOES NOT PASS TRIM."
+               warn "  BACKUP_TRIM is on and having no effect. Check 'lsusb -t' shows uas," 
+               warn "  not usb-storage, and that the enclosure supports it." ;;
+      *) ok "TRIM reaches the device (discard granularity $dg)" ;;
+    esac
+  fi
   mountpoint -q "$DEST" || die "$DEST still is not a mountpoint"
   ok "mounted $DEST"
   df -h "$DEST" | tail -1 | sed 's/^/       /'

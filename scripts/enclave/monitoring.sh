@@ -330,14 +330,27 @@ set_args() {
   local f="$1" val="$2"
   [ -f "$f" ] || { warn "no $f"; return 1; }
   cp -a "$f" "/var/backups/$(basename "$f").$(date +%Y%m%dT%H%M%S)"
-  if grep -q '^ARGS=' "$f"; then sed -i "s|^ARGS=.*|ARGS=\"$val\"|" "$f"
-  else printf 'ARGS="%s"\n' "$val" >> "$f"; fi
+  # NEVER BUILD A sed SUBSTITUTION OUT OF THIS VALUE.
+  #
+  # The old line was  sed -i "s|^ARGS=.*|ARGS=\"$val\"|"  and it broke on 2026-09-18 with
+  #     sed: -e expression #1, char 180: unknown option to `s'
+  # because $val contains SYSTEMD_UNITS, which is a regex full of pipes:
+  #     (auditd|chrony|sshd|ssh|ufw|nginx|...)\.(service|timer)
+  # The first pipe inside the value ENDS the s command and the rest is read as flags. No
+  # delimiter is safe here either: the value also carries / (paths), & (would expand to the
+  # whole match), . and * - picking a different separator just moves the landmine.
+  #
+  # AND IT ONLY FAILED ON THE SECOND RUN. With no ARGS= line the old code took the append
+  # branch and worked; once ARGS= existed the sed branch fired and failed forever after. A
+  # script that works once and then breaks is worse than one that never works, because the
+  # first run is the one you test.
+  #
+  # So: delete every ARGS= line and append the new one. Same end state, no expression
+  # language involved, and it collapses duplicates on the way through.
+  sed -i '/^ARGS=/d' "$f"
+  printf 'ARGS="%s"\n' "$val" >> "$f"
   local n; n="$(grep -c '^ARGS=' "$f")"
-  if [ "$n" -ne 1 ]; then
-    local keep; keep="$(grep '^ARGS=' "$f" | tail -1)"
-    sed -i '/^ARGS=/d' "$f"; printf '%s\n' "$keep" >> "$f"
-    warn "$(basename "$f") had $n ARGS lines - collapsed to one"
-  fi
+  [ "$n" -eq 1 ] || warn "$(basename "$f") has $n ARGS lines after rewrite - inspect it"
 }
 
 # PROVISIONED, NOT CLICKED. A rebuilt collector comes up with its datasource already

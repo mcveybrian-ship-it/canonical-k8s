@@ -88,6 +88,25 @@ These are the ones an assessor reads first. All four are architectural, not pape
 
 Found 2026-09-17, runbook §9b. **Nothing in the current build path depends on MAAS** — `03-compose-vm.sh` composes from `virsh` directly — so this is not blocking. Three options: pursue Canonical, test a newer version, or remove it from the boundary. **Plan as though removing it is the answer.**
 
+## 6a. ⬜ STIG/SRG assessment — opened 2026-09-18
+
+| | Item | Notes | Status |
+|---|---|---|---|
+| **6a.1** | **Download the Kubernetes STIG V2R5 MANUAL XCCDF** from cyber.mil | We have only the **SCAP 1-3 benchmark** — 61 rules, which is the *automatable subset*. **34 V-IDs in the observed range are absent** (V-242383, 242386–388, 242391/392, 242394–399, 242401, 242410–417, 242435–437, 242439–443, 242447/448, 242454/455, 242458). Every K8s coverage figure is a **floor** until this lands | ⬜ **blocks final gap numbers** |
+| **6a.2** | **The control baseline and overlay set** | The gap count is meaningless without it — the tool's 1,014 denominator is the whole 800-53 catalogue, not an IL5 baseline. **AO input; Brian is the AO for now.** Also what `ssp.md` is blocked on | 🔴 **blocks the gap number AND `ssp.md`** |
+| **6a.3** | **Assess Container Platform SRG against `svc-harbor-01` NOW** | Not a future item. By the SRG's own definition (engine + registry + key-value store) **Harbor-under-Docker is already a container platform**, missing only the keystore. No Harbor STIG and no registry SRG exist, so this SRG **is** the instrument. ~140 rules after tailoring | ⬜ open |
+| **6a.4** | **V-233201 — local cache of PKI revocation data** | ⚠️ **The air gap makes this MANDATORY and the hardest PKI rule in the set, not N/A.** With no OCSP reachability, CRLs must be couriered in on a defined cadence or every certificate validates against stale revocation state | ⬜ open · needs a cadence decision |
+| **6a.5** | **V-233233 — registry images patched within 30 days** | Demands a **≤30-day sneakernet cadence, permanently**. Operationally the hardest requirement in the document for this enclave. Not waivable on air-gap grounds | ⬜ open · pairs with the weekly Trivy decision (§3.2) |
+| **6a.6** | **V-278968 — is `docker.io` from Ubuntu universe "vendor supported"?** | CAT I. Whether Ubuntu Pro `esm-apps` coverage of `universe` satisfies "a version supported by the vendor" for a container runtime is a question for **Canonical and the AO**. Do not assert either way without a Canonical source | ⬜ open |
+
+| **6a.7** | **pg-01..03 build must start from §9a.2a, not §9a.3** | Four traps found 2026-09-18 *before* the build: Patroni's default `md5` replication user is an **instant CAT I on all three nodes** (V-261892); V-261967 contradicts 25 other rules over `log_destination`; ~60 fixtexts tell you to edit files Patroni regenerates; and 13 filesystem checks point at **RHEL paths that do not exist on Ubuntu** | ⬜ **read before building** |
+| **6a.8** | **Exercise a Patroni failover under FIPS before declaring pg-01..03 built** | Patroni is Python and `hashlib.md5()` **raises** under FIPS. Whether Patroni or its etcd client touch MD5 on the bootstrap/failover path is **UNDETERMINED**. This runbook is 4-for-4 on hardening breaking what it does not touch | ⬜ **unverified, must be exercised** |
+| **6a.9** | **Decide pgcrypto vs LUKS for Postgres at-rest, in writing** | V-261901/930/931 (two CAT I) name pgcrypto. **pgcrypto is not inside any FIPS validation boundary** and its `crypt()`/`gen_salt()` fail at runtime under FIPS OpenSSL. LUKS at the VM disk layer is the defensible answer — but the substitution has to be *stated*, not implied | ⬜ open |
+| **6a.10** | **Author the Postgres org-defined baseline** | 27 of 111 rules compare against a site baseline — approved extensions, superusers, object owners, port, pinned package version, per-role connection limits. **This baseline is the real deliverable** and is the tailorable artifact that survives to the next engagement. Missing baseline MUST yield Not Reviewed, never NotAFinding — 27 chances for a hollow pass | ⬜ open |
+| **6a.11** | **Record the Crunchy-vs-PGDG tailoring statement** | This is the **Crunchy Data** Postgres 16 STIG. If pg-01..03 run Ubuntu/PGDG Postgres, applicability is a tailoring decision and V-283674's "vendor supported" reads differently. Defensible either way — but it must be written down, not assumed | ⬜ open |
+
+⚠️ **Do not over-claim air-gap N/A.** Of 188 Container Platform SRG rules, only **8** are genuinely not applicable. The air gap changes *how* the rest are satisfied, not *whether* they apply — and 6a.4 is the clearest case of a rule that gets **harder**, not waived.
+
 ## 7. Never mirrored, never built
 
 - **Landscape** and the **Enterprise Store** — never in a transfer bundle. Blocked on a transfer trip before they are blocked on writing. ⚠️ *State not re-verified since it was recorded.*

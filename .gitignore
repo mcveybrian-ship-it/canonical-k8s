@@ -109,3 +109,9 @@ airgapped-contracts.yaml
 ca-params.env
 */ca-params.env
 scripts/enclave/ca-params.env
+
+# DISA STIG / SRG reference material - 42 MB of public cyber.mil downloads.
+# Re-downloadable, so the BYTES do not belong in a public repo; the PROVENANCE does.
+# docs/compliance/stig-manifest.md carries filename + SHA-256 + date, which is what an
+# assessor asks for. Added 2026-09-18.
+docs/compliance/stigs/

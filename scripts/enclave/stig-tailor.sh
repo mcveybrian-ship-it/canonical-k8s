@@ -2364,6 +2364,25 @@ v1r6_audit_at_boot() {
     && ! v1r6_audit_default_grub | grep -v 'audit=1' | grep -q 'GRUB_CMDLINE'
 }
 v1r6_journal_dirs()  { stat -c '%a %n' /var/log/journal /run/log/journal 2>/dev/null || true; }
+# THE MACHINE-ID SUBDIRECTORIES, WHICH v1r6_journal_dirs DOES NOT SEE.
+#
+# Measured on host-4 2026-09-18: /var/log/journal and /run/log/journal were both 0640 and the
+# subdirectory /var/log/journal/<machine-id> was 2750. The apply was gated on the PARENTS
+# only, so it was skipped - and the file it would have written is precisely what fixes the
+# subdirectory. The result was an advice loop: v1r6 --apply said "fix: run fixups --apply",
+# fixups --apply said "v1r6 --apply writes it", and neither wrote anything.
+#
+# A trigger that cannot see the broken object will never fire on it.
+v1r6_journal_subbad() {
+  local sub
+  for sub in /var/log/journal/*/ /run/log/journal/*/; do
+    [ -d "$sub" ] || continue
+    case "$(stat -c %a "$sub" 2>/dev/null)" in
+      640|600|0640|0600) : ;;
+      *) printf '%s(%s) ' "$sub" "$(stat -c %a "$sub" 2>/dev/null)" ;;
+    esac
+  done
+}
 # CHECKING THE DIRECTORIES WAS NOT ENOUGH. V-270757 is about directory modes and V-270762 is
 # about FILE group ownership, and the fix for the first broke the second. Report both.
 v1r6_journal_badfiles() {
@@ -2706,7 +2725,8 @@ RULES
       say "   answered - V-270757 forbids the setgid bit journald needed. runbook 10.1."
     fi
   fi
-  if v1r6_journal_dirs | awk '{print $1}' | grep -qv '^640$' || [ -n "$jreal" ]; then
+  if v1r6_journal_dirs | awk '{print $1}' | grep -qv '^640$' || [ -n "$jreal" ] \
+     || [ -n "$(v1r6_journal_subbad)" ]; then
     n_todo=$((n_todo+1))
     if [ "$apply" -eq 1 ]; then
       # DISA names this exact filename. MEASURED on svc-mgmt-01: it wins over
@@ -2789,7 +2809,9 @@ TMPF
     if [ -n "$subbad" ]; then
       warn "   parent directories are 0640 but a MACHINE-ID SUBDIRECTORY is not:$subbad"
       say  "      journald resets these after a systemd upgrade. UBTU-24-700020 checks them."
-      say  "      fix: sudo $0 fixups --apply   (re-applies the declared tmpfiles rule)"
+      say  "      fix: sudo $0 v1r6 --apply   (writes DISA's four-line tmpfiles rule, which"
+      say  "           is what corrects the subdirectory - fixups only re-runs systemd-tmpfiles"
+      say  "           against whatever rule is already there)"
       failed=1
     else
       ok "   both directories AND every machine-id subdirectory are 0640"

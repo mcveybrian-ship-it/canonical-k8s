@@ -32,10 +32,50 @@ aborted `05-harden-host.sh` on all seven VMs; and `systemctl show -p Result` ret
 **`success` for a service that does not exist**, so the first V-270650 answer would have passed
 on a machine with the timer deleted.
 
-⬜ **Owed right now:** `stig-tools.sh collect host-4` — host-4 scanned clean at 01:06:48 but the
-collect ran 30 seconds too early, so **stage-01 still holds its 2026-09-16 result**. One command.
+✅ **DONE 2026-09-18:** `host-4` collected. It moved **166/10/11/7 → 169/9/9/7**, and all four
+hosts now match exactly on Not Applicable (9) and Not Reviewed (9), **rule for rule**. Only two
+Open are unique to host-4, and both are below.
 
-⚠️ **Build divergence found:** `sysstat` is installed on `host-1/2/3` and **not** on `host-4`.
+⏸️ **DEFERRED BY DECISION 2026-09-18 — `ufw` on `host-4`, and it is NOT a one-liner.**
+`V-270655` is the single difference between host-4 (6 Open) and the other three (5).
+`/etc/ufw/ufw.conf` says `ENABLED=no`. **Do not "just enable it."** Measured:
+
+```
+DEFAULT_INPUT_POLICY="DROP"    DEFAULT_FORWARD_POLICY="DROP"
+```
+
+and host-4's table in `stig-tailor.sh ufw_rules()` holds **two rows** — 9100 and 9177 to
+`svc-obs-01` — with **no `22/tcp`**. The script's own comment says those rows exist "for the day
+it does" have a table. Enabling it drops SSH on the machine with **no BMC**, and via
+`FORWARD=DROP` cuts bridged traffic for **every guest in the enclave** at the same moment.
+
+**His call: leave it, and fully configure `ufw` once the build has finished setting things up.**
+That means writing host-4's real rule table first — `22/tcp`, the observability pair, libvirt as
+required, and whatever the composed cluster VMs need — then applying it with a second session
+open. Same open question as `svc-mgmt-01`, whose MAAS port list is still unconfirmed.
+
+⚠️ **`V-270718` on host-4 is a STANDING DEVIATION, not a forgotten window.** `/mnt/vmbackup` is
+a **USB-attached** Micron CT4000X10PROSSD9 (`sda`, 3.6 T, LUKS, 405 GB used), so `usb_storage`
+and `uas` must stay loaded or the backups cease to exist — `usb disable` would break them. Same
+root as §10b's "the destination is on the machine it backs up", and the same fix: a non-USB
+target (iSCSI or NFS) closes both. **It wants an answer-file entry stating the deviation, not a
+remediation.** `enclave-vm-backup.timer` is enabled and last ran 07:00 on 2026-09-18.
+
+ℹ️ The retired **WD easystore** (`sdb`, 4.5 T, `crypto_LUKS`) is still plugged into host-4 and
+unmounted. Either a free second copy or a USB device attached to the hypervisor for no reason —
+worth deciding which.
+
+⚠️ **`sysstat`: TWO DIFFERENT ANSWERS TO ONE FINDING — his call, item 2.** On **2026-09-16**
+the decision was to **purge the package** ("rather than chmod-ing files a cron job recreates
+hourly — node-exporter already covers it"), which is why host-4 has no `sysstat`. On
+**2026-09-18** I set `UMASK=0027` on `host-1/2/3` instead, as `fixups` item 2b, **without
+checking that earlier decision**. Both close V-270756; the enclave now answers one finding two
+ways. **Purge is probably the better end state, but it is gated on the next line.**
+
+🔴 **`host-1/2/3` HAVE NO MONITORING.** `node-exporter` is **inactive** on all three and
+**active** on host-4 — they were never added to step 09a. This was in no earlier status summary.
+It also gates the `sysstat` decision: purging there today would leave them with no performance
+data at all. **Monitoring first, then purge.**
 Not a problem today, but "the hosts are identical" is no longer true, and `stage-01` and the four
 VMs also still carry `UMASK=0022`.
 

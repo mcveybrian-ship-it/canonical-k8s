@@ -399,6 +399,65 @@ count **excludes ESM**. On `host-4` it reported `3;0` — three updates, zero se
 have missed all three; the rule is now a disjunction across `apt-check`, `esm-apps` and
 `esm-infra`. Source: `docs/open-questions.md` Q28 · suggested controls **SI-2**, CM-8, SA-22.
 
+### 4.1g ✅ PostgreSQL is community, assessed against a tailored vendor STIG — AO DECISION 2026-09-18
+
+> **The database tier is community PostgreSQL 16 from Ubuntu `main`, not a commercial
+> distribution. It is assessed against the DISA Crunchy Data Postgres 16 STIG V1R3 with
+> documented tailoring, plus the 34 Database SRG requirements that STIG has no child rule for.**
+
+**The AO's reasoning, recorded because it is the rationale an assessor will test:** *"I do not
+want to be dependent on a provider for a product I can get and set up ourselves and have to pay
+licensing on — as long as the Postgres we are using is compatible with FIPS-enabled Ubuntu and
+can be hardened."*
+
+**The condition was verified, not assumed.** Measured 2026-09-18 against the enclave mirror:
+
+| Package | Version | Component | Support |
+|---|---|---|---|
+| `postgresql-16` | 16.15-0ubuntu0.24.04.1 | **main** | Canonical standard security to 2029, ESM to 2036 |
+| `postgresql-16-pgaudit` | 16.0-1 | universe | `esm-apps` — entitled and now enabled |
+| `patroni` | 3.2.2-2 | universe | `esm-apps` |
+| `etcd-server` | 3.4.30-1ubuntu0.24.04.3+esm2 | main | already receiving ESM updates |
+
+**FIPS capability is structural, not claimed:** `postgresql-16` depends on **`libssl3t64`**, the
+system OpenSSL. On these hosts that library loads the FIPS provider (§1.1), so the database
+inherits the validated module by the same mechanism as every other service. No separate crypto
+path, nothing to certify independently.
+
+**Why a vendor STIG for a non-vendor product.** There is no community-PostgreSQL STIG at any
+version — DISA's only other PostgreSQL benchmark is `PGS_SQL_9-x`, which is **Sunset**. The
+Database SRG's own fallback rule is to use the SRG *"when a product-specific STIG is not
+available"*; one **is** available for PostgreSQL 16, written for a different distribution of the
+same upstream source. **Tailoring a close product STIG produces materially better security than
+generic SRG checks** — 111 specific rules naming real settings and queries, against 142 generic
+ones — and the 34-rule delta covers what it misses, including two CAT I the product STIG never
+inherited (V-206555 password complexity, V-206561 obscured authentication feedback).
+
+**The tailoring, stated up front rather than defended later** — this is the part an assessor
+challenges, so it is written before the assessment, not after:
+
+| The STIG assumes | This enclave | Effect |
+|---|---|---|
+| Crunchy Data distribution (**334** mentions) | community PostgreSQL 16, Ubuntu `main` | same upstream source, different packaging |
+| `/usr/pgsql-16/{bin,lib,share}` | `/usr/lib/postgresql/16/`, `/usr/share/postgresql/16/` | 13 filesystem checks retargeted |
+| config inside `PGDATA` | `/etc/postgresql/16/main` | ownership/mode checks retargeted |
+| `rpm -qa` / `dnf` | `dpkg` / `apt-cache` | 4 package checks retargeted |
+| pgaudit shipped by the vendor | `postgresql-16-pgaudit` from the mirror | **available — verified**; 15 rules depend on it |
+| **no HA awareness at all** (0 mentions of Patroni) | Patroni 3.2.2 | ⚠️ see runbook §9a.2a |
+
+⚠️ **Two things this decision does NOT settle, and neither may be assumed:**
+
+1. **Whether Patroni runs under FIPS at all.** Patroni is Python and `hashlib.md5()` **raises**
+   on FIPS-enforcing builds. Whether Patroni or its etcd client touch MD5 on the bootstrap or
+   failover path is **undetermined**. A real failover must be performed under FIPS before
+   `pg-01..03` are declared built.
+2. **`V-283674` asks for a "vendor supported" version.** With community packaging the vendor is
+   **Canonical**, and `postgresql-16` being in `main` is the evidence. That reading should be
+   stated in the assessment rather than left for an assessor to infer.
+
+Source: `docs/open-questions.md` · runbook §9a.2a · `HANDOFF.md` §3 · suggested controls
+**CM-6**, SA-4, SA-22, SI-2.
+
 ### 4.2 ⬜ Third-party packages no subscription tier covers
 
 > **Between 24 and 46 packages per machine are covered by no subscription at any tier.**

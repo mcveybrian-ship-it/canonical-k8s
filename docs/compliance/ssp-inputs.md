@@ -447,10 +447,18 @@ challenges, so it is written before the assessment, not after:
 
 ⚠️ **Two things this decision does NOT settle, and neither may be assumed:**
 
-1. **Whether Patroni runs under FIPS at all.** Patroni is Python and `hashlib.md5()` **raises**
-   on FIPS-enforcing builds. Whether Patroni or its etcd client touch MD5 on the bootstrap or
-   failover path is **undetermined**. A real failover must be performed under FIPS before
-   `pg-01..03` are declared built.
+1. ✅ **RESOLVED BY INSPECTION 2026-09-18 — Patroni contains no runtime MD5.** The concern was
+   that Patroni is Python and `hashlib.md5()` raises on FIPS-enforcing builds. The packages were
+   downloaded from the enclave mirror and read: **`patroni` 3.2.2-2 and `python3-etcd` 0.4.5-4
+   contain ZERO `hashlib` imports and zero `.md5()` calls outside test code.** The only hits are
+   in `etcd/tests/integration/helpers.py`, which generates certificate serials for integration
+   tests and never executes at runtime. Runtime crypto is `ssl` (both, → OpenSSL → the FIPS
+   provider) and `hmac` in `patroni/api.py` for REST API authentication. **The MD5-under-FIPS
+   failure mode is not present in this version.**
+   ⚠️ Still worth one check at build time: HMAC is FIPS-approved *with an approved digest*, so
+   confirm the digest `patroni/api.py` uses if the REST API is exposed. It is not on the
+   bootstrap or failover path. And a real failover under FIPS remains the proof — static
+   analysis lowers the risk, it does not replace the test.
 2. **`V-283674` asks for a "vendor supported" version.** With community packaging the vendor is
    **Canonical**, and `postgresql-16` being in `main` is the evidence. That reading should be
    stated in the assessment rather than left for an assessor to infer.

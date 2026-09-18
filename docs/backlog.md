@@ -103,7 +103,27 @@ bottom.
 |---|---|---|---|
 | **1** | 🔴 **`U_Kubernetes_V2R5_STIG.zip`** — the **Manual** STIG. **STILL MISSING as of 2026-09-18** | Only the SCAP 1-3 benchmark is present: **61 rules, the automatable subset**. **34 V-IDs in the observed range are absent**. V2R5 confirmed current | **Every K8s coverage figure is a FLOOR**, and so is the Container Platform SRG overlap analysis |
 | ~~2~~ | ✅ **OBTAINED 2026-09-18 — `U_BIND_9-x_V3R3_STIG.zip`, 73 rules / 43 CCIs / 3 CAT I.** Adds **26** 800-53 controls to coverage, taking the applicable set from 109 to **115** | 🆕 **New requirement created 2026-09-18** by standing up `bind9` on `svc-mgmt-01`. **Evaluate-STIG ships NOTHING for BIND** — its only DNS content is `U_MS_Windows_Server_DNS_STIG`, which is Microsoft DNS. **A BIND 9.x STIG does exist; the V3 series is current (V3R3, 01 Jul 2026)** — take the latest, the filename pattern is `U_BIND_9-x_V<n>R<n>_STIG.zip` | A DNS server in the boundary with no benchmark is an unassessed component |
-| ~~3~~ | ✅ **OBTAINED 2026-09-18 — `U_ASD_V6R4_STIG.zip`, 286 rules / 225 CCIs / 34 CAT I.** ⚠️ **Not in the applicable set**: nothing in this enclave deploys locally developed code. Held against the day that changes, or if the Application Server SRG exclusion is challenged | Both the Application Server and Web Server SRG overviews redirect application-layer requirements here. **Only needed if locally developed code is ever deployed into this enclave** | Nothing today. Revisit only if the Application Server SRG exclusion is challenged |
+| **3** | ✅ **OBTAINED — `U_ASD_V6R4_STIG.zip`. 🔴 IN SCOPE, not held in reserve** | **286 rules / 225 CCIs / 34 CAT I** — the largest document in the set. **AO 2026-09-18, from prior experience: *"I know 100% I will have to do that one — a lot end up being not applicable but I still have to fill it out."*** So the deliverable is a **completed checklist with a defensible rationale on every row**, not an exclusion argument | ⬜ **286 rows to answer** |
+
+#### How the 286 ASD rows get answered without writing 286 justifications
+
+✅ **139 of 286 rules (49%) carry their own "not applicable" clause in DISA's CheckText.**
+For those the rationale is **DISA's own words plus a statement that the condition holds** —
+quotable, consistent, and generatable. That is the cheap half, and doing it by hand is how
+286 rows end up with 286 slightly different wordings for an assessor to pick at.
+
+The remaining 147 need judgement, but they **group**. Measured theme counts (rules can match
+more than one — this is for grouping, not arithmetic): database/SQL **28**, no-locally-developed-
+code/COTS **17**, source code and SDLC **17**, DoD PKI/certificates **14**, web service/API/SOAP
+**8**, mobile code **2**.
+
+**The plan: answer ~12 themes once each, then apply. Not 286 individual write-ups.**
+
+⚠️ **Two themes will NOT be N/A and should be expected to bite:**
+- **database/SQL (28)** — PostgreSQL 16 is real, and `pg-01..03` are being built. These
+  overlap the Postgres 16 STIG and need reconciling, not waiving.
+- **DoD PKI / certificates (14)** — same private-CA problem as everywhere else in this
+  enclave. AO acceptance, not a technical answer.
 
 ❌ **A DNS SRG is NOT needed.** The only DISA "DNS STIG" is **V4R1.20 from 2017** and is
 superseded by the BIND 9.x series. **A product STIG exists for our DNS server**, so the SRG

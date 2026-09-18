@@ -386,6 +386,83 @@ cmd_collect() {
   return $rc
 }
 
+# --------------------------------------------------------------------------------- coverage
+# Q28 EVIDENCE: WHO PATCHES EACH INSTALLED PACKAGE.
+#
+# The SSP needs a NAMED list of packages no subscription covers, not a count. A count nobody
+# has read is not evidence, and a hand-written list drifts from the day it is typed - so this
+# generates it from the machine every time.
+#
+# HOW THE CLASSIFICATION WORKS, because the obvious methods are wrong:
+#
+#   `apt list --installed` marks locally-installed packages `[installed,local]`. On host-4 that
+#   returned ZERO while 64 packages were in fact universe-only - the marker catches debs with no
+#   apt entry at all, not packages whose archive gives them weaker support.
+#
+#   So this reads the COMPONENT from the apt list FILENAMES, which encode it
+#   (..._dists_noble_universe_binary-amd64_Packages), and buckets every installed package:
+#
+#     main / restricted     standard Ubuntu security support to 2029, then esm-infra
+#     universe / multiverse esm-apps ONLY - entitled here, and it had to be switched on
+#     no archive at all     nothing in any configured source provides it. THE Q28 LIST.
+#
+# Measured 2026-09-18: the third bucket is FIVE package installs across the whole enclave, not
+# the "24-46 per machine" the question assumed - that figure was the universe bucket, which IS
+# covered. Run it on each machine; it reads only and needs no privilege.
+cmd_coverage() {
+  python3 - <<'COVPY'
+import glob, gzip, os, subprocess, collections
+comp_of = {}
+for f in glob.glob('/var/lib/apt/lists/*_Packages*'):
+    base = os.path.basename(f)
+    comp = next((c for c in ('main','universe','restricted','multiverse')
+                 if '_%s_binary' % c in base), None)
+    if not comp:
+        continue
+    opener = gzip.open if f.endswith('.gz') else open
+    try:
+        with opener(f, 'rt', errors='replace') as fh:
+            for line in fh:
+                if line.startswith('Package: '):
+                    comp_of.setdefault(line[9:].strip(), set()).add(comp)
+    except OSError:
+        pass
+inst = subprocess.run(['dpkg-query','-W','-f','${Package}\n'],
+                      capture_output=True, text=True).stdout.split()
+b = collections.defaultdict(list)
+for p in inst:
+    c = comp_of.get(p)
+    if not c:                                   b['none'].append(p)
+    elif c & {'main','restricted'}:             b['main'].append(p)
+    else:                                       b['universe'].append(p)
+host = os.uname().nodename
+print("\n  PACKAGE SUPPORT COVERAGE on %s - %d installed\n" % (host, len(inst)))
+print("    %-46s %4d   standard security support" % ("main / restricted", len(b['main'])))
+print("    %-46s %4d   esm-apps ONLY - verify it is enabled" % ("universe / multiverse", len(b['universe'])))
+print("    %-46s %4d   NOTHING PROVIDES THESE" % ("no archive in any configured source", len(b['none'])))
+if b['none']:
+    print("\n  THE Q28 LIST - name these in the SSP with their patching route:")
+    for p in sorted(b['none']):
+        out = subprocess.run(['dpkg-query','-W','-f','${Version}\t${Maintainer}','--',p],
+                             capture_output=True, text=True).stdout.split('\t')
+        ver = out[0] if out else '?'
+        who = out[1] if len(out) > 1 else '?'
+        print("    %-26s %-14s %s" % (p, ver, who))
+else:
+    print("\n  [ok] every installed package is provided by a configured archive")
+if b['universe']:
+    print("\n  universe/multiverse (esm-apps covers these - it is NOT on by default):")
+    line = "    "
+    for p in sorted(b['universe']):
+        if len(line) + len(p) > 100:
+            print(line); line = "    "
+        line += p + " "
+    if line.strip():
+        print(line)
+print()
+COVPY
+}
+
 # ----------------------------------------------------------------------------------- fetch
 cmd_fetch() {
   # THE MACHINE CHECK COMES BEFORE THE PRIVILEGE CHECK, DELIBERATELY.
@@ -822,9 +899,10 @@ case "${1:-status}" in
   publish) shift; cmd_publish "$@" ;;
   answers) shift; cmd_answers "$@" ;;
   collect) shift; cmd_collect "$@" ;;
+  coverage) cmd_coverage ;;
   fetch)   shift; cmd_fetch "$@" ;;
   scan)    shift; cmd_scan "$@" ;;
   detect)  shift; cmd_detect "$@" ;;
   status)  shift; cmd_status "$@" ;;
-  *) printf 'usage: %s {publish|answers <machine>|collect [machine...]|fetch|detect|scan|status}\n' "$0" >&2; exit 2 ;;
+  *) printf 'usage: %s {publish|answers <machine>|collect [machine...]|coverage|fetch|detect|scan|status}\n' "$0" >&2; exit 2 ;;
 esac

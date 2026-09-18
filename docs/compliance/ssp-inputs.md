@@ -347,8 +347,51 @@ The AO's answer has two parts, and both matter:
    package is **named in the SSP with that stated** — an unpatched named list is defensible, an
    uncounted one is not.
 
-⬜ **Owed: the list itself does not exist yet.** It must be generated from the machines, not
-written, or it drifts from the day it is typed.
+#### ✅ THE LIST, MEASURED 2026-09-18 — and the question's premise was wrong
+
+Q28 assumed **"24–46 third-party packages per machine, no subscription covers them at any
+tier."** Measured across all eight machines, that figure was counting the **`universe`** bucket,
+which **is** covered — by `esm-apps`, entitled all along and now enabled. The genuinely
+uncovered set is **five package installs in the entire enclave**, four distinct packages:
+
+| Package | Version | Origin | On | Patching route |
+|---|---|---|---|---|
+| `contracts-airgapped` | 1.8.1 | Canonical Ltd | `svc-mgmt-01`, `svc-repo-01` | Canonical Support Portal / KB article — requires Infra tier or above. Carried in on the patch trip |
+| `get-resource-tokens` | 1.8.1 | Canonical Ltd | `svc-repo-01` | as above |
+| `pro-airgapped` | 1.8.1 | Canonical Ltd | `svc-repo-01` | as above |
+| `grafana` | 13.2.1 | Grafana Labs | `svc-obs-01` | grafana.com releases. Carried in on the patch trip. Verified: its only apt source is `/var/lib/dpkg/status` — no archive behind it |
+
+**Per-machine totals** (installed / main+restricted / universe / no archive):
+
+| | host-1 | host-2 | host-3 | host-4 | svc-mgmt-01 | svc-repo-01 | svc-harbor-01 | svc-obs-01 |
+|---|---|---|---|---|---|---|---|---|
+| installed | 855 | 855 | 854 | 969 | 722 | 552 | 538 | 544 |
+| universe (esm-apps) | 30 | 30 | 30 | 64 | 60 | 21 | 24 | 34 |
+| **no archive** | 0 | 0 | 0 | 0 | **1** | **3** | 0 | **1** |
+
+✅ **Docker is NOT an exception here.** Q28 named it specifically. Measured on `svc-harbor-01`:
+the installed package is **`docker.io` from Ubuntu `universe`**, not `docker-ce` from Docker's
+own repository — so `esm-apps` covers it. **There are no third-party apt sources anywhere in the
+enclave**; every source is `svc-repo-01` mirroring Ubuntu's own archives (archive, esm-apps,
+esm-infra, fips-updates, usg).
+
+⚠️ **The remaining exposure is container images, not packages.** Harbor's own components and
+anything pushed into it are outside apt entirely, so no subscription tier is even relevant to
+them — and their currency is governed by §4.1e's Trivy database question, not by this one. That
+is a different control surface and should not be folded into this list.
+
+**REGENERATE RATHER THAN TRANSCRIBE.** This table is a snapshot; the command is the evidence:
+
+```bash
+### MACHINE: any enclave machine ###
+./scripts/enclave/stig-tools.sh coverage
+```
+
+It reads the **component** from the apt list filenames rather than trusting
+`apt list --installed`'s `[installed,local]` marker — which returned **zero** on `host-4` while
+64 packages were in fact universe-only, because that marker catches debs with no apt entry at
+all, not packages whose archive gives them weaker support. It needs no privilege and changes
+nothing.
 
 ⚠️ **A measurement trap found alongside this, and it is still live:** `apt-check`'s security
 count **excludes ESM**. On `host-4` it reported `3;0` — three updates, zero security — while

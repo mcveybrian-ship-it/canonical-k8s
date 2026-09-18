@@ -14,6 +14,32 @@ Last updated **2026-09-11 02:40 UTC** (2026-09-10 21:40 Central). All timestamps
 
 ### ⏭ NEXT SESSION — start here, in this order
 
+**2026-09-18 01:30 UTC — `host-1/2/3` are done and identical: USG 213/3, V1R6 171/9/9/5.**
+Three controls closed on 2026-09-17/18, each of which had been passing or unreviewed for the
+wrong reason:
+
+| | What changed | Why it was not already right |
+|---|---|---|
+| **V-270755** | **Every host has a WiFi card AND a Bluetooth radio** — Realtek RTL8821CE on `host-1/2/3`, MediaTek MT7922 on `host-4`, USB Bluetooth on all four. Now blocked at the kernel in `/etc` **and** in the running FIPS initramfs | DISA's check lists wireless *interfaces*, so where no driver is bound it scores **Not Applicable on a machine with a radio in it** — `host-4` did exactly that. And there is **no Bluetooth rule anywhere in V1R6**. Runbook §6.3g.1 |
+| **V-270756** | `sysstat`'s `UMASK` set at the source | The control **passed on all three and re-opened overnight with nothing done to the machines** — `sysstat` writes a new 0644 file every 10 minutes. A chmod cannot hold a value another program sets on a timer |
+| **V-270650** | Answered from `dailyaidecheck.timer`'s last trigger | DISA's check is a full `aide --check`; it **timed out at 15 minutes on `host-1`/`host-2` and completed on `host-3`** — identical machines. The Not Reviewed reported scan duration, not state |
+
+⚠️ **Three bugs in our own tooling, all of which produced a confidently wrong answer:**
+`update-initramfs -u` rebuilt the **-generic** kernel these hosts do not boot and reported
+success (a lesson `cmd_luksenroll` already carried — it is now one shared helper);
+`radio status` exited 1 printing nothing on any machine **without** a radio, which would have
+aborted `05-harden-host.sh` on all seven VMs; and `systemctl show -p Result` returns
+**`success` for a service that does not exist**, so the first V-270650 answer would have passed
+on a machine with the timer deleted.
+
+⬜ **Owed right now:** `stig-tools.sh collect host-4` — host-4 scanned clean at 01:06:48 but the
+collect ran 30 seconds too early, so **stage-01 still holds its 2026-09-16 result**. One command.
+
+⚠️ **Build divergence found:** `sysstat` is installed on `host-1/2/3` and **not** on `host-4`.
+Not a problem today, but "the hosts are identical" is no longer true, and `stage-01` and the four
+VMs also still carry `UMASK=0022`.
+
+
 ✅ **THE PORTABILITY TEST PASSED — `svc-harbor-01`, 2026-09-14 04:30 UTC.** All five new
 Answer File entries fired on a second, dissimilar machine: V-270682, V-270694, V-270748,
 V-270816 and V-278917 all `NF`. **The no-ResultHash design works.** That was the open
@@ -46,10 +72,16 @@ DISAStatus Sunset`, refused, and `scan` correctly named it and returned non-zero
 **Everything from 2026-09-14 is in the tables below.** `svc-obs-01` is fully built, monitored,
 TLS'd, hardened (**211/5**), scanned (**4 Open, 9 NR**) and collecting audit-volume samples.
 
-**ALL FIVE MACHINES ARE HARDENED — 2026-09-14.** `svc-obs-01` joined on 2026-09-14.
+**ALL EIGHT MACHINES ARE HARDENED — `host-1`, `host-2` and `host-3` joined 2026-09-17/18.**
+All three land on **USG 213 / 3** and **V1R6 NF=171 NA=9 NR=9 Open=5**, byte-identical to each
+other — the lowest numbers in the enclave, and the first three built entirely by
+`05-harden-host.sh` rather than by hand.
 
 | machine | USG pass / fail | V1R6 Open | measured |
 |---|---|---|---|
+| `host-1` | **213 / 3** | **5** | V1R6 2026-09-18 01:06 |
+| `host-2` | **213 / 3** | **5** | V1R6 2026-09-18 01:06 |
+| `host-3` | **213 / 3** | **5** | V1R6 2026-09-18 01:01 |
 | `host-4` | 208 / 8 → re-audited 2026-09-16 with the chrony deviations, expect **208 / 5** | **5** | 2026-09-16 |
 | `svc-harbor-01` | **210 / 6** | **5** | USG 2026-09-16 |
 | `svc-mgmt-01` | **209 / 6** | **6** | USG 2026-09-16 |

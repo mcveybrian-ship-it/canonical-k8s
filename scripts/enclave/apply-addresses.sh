@@ -407,6 +407,77 @@ cmd_zone_install() {
   fi
 }
 
+# ------------------------------------------------------------------------- resolver-install
+# POINT THIS MACHINE'S RESOLVER AT THE ENCLAVE DNS.
+#
+# A systemd-resolved DROP-IN, not netplan. Netplan means re-applying network configuration on
+# a host whose only NIC is a bridge carrying every guest's traffic - for a change that has
+# nothing to do with addressing. The drop-in is a file and a service restart.
+#
+# THIS IS SAFE BY CONSTRUCTION because of the tier order. nsswitch reads `hosts: files dns`,
+# so /etc/hosts still wins for every name it carries. If the DNS host is down, or this
+# configuration is wrong, every machine and service already pinned in /etc/hosts keeps
+# resolving exactly as it does today. DNS only adds what the hosts file cannot express.
+#
+# DNSSEC is off: the zone is unsigned and there is no chain of trust to a root that this
+# enclave can reach. Turning it on would make every lookup fail closed.
+RESOLVED_DROPIN=/etc/systemd/resolved.conf.d/10-enclave-dns.conf
+
+resolver_render() {
+  local dns; dns="$(eval "printf '%s' \"\${${ZONE_NS//-/_}:-}\"")"
+  dns="${dns:-${SVC_MGMT_01:-}}"
+  printf '# Enclave DNS. Written by apply-addresses.sh - do not edit.\n'
+  printf '#\n'
+  printf '# /etc/hosts STILL WINS - nsswitch is "hosts: files dns". This server only answers\n'
+  printf '# what a hosts file cannot express: the *.apps wildcard, and a forwarder for CoreDNS\n'
+  printf '# so pods fail fast instead of timing out. runbook 9a.4.\n'
+  printf '[Resolve]\n'
+  printf 'DNS=%s\n' "$dns"
+  printf 'Domains=%s\n' "$ENCLAVE_DOMAIN"
+  printf 'DNSSEC=no\n'
+  printf 'DNSOverTLS=no\n'
+  printf 'Cache=yes\n'
+}
+
+cmd_resolver_install() {
+  [ "$(id -u)" -eq 0 ] || die "run with sudo"
+  local dns; dns="$(eval "printf '%s' \"\${${ZONE_NS//-/_}:-}\"")"
+  dns="${dns:-${SVC_MGMT_01:-}}"
+  [ -n "$dns" ] || die "no address for the DNS server ($ZONE_NS) in $ADDRS"
+
+  # DO NOT POINT AT A SERVER THAT IS NOT ANSWERING. A resolver configured at a dead address
+  # adds a timeout to every lookup that /etc/hosts does not already cover - which is the exact
+  # failure this whole design exists to avoid.
+  command -v dig >/dev/null 2>&1 || die "dig absent - apt install dnsutils"
+  local probe; probe="$(dig +short +time=3 "@$dns" "svc-repo-01.$ENCLAVE_DOMAIN" 2>/dev/null)"
+  [ -n "$probe" ] || die "$dns did not answer for svc-repo-01.$ENCLAVE_DOMAIN.
+       REFUSING to point this machine at a server that is not serving. Run
+       'apply-addresses.sh zone-install' on $ZONE_NS first, and check it from here with
+       'dig @$dns svc-repo-01.$ENCLAVE_DOMAIN'."
+  ok "$dns answers (svc-repo-01 -> $probe)"
+
+  install -d -m 0755 "$(dirname "$RESOLVED_DROPIN")"
+  [ -f "$RESOLVED_DROPIN" ] && cp -a "$RESOLVED_DROPIN" "$RESOLVED_DROPIN.bak-$(date +%Y%m%dT%H%M%S)"
+  resolver_render > "$RESOLVED_DROPIN"
+  chmod 0644 "$RESOLVED_DROPIN"
+  ok "wrote $RESOLVED_DROPIN"
+
+  systemctl restart systemd-resolved || die "systemd-resolved would not restart - $RESOLVED_DROPIN is suspect"
+  sleep 1
+
+  # PROVE ALL THREE TIERS, not just that something resolved.
+  local viahosts wildcard outside
+  viahosts="$(getent hosts "svc-repo-01.$ENCLAVE_DOMAIN" | awk '{print $1}')"
+  wildcard="$(getent hosts "test.apps.$ENCLAVE_DOMAIN" | awk '{print $1}')"
+  outside="$(getent hosts nosuchname.example.invalid 2>/dev/null | awk '{print $1}')"
+  [ -n "$viahosts" ] && ok "hosts-file name still resolves: svc-repo-01 -> $viahosts" \
+                     || warn "svc-repo-01 no longer resolves - THIS IS A REGRESSION"
+  [ -n "$wildcard" ] && ok "wildcard now resolves via DNS: test.apps -> $wildcard" \
+                     || warn "the *.apps wildcard did not resolve - DNS is not being consulted"
+  [ -z "$outside" ]  && ok "an outside name returns nothing, immediately" \
+                     || warn "an outside name resolved to $outside - unexpected"
+}
+
 case "${1:-}" in
   render) render ;;
   apply)  apply_local ;;
@@ -414,5 +485,7 @@ case "${1:-}" in
   verify) verify ;;
   zone)   cmd_zone ;;
   zone-install) cmd_zone_install ;;
+  resolver)     resolver_render ;;
+  resolver-install) cmd_resolver_install ;;
   *)      sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

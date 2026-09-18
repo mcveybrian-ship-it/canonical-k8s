@@ -18,16 +18,24 @@ verified this session is marked **[VERIFY]** and must be settled on the **pathfi
 three hosts. MAAS runs on `svc-01`, which is a VM, which runs on a host — so MAAS cannot
 install the host it depends on. Something has to come first.
 
-**Resolution: autoinstall all three hosts from removable media.** MAAS then manages only the
-VMs, not the host OS. For three machines this is simpler than a PXE bootstrap, gives you a
-version-controlled config that produces three identical hosts, and removes the dependency
-loop entirely. MAAS is still the VM host manager and composer (runbook §7) — it just never
-touches the metal.
+**Resolution: autoinstall all four hosts from removable media.** For four machines this is
+simpler than a PXE bootstrap, gives you a version-controlled config that produces identical
+hosts, and removes the dependency loop entirely.
+
+> 🔴 **UPDATED 2026-09-18: MAAS IS REMOVED FROM THE BOUNDARY.** This paragraph used to end
+> *"MAAS is still the VM host manager and composer"*. It is not, and neither is it anything
+> else here: it does not run under FIPS, and it was purged from `svc-mgmt-01` by AO decision.
+> **VMs are composed by [`03-compose-vm.sh`](../scripts/install/03-compose-vm.sh)** from `virsh`
+> directly, using `enclave-addresses.env` and `vm-specs.env`. Runbook §7, `ssp-inputs.md` §4.1h.
 
 **The STIG "fresh install" rule collides with the bootstrap order.** Canonical is explicit
-that STIG hardening runs on a fresh installation. But host-1 has to carry `svc-01` — and
-therefore MAAS, Landscape and the Pro contract server — before *any* host can attach to Pro
-and enable FIPS or USG. So host-1 is not fresh by the time hardening is possible.
+that STIG hardening runs on a fresh installation. But one host has to carry the **Ubuntu Pro
+air-gapped contract server** before *any* machine can attach to Pro and enable FIPS or USG. So
+that host is not fresh by the time hardening is possible.
+
+> **Updated 2026-09-18.** The collision is unchanged but smaller: it is now the contract server
+> alone, not "MAAS, Landscape and the Pro contract server". In this build it is `svc-mgmt-01` on
+> **host-4**, which is why host-4 is built first.
 
 Options, in order of preference:
 
@@ -190,7 +198,7 @@ connect to, and being locked out of a half-built machine on a rack costs more th
 on a lab network. Step 03 hardening sets it `false`, which is what the STIG requires. The
 console password is set either way and is the last-resort way in.
 
-## 4a. The seed stick builds them; MAAS redeploys them. Settled.
+## 4a. The seed stick builds them. 🔴 MAAS no longer redeploys them — nothing does.
 
 **Raised as an open question 2026-09-17 and closed the same night — it was already answered.**
 Runbook §4 states it directly: *"The answer is lifecycle, not initial build. Composing a VM
@@ -210,8 +218,27 @@ The evidence settles it beyond the stated intent:
 
 > **Partitioning and LUKS are install-time and not retrofittable.** Learning MAAS's storage
 > model on the first install of a machine whose layout cannot be changed afterwards is the
-> wrong place to take that risk. Build the three the proven way; prove a MAAS deploy later, on
-> a host you can afford to rebuild.
+> wrong place to take that risk.
+
+### 🔴 UPDATE 2026-09-18 — the second half of that title no longer holds
+
+**MAAS was removed from the boundary.** It never ran under FIPS, so the redeploy capability this
+section was preserving **never actually existed on these machines** — it was a plan, not a
+working mechanism. Removing MAAS did not take a capability away; it stopped us paying ~30 open
+ports and 5 GB/day of syslog for one we did not have.
+
+**What that means for a rebuild, stated plainly:**
+
+| | |
+|---|---|
+| Building a host | Seed stick, exactly as below. Unchanged and proven — four hosts built this way |
+| **Rebuilding a failed host** | ⚠️ **Seed stick and somebody at the rack.** There is no network redeploy. These machines have **no BMC**, and the LUKS root prompts at a physical console |
+| VM creation | `03-compose-vm.sh`, which works under FIPS |
+
+⚠️ **This is the same exposure as `ssp-inputs.md` §2.1a**, and removing MAAS makes it permanent
+rather than creating it. **TPM unlock is the mitigation that actually changes it** — backlog 2.4.
+If a future site wants network redeploy, that is a FIPS-compatible provisioning tool to be
+chosen, not MAAS to be reinstated.
 
 **One consequence to carry into the SSP.** If MAAS never deploys anything, it is a VM with
 ~30 open ports doing nothing, and an assessor will ask what it is for. Its answer is

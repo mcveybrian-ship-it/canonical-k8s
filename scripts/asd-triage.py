@@ -125,11 +125,139 @@ def srg_family(stig_id: str) -> str:
     return m.group(1) if m else 'other'
 
 
+# THE ANSWERS FILE IS HAND-EDITED AND MUST SURVIVE REGENERATION.
+#
+# The triage document is generated and says so. The ANSWERS are the opposite: they are the
+# only part a person writes, they are the expensive part, and re-running this tool after DISA
+# publishes V6R5 must not destroy them.
+#
+# So this MERGES. It reads any answer already present, keyed by question id, and re-emits it
+# under a freshly generated skeleton. A question that disappears from the STIG keeps its answer
+# in an ORPHANED section rather than being silently dropped - if the rule returns in a later
+# release you want to know what you had said about it.
+#
+# Unanswered slots carry GUILLEMETS, matching docs/compliance/baseline/README.md: visually
+# obvious, nobody types them by accident, and the completion check is one command:
+#     grep -c '«' docs/compliance/asd-answers.md
+ANSWER_RE = re.compile(r'^<!-- id:(?P<id>[^ ]+) -->$(?P<body>.*?)(?=^<!-- id:|\Z)', re.S | re.M)
+
+
+def _qid(prefix, text):
+    return prefix + re.sub(r'[^a-z0-9]+', '-', (text or 'unparsed').lower())[:50]
+
+
+def write_answers(path, props, without):
+    """Regenerate the skeleton, preserving every answer already written."""
+    existing = {}
+    if os.path.exists(path):
+        for m in ANSWER_RE.finditer(open(path).read()):
+            a = re.search(r'^\*\*Answer:\*\*\s*(.*?)$', m.group('body'), re.M)
+            if a and '«' not in a.group(1):
+                existing[m.group('id')] = a.group(1).strip()
+
+    L = []
+    fam = collections.defaultdict(list)
+    for r in without:
+        fam[srg_family(r['stig_id'])].append(r)
+
+    answered = sum(1 for p in props if _qid('prop:', p) in existing) + \
+               sum(1 for f in fam if 'fam:' + f in existing)
+    total = len(props) + len(fam)
+
+    L.append('# ASD STIG — answers')
+    L.append('')
+    L.append('**THIS FILE IS HAND-WRITTEN.** It is the only part of the ASD work a person writes,')
+    L.append('and re-running `asd-triage.py` **merges rather than overwrites** — answers survive.')
+    L.append('')
+    L.append('Replace every `« … »` with a statement of fact about this system. Completion check:')
+    L.append('')
+    L.append('```bash')
+    L.append("grep -c '«' docs/compliance/asd-answers.md     # 0 means finished")
+    L.append('```')
+    L.append('')
+    L.append('> **Write a FACT, not a verdict.** *"There is no locally developed application; this')
+    L.append('> enclave hosts vendor products only"* is evidence. *"N/A"* is not. Each checklist row')
+    L.append("> is then composed from your fact PLUS DISA's own sentence quoted verbatim — which is")
+    L.append('> what makes 139 near-identical rows defensible rather than repetitive.')
+    L.append('')
+    L.append('**Progress: %d of %d answered.**' % (answered, total))
+    L.append('')
+    L.append('---')
+    L.append('')
+    L.append('## Part 1 — properties the STIG asks about')
+    L.append('')
+    L.append('%d questions covering %d rules that carry their own N/A clause.'
+             % (len(props), sum(len(v) for v in props.values())))
+    L.append('')
+    for prop, v in sorted(props.items(), key=lambda kv: -len(kv[1])):
+        qid = _qid('prop:', prop)
+        hi = sum(1 for r in v if r['severity'] == 'high')
+        L.append('<!-- id:%s -->' % qid)
+        L.append('### %s — %d rules%s' % (prop or '&lt;unparsed&gt;', len(v),
+                                             ', **%d CAT I**' % hi if hi else ''))
+        L.append('')
+        L.append('> %s' % v[0]['na_clause'])
+        L.append('')
+        L.append('**Answer:** %s' % existing.get(qid, '« state the fact about this system »'))
+        L.append('')
+        L.append('<details><summary>%d rules</summary>' % len(v))
+        L.append('')
+        for r in v:
+            L.append('- `%s` %s — %s' % (r['vid'], r['stig_id'], r['title'][:95]))
+        L.append('')
+        L.append('</details>')
+        L.append('')
+    L.append('---')
+    L.append('')
+    L.append('## Part 2 — rules with NO N/A clause')
+    L.append('')
+    L.append('%d rules. DISA offers no exemption, so each family needs its own answer.' % len(without))
+    L.append('**Expect the database and PKI families NOT to be N/A.**')
+    L.append('')
+    for f, v in sorted(fam.items(), key=lambda kv: -len(kv[1])):
+        qid = 'fam:' + f
+        hi = sum(1 for r in v if r['severity'] == 'high')
+        L.append('<!-- id:%s -->' % qid)
+        L.append('### `%s` — %d rules%s' % (f, len(v), ', **%d CAT I**' % hi if hi else ''))
+        L.append('')
+        L.append('**Answer:** %s' % existing.get(qid, '« does this family apply? if only partly, name the rules »'))
+        L.append('')
+        L.append('<details><summary>%d rules</summary>' % len(v))
+        L.append('')
+        for r in v:
+            L.append('- `%s` %s **[%s]** — %s' % (r['vid'], r['stig_id'], r['severity'], r['title'][:95]))
+        L.append('')
+        L.append('</details>')
+        L.append('')
+
+    known = {_qid('prop:', p) for p in props} | {'fam:' + f for f in fam}
+    orphans = {k: a for k, a in existing.items() if k not in known}
+    if orphans:
+        L.append('---')
+        L.append('')
+        L.append('## ⚠️ Orphaned answers — the question is gone, the answer is kept')
+        L.append('')
+        L.append('Answered against a question this STIG release no longer asks. **Not deleted:**')
+        L.append('if the rule returns in a later release, you want to know what you said.')
+        L.append('')
+        for k, a in sorted(orphans.items()):
+            L.append('<!-- id:%s -->' % k)
+            L.append('### %s' % k)
+            L.append('')
+            L.append('**Answer:** %s' % a)
+            L.append('')
+
+    open(path, 'w').write('\n'.join(L) + '\n')
+    print('  wrote %s  (%d questions, %d already answered)' % (path, total, answered))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--xccdf', required=True)
     ap.add_argument('--json')
     ap.add_argument('--md')
+    ap.add_argument('--answers', help='write/refresh the ANSWERS skeleton; never '
+                                      'overwrites an answer already given')
     ap.add_argument('--min-cluster', type=int, default=2,
                     help='conditions shared by fewer rules than this are listed individually')
     args = ap.parse_args()
@@ -180,6 +308,9 @@ def main():
     for f, n in fam.most_common():
         hi = sum(1 for r in without if srg_family(r['stig_id']) == f and r['severity'] == 'high')
         print("    %-12s %3d%s" % (f, n, "   (%d CAT I)" % hi if hi else ""))
+
+    if args.answers:
+        write_answers(args.answers, props, without)
 
     if args.json:
         with open(args.json, 'w') as fh:

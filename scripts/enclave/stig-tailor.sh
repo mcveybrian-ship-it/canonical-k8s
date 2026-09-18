@@ -452,6 +452,29 @@ fixups_plan() {
     say "   state: sysstat not installed here"
   fi
 
+  printf '\n  2c. file_permissions_var_log_stig - logrotate recreates files world-readable\n'
+  say "   THIS, not sysstat, is what keeps re-opening V-270756. Purging sysstat on host-1/2/3"
+  say "   removed two offenders and FOUR more appeared, two created by libvirt an hour earlier."
+  local _lr_bad="" _lr_none="" _lr_f
+  for _lr_f in /etc/logrotate.d/*; do
+    [ -f "$_lr_f" ] || continue
+    grep -q "/var/log" "$_lr_f" 2>/dev/null || continue
+    if grep -qE "^[[:space:]]*create[[:space:]]+0?64[4-7]" "$_lr_f" 2>/dev/null; then
+      _lr_bad="$_lr_bad $(basename "$_lr_f")"
+    elif ! grep -qE "^[[:space:]]*create[[:space:]]" "$_lr_f" 2>/dev/null; then
+      _lr_none="$_lr_none $(basename "$_lr_f")"
+    fi
+  done
+  say "   recreate world-readable ON PURPOSE:${_lr_bad:- none}"
+  say "   no 'create' line, so the daemon's umask decides:${_lr_none:- none}"
+  say "   fix: 'create $LOGMODE root adm' on the four whose writer is ROOT -"
+  say "        alternatives, dpkg, ubuntu-pro-client, unattended-upgrades"
+  say "   NOT touched: rsyslog (writes as syslog), chrony (_chrony), sssd. Without a create"
+  say "        line the DAEMON makes the file on reopen, so forcing root:adm onto a non-root"
+  say "        writer breaks its logging outright. Adding a package to that list is a"
+  say "        decision about its writer, not a mechanical edit."
+  say "   also: /var/log/libvirt/{qemu,lxc}/.placeholder arrive 0644 and no package owns them"
+
   printf '\n  3. file_groupowner_var_log - /var/log must be group-owned by syslog\n'
   if getent group syslog >/dev/null 2>&1; then
     say "   state: syslog group EXISTS - fix is 'chgrp syslog /var/log'"
@@ -977,7 +1000,7 @@ EOF
     # anchors on a brace alone on its line, and a stanza written as `/path/to.log {` has no
     # such line. Without this check the config would still be VALID, logrotate would still
     # accept it, and this would report success having changed nothing at all.
-    if ! grep -qE "^[[:space:]]*create[[:space:]]+$LOGMODE[[:space:]]+root[[:space:]]+adm" "$lrp"; then
+    if ! grep -qE "^[[:space:]]*create[[:space:]]+${LOGMODE}[[:space:]]+root[[:space:]]+adm" "$lrp"; then
       cp -a "$lrbak" "$lrp"
       warn "2c. could not place a create line in $lr_file - REVERTED, nothing changed."
       warn "   its stanza is shaped in a way this edit does not handle. Fix it by hand:"

@@ -303,7 +303,7 @@ host-1	hypervisor
 host-2	hypervisor
 host-3	hypervisor
 host-4	hypervisor
-svc-mgmt-01	maas
+svc-mgmt-01	contracts
 svc-repo-01	mirror
 svc-harbor-01	registry
 svc-obs-01	observability
@@ -664,8 +664,10 @@ groups:
           description: "Sustained CPU above ${AL_CPU_PCT}%. A build or a scan spikes; a runaway loop does not stop."
           action: >-
             'top -b -n1 | head -20' on {{ \$labels.machine }}.
-            On svc-mgmt-01 check MAAS first - it has been seen invoking machine-resources
-            through sudo roughly twice a second, which also floods the audit log.
+            NOTE: the known cause of sustained CPU on svc-mgmt-01 was MAAS calling
+            machine-resources ~1.7 times a second through sudo, which also flooded the
+            audit log. MAAS was REMOVED from the boundary on 2026-09-18, so that
+            explanation no longer applies - a spike there now is something new.
 
   # ---------------------------------------------------------------- memory
   - name: enclave-memory

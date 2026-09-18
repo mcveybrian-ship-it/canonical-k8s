@@ -234,6 +234,29 @@ apply_local() {
   # write and does not manage - so `apply` said 17 where `verify` said 16 and neither was
   # wrong about anything. A number that does not mean what its label says invites exactly
   # the hunt it just cost.
+  # THE 127.0.1.1 LINE SHADOWS THE MANAGED BLOCK, AND WE DELIBERATELY DO NOT TOUCH IT.
+  #
+  # Ubuntu writes `127.0.1.1 <hostname>` by convention. On svc-repo-01 it was written as
+  # `127.0.1.1 svc-repo-01 svc-repo-01.enclave.internal` - WITH the FQDN - so the machine's
+  # own fully-qualified name resolved to LOOPBACK instead of its enclave address, while the
+  # other seven machines resolved it correctly. Measured 2026-09-18.
+  #
+  # It is benign today: TLS still validates because a certificate is checked against the NAME,
+  # not the address it connected to, and the SAN carries DNS:svc-repo-01.enclave.internal.
+  # It stops being benign the moment a service binds to a specific address and something on
+  # the same box connects to it by name.
+  #
+  # We warn rather than edit: that line is outside the managed markers, and silently rewriting
+  # a region we promised not to touch is worse than a machine with an odd hosts file.
+  local myfqdn; myfqdn="$(hostname -s).$ENCLAVE_DOMAIN"
+  if grep -qE "^127\.0\.1\.1[[:space:]].*[[:space:]]$myfqdn([[:space:]]|\$)" /etc/hosts 2>/dev/null; then
+    warn "127.0.1.1 carries this machine's FQDN ($myfqdn), which SHADOWS the managed entry:"
+    grep -nE "^127\.0\.1\.1" /etc/hosts | sed 's/^/         /' >&2
+    warn "  '$myfqdn' will resolve to LOOPBACK on this machine, not to its enclave address."
+    warn "  Harmless until something binds to a specific address. To fix, drop the FQDN from"
+    warn "  that line, leaving just the short hostname - it is OUTSIDE the managed block, so"
+    warn "  this script will not do it for you."
+  fi
   ok "$(hostname): /etc/hosts updated, $(sed -n "/^$BEGIN\$/,/^$END\$/p" /etc/hosts | grep -c "$ENCLAVE_DOMAIN") name(s) in the managed block"
 }
 

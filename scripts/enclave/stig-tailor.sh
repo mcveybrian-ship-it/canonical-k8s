@@ -436,6 +436,11 @@ fixups_plan() {
   fi
 
   printf '\n  2b. file_permissions_var_log_stig - sysstat writes a new 0644 file every day\n'
+  say "   THE ENCLAVE'S ANSWER TO THIS RULE IS TO PURGE sysstat, decided 2026-09-16:"
+  say "     node-exporter already publishes CPU, disk, memory and load, so the package earns"
+  say "     nothing and its files re-open this control every single day. host-4 was purged"
+  say "     then; host-1/2/3 followed on 2026-09-18 once node-exporter reached them."
+  say "   This fixup is the FALLBACK for a machine where sysstat must stay:"
   say "   owner of the value: UMASK in $SYSSTAT_CONF, which ships as 0022"
   say "   fix: UMASK=$SYSSTAT_UMASK there, then DISA's own find/chmod once over /var/log"
   say "   why it matters: this control PASSED on host-1/2/3 on 2026-09-17 and re-opened by"
@@ -866,6 +871,13 @@ EOF
   # sysstat's collector writes /var/log/sysstat/sa<DD> every ten minutes and sa2 writes
   # sar<DD> at 23:53, both with the mode implied by UMASK in its own config, which ships as
   # 0022 - so 0644.
+  #
+  # THE PREFERRED ANSWER IS TO PURGE THE PACKAGE, not to run this fixup. Decided 2026-09-16
+  # for host-4 and applied to host-1/2/3 on 2026-09-18: node-exporter already publishes what
+  # sysstat collects, so the package earns nothing and its files re-open the control daily.
+  # This code stays because it is the right fix for any machine that genuinely needs sysstat,
+  # and because a machine can arrive with it installed. Where the package is absent it says so
+  # and does nothing.
   #
   # MEASURED ON host-1 2026-09-18, and it is the clearest possible demonstration of why a
   # chmod is not a fix:

@@ -92,7 +92,20 @@ Found 2026-09-17, runbook §9b. **Nothing in the current build path depends on M
 
 | | Item | Notes | Status |
 |---|---|---|---|
-| **6a.1** | **Download the Kubernetes STIG V2R5 MANUAL XCCDF** from cyber.mil | We have only the **SCAP 1-3 benchmark** — 61 rules, which is the *automatable subset*. **34 V-IDs in the observed range are absent** (V-242383, 242386–388, 242391/392, 242394–399, 242401, 242410–417, 242435–437, 242439–443, 242447/448, 242454/455, 242458). Every K8s coverage figure is a **floor** until this lands | ⬜ **blocks final gap numbers** |
+| **6a.1** | 🔴 **cyber.mil download list — CAC required, next trip** | See the table below — it is short and two of the items now block real work | ⬜ **needs a CAC trip** |
+
+### 🔴 6a.1 — What to download from cyber.mil (CAC-only)
+
+| # | Item | Why | Blocks |
+|---|---|---|---|
+| **1** | **Kubernetes STIG V2R5 — the MANUAL XCCDF** (`U_Kubernetes_V2R5_STIG.zip`, **not** the SCAP one we have) | We hold only the **SCAP 1-3 benchmark, 61 rules** — the *automatable subset*. **34 V-IDs in the observed range are absent** (V-242383, 242386–388, 242391/392, 242394–399, 242401, 242410–417, 242435–437, 242439–443, 242447/448, 242454/455, 242458) | **Every K8s coverage figure is a FLOOR until this lands.** Also makes the Container Platform SRG overlap analysis a floor |
+| **2** | **A BIND / DNS STIG, if DISA publishes one** — search "BIND" and "DNS" | 🆕 **New requirement as of 2026-09-18** — we now run `bind9` on `svc-mgmt-01` serving `enclave.internal`. **Evaluate-STIG ships nothing for BIND**; its only DNS content is `U_MS_Windows_Server_DNS_STIG`, which is Microsoft DNS | A DNS server in the boundary with no benchmark is an unassessed component |
+| **3** | **The DNS SRG** — the fallback if no BIND STIG exists | Same pattern as nginx: no product STIG → assess against the technology SRG. Get it **whether or not** a BIND STIG exists, so the fallback is on hand | as above |
+| **4** | **Application Security and Development STIG** — *conditional* | Both the Application Server and Web Server SRG overviews explicitly redirect application-layer requirements here. **Only needed if locally developed code is ever deployed into this enclave.** Nothing today requires it | Nothing now. Revisit if the Application Server SRG exclusion is ever challenged |
+| **5** | **While logged in: confirm whether product STIGs exist for nginx, Harbor, Grafana or Prometheus** | The applicability decisions assign these to the Web Server and Container Platform SRGs **by technology-family fit, not by confirmed absence of a product STIG**. That distinction matters to an assessor | Nothing today, but it strengthens (or breaks) the applicability determination |
+
+✅ **Not needed:** Ubuntu 24.04 V1R6 ships with Evaluate-STIG. Ubuntu 22.04 V2R9 was downloaded
+but is **not applicable** — this enclave runs 24.04.
 | **6a.2** | **The control baseline and overlay set** | The gap count is meaningless without it — the tool's 1,014 denominator is the whole 800-53 catalogue, not an IL5 baseline. **AO input; Brian is the AO for now.** Also what `ssp.md` is blocked on | 🔴 **blocks the gap number AND `ssp.md`** |
 | **6a.3** | **Assess Container Platform SRG against `svc-harbor-01` NOW** | Not a future item. By the SRG's own definition (engine + registry + key-value store) **Harbor-under-Docker is already a container platform**, missing only the keystore. No Harbor STIG and no registry SRG exist, so this SRG **is** the instrument. ~140 rules after tailoring | ⬜ open |
 | **6a.4** | **V-233201 — local cache of PKI revocation data** | ⚠️ **The air gap makes this MANDATORY and the hardest PKI rule in the set, not N/A.** With no OCSP reachability, CRLs must be couriered in on a defined cadence or every certificate validates against stale revocation state | ⬜ open · needs a cadence decision |

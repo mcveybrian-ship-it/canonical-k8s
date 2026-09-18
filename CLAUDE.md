@@ -1,8 +1,15 @@
 # Project: Air-Gapped IL5 Kubernetes Platform Selection
 
-Read `HANDOFF.md` before doing anything — it carries the locked decisions and verified
-findings from the prior session. Then read `docs/open-questions.md` for what is still
-unanswered. `README.md` has the repository map and the build/publish workflow.
+**Read [`docs/backlog.md`](docs/backlog.md) FIRST — it is the single live list of what is
+outstanding, and it is maintained as part of the work rather than reconstructed afterwards.**
+Then `HANDOFF.md` for the locked decisions and verified findings, and
+`docs/open-questions.md` for the questions with their history. `README.md` has the repository
+map and the build/publish workflow.
+
+**When something closes, move it to `docs/backlog.md` §9 with a date — do not delete it. When
+something is found, give it a row the same day.** That file exists because the answer to "what
+is left" was spread across four documents, none of which was a list, and it kept getting
+rebuilt from memory at the start of every session.
 
 ## What this project is
 

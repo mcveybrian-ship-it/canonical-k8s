@@ -10,7 +10,10 @@ Last updated **2026-09-18 02:15 UTC** (2026-09-17 21:15 Central). All timestamps
 
 ## 0a. WORKING LIST — priority order as of 2026-09-18 02:15 UTC (2026-09-17 21:15 Central)
 
-**Read this for "what next". The tables below record state; this records order.**
+**➡️ THE LIVE BACKLOG IS [`docs/backlog.md`](../docs/backlog.md).** Read that for "what is
+left". This section records ORDER and the tables below record STATE — neither is a list, which
+is why the backlog was created 2026-09-18. If they disagree, the backlog wins for what is
+outstanding and this section wins for what order to do it in.
 
 ### ⏭ NEXT SESSION — start here, in this order
 

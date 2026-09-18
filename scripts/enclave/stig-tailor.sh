@@ -935,6 +935,81 @@ EOF
     ok "2b. no file under /var/log is more permissive than $LOGMODE"
   fi
 
+  # ---- 2c. LOGROTATE IS WHAT KEEPS RE-OPENING V-270756 -----------------------------------
+  #
+  # Purging sysstat on host-1/2/3 removed two offenders and FOUR MORE APPEARED, two of them
+  # created by libvirt which had been installed an hour earlier. The pattern is not sysstat;
+  # sysstat was one instance of it.
+  #
+  # Surveyed on host-1 2026-09-18 - of the logrotate stanzas covering /var/log:
+  #
+  #   THREE recreate world-readable ON PURPOSE:  alternatives, dpkg, ubuntu-pro-client
+  #                                              (`create 0644 root root` / `create 644`)
+  #   TWELVE have no `create` line at all, so the mode comes from the writing daemon's umask,
+  #        which for a root daemon is 022 -> 0644. That is exactly how
+  #        /var/log/unattended-upgrades/*.log arrived at 644.
+  #
+  # WHY NOT FIX ALL FIFTEEN. Without `create`, logrotate does not make the new file - the
+  # DAEMON does, on reopen. Forcing `create 0640 root adm` onto a stanza whose writer is not
+  # root breaks that daemon's logging entirely. rsyslog writes as syslog, chrony as _chrony,
+  # sssd has its own handling - those are deliberately untouched, and their files are correct
+  # today because the /var/log work in item 1 set them.
+  #
+  # So this table is the ones whose writer IS root, where root:adm 0640 is safe. Adding a
+  # package here is a decision about that package's writer, not a mechanical edit.
+  local lr_file lr_mode
+  for lr_file in alternatives dpkg ubuntu-pro-client unattended-upgrades; do
+    local lrp="/etc/logrotate.d/$lr_file"
+    [ -f "$lrp" ] || { say "2c. no $lrp - skipped"; continue; }
+    if grep -qE "^[[:space:]]*create[[:space:]]+0?640[[:space:]]" "$lrp"; then
+      say "2c. $lr_file already creates at $LOGMODE"
+      continue
+    fi
+    backup_file "$lrp"; local lrbak="$LAST_BACKUP"
+    if grep -qE "^[[:space:]]*create[[:space:]]" "$lrp"; then
+      # Has a create line with the wrong mode - rewrite the mode, keep the stanza shape.
+      sed -i -E "s|^([[:space:]]*)create[[:space:]]+[0-7]+[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]+|\1create $LOGMODE root adm|" "$lrp"
+    else
+      # No create line - add one after every opening brace in the file.
+      sed -i -E "s|^([[:space:]]*)\{[[:space:]]*$|\1{\n\1  create $LOGMODE root adm|" "$lrp"
+    fi
+    # DID THE EDIT ACTUALLY LAND? Both sed forms can match nothing - the add-a-create branch
+    # anchors on a brace alone on its line, and a stanza written as `/path/to.log {` has no
+    # such line. Without this check the config would still be VALID, logrotate would still
+    # accept it, and this would report success having changed nothing at all.
+    if ! grep -qE "^[[:space:]]*create[[:space:]]+$LOGMODE[[:space:]]+root[[:space:]]+adm" "$lrp"; then
+      cp -a "$lrbak" "$lrp"
+      warn "2c. could not place a create line in $lr_file - REVERTED, nothing changed."
+      warn "   its stanza is shaped in a way this edit does not handle. Fix it by hand:"
+      warn "     add   create $LOGMODE root adm   inside the stanza in $lrp"
+      failed=1
+      continue
+    fi
+    if logrotate_config_ok; then
+      ok "2c. $lr_file now creates at $LOGMODE root adm (backup: $lrbak)"
+    else
+      cp -a "$lrbak" "$lrp"
+      warn "2c. logrotate rejected the edit to $lr_file - REVERTED. Its output:"
+      printf '%s\n' "$LOGROTATE_OUT" | sed 's/^/       /'
+      failed=1
+    fi
+  done
+
+  # THE libvirt PLACEHOLDERS. /var/log/libvirt/{qemu,lxc}/.placeholder arrive at 0644 and are
+  # owned by NO package - `dpkg -S` finds nothing, they are made at runtime when libvirt
+  # creates its log directories. Nothing rewrites them, so a chmod holds; they are listed
+  # explicitly rather than swept up so that a future one is noticed rather than silently
+  # absorbed.
+  local ph
+  for ph in /var/log/libvirt/qemu/.placeholder /var/log/libvirt/lxc/.placeholder; do
+    [ -f "$ph" ] || continue
+    if [ "$(stat -c %a "$ph")" = "${LOGMODE#0}" ]; then
+      say "2c. $ph already $LOGMODE"
+    else
+      chmod "$LOGMODE" "$ph" && ok "2c. $ph -> $LOGMODE"
+    fi
+  done
+
   # ---- 3. /var/log group ownership -------------------------------------------------------
   if getent group syslog >/dev/null 2>&1; then
     # Usually a no-op: rsyslog's postinst already runs `chgrp syslog /var/log; chmod g+w`.

@@ -3280,10 +3280,13 @@ host-4	9100/tcp	allow	__SVC_OBS_01__	node-exporter. NOTE: host-4 has no rule tab
 host-4	9177/tcp	allow	__SVC_OBS_01__	prometheus-libvirt-exporter. Per-guest CPU, disk and network for EVERY VM in the enclave - the single most revealing port in the boundary. Source-restricted, always
 host-1	22/tcp	limit	any	ssh - the ONLY management path into this machine. No BMC, no serial console, and the LUKS root prompts at a physical console, so losing ssh means a drive to the rack. `limit` not `deny`: rate-limiting is what the STIG rule is aimed at
 host-1	9100/tcp	allow	__SVC_OBS_01__	node-exporter, source-restricted to the collector. Not listening yet - monitoring has not been extended to the bare-metal hosts - but the rule is written now so enabling the exporter is not also a firewall change
+host-1	9177/tcp	allow	__SVC_OBS_01__	prometheus-libvirt-exporter. Added 2026-09-18 when host-1 became a virtualisation host - per-guest CPU, disk and network for every VM it runs. Source-restricted to the collector, always: this is the most revealing port on the machine
 host-2	22/tcp	limit	any	ssh - same reasoning as host-1
 host-2	9100/tcp	allow	__SVC_OBS_01__	node-exporter, source-restricted to the collector
+host-2	9177/tcp	allow	__SVC_OBS_01__	prometheus-libvirt-exporter. Added 2026-09-18 when host-2 became a virtualisation host - per-guest CPU, disk and network for every VM it runs. Source-restricted to the collector, always: this is the most revealing port on the machine
 host-3	22/tcp	limit	any	ssh - same reasoning as host-1
 host-3	9100/tcp	allow	__SVC_OBS_01__	node-exporter, source-restricted to the collector
+host-3	9177/tcp	allow	__SVC_OBS_01__	prometheus-libvirt-exporter. Added 2026-09-18 when host-3 became a virtualisation host - per-guest CPU, disk and network for every VM it runs. Source-restricted to the collector, always: this is the most revealing port on the machine
 svc-mgmt-01	9100/tcp	allow	__SVC_OBS_01__	node-exporter. Same caveat as host-4: no rule table yet, the MAAS port list is unconfirmed
 EOF
 }

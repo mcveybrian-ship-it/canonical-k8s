@@ -272,7 +272,14 @@ cmd_libvirt() {
 # Machines that do not exist yet are listed anyway and show as DOWN. That is deliberate: a
 # target list that only contains what is already running cannot tell you something is missing.
 scrape_targets() {
+# EVERY MACHINE THAT RUNS AN EXPORTER. Adding a machine to the enclave does NOT add it here -
+# found 2026-09-18, when host-1/2/3 had been built, hardened and made VM-ready while Prometheus
+# was still scraping six targets and had never heard of them. Three hypervisors were invisible.
+# If you build a machine, add it here in the same pass.
 cat <<'EOF'
+host-1	hypervisor
+host-2	hypervisor
+host-3	hypervisor
 host-4	hypervisor
 svc-mgmt-01	maas
 svc-repo-01	mirror
@@ -281,7 +288,7 @@ svc-obs-01	observability
 EOF
 }
 # Hypervisors additionally run the libvirt exporter - per-guest metrics FROM the host.
-scrape_hypervisors() { printf 'host-4\n'; }
+scrape_hypervisors() { printf 'host-1\nhost-2\nhost-3\nhost-4\n'; }
 
 GRAFANA_DEB="${GRAFANA_DEB:-grafana_13.2.1_33191028959_linux_amd64.deb}"
 GRAFANA_SHA="${GRAFANA_SHA:-b4f088f661c5103746f23cb5cbbe2b2bb2e18ba9870ad68a3c2a90451f511ded}"

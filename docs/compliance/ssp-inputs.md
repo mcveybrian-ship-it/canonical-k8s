@@ -466,6 +466,59 @@ challenges, so it is written before the assessment, not after:
 Source: `docs/open-questions.md` · runbook §9a.2a · `HANDOFF.md` §3 · suggested controls
 **CM-6**, SA-4, SA-22, SI-2.
 
+### 4.1h ✅ MAAS is removed from the boundary — AO DECISION 2026-09-18
+
+> **MAAS is removed entirely. `svc-mgmt-01` remains, because it also hosts the Ubuntu Pro
+> air-gapped contract server, which every machine's FIPS, ESM and USG entitlement depends on.**
+
+The AO: *"I recommend dumping and removing MAAS totally — no value to me, just a headache."*
+Concurred, on evidence:
+
+| | |
+|---|---|
+| **It does not work** | MAAS does not run under FIPS. It was broken for **7 days while `systemctl is-active` reported healthy** — the unit was up, the job was dead |
+| **Its purpose is unreachable** | Its documented role here was *redeploy the physical hosts over PXE after failure* (runbook §4840). It cannot, and cannot while FIPS is on |
+| **It is the largest attack surface in the enclave** | ~30 open ports (`5239-5284`, `3128`, `8000`, `53`, `67/udp`, `69/udp`, `5353`) for zero delivered function |
+| **It pollutes the audit trail** | **144,840 sudo invocations in 24 hours** — 1.68/second — from `machine-resources`. 5 GB/day of syslog, and a direct driver of V-270816 |
+| **It carries an unassessed database** | MAAS runs its own PostgreSQL 16, never assessed against any benchmark (runbook §8727). Removing MAAS removes that surface with it |
+| **It blocks other work** | `svc-mgmt-01` has **no ufw rule table** precisely because MAAS's port list was never confirmed. Removing MAAS unblocks the firewall |
+| **13 packages** | `maas`, `maas-agent`, `maas-cli`, `maas-common`, `maas-dhcp`, `maas-netmon`, `maas-proxy`, `maas-rack-controller`, `maas-region-api`, `maas-region-controller`, `python3-django-maas`, `python3-maas-client`, `python3-maas-provisioningserver` |
+
+✅ **Verified before agreeing — nothing depends on MAAS's DNS.** All machines resolve via
+`127.0.0.53` (systemd-resolved) against `/etc/hosts`, which carries 16–19 enclave entries rendered
+by `apply-addresses.sh`. MAAS's `named` serves nothing.
+
+🔴 **WHAT MUST SURVIVE: `contracts-airgapped.service`**, enabled and active on `:8484`. That is the
+Ubuntu Pro air-gapped contract server. Without it there is **no FIPS stream, no `esm-apps`, no
+`esm-infra`, no USG** on any of the eight machines. **Removing MAAS must not remove
+`svc-mgmt-01`**, and Pro attachment must be re-verified on every machine afterwards.
+
+**The cost, stated honestly:** rebuilding a *physical* host now requires a seed USB and somebody
+at the rack, rather than a network redeploy. On machines with **no BMC** and a **LUKS passphrase
+at the console**, that is the same exposure as §2.1a wearing another hat — it is not created by
+this decision, it is made permanent by it. TPM unlock (§2.1a) is the mitigation that matters.
+
+Source: `docs/runbook.md` §9b, §4840, §7607 · suggested controls **CM-7** (least functionality),
+SA-22, RA-5.
+
+### 4.1i ✅ Log retention is 90 days, aligned with metrics — AO DECISION 2026-09-18
+
+> **Audit and syslog are retained 90 days on the collector — the same window as Prometheus —
+> unless the programme provides an external air-gapped system, in which case logs ship to it from
+> `svc-obs-01` alone.**
+
+The AO's first answer was 30 days; raised to 90 on the observation that **Prometheus already
+retains metrics for 90 days**, and mismatched windows mean that for days 31–90 you have a metric
+spike with no log to explain it. Aligning them is a one-line change now and a migration later.
+
+**Egress is from ONE machine, not eight.** That is the part that matters for AU-9(2): on four
+physical hosts with everything virtualised, **no placement of the collector satisfies AU-9(2) —
+it fails for exactly four machines wherever it sits** (verified by arithmetic, not assumed).
+Only shipping records out of the boundary closes it. Until that external system exists, AU-9(2)
+is a documented partial with a stated exception.
+
+Source: `docs/open-questions.md` Q25 · suggested controls **AU-11**, AU-4, AU-9(2), AU-12(1).
+
 ### 4.2 ⬜ Third-party packages no subscription tier covers
 
 > **Between 24 and 46 packages per machine are covered by no subscription at any tier.**

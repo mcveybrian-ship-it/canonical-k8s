@@ -300,6 +300,10 @@ cmd_show() {
 VARCONF_SRC=/usr/lib/tmpfiles.d/var.conf
 VARCONF_DST=/etc/tmpfiles.d/var.conf
 APT_LOGROTATE=/etc/logrotate.d/apt
+# sysstat writes a NEW accounting file every day and a summary every night, and it takes the
+# mode from its own UMASK setting - not from logrotate, and not from anything usg touches.
+SYSSTAT_CONF=/etc/sysstat/sysstat
+SYSSTAT_UMASK="${STIG_SYSSTAT_UMASK:-0027}"
 APT_HOOK=/etc/apt/apt.conf.d/99-stig-log-perms
 RSYSLOG_LOGROTATE=/etc/logrotate.d/rsyslog
 RSYSLOG_STIG=/etc/rsyslog.d/60-stig.conf
@@ -429,6 +433,18 @@ fixups_plan() {
     say "   state: a 'create' line is already present"
   else
     say "   state: no 'create' line"
+  fi
+
+  printf '\n  2b. file_permissions_var_log_stig - sysstat writes a new 0644 file every day\n'
+  say "   owner of the value: UMASK in $SYSSTAT_CONF, which ships as 0022"
+  say "   fix: UMASK=$SYSSTAT_UMASK there, then DISA's own find/chmod once over /var/log"
+  say "   why it matters: this control PASSED on host-1/2/3 on 2026-09-17 and re-opened by"
+  say "        itself overnight - sa<DD> is written every 10 minutes and sar<DD> at 23:53."
+  say "        A chmod cannot hold a value another program sets on a schedule."
+  if [ -f "$SYSSTAT_CONF" ]; then
+    say "   state: UMASK=$(awk -F= '/^[[:space:]]*UMASK=/{print $2; exit}' "$SYSSTAT_CONF" 2>/dev/null || echo '<unset>')"
+  else
+    say "   state: sysstat not installed here"
   fi
 
   printf '\n  3. file_groupowner_var_log - /var/log must be group-owned by syslog\n'
@@ -844,6 +860,69 @@ EOF
     ok "   existing /var/log/apt files set to $LOGMODE"
   fi
 
+  # ---- 2b. sysstat RE-CREATES A 0644 FILE EVERY DAY -------------------------------------
+  #
+  # V-270756 / UBTU-24-700010 fails on any file under /var/log matching `find -perm /137`.
+  # sysstat's collector writes /var/log/sysstat/sa<DD> every ten minutes and sa2 writes
+  # sar<DD> at 23:53, both with the mode implied by UMASK in its own config, which ships as
+  # 0022 - so 0644.
+  #
+  # MEASURED ON host-1 2026-09-18, and it is the clearest possible demonstration of why a
+  # chmod is not a fix:
+  #
+  #     -rw-r-----  sa17     <- chmod'd to 0640 at 23:50 on the 17th
+  #     -rw-r--r--  sar17    <- written 00:07 on the 18th, back to 0644
+  #     -rw-r--r--  sa18     <- written 00:20 on the 18th, back to 0644
+  #
+  # The control had PASSED on all three hosts the day before and re-opened overnight with no
+  # change to the machine. It will re-open every single day until the value is fixed where
+  # the file is created. That is this file, and it is one line.
+  if [ -f "$SYSSTAT_CONF" ]; then
+    local cur_um; cur_um="$(awk -F= '/^[[:space:]]*UMASK=/{print $2; exit}' "$SYSSTAT_CONF" 2>/dev/null)"
+    if [ "$cur_um" = "$SYSSTAT_UMASK" ]; then
+      say "2b. $SYSSTAT_CONF already has UMASK=$SYSSTAT_UMASK"
+    else
+      backup_file "$SYSSTAT_CONF"
+      if grep -qE '^[[:space:]]*UMASK=' "$SYSSTAT_CONF"; then
+        sed -i -E "s/^[[:space:]]*UMASK=.*/UMASK=$SYSSTAT_UMASK/" "$SYSSTAT_CONF"
+      else
+        printf 'UMASK=%s\n' "$SYSSTAT_UMASK" >> "$SYSSTAT_CONF"
+      fi
+      if [ "$(awk -F= '/^[[:space:]]*UMASK=/{print $2; exit}' "$SYSSTAT_CONF")" = "$SYSSTAT_UMASK" ]; then
+        ok "2b. $SYSSTAT_CONF UMASK $cur_um -> $SYSSTAT_UMASK (new files will be $LOGMODE)"
+      else
+        warn "2b. could not set UMASK in $SYSSTAT_CONF - V-270756 will re-open tomorrow"
+        failed=1
+      fi
+    fi
+  else
+    say "2b. no $SYSSTAT_CONF - sysstat is not installed here, nothing to do"
+  fi
+
+  # NOW CORRECT WHAT ALREADY EXISTS, with DISA's own FixText command - but SAY WHAT IT
+  # TOUCHED first. A silent recursive chmod across /var/log is exactly the kind of thing
+  # that should never happen without the operator seeing the list.
+  local offenders
+  offenders="$(find /var/log -perm /137 ! -name '*[bw]tmp' ! -name '*lastlog' -type f \
+                 -exec stat -c '%n %a' {} \; 2>/dev/null || true)"
+  if [ -n "$offenders" ]; then
+    say "2b. files under /var/log more permissive than $LOGMODE - correcting:"
+    printf '%s\n' "$offenders" | sed 's/^/       /'
+    find /var/log -perm /137 ! -name '*[bw]tmp' ! -name '*lastlog' -type f \
+      -exec chmod "$LOGMODE" {} + 2>/dev/null || true
+    local still
+    still="$(find /var/log -perm /137 ! -name '*[bw]tmp' ! -name '*lastlog' -type f 2>/dev/null || true)"
+    if [ -z "$still" ]; then
+      ok "   V-270756 clean - no file under /var/log matches DISA's find"
+    else
+      warn "   still more permissive than $LOGMODE:"
+      printf '%s\n' "$still" | sed 's/^/       /'
+      failed=1
+    fi
+  else
+    ok "2b. no file under /var/log is more permissive than $LOGMODE"
+  fi
+
   # ---- 3. /var/log group ownership -------------------------------------------------------
   if getent group syslog >/dev/null 2>&1; then
     # Usually a no-op: rsyslog's postinst already runs `chgrp syslog /var/log; chmod g+w`.
@@ -1131,6 +1210,19 @@ fixups_verify() {
   else
     warn "$APT_HOOK MISSING - the next apt run will reset /var/log/apt modes to 0644"
     fail=1
+  fi
+  # sysstat's UMASK is the one that re-opens V-270756 on a timer rather than on an event, so
+  # verify the SETTING and not only today's files - the files will look right for hours after
+  # a chmod and be wrong again by morning.
+  if [ -f "$SYSSTAT_CONF" ]; then
+    local vum; vum="$(awk -F= '/^[[:space:]]*UMASK=/{print $2; exit}' "$SYSSTAT_CONF" 2>/dev/null)"
+    if [ "$vum" = "$SYSSTAT_UMASK" ]; then
+      say "sysstat UMASK=$vum - new accounting files will be $LOGMODE"
+    else
+      warn "sysstat UMASK=${vum:-<unset>}, expected $SYSSTAT_UMASK - V-270756 WILL re-open"
+      warn "  the next time sa1 or sa2 runs, whatever today's file modes look like"
+      fail=1
+    fi
   fi
   local offenders
   offenders="$(find /var/log -type f -perm /0137 -printf '%M %U:%G %p\n' 2>/dev/null | sort -k3)"

@@ -77,6 +77,7 @@ V-270694	UBTU-24-200680	/etc/profile.d/ssh_confirm.sh IS present and prompts for
 V-270817	UBTU-24-900930	no cron.weekly script offloads the audit trail, because audit offload is not implemented in this enclave yet - the scanner finds man-db in cron.weekly and cannot decide, leaving NR where every other machine is honestly Open	NR
 V-270682	UBTU-24-200250	there are NO temporary accounts on any enclave machine - every interactive account, meaning UID >= 1000 with a real login shell, is a permanent named administrator. Service accounts such as libvirt-qemu hold nologin and are not interactive	NR
 V-270755	UBTU-24-600230	the machine HAS a radio, so the scanner's NOT APPLICABLE is false whenever no driver happens to be bound; this answers NF only when a modprobe block is actually in place, and leaves it OPEN when the radio is merely unbound	NA
+V-270650	UBTU-24-100110	DISA's check is a FULL aide --check, which does not finish inside Evaluate-STIG's 15-minute per-rule timeout on a host with bulk data - it aborted on host-1 and host-2 and completed on host-3, same configuration. The nightly dailyaidecheck.timer IS the integrity check, and its result is better evidence than making the scanner re-run one	NR
 EOF
 }
 
@@ -249,6 +250,62 @@ if (($rel -match "Ubuntu 24\.04") -and ($rel -match "LTS") -and $supported) {
 }
 else {
     $V.Results = "OPEN. Release string: '" + $rel.Trim() + "'. Pro contract expiry: '" + $expires + "'. Either the release is not 24.04 LTS or the Ubuntu Pro contract is absent or expired. An expired contract means no FIPS or ESM updates are reaching this machine, which is a real finding and not a paperwork one."
+}
+return $V
+EOF
+  ;;
+  V-270650) cat <<'EOF'
+$V = @{ Valid = $false; Results = "" }
+$c_bin = @'
+command -v aide 2>/dev/null
+'@
+$c_en = @'
+systemctl is-enabled dailyaidecheck.timer 2>/dev/null
+'@
+$c_act = @'
+systemctl is-active dailyaidecheck.timer 2>/dev/null
+'@
+$c_last = @'
+systemctl show dailyaidecheck.timer -p LastTriggerUSec --value 2>/dev/null
+'@
+$c_age = @'
+t=$(systemctl show dailyaidecheck.timer -p LastTriggerUSec --value 2>/dev/null)
+if [ -n "$t" ] && [ "$t" != "n/a" ]; then
+  e=$(date -d "$t" +%s 2>/dev/null); n=$(date +%s)
+  if [ -n "$e" ]; then echo $(( (n - e) / 86400 )); fi
+fi
+'@
+$c_status = @'
+systemctl show dailyaidecheck.service -p ExecMainStatus --value 2>/dev/null
+'@
+$c_db = @'
+stat -c "%n %y" /var/lib/aide/aide.db 2>/dev/null
+'@
+$bin  = @(bash -c $c_bin)    | Where-Object { $_ -ne "" }
+$en   = @(bash -c $c_en)     | Where-Object { $_ -ne "" }
+$act  = @(bash -c $c_act)    | Where-Object { $_ -ne "" }
+$last = @(bash -c $c_last)   | Where-Object { $_ -ne "" -and $_ -ne "n/a" }
+# @() OUTSIDE the pipeline, not inside. `@(cmd) | Where-Object` hands back a SCALAR when one
+# element survives, and then $age[0] indexes into the STRING rather than the array: for a
+# one-character result like "0" that yields the CHAR '0', and [int] on a char is its ASCII
+# code - 48. Measured on host-1 2026-09-18: a timer that had fired six hours earlier was
+# reported as "48 day(s) ago" and the control came back OPEN. Wrapping the whole pipeline
+# keeps it an array, and the conversion goes through -join so a scalar cannot be indexed at all.
+$age  = @(bash -c $c_age | Where-Object { $_ -ne "" })
+$st   = @(bash -c $c_status) | Where-Object { $_ -ne "" }
+$db   = @(bash -c $c_db)     | Where-Object { $_ -ne "" }
+$maxdays = 8
+$days = -1
+if ($age.Count -gt 0) { try { $days = [int]($age -join '') } catch { $days = -1 } }
+if ($bin.Count -eq 0) {
+    $V.Results = "OPEN. AIDE is not installed, so there is no file integrity tool for this control to check. If a tool other than AIDE is in use here, the control is Not Applicable and needs a different answer."
+}
+elseif (($en -join '') -eq 'enabled' -and ($act -join '') -eq 'active' -and $days -ge 0 -and $days -le $maxdays) {
+    $V.Valid = $true
+    $V.Results = "NOT A FINDING. DISA's CheckText for this rule is a FULL 'aide -c /etc/aide/aide.conf --check', which walks the entire filesystem. On a hypervisor carrying VM images and a backup volume that does not finish inside Evaluate-STIG's 15-minute per-rule timeout: measured 2026-09-18, it ABORTED on host-1 and host-2 and COMPLETED on host-3, which are identically configured machines. A Not Reviewed here reports SCAN DURATION, not system state. THE INTEGRITY CHECK IS RUNNING ON A SCHEDULE, and this is its evidence: dailyaidecheck.timer is " + ($en -join '') + " and " + ($act -join '') + ", and it LAST FIRED at " + ($last -join '') + ", which is " + $days + " day(s) ago against a daily schedule. AIDE database: " + $(if ($db.Count -eq 0) { "not readable at this privilege level" } else { $db -join '; ' }) + ". /etc/default/aide sets COMMAND=update, so each run verifies the filesystem against the database and writes the new one. NOTE ON WHAT IS DELIBERATELY NOT USED AS EVIDENCE: 'systemctl show <unit> -p Result' returns 'success' for a unit that has NEVER RUN, and for a unit that does not exist at all - verified on host-1 2026-09-18 against a fabricated service name. Any answer keyed on Result would pass on a machine where this timer had been removed. The last-trigger time cannot be faked that way, which is why it is the gate. Raising -VulnTimeout would let the scanner reproduce this itself at roughly an hour per host per scan, and would prove nothing this does not."
+}
+else {
+    $V.Results = "OPEN. AIDE is installed but the scheduled integrity check is not demonstrably running. dailyaidecheck.timer is_enabled=" + $(if ($en.Count -eq 0) { "<none>" } else { $en -join '' }) + ", is_active=" + $(if ($act.Count -eq 0) { "<none>" } else { $act -join '' }) + ", last trigger=" + $(if ($last.Count -eq 0) { "<never>" } else { $last -join '' }) + " (" + $(if ($days -lt 0) { "unparseable or never" } else { "$days day(s) ago, limit $maxdays" }) + "), service ExecMainStatus=" + $(if ($st.Count -eq 0) { "<none>" } else { $st -join '' }) + ". A file integrity tool that is installed but not actually running is precisely the finding this control exists to catch."
 }
 return $V
 EOF

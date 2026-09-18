@@ -239,6 +239,49 @@ that nothing is blocking — so this statement self-invalidates rather than goin
 runbook §6.3g.1 · `scripts/enclave/stig-tailor.sh radio` · suggested controls **AC-18**
 (wireless access), SC-40, CM-7.
 
+### 4.1b ⚠️ The account lockout is not a lockout for the account holder
+
+> **`deny = 3` with `unlock_time = 0` is implemented as DISA requires. Its effectiveness against
+> an adversary who already has a shell is limited by design, and that limit should be stated
+> rather than discovered.**
+
+Measured on `host-2` 2026-09-18 during a real lockout: the tally file
+`/var/run/faillock/encadmin` is owned by the locked-out user and mode `rw-rw----`.
+`pam_faillock` creates it as that user because it must write the tally during that user's own
+authentication. So the account holder clears their own lockout with one unprivileged command
+(`faillock --user "$(id -un)" --reset`) and may then resume guessing three passwords at a time,
+indefinitely.
+
+**This is `pam_faillock`'s default behaviour, not a misconfiguration**, and `usg fix` wrote the
+configuration — so changing it would be a deviation from DISA's own remediation. The control is
+real against a remote attacker with no session; it is close to no control against one who has
+one. Key-based SSH also never reaches `pam_faillock`, so a lockout removes privilege, not access.
+
+The operational consequence is documented separately and matters more day to day: the previous
+recovery procedure said to reboot, which on `host-1..4` means a passphrase at the physical
+console. Source: runbook §6.3m · suggested controls **AC-7**, IA-5.
+
+### 4.1c ⚠️ Ceph OSDs share a device with guest storage on this hardware
+
+> **The design requires one whole device per Ceph OSD. The lab gives each OSD a partition on
+> the same NVMe that already carries guest OS disks and the database data volume.**
+
+Measured 2026-09-18. Each cluster host has exactly one NVMe; 500 GB of it is `crypt-data`
+serving `/var/lib/libvirt/images` and `/var/lib/libvirt/images-data`, and an OSD would take the
+unpartitioned remainder — ~454 GB on `host-1`, ~431 GB on `host-2`, ~1.3 TB on `host-3`.
+
+Two consequences, both of which belong in the SSP rather than in a footnote:
+
+- **Availability.** An OSD contending with guest I/O on one queue is not the isolation the
+  design assumes, and a device failure takes the OSD *and* every guest on that host together —
+  which is also the failure mode §3.1 already declines to claim protection against.
+- **Evidence.** No Ceph performance or recovery timing measured on this hardware transfers to
+  production. Anything asserted from lab measurement must say so.
+
+⚠️ **Ceph has never been executed** — runbook §9 states this in its own text. No claim about
+the storage tier is currently evidenced by anything. Source: runbook §9, §7.2 · suggested
+controls SC-5, CP-2, SA-4.
+
 ### 4.2 ⬜ Third-party packages no subscription tier covers
 
 > **Between 24 and 46 packages per machine are covered by no subscription at any tier.**

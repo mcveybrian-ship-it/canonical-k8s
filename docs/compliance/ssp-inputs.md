@@ -282,6 +282,80 @@ Two consequences, both of which belong in the SSP rather than in a footnote:
 the storage tier is currently evidenced by anything. Source: runbook §9, §7.2 · suggested
 controls SC-5, CP-2, SA-4.
 
+### 4.1d ✅ Notification is a monitored alert, not email — AO DECISION 2026-09-18
+
+> **V-270818 and V-270819 are satisfied by an in-boundary alert on the monitoring stack. Email
+> cannot leave the air gap, and the STIG itself is why.**
+
+`auditd` is configured with `space_left_action = email` and `action_mail_acct = root`, and
+Postfix is `inet_interfaces = loopback-only` **because the STIG requires it**. The notification
+is therefore generated and delivered to a local mailbox nobody reads. The compensating control
+is Prometheus and Alertmanager on `svc-obs-01`, alerting on audit filesystem usage and on
+`auditd` failure, surfaced on a dashboard an operator uses.
+
+**This is a different mechanism from the one the control names, and that is stated rather than
+glossed.** It is also demonstrably more effective here: on its first scrape the stack published
+`enclave_auditd_lost` and found **four of five machines had lost 446–500 audit events** —
+V-270819's condition, detected directly rather than inferred, by a mechanism that actually
+reaches a human.
+
+ℹ️ **The AO's decision carries a forward condition:** if a mail path out of the boundary is
+ever authorised, `auditd`'s existing email configuration is already correct and needs only a
+relay — the control would then be met by the named mechanism as well. Nothing in this decision
+forecloses that. Source: `docs/open-questions.md` Q26 · suggested controls **AU-5(1)**, AU-5,
+SI-4.
+
+### 4.1e ✅ Vulnerability data has an agreed maximum age — AO DECISION 2026-09-18
+
+> **Trivy's vulnerability database is refreshed WEEKLY by transfer media. Scan results are
+> quoted with the database date beside them.**
+
+Nothing in the enclave can reach Trivy's update endpoint. Measured 2026-09-15: the database was
+built 2026-09-08 and expired by Trivy's own `NextUpdate` on 2026-09-09 — **and Harbor kept
+reporting images clean, because a stale database and a genuinely clean image are
+indistinguishable from the portal.**
+
+The AO's answer sets two things:
+
+| | |
+|---|---|
+| **Refresh cadence** | Weekly — the DB is an OCI artifact and rides the same transfer route as everything else |
+| **Alert threshold** | **10 days, not 7.** A weekly refresh means the DB is legitimately almost 7 days old just before each transfer, so alerting at 7 would fire every week while the policy was being MET. The alert must catch a MISSED cycle. Both are parameters: `AL_TRIVY_DB_POLICY_DAYS` and `AL_TRIVY_DB_GRACE_DAYS` |
+
+ℹ️ Trivy's secret detection, misconfiguration checks and SBOM/licence inventory **do not use
+this database** and are unaffected offline. Only CVE matching is age-bound. Source:
+`docs/open-questions.md` Q27 · `docs/compliance/dashboards-and-metrics.md` §4c · suggested
+controls **RA-5**, SI-2, SI-5.
+
+### 4.1f ✅ Third-party packages — a named list and a defined route — AO DECISION 2026-09-18
+
+> **24–46 packages per machine are covered by no Ubuntu subscription at any tier. They are
+> patched on demand via the same transfer media that carries OS patches, and where no patching
+> exists for one it is named in this SSP rather than counted.**
+
+The `esm-apps` half of this closed by measurement — the entitlement was present all along and
+had simply never been enabled; switching it on revealed three pending security updates nothing
+in the enclave could previously see. What remained was the genuinely uncovered third-party set:
+Docker, the Harbor components, and anything carried in as a `.deb`.
+
+The AO's answer has two parts, and both matter:
+
+1. **There IS a route.** A technician carrying the OS patch bundle can carry third-party
+   packages in the same trip, so "no subscription covers it" does not mean "it can never be
+   patched." The cadence is the patch cadence, not a separate process.
+2. **The "nobody" case is handled explicitly.** Where a component has no upstream patching the
+   package is **named in the SSP with that stated** — an unpatched named list is defensible, an
+   uncounted one is not.
+
+⬜ **Owed: the list itself does not exist yet.** It must be generated from the machines, not
+written, or it drifts from the day it is typed.
+
+⚠️ **A measurement trap found alongside this, and it is still live:** `apt-check`'s security
+count **excludes ESM**. On `host-4` it reported `3;0` — three updates, zero security — while
+`pro` reported three esm-apps *security* updates. Any alert keyed on `apt-check` alone would
+have missed all three; the rule is now a disjunction across `apt-check`, `esm-apps` and
+`esm-infra`. Source: `docs/open-questions.md` Q28 · suggested controls **SI-2**, CM-8, SA-22.
+
 ### 4.2 ⬜ Third-party packages no subscription tier covers
 
 > **Between 24 and 46 packages per machine are covered by no subscription at any tier.**

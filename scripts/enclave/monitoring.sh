@@ -342,7 +342,15 @@ AL_AIDE_STALE="${AL_AIDE_STALE:-129600}"          # 36h - dailyaidecheck has mis
 AL_BACKUP_STALE="${AL_BACKUP_STALE:-93600}"       # 26h - the nightly backup missed a run
 AL_BACKUP_DETACHED_FOR="${AL_BACKUP_DETACHED_FOR:-2h}"  # detached is normal briefly, not for hours
 AL_BACKUP_FREE_BYTES="${AL_BACKUP_FREE_BYTES:-200000000000}"  # 200 GB left on the backup volume
-AL_TRIVY_DB_STALE="${AL_TRIVY_DB_STALE:-2592000}"       # 30d - Trivy scanning against month-old data
+# TRIVY DB AGE - AO DECISION 2026-09-18: the refresh policy is WEEKLY.
+#
+# THE ALERT THRESHOLD IS NOT THE POLICY. A weekly refresh means the database is legitimately
+# almost 7 days old just before each transfer, so an alert at 7d would fire every single week
+# while the policy was being MET. The alert has to catch a MISSED cycle, so it is the policy
+# plus a grace window. Both are parameters: change the policy and the alert follows.
+AL_TRIVY_DB_POLICY_DAYS="${AL_TRIVY_DB_POLICY_DAYS:-7}"   # AO decision: carry a fresh DB in weekly
+AL_TRIVY_DB_GRACE_DAYS="${AL_TRIVY_DB_GRACE_DAYS:-3}"     # missed-cycle allowance before alerting
+AL_TRIVY_DB_STALE="${AL_TRIVY_DB_STALE:-$(( (AL_TRIVY_DB_POLICY_DAYS + AL_TRIVY_DB_GRACE_DAYS) * 86400 ))}"
 AL_APT_STALE="${AL_APT_STALE:-2592000}"                 # 30d - the mirror snapshot this machine sees
 AL_PRO_EXPIRY_DAYS="${AL_PRO_EXPIRY_DAYS:-90}"          # warn this far ahead of the Pro contract ending
 
@@ -1037,7 +1045,7 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "Trivy is scanning against vulnerability data over 30 days old"
+          summary: "Trivy is scanning against vulnerability data older than the agreed refresh cycle"
           description: "The database was built {{ \$value | printf \"%.0f\" }} seconds ago. Scans still report clean, against data that is not."
           action: >-
             The DB is an OCI artifact and has to be carried in like everything else. Until it

@@ -198,8 +198,30 @@ cmd_exporter() {
   # THE FLAG, BEFORE THE COLLECTOR. `collector_success{collector="textfile"} 1` is true even
   # when no directory is configured - succeeding at reading nothing. So confirm the running
   # process was actually given the directory, from its own command line.
-  local cmdline
-  cmdline="$(tr '\0' ' ' < "/proc/$(pgrep -x prometheus-node-exporter | head -1)/cmdline" 2>/dev/null || true)"
+  # ASK SYSTEMD FOR THE PID, NOT pgrep.
+  #
+  # This was `pgrep -x prometheus-node-exporter`, and -x matches the process NAME, which the
+  # kernel truncates to 15 characters. The real name is 25, so pgrep matched NOTHING, printed
+  # its own warning about the length, and returned empty - and then:
+  #
+  #     /proc/$(empty)/cmdline  ->  /proc//cmdline  ->  /proc/cmdline
+  #
+  # The double slash collapses and /proc/cmdline is a real, readable file: THE KERNEL COMMAND
+  # LINE. So the check read `BOOT_IMAGE=/vmlinuz... fips=1` , found no textfile flag in it, and
+  # declared "THE RUNNING EXPORTER HAS NO TEXTFILE DIRECTORY" on three machines where it was
+  # configured, running and serving node_textfile metrics. Measured 2026-09-18 on host-1/2/3.
+  #
+  # A false FAIL is less dangerous than a false pass, but it trains the reader to ignore this
+  # script's warnings, which costs the same in the end.
+  local mainpid cmdline=""
+  mainpid="$(systemctl show prometheus-node-exporter -p MainPID --value 2>/dev/null)"
+  if [ -n "$mainpid" ] && [ "$mainpid" != 0 ] && [ -r "/proc/$mainpid/cmdline" ]; then
+    cmdline="$(tr '\0' ' ' < "/proc/$mainpid/cmdline" 2>/dev/null || true)"
+  else
+    warn "could not read the exporter's PID from systemd (MainPID='${mainpid:-unset}')"
+    warn "  - reporting what is CONFIGURED instead of what is running, and saying so"
+    cmdline="$(grep -h '^ARGS=' "$NE_DEFAULTS" 2>/dev/null || true)"
+  fi
   case "$cmdline" in
     *"--collector.textfile.directory=$TEXTFILE_DIR"*)
       ok "textfile directory is on the running command line" ;;

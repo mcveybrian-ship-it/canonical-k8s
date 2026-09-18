@@ -117,6 +117,23 @@ Found 2026-09-17, runbook §9b. **Nothing in the current build path depends on M
 
 ⚠️ **Do not over-claim air-gap N/A.** Of 188 Container Platform SRG rules, only **8** are genuinely not applicable. The air gap changes *how* the rest are satisfied, not *whether* they apply — and 6a.4 is the clearest case of a rule that gets **harder**, not waived.
 
+## 6b. ✅ MAAS removed 2026-09-18 — what it cost and what it left
+
+**Open listeners on `svc-mgmt-01`: 76 → 21.** Remaining ports are `22 25 53 80 123 323 443 5432
+8484 9100` — ssh, postfix (loopback), DNS, nginx redirect, time, TLS, postgres, the Pro contract
+server, node-exporter. 13 packages and 10 services gone.
+
+✅ **Ubuntu Pro survived**, which was the gate: `pro refresh` succeeded with MAAS fully down, and
+`esm-apps`, `fips-updates` and `usg` stayed enabled. The contract server is independent of MAAS.
+
+| | Item | Status |
+|---|---|---|
+| **6b.1** | ⚠️ **`autoremove` took `bind9` with MAAS** — its only reverse-deps were MAAS packages. `named.service` reported `Loaded: not-found`, which reads like a broken config and is a missing package. Zone files in `/etc/bind/enclave/` survived; reinstall + `zone-install` is the recovery. **`apt-mark manual bind9` before the purge on a rebuild** | ✅ recorded in runbook §9a.4 |
+| **6b.2** | **`postgresql@16-main` still installed on `svc-mgmt-01`** — it was MAAS's database. Confirm nothing else uses it, then remove. Until then it is an unassessed database in the boundary | ⬜ open |
+| **6b.3** | **Two pre-existing failed units on `svc-mgmt-01`** — `openipmi` (no `/dev/ipmi0` on a VM) and `sssd` (no configured domains). Not MAAS's doing. `stig-tailor.sh fixups --apply` clears both via item 0b | ⬜ open |
+| **6b.4** | **None of the four service VMs has today's `fixups`** — including item 2c, the logrotate `create` fix. They will re-open V-270756 on their next rotation exactly as the hosts would have | ⬜ open |
+| **6b.5** | **`esm-infra` is disabled on host-4** — visible in the `pro status` from the gate check. Known inconsistency, see §3.6 | ⬜ open |
+
 ## 7. Never mirrored, never built
 
 - **Landscape** and the **Enterprise Store** — never in a transfer bundle. Blocked on a transfer trip before they are blocked on writing. ⚠️ *State not re-verified since it was recorded.*

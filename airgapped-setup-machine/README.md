@@ -6,9 +6,9 @@
 *how* things were built and why; they have gone stale more than once. If they disagree with
 this section, this section wins and the other one gets fixed.
 
-Last updated **2026-09-11 02:40 UTC** (2026-09-10 21:40 Central). All timestamps in this repo are **UTC** — every enclave machine runs UTC and the audit logs are UTC, so mixing local time into an auditable procedure is how two records stop lining up.
+Last updated **2026-09-18 02:15 UTC** (2026-09-17 21:15 Central). All timestamps in this repo are **UTC** — every enclave machine runs UTC and the audit logs are UTC, so mixing local time into an auditable procedure is how two records stop lining up.
 
-## 0a. WORKING LIST — priority order as of 2026-09-14 04:15 UTC (2026-09-13 23:15 Central)
+## 0a. WORKING LIST — priority order as of 2026-09-18 02:15 UTC (2026-09-17 21:15 Central)
 
 **Read this for "what next". The tables below record state; this records order.**
 
@@ -325,7 +325,7 @@ the gap. Q6 — the container-image bundle size — still gates Harbor's disk si
 | `build-01` | **`10.2.10.124`** | online | Physical, 32 GB. Writes the transfer SSD; holds the `private-sync.sh` backup |
 | Hyper-V host (R7515) | — | online | Windows Server 2022. Runs `stage-01`; seed-stick writer |
 | `host-4` | **`10.2.20.158`** | **air-gapped** | **BUILT 2026-09-01/02.** Services host. LUKS on 2 of 3 NVMe, 125 GB RAM. **Step 03 host prep DONE** - mirror apt, br0, 1.8T LUKS-backed image pool, verified after a cold boot. **Step 03 DONE.** Installs from `svc-repo-01` |
-| `host-1..3` | `10.2.20.155-157` | **air-gapped** | ✅ **BUILT 2026-09-17** from seed sticks (§4a: the stick builds them, MAAS redeploys them — except MAAS cannot, see runbook §9b). Verified: STIG LV layout, 500 GB encrypted data volume, remainder raw for Ceph, one console passphrase, no default route, KVM live, TPM 2.0 (AMD fTPM). **`hardened=no`, `pro_attached=no` — step 05 is next.** No BMC on any of them |
+| `host-1..3` | `10.2.20.155-157` | **air-gapped** | ✅ **BUILT 2026-09-17** from seed sticks (§4a: the stick builds them, MAAS redeploys them — except MAAS cannot, see runbook §9b). Verified: STIG LV layout, 500 GB encrypted data volume, remainder raw for Ceph, one console passphrase, no default route, KVM live, TPM 2.0 (AMD fTPM). ✅ **HARDENED 2026-09-17/18 by `05-harden-host.sh`** — Pro attached, FIPS `6.8.0-138-fips`, USG **213/3**, V1R6 **171/9/9/5**, byte-identical across all three. ✅ **VM-READY** (§6.5): libvirt, `br0`, `images` pool on 300 GB, `images-data` on 200 GB. ⏸️ **Nothing composed — Kubernetes paused by decision 2026-09-18, not blocked.** **No BMC on any of them**, which is why the bridge step and every module blacklist refuse rather than guess |
 | `svc-mgmt-01` | `10.2.20.161` | **air-gapped** | **CONTRACTS SERVER RUNNING 2026-09-04.** Attached to its own contracts server; esm-infra/esm-apps/fips-updates/usg all entitled. MAAS still to come |
 | `svc-repo-01` | `10.2.20.162` | **air-gapped** | **SERVING 2026-09-03.** 318 GB mirror over nginx, 9/9 suites verified, keys at `/keys/`, the 3 PPA debs at `/debs/`. host-4 installs from it |
 

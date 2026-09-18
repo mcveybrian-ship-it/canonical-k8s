@@ -327,7 +327,7 @@ monitoring strategy that lists capabilities without results is a procurement doc
 |---|---|
 | **`auditd` had lost 446–500 events on four of five machines** | The kernel dropped audit records — the trail has holes. One machine alone was at zero. This is V-270819 territory **measured directly rather than inferred**, and it is the strongest evidence in the package that a monitored signal is the only notification this enclave can deliver |
 | **USB storage unblocked on the hypervisor** | Expected while the backup window was open — but the control was failing on that machine at that moment and **nothing else said so** |
-| **144,840 sudo invocations in 24 hours on `svc-mgmt-01`** | 1.68 per second. The MAAS `machine-resources` storm, measured rather than estimated. Root cause still open (`poam.md` ENG-28) |
+| **144,840 sudo invocations in 24 hours on `svc-mgmt-01`** | 1.68 per second. The MAAS `machine-resources` storm, measured rather than estimated. ✅ **CLOSED 2026-09-18 by removing MAAS from the boundary** — the root cause was never found and no longer needs to be (`poam.md` ENG-28) |
 | **Two machines' checklists were 3.1 days stale** | A re-scan that was owed, now visible as a number instead of a memory |
 
 ### 6.2 Findings that nothing else in the enclave could have produced
@@ -472,7 +472,7 @@ Stated as gaps rather than omitted.
 |---|---|
 | **No notification path** | §7. The single unresolved item |
 | **No CVE-level scanning of the machines themselves** | The patch-posture family measures how far behind the mirror each machine is, which is a **different question** from whether an installed package has a known CVE. Closing it needs Trivy pointed at a filesystem, and **there is no Trivy CLI anywhere in the enclave** — it exists only inside Harbor's container. Either route is bounded by the same dated database, so it would report CVE exposure as of the database's date, not today (`poam.md` ENG-41) |
-| **No role dashboards for the mirror or MAAS** | The mirror needs Release-file age, repository growth and a **pool** URL probe — `Release` returning 200 while `pool` returns 401 reads as success, and that trap has already been hit in this project. MAAS needs DHCP pool utilisation |
+| **No role dashboard for the mirror** (the MAAS half is moot — removed 2026-09-18) | The mirror needs Release-file age, repository growth and a **pool** URL probe — `Release` returning 200 while `pool` returns 401 reads as success, and that trap has already been hit in this project. MAAS needs DHCP pool utilisation |
 | **No alerts on the collector itself** | Rule-evaluation failures, a growing notification queue and the time-series database nearing its retention ceiling are all visible on the collector dashboard and none of them page. **There is a limit to how far this can go: a Prometheus that cannot evaluate rules cannot evaluate the rule that says so.** Genuinely closing it needs something outside the collector watching the collector |
 | **No Kubernetes monitoring** | The cluster does not exist yet. Scraping it from the collector is a step-06 design input (§2.1) |
 | **No database monitoring** | The PostgreSQL guests do not exist yet, and the **synchronous-degradation alert is owed** — it is the rule that makes the `synchronous_mode_strict=off` decision defensible (`poam.md` ENG-06) |

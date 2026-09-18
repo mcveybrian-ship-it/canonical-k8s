@@ -100,7 +100,9 @@ production hardware in a facility somebody has to be escorted into.
 | Source | `docs/02-host-install.md` §4c · runbook §6.3i.1 · suggested controls CP-10, MA-4 |
 
 **Two BOM requirements follow, cheap at purchase and expensive to retrofit:** production hosts
-need a **BMC with IPMI/Redfish and serial-over-LAN** — it is also what lets MAAS deliver the
+need a **BMC with IPMI/Redfish and serial-over-LAN**. ⚠️ **Updated 2026-09-18: MAAS was removed
+from the boundary**, so network redeploy is no longer available at all — which makes a BMC the
+ONLY remote recovery mechanism rather than one of two. It was also what would have let MAAS deliver the
 redeploy-after-failure capability that justifies its place in the boundary — and **unattended
 unlock must be settled before the hardware is specified**, which per §6.3i.1 means Secure Boot
 is a prerequisite rather than a deferrable nicety.

@@ -61,7 +61,7 @@ failures are survivable and which are not.
 
 Four bare-metal hosts running KVM/libvirt. Hosts 1–3 each carry a Kubernetes control-plane
 guest, a worker guest and a PostgreSQL guest. Host 4 carries the fourth worker — the one that
-gives Ceph a fourth failure domain — plus all four enclave service guests: MAAS and the Ubuntu
+gives Ceph a fourth failure domain — plus all four enclave service guests: the Ubuntu
 Pro contract server on `svc-mgmt-01`, the apt mirror and Landscape mirror on `svc-repo-01`,
 Harbor with its registry, database and Trivy on `svc-harbor-01`, and Prometheus, Alertmanager
 and Grafana on `svc-obs-01` (runbook §1, §1.1).
@@ -71,7 +71,7 @@ availability decision.**
 
 | Failure | What survives | What is lost |
 |---|---|---|
-| **Any of hosts 1–3** | etcd keeps quorum on the remaining two control planes; the remaining workers keep running; **Harbor, MAAS and the mirror are all standing, so rescheduled pods can pull images**; Ceph rebuilds the lost replica onto the fourth failure domain; the two surviving PostgreSQL guests retain an etcd quorum and a synchronous pair | One control plane, one worker, one database node. Capacity, not function |
+| **Any of hosts 1–3** | etcd keeps quorum on the remaining two control planes; the remaining workers keep running; **Harbor, DNS and the mirror are all standing, so rescheduled pods can pull images**; Ceph rebuilds the lost replica onto the fourth failure domain; the two surviving PostgreSQL guests retain an etcd quorum and a synchronous pair | One control plane, one worker, one database node. Capacity, not function |
 | **Host 4** | etcd keeps quorum on hosts 1–3; running pods keep running on locally cached images; Ceph still holds three copies across three surviving hosts | **The ability to build and patch**, not the ability to run — plus, critically for this plan, **the ability to restore anything** (§3.1) |
 
 Putting the registry on a cluster host is what makes a host failure cascade: the host dies,
@@ -154,7 +154,7 @@ Measured 2026-09-14, allocated bytes rather than qcow2 ceilings, cross-checked a
 | Guest | Irreplaceable state | Size |
 |---|---|---|
 | `svc-repo-01` | **Nothing** — but re-mirroring costs another transfer trip | **331 GB** |
-| `svc-mgmt-01` | The **issuing CA private key**, and the MAAS database of enrolled machines | 34 GB |
+| `svc-mgmt-01` | The **issuing CA private key**, the Ubuntu Pro contract server, and the enclave DNS zones | 34 GB — ⚠️ **re-measure: MAAS and its database were removed 2026-09-18** |
 | `svc-harbor-01` | Images that have been pushed, and Trivy's vulnerability database | 15 GB |
 | `svc-obs-01` | Grafana's database and Prometheus history | 7.2 GB |
 | | **total** | **386 GB** |
@@ -455,7 +455,7 @@ per-guest timeout and boot timeout are parameters in `vm-specs.env`.
 |---|---|---|
 | 1 | `svc-obs-01` | It scrapes the other four and runs the alert rules. Stopping it first keeps a *planned* outage out of Prometheus as a fake incident |
 | 2 | `svc-harbor-01` | Containerised PostgreSQL under docker-compose; the service must stop eleven containers and give the database a clean close. The slowest and most delicate stop — give it the most room |
-| 3 | `svc-mgmt-01` | MAAS's own PostgreSQL plus the Pro contract server. Another database that wants a clean stop |
+| 3 | `svc-mgmt-01` | The Pro contract server and enclave DNS. ⚠️ MAAS's PostgreSQL was removed 2026-09-18; `postgresql@16-main` may still be installed — confirm before assuming a database needs a clean stop |
 | 4 | `svc-repo-01` | nginx over static files. Nothing to lose, and it is what everything else installs from, so it stays up longest |
 
 **But the order is the small half.** `virsh shutdown` is **asynchronous** — it sends ACPI and

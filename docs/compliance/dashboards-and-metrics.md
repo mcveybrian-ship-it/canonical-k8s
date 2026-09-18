@@ -100,7 +100,7 @@ said it. That is deliberate — a machine cannot mislabel itself.
 | role | machine |
 |---|---|
 | `hypervisor` | `host-4` |
-| `maas` | `svc-mgmt-01` |
+| `contracts` | `svc-mgmt-01` | ⚠️ was `maas`; MAAS removed 2026-09-18, the machine now serves the Pro contract server and DNS |
 | `mirror` | `svc-repo-01` |
 | `registry` | `svc-harbor-01` |
 | `observability` | `svc-obs-01` |
@@ -186,7 +186,7 @@ anything about the Answer File.
 - **Failed sudo, 24 h rolling** — `pam_faillock` here is `deny=3 unlock_time=0`, so three
   failures is a **permanent** lockout until the tally is cleared by hand. This is the warning.
 - **Accounts carrying a faillock tally**.
-- **sudo invocations, 24 h rolling** — not a control. An open investigation: MAAS invokes
+- **sudo invocations, 24 h rolling** — not a control. ✅ **The investigation closed 2026-09-18 when MAAS was removed.** It was: MAAS invokes
   `machine-resources` via sudo roughly 1.7 times per second on `svc-mgmt-01`. This panel is
   here to establish whether it is constant or bursty.
 
@@ -804,9 +804,11 @@ glob will happily report another machine's checklist as this one's.
   filesystem (possible today, needs the image name and a writable cache dir), or carry a
   binary in on the next transfer trip. Either way the result is bounded by the same dated
   database as Q27, so it would tell you CVE exposure *as of 2026-09-08*, not today.
-- **No role dashboards for the mirror or MAAS.** The mirror needs Release-file age,
+- **No role dashboard for the mirror.** (The MAAS half of this gap is moot — MAAS was removed
+  from the boundary 2026-09-18.) The mirror needs Release-file age,
   `/srv/repo` growth and a **pool** URL probe — `Release` returning 200 while `pool` returns
-  401 reads as success. MAAS needs DHCP pool utilisation.
+  401 reads as success. ➕ **Enclave DNS now wants one too**: zone serial, query rate, and
+  NXDOMAIN ratio — a spike in NXDOMAIN is usually a name that should exist and does not.
 - **No alerts on the collector itself.** Rule evaluation failures, a growing notification
   queue and TSDB nearing its retention ceiling are all visible on the collector dashboard and
   none of them page. There is a limit to how far this can go: **a Prometheus that cannot

@@ -56,25 +56,25 @@ written out in full because every configuration-management claim below depends o
 ### 2.1 Four hosts, ten guests, and no egress
 
 The enclave is **four bare-metal hosts** running KVM/libvirt from distribution packages, with
-guests composed by MAAS through `virsh`. The operating system is Ubuntu 24.04 LTS on host and
+guests composed by `03-compose-vm.sh` through `virsh` (MAAS was removed 2026-09-18). The operating system is Ubuntu 24.04 LTS on host and
 guest, with the Minimal variant on cluster nodes and the standard server image on the hosts
 and the service VMs (runbook §1, §2.3, §2.4).
 
 Three hosts carry one Kubernetes control-plane guest and one worker guest each. The fourth
 host carries the worker that gives Ceph its fourth failure domain, plus every enclave service
-in four separate guests: `svc-mgmt-01` (MAAS region and rack controllers, and the Ubuntu Pro
+in four separate guests: `svc-mgmt-01` (the Ubuntu Pro
 air-gapped contract server), `svc-repo-01` (the apt mirror over nginx, and the Landscape
 repository mirror), `svc-harbor-01` (the Harbor registry with its own PostgreSQL and Trivy),
 and `svc-obs-01` (Prometheus, Alertmanager and Grafana).
 
 **The services are concentrated on one host deliberately, and the reasoning is a
 configuration-management argument.** None of these services is highly available — Harbor is
-not clustered, Landscape is not, and MAAS region HA is not worth its complexity at this scale.
+not clustered, Landscape is not, and and MAAS was removed from the boundary entirely on 2026-09-18.
 Spreading them across hosts therefore buys no availability; it only distributes the blast
 radius. What matters is *which* failure takes them out. Put Harbor on a cluster host and a
 host failure cascades: the host dies, pods reschedule, and the rescheduled pods need image
 pulls from a registry that died with the host. On the fourth host, losing any of hosts 1–3
-leaves Harbor, MAAS and the mirror standing, so the cluster can recover from the failure it
+leaves Harbor, DNS and the mirror standing, so the cluster can recover from the failure it
 just had. Losing the fourth host is the inverse and far milder — etcd keeps quorum, running
 pods keep running on cached images, and Ceph still holds three copies across three surviving
 hosts. **You lose the ability to build and patch, not the ability to run** (runbook §1.1).
@@ -92,7 +92,7 @@ structural — the enclave on its own switch or VLAN with no gateway address on 
 all — and it is tracked as a POA&M item (`poam.md` ENG-50) rather than described here as
 though it were done. Whether the boundary router is in scope is «yes or no - inherited».
 
-Name resolution is `hosts: files dns` on every node, so `/etc/hosts` wins and MAAS DNS is the
+Name resolution is `hosts: files dns` on every node, so `/etc/hosts` wins and **`bind9` on `svc-mgmt-01`** is the
 fallback. That order is deliberate: `apt`, `containerd` and `pro attach` must not stop working
 because a single service VM is rebooting. The domain is `enclave.internal` and **not**
 `enclave.local`, because `systemd-resolved` routes any multi-label `.local` name to
@@ -120,7 +120,9 @@ build (`poam.md` AO-01).
 
 Two packaging decisions in this enclave exist **because of** that posture, and they are
 configuration-management facts rather than preferences. A snap takes its cryptography from its
-base snap and not from the host, so Ceph and MAAS are deployed from **deb packages** rather
+base snap and not from the host, so Ceph and MAAS were deployed from **deb packages** rather
+(⚠️ MAAS was removed from the boundary 2026-09-18; the reasoning is retained because it still
+governs Ceph, and because it is the precedent for any future snap decision)
 than from their snaps: `microceph` and `maas` both declare `base: core24`, and `core24` has no
 `fips-updates/stable` channel — only candidate, beta and edge. Debs link the host's OpenSSL,
 which on a FIPS host is the validated module. The Kubernetes snap is unaffected because it
@@ -643,7 +645,7 @@ the check was not trustworthy. Worked examples, all measured:
 | Removable media | `usb_storage` **and `uas`** blocklisted. `uas` matters: blocking only `usb_storage` leaves a UAS enclosure working while the control looks applied | runbook §6.3g |
 | Media exception | A **time-boxed, logged window** rather than a standing exception. `stig-tailor.sh usb enable [--minutes N]` auto-closes on a timer, and every open and close records who, when and which modules | runbook §6.3g |
 | Admin web UIs | **Refused deliberately.** `cockpit` and `cockpit-machines` are both in the mirror and `cockpit-machines` is a good libvirt UI — but it is a listening admin service on every hypervisor, **no DISA STIG exists for Cockpit**, and on the hypervisor it means opening a port on the one machine where ufw deliberately refuses to manage rules. Control is `virsh` over SSH, which adds **zero** listening surface | runbook §10a |
-| Removed surface | MAAS's `3128` squid proxy is pointless surface in an air gap with a local mirror — **removed rather than firewalled** | runbook §6.3e |
+| Removed surface | MAAS's `3128` squid proxy was pointless surface in an air gap with a local mirror. ✅ **MAAS was removed entirely 2026-09-18** — open listeners on `svc-mgmt-01` went **76 → 21** | runbook §6.3e |
 | Service binds | Prometheus, Alertmanager and Grafana bind loopback only; Grafana is reachable solely through nginx on 443 with an enclave certificate. **All five components bind all interfaces out of the box**, so `monitoring.sh` proves the bind with `ss` after every restart rather than trusting the configuration it just wrote | `../dashboards-and-metrics.md` §9 |
 | Hardware-dependent timers | `prometheus-node-exporter-collectors` installs five systemd timers. Each is kept **only if the hardware it reads exists**, checked per machine — the hypervisor keeps `nvme` and `smartmon`, the guests do not. Same command, different correct answer; a hardcoded list would be wrong on one of them | runbook §10a |
 

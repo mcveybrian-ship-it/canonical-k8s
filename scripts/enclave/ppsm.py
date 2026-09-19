@@ -257,6 +257,8 @@ def main():
     ap.add_argument("--tailor", default=os.path.join(HERE, "stig-tailor.sh"))
     ap.add_argument("--addresses", default=os.path.join(HERE, "enclave-addresses.env"))
     ap.add_argument("--nmap", default=None, help="an existing nmap -oX result to use (optional)")
+    ap.add_argument("--scanner", default=os.uname()[1].split(".")[0],
+                    help="the machine the nmap scan ran FROM (default: this one). Its own row is a loopback view")
     ap.add_argument("--scan", action="store_true",
                     help="run the reachability scan now (needs root and nmap); XML is written beside --out")
     ap.add_argument("--out", default=None, help="write the CLSA here (default: stdout)")
@@ -317,6 +319,17 @@ def main():
             reach = None
             if scan is not None and m in addr_of:
                 reach = scan.get(addr_of[m], {}).get((proto, port), "not scanned" if addr_of[m] not in scan else "closed/filtered")
+                # TWO THINGS THE SCAN CANNOT SEE, measured 2026-09-19:
+                # 1. A machine scanning ITSELF goes over loopback, and ufw does not filter lo -
+                #    so its own row is not the view anyone else on the enclave gets.
+                # 2. ufw LIMIT counts NEW connections per source across every limit rule. The
+                #    scan's own probes and retries exhaust the 6-per-30s allowance, and ports
+                #    probed later read "filtered" while Prometheus scrapes them every 15 s
+                #    without a miss (it holds its connections open). Not evidence of anything.
+                if m == a.scanner:
+                    reach = "%s (self-scan: ufw not in path)" % reach
+                elif reach in ("filtered", "closed/filtered") and any(r["action"] == "limit" for r in lv):
+                    reach = "filtered - ufw LIMIT tripped by the scan itself; not a reachability result"
             calrow = cal.find(svc["cal"], proto, port) if svc else None
 
             if bind == "loopback":
@@ -336,7 +349,7 @@ def main():
                 # WHEN A SCAN EXISTS IT WINS OVER THE ASSUMPTION. ss says what is bound; only the
                 # scan says what answers. A systemd IPAddressDeny filter, for one, is invisible to
                 # ss - calling that port "reachable" would be a false finding.
-                blocked = reach is not None and reach not in ("open", "open|filtered")
+                blocked = reach is not None and (reach == "filtered" or reach == "closed/filtered" or reach == "closed")
                 if proc != "docker-proxy" and not active.get(m) and blocked:
                     finding("BOUND BUT NOT REACHABLE", m, "%s/%s (%s) binds %s but the scan got '%s' - filtered by something other than ufw; record what" % (port, proto, proc, bind, reach))
                 elif proc != "docker-proxy" and not active.get(m):

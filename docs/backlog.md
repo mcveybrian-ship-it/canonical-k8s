@@ -51,6 +51,7 @@ These are the ones an assessor reads first. All four are architectural, not pape
 | **3.6** | **Make `esm-apps` consistent** across all eight | Enabled inconsistently; `esm-infra` too. It was entitled all along and simply never switched on | ⬜ open |
 | **3.7** | **Root CA key custody** | A policy question, not a mechanism | ⬜ open · `ssp-inputs.md` §2.5 |
 | **3.8** | **Retire or justify the second USB disk on host-4** | The old WD easystore (`sdb`, 4.5 T, LUKS) is still plugged in and unmounted. Either a free second copy or a USB device on the hypervisor for no reason | ⬜ open |
+| **3.9** | **`ufw_rate_limit` now fails on host-1/2/3 — caused by adding monitoring, fixable** | Found 2026-09-19 rescan: USG 213/3 → **212/4** on all three; V1R6 unchanged at 171/9/9/5. Measured cause: **9100 (node-exporter) and 9177 (libvirt exporter) now listen** on the host address, added 2026-09-18, and their ufw rows are `allow`; the rule fails if ANY listening port is not `limit`. **Unlike 443 on the mirror, `limit` should be safe here:** the only permitted source is `svc-obs-01`, scraping every 15 s = ~2 connections per 30 s per port, well under ufw's 6-per-30 s threshold. Change the six host rows in `stig-tailor.sh` to `limit`, re-apply, **confirm all 15 Prometheus targets stay `up`**, rescan. Would take host-1/2/3 back to 213/3 | ⬜ open · small |
 
 ## 4. Documents — 6 of 10 baseline artifacts not started
 

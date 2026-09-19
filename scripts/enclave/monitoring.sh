@@ -1696,6 +1696,13 @@ FACTSPY
 # and a scrape interval is not a measurement interval.
 cmd_facts_timer() {
   need_root; guard_in_gap
+  # THE UNIT RUNS AS ROOT, SO IT RUNS A ROOT-OWNED COPY - backlog 3.11. It used to execute
+  # $HERE/monitoring.sh: the repo copy in encadmin's home, encadmin:encadmin 770. Anything that
+  # could write as encadmin got root on the next 15-minute tick, with no sudo password and no
+  # sudo record. Re-run facts-timer after pushing a new version so the copy is refreshed.
+  "$HERE/install-runtime.sh" || die "could not install the root-owned runtime copy"
+  local rt; rt="$("$HERE/install-runtime.sh" --print-dir)"
+  [ -x "$rt/monitoring.sh" ] || die "$rt/monitoring.sh missing after install-runtime.sh"
   cat > /etc/systemd/system/enclave-facts.service <<UNIT
 [Unit]
 Description=Publish enclave compliance facts for node-exporter
@@ -1703,7 +1710,7 @@ After=network.target
 
 [Service]
 Type=oneshot
-ExecStart=$HERE/monitoring.sh facts
+ExecStart=$rt/monitoring.sh facts
 UNIT
   # CALENDAR, NOT MONOTONIC CHAINING.
   #

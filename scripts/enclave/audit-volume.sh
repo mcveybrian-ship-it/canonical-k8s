@@ -114,7 +114,13 @@ cmd_report() {
 
 cmd_install() {
   need_root
-  local self; self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/$(basename "${BASH_SOURCE[0]}")"
+  # THE UNIT RUNS AS ROOT, SO IT RUNS A ROOT-OWNED COPY - backlog 3.11. This used to point at
+  # the repo copy in encadmin's home, writable by encadmin: a root timer executing
+  # user-writable code is a sudo bypass. Re-run `install` after pushing a new version.
+  local here; here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+  "$here/install-runtime.sh" || { echo "could not install the root-owned runtime copy" >&2; exit 1; }
+  local self; self="$("$here/install-runtime.sh" --print-dir)/$(basename "${BASH_SOURCE[0]}")"
+  [ -x "$self" ] || { echo "$self missing after install-runtime.sh" >&2; exit 1; }
   cat > "/etc/systemd/system/$UNIT.service" <<EOF
 [Unit]
 Description=Sample audit log volume for svc-log-01 sizing

@@ -1039,7 +1039,13 @@ cmd_schedule() {
   local at="${1:-02:00}"
   case "$at" in [0-2][0-9]:[0-5][0-9]) : ;; *) die "--at wants HH:MM, got '$at'" ;; esac
   [ -n "$DEST" ] || die "no destination set - fix BACKUP_DEST in vm-specs.env first"
-  local self; self="$(readlink -f "$0")"
+  # THE UNITS RUN AS ROOT, SO THEY RUN A ROOT-OWNED COPY - backlog 3.11. This used to be
+  # "$(readlink -f "$0")", i.e. the repo copy in encadmin's home, writable by encadmin: a
+  # root timer executing user-writable code is a sudo bypass. Re-run `schedule` after
+  # pushing a new version so the copy is refreshed.
+  "$HERE/install-runtime.sh" || die "could not install the root-owned runtime copy"
+  local self; self="$("$HERE/install-runtime.sh" --print-dir)/vm-backup.sh"
+  [ -x "$self" ] || die "$self missing after install-runtime.sh"
 
   # ---- the schedule, in the operator's timezone, PROVEN BEFORE IT IS INSTALLED ----------
   # A calendar spec systemd cannot parse produces a timer that never fires and reports no

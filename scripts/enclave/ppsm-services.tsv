@@ -13,9 +13,14 @@
 #             CAL has no entry (then it needs a local CLSA entry and AO approval)
 #   purpose   one line, for the CLSA. Firewall justifications live in stig-tailor.sh ufw_rules();
 #             this says what the service is, not why the port is open.
+#   clsa      ONLY where cal is - and the port is reachable off the machine: the proposed local
+#             CLSA service name WITHOUT the ORG prefix (ppsm.py adds «PPSM_ORG»-). Written the
+#             way the CAL's CLSA sheet names things: VENDOR-PRODUCT-FUNCTION, upper case.
+#   risk      same rows: what the service exposes, how, and what limits it - the paragraph the
+#             AO decides on. Facts only; each was checked against the config when written.
 #
 # A listener that matches no row is reported as UNIDENTIFIED - add a row, or remove the service.
-proto	port	process	cal	purpose
+proto	port	process	cal	purpose	clsa	risk
 tcp	22	sshd,systemd	SSH	OpenSSH - administrative access. FIPS ciphers, key auth, DoD banner
 tcp	22	sshd	SSH	OpenSSH - administrative access. FIPS ciphers, key auth, DoD banner
 tcp	53	named	DNS	BIND 9 - authoritative for enclave.internal and its reverse zone, recursion off (svc-mgmt-01)
@@ -25,10 +30,11 @@ tcp	80	nginx	HTTP	nginx - 301 redirect to HTTPS only; no content is served in cl
 tcp	443	nginx	HTTPS	nginx TLS front end: apt mirror (svc-repo-01), Grafana (svc-obs-01), Ubuntu Pro contracts server proxied to 127.0.0.1:8484 (svc-mgmt-01)
 tcp	80	docker-proxy	HTTP	Harbor registry, published by Docker - redirect to HTTPS. Docker bypasses ufw for this port
 tcp	443	docker-proxy	HTTPS	Harbor container registry over TLS, published by Docker. Docker bypasses ufw for this port
-tcp	8484	contracts-airga	-	Ubuntu Pro air-gapped contracts server. Runbook says loopback-only via systemd IPAddressDeny, which ss cannot see - verify with the reachability scan
-tcp	9100	prometheus-node	-	Prometheus node-exporter - host metrics, scraped only by svc-obs-01
-tcp	9177	prometheus-libv	-	Prometheus libvirt exporter - per-guest metrics on hypervisors, scraped only by svc-obs-01
+tcp	8484	contracts-airga	-	Ubuntu Pro air-gapped contracts server. Host-local by a systemd IPAddressDeny filter, which ss cannot see - the 2026-09-19 scan measured it filtered	CANONICAL-UBUNTU-PRO-CONTRACTS	Plain-HTTP API of the Ubuntu Pro air-gapped contracts server; answers entitlement requests for every machine's `pro` client. contracts-airgapped has no bind-address option, only --port, so the socket binds all interfaces. Off-host access is dropped by systemd IPAddressDeny=any / IPAddressAllow=localhost on the unit, and ufw on svc-mgmt-01 has no rule for 8484 - two independent filters. Clients reach it only through nginx TLS on 443, proxied to 127.0.0.1:8484. The entry is requested because the socket is bound, not because it is reachable: approve as host-local only
+tcp	9100	prometheus-node	-	Prometheus node-exporter - host metrics, scraped only by svc-obs-01	PROMETHEUS-NODE-EXPORTER	Plain HTTP, no authentication (no --web.config.file is set). Read-only: host CPU, memory, disk, network counters, systemd unit states, and the enclave compliance facts - which include each machine's listening ports and ufw rules. No write path. Bound to the machine's enclave address, not all interfaces; ufw admits only svc-obs-01. Residual risk: metrics cross the enclave LAN in clear. Available mitigation, not yet built: TLS via --web.config.file with a certificate from the enclave CA
+tcp	9177	prometheus-libv	-	Prometheus libvirt exporter - per-guest metrics on hypervisors, scraped only by svc-obs-01	PROMETHEUS-LIBVIRT-EXPORTER	Plain HTTP, no authentication. Read-only: per-guest state, vCPU, memory, disk and interface counters, and guest names, from libvirt on the hypervisors. The HTTP endpoint serves metrics only. Bound to the host's enclave address; ufw admits only svc-obs-01. Residual risk: guest inventory and counters cross the enclave LAN in clear. Available mitigation, not yet built: TLS with a certificate from the enclave CA
 tcp	25	master	SMTP-25	Postfix local delivery - loopback only
+tcp	25	master,smtpd	SMTP-25	Postfix local delivery - loopback only (ss lists smtpd too while a local connection is open)
 tcp	53	systemd-resolve	DNS	systemd-resolved stub resolver - loopback only
 udp	53	systemd-resolve	DNS	systemd-resolved stub resolver - loopback only
 udp	323	chronyd	-	chrony command socket - loopback only

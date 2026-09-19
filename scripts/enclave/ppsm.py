@@ -29,10 +29,13 @@ WHERE EACH INPUT COMES FROM, and why none of it is typed into the document:
                 a systemd IPAddressDeny filter, for one, is invisible to ss.
 
 WHAT IT WILL NOT DO: approve anything. A service the CAL does not list is marked for AO
-approval, not waved through. The AO's decision is recorded by whoever makes it.
+approval, not waved through. The report drafts ONE proposed local CLSA entry per such service,
+in the CAL workbook's CLSA-sheet columns, with a decision line the AO signs - the paperwork is
+generated from the same measurements as the findings, so it cannot drift from them.
 
 The output is THIS SITE'S PORT INVENTORY. It does not go in the git repository - origin is
-public. Write it to the evidence directory.
+public. Write it to /srv/stig-evidence/PPSM/ - NOT under an Evaluate-STIG host directory,
+whose rotation deletes it (refused below).
 """
 import argparse, collections, datetime, json, os, re, sys, urllib.parse, urllib.request
 import xml.etree.ElementTree as ET
@@ -67,7 +70,9 @@ def read_services(path):
         f = line.rstrip("\n").split("\t")
         if len(f) < 5:
             sys.exit("%s: malformed row (want 5 TAB-separated fields): %r" % (path, line))
-        rows.append({"proto": f[0], "port": f[1], "process": f[2], "cal": f[3], "purpose": f[4]})
+        f += [""] * (7 - len(f))
+        rows.append({"proto": f[0], "port": f[1], "process": f[2], "cal": f[3], "purpose": f[4],
+                     "clsa": f[5], "risk": f[6]})
     return rows
 
 
@@ -151,25 +156,27 @@ class CAL:
     Located by header text rather than fixed letters, so a column added by DISA is survivable
     and a renamed one fails loudly."""
 
-    def __init__(self, path):
-        rows = xlsx_sheet(path, "CAL by Port")
+    NEED = ["Network", "Low Port", "High Port", "TCP/UDP", "Service name"]
+
+    @staticmethod
+    def locate(rows, sheet):
+        """(header index, {column name: letter}, {boundary number: letter}) for one sheet."""
         # Header cells carry line breaks ("Low\nPort") - normalise before comparing, or the
         # lookup fails on a layout that has not actually changed.
         norm = lambda r: {k: " ".join((v or "").split()) for k, v in r.items()}
-        hdr = None
-        for i, r in enumerate(rows):
-            if "Low Port" in norm(r).values():
-                hdr = i
-                break
+        hdr = next((i for i, r in enumerate(rows) if "Low Port" in norm(r).values()), None)
         if hdr is None:
-            sys.exit("CAL: no 'Low Port' header row - workbook layout changed")
+            sys.exit("CAL %r: no 'Low Port' header row - workbook layout changed" % sheet)
         names = {v: k for k, v in norm(rows[hdr]).items() if v}
         nums = {v: k for k, v in norm(rows[hdr + 1]).items() if v}
-        need = ["Network", "Low Port", "High Port", "TCP/UDP", "Service name"]
-        for n in need:
+        for n in CAL.NEED:
             if n not in names:
-                sys.exit("CAL: column %r not found - workbook layout changed" % n)
-        self.c = {n: names[n] for n in need}
+                sys.exit("CAL %r: column %r not found - workbook layout changed" % (sheet, n))
+        return hdr, {n: names[n] for n in CAL.NEED}, nums
+
+    def __init__(self, path):
+        rows = xlsx_sheet(path, "CAL by Port")
+        hdr, self.c, nums = self.locate(rows, "CAL by Port")
         self.b = {k: nums[k] for k in ("07", "08", "11", "12") if k in nums}
         if len(self.b) < 4:
             sys.exit("CAL: boundary numbering row not where expected")
@@ -180,6 +187,35 @@ class CAL:
                 if m:
                     self.expires = m.group(1)
         self.rows = [r for r in rows[hdr + 2:] if r.get(self.c["TCP/UDP"])]
+        # OTHER ORGANISATIONS' LOCAL ENTRIES. Not an approval of ours - evidence that the
+        # AO-approval path for this kind of service is an established one.
+        crows = xlsx_sheet(path, "CLSA")
+        chdr, cc, _ = self.locate(crows, "CLSA")
+        self.clsa = [r for r in crows[chdr + 2:] if r.get(cc["TCP/UDP"])]
+        self.cc = cc
+
+    GENERIC = {"HTTP", "HTTPS", "TCP", "UDP", "API", "WEB", "DATA", "SERVER", "SERVICE"}
+
+    def precedent(self, proto, port, name):
+        """Unclassified CLSA entry names at this protocol and port that share a word with our
+        proposed name. BOTH, because a port alone is the false-hit trap: 9100/tcp carries
+        rendering services and web apps that have nothing to do with an exporter. Wide ranges
+        are skipped - a 1000-port entry "matches" everything and proves nothing."""
+        words = {w for w in re.split(r"[-_ ]+", name.upper()) if len(w) > 2} - self.GENERIC
+        out = []
+        for r in self.clsa:
+            if r.get(self.cc["Network"]) != "U" or not r.get(self.cc["TCP/UDP"], "").upper().startswith(proto.upper()):
+                continue
+            try:
+                lo = int(r.get(self.cc["Low Port"]))
+                hi = int(r.get(self.cc["High Port"]) or lo)
+            except ValueError:
+                continue
+            if hi - lo <= 10 and lo <= int(port) <= hi:
+                n = r.get(self.cc["Service name"], "")
+                if n and n not in out and words & set(re.split(r"[-_ ]+", n.upper())):
+                    out.append(n)
+        return out
 
     def find(self, name, proto, port):
         """The CAL row for this exact service name, protocol and port - unclassified network."""
@@ -263,6 +299,16 @@ def main():
                     help="run the reachability scan now (needs root and nmap); XML is written beside --out")
     ap.add_argument("--out", default=None, help="write the CLSA here (default: stdout)")
     a = ap.parse_args()
+    # NEVER INSIDE AN EVALUATE-STIG HOST DIRECTORY. Its next run rotates everything there into
+    # Previous/ and keeps PreviousToKeep (default 1) - so the scan after that DELETES the CLSA,
+    # the nmap evidence and the CAL copy. It did the first half on svc-obs-01 on 2026-09-19.
+    if a.out:
+        d = os.path.dirname(os.path.abspath(a.out))
+        while d != os.path.dirname(d):
+            if os.path.exists(os.path.join(d, "Evaluate-STIG.log")):
+                sys.exit("--out is inside Evaluate-STIG's output tree (%s) - its next scan rotates and then deletes"
+                         " it. Use a sibling, e.g. /srv/stig-evidence/PPSM/" % d)
+            d = os.path.dirname(d)
 
     env = read_env(a.addresses)
     addr_of = {k.lower().replace("_", "-"): v for k, v in env.items()
@@ -310,6 +356,7 @@ def main():
             finding("STALE", m, "listener facts are %.0f minutes old" % (fresh[m] / 60))
 
     rows = []
+    ao = collections.defaultdict(lambda: {"svc": None, "where": []})
     for m in machines:
         for s in sorted(socks_by.get(m, []), key=lambda s: (s["bind"] == "loopback", s["proto"], int(s["port"]))):
             proto, port, proc, bind = s["proto"], s["port"], s["process"], s["bind"]
@@ -360,6 +407,11 @@ def main():
                     finding("NO DESIGN RECORD", m, "%s/%s (%s) is not in stig-tailor.sh ufw_rules() - no recorded reason for it to be open" % (port, proto, proc))
                 if svc and svc["cal"] == "-":
                     finding("AO APPROVAL", m, "%s/%s %s - not on the CAL; needs a local CLSA entry approved by the AO" % (port, proto, proc))
+                    ao[(proto, port, proc)]["svc"] = svc
+                    ao[(proto, port, proc)]["where"].append({
+                        "machine": m, "bind": bind, "fw": fw, "reach": reach,
+                        "enforcing": bool(active.get(m)),
+                        "design": ("%s from %s" % (dz["action"], dz["source"])) if dz else "NOT IN THE DESIGN TABLE"})
                 elif svc and calrow is None:
                     finding("CAL MISMATCH", m, "%s/%s: ppsm-services.tsv names CAL service %r but the CAL has no such entry at this port" % (port, proto, svc["cal"]))
                 elif calrow and "RED" in (calrow.get("11", ""), calrow.get("12", "")):
@@ -439,6 +491,59 @@ def main():
     else:
         L.append("None.")
     L.append("")
+    L.append("## AO decision — proposed local CLSA entries")
+    L.append("")
+    if not ao:
+        L.append("None - every external service is on the CAL.")
+    else:
+        L.append("The %d AO APPROVAL findings above are **%d services**. Each needs one local CLSA entry, written in the"
+                 " columns of the CAL workbook's CLSA sheet, and a decision from the AO. **Nothing here is approved until"
+                 " the decision line is signed.** `«…»` values come from `facility-profile.env` — the ORG prefix is the"
+                 " DoD component that owns the system, as the CLSA sheet uses it."
+                 % (kinds["AO APPROVAL"], len(ao)))
+        L.append("")
+        for n, ((proto, port, proc), g) in enumerate(sorted(ao.items(), key=lambda kv: -len(kv[1]["where"])), 1):
+            svc = g["svc"]
+            name = "«PPSM_ORG»-" + (svc["clsa"] or "«NAME»")
+            L.append("### %d. `%s` — %s/%s on %d machine%s" % (n, name, port, proto, len(g["where"]), "" if len(g["where"]) == 1 else "s"))
+            L.append("")
+            L.append("| CLSA field | Proposed |")
+            L.append("|---|---|")
+            L.append("| Network | U |")
+            L.append("| Service name | %s |" % name)
+            L.append("| TCP/UDP | %s |" % ("TCP (6)" if proto == "tcp" else "UDP (17)"))
+            L.append("| Low / High port | %s / %s |" % (port, port))
+            L.append("| ORG | «PPSM_ORG» |")
+            L.append("| 11 Enclave GW to Enclave · 12 Enclave to Enclave GW | AO · AO |")
+            L.append("| 01–10, 13–16 | - (no DISN, ISP, DMZ or VPN connection exists) |")
+            L.append("")
+            L.append("**What it is.** %s" % svc["purpose"])
+            L.append("")
+            L.append("**Risk and mitigation.** %s" % (svc["risk"] or "⚠️ NOT WRITTEN - add the risk column in ppsm-services.tsv"))
+            L.append("")
+            L.append("| Machine | Bind | Allowed from (design) | Firewall now | Reachable from svc-obs-01 |")
+            L.append("|---|---|---|---|---|")
+            for w in g["where"]:
+                L.append("| %s | %s | %s | %s | %s |" % (w["machine"], w["bind"], w["design"], w["fw"], w["reach"] or "no scan"))
+            L.append("")
+            gaps = [w["machine"] for w in g["where"] if not w["enforcing"] and w["reach"] not in ("filtered", "closed/filtered", "closed")]
+            if gaps:
+                L.append("⚠️ **Not yet as designed on %s** — ufw is not enforcing there, so the source restriction above is"
+                         " not in force. An approval now is an approval of the design; make it conditional on the firewall." % ", ".join(gaps))
+                L.append("")
+            prec = cal.precedent(proto, port, svc["clsa"])
+            if prec:
+                L.append("**Precedent.** %d other unclassified CLSA entr%s for the same kind of service at %s/%s in this CAL: %s."
+                         " Not an approval of this entry — evidence the AO-approval path for it is an established one."
+                         % (len(prec), "y" if len(prec) == 1 else "ies", port, proto, ", ".join("`%s`" % x for x in prec[:6])))
+            else:
+                L.append("**Precedent.** No other unclassified CLSA entry for this kind of service at %s/%s in this CAL -"
+                         " this entry stands on its own justification." % (port, proto))
+            L.append("")
+            L.append("**Decision:** ☐ Approve  ☐ Approve with conditions: ______________________  ☐ Disapprove")
+            L.append("")
+            L.append("«AO_NAME», Authorizing Official — signature ____________________  date __________")
+            L.append("")
     L.append("## Inventory — external listeners")
     L.append("")
     cols = ["Machine", "Port", "Process", "Bind", "Service", "CAL service", "CAL 11 / 12", "Firewall", "Reachable", "Design reason"]

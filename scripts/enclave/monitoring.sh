@@ -1639,6 +1639,71 @@ if newest:
     emit("enclave_apt_metadata_date_seconds", newest,
          help="newest Date: across this machine's apt Release files - how current its package metadata is")
 
+# ------------------------------------------------------------ listeners and firewall (PPSM)
+# PORTS, PROTOCOLS AND SERVICES, MEASURED - backlog 6a.22. The CLSA has to list every port
+# every machine listens on, TCP AND UDP, with the process behind it. Publishing that here
+# means the inventory is collected inside the gap by the timer that already runs as root on
+# every machine: no SSH key, no stage-01, and it is current to 15 minutes rather than a
+# snapshot from whenever somebody last looked.
+#
+# bind: "loopback" is unreachable off the box and ufw does not filter it; "all" is a wildcard
+# bind; "address" is bound to one specific address. IPv4 and IPv6 sockets for the same
+# service collapse into one sample, keeping the widest bind - the question is "what can be
+# reached", not "how many sockets".
+rc, o, e = run(["ss", "-H", "-tulpn"])
+if rc == 0:
+    socks = {}
+    for line in o.splitlines():
+        f = line.split()
+        if len(f) < 5:
+            continue
+        proto, local = f[0], f[4]
+        if proto not in ("tcp", "udp"):
+            continue
+        host, _, port = local.rpartition(":")
+        if not port.isdigit():
+            continue
+        h = host.strip("[]")
+        if "%lo" in h or h.startswith("127.") or h in ("::1",):
+            bind = "loopback"
+        elif h in ("0.0.0.0", "*", "::", ""):
+            bind = "all"
+        else:
+            bind = "address"
+        m = re.findall(r'\("([^"]+)",pid=', line)
+        proc = ",".join(sorted(set(m))) if m else "unknown"
+        key = (proto, port, proc)
+        rank = {"loopback": 0, "address": 1, "all": 2}
+        if key not in socks or rank[bind] > rank[socks[key]]:
+            socks[key] = bind
+    for (proto, port, proc), bind in sorted(socks.items()):
+        emit("enclave_listen_socket", 1,
+             {"proto": proto, "port": port, "process": proc, "bind": bind},
+             help="a listening TCP or unconnected UDP socket on this machine, from ss -tulpn as root. bind=loopback is unreachable off the box")
+    SRC["listeners"] = 1
+else:
+    SRC["listeners"] = 0
+
+# ufw: whether it is enforcing, and the rules it would enforce. ABSENT when ufw is not
+# installed - a machine with no ufw has no rule table, which is not the same as an empty one.
+if os.path.exists("/usr/sbin/ufw"):
+    rc, o, e = run(["/usr/sbin/ufw", "status"])
+    rc2, o2, e2 = run(["/usr/sbin/ufw", "show", "added"])
+    if rc == 0 and o.strip() and rc2 == 0:
+        emit("enclave_ufw_active", 1 if re.search(r"^Status:\s*active", o, re.M) else 0,
+             help="1 if ufw is enforcing on this machine")
+        # `ufw status` prints NO rules while inactive - host-4 and svc-mgmt-01 are exactly
+        # that case. `ufw show added` lists the table in both states, as the commands that
+        # built it: "ufw limit from 10.2.20.164 to any port 9100 proto tcp".
+        for line in o2.splitlines():
+            line = line.strip()
+            if line.startswith("ufw ") and not line.startswith("ufw show"):
+                emit("enclave_ufw_rule", 1, {"rule": line[4:]},
+                     help="a rule in ufw's table, as the command that added it. Present whether or not ufw is enforcing - enclave_ufw_active says which")
+        SRC["ufw"] = 1
+    else:
+        SRC["ufw"] = 0
+
 # --------------------------------------------------------------------------- producer
 # Harbor is probed by the shell (it needs curl and a TLS endpoint), and its result arrives
 # as a flag so that source_ok is emitted in one place.

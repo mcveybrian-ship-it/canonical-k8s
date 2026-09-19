@@ -214,6 +214,40 @@ def read_nmap(path):
     return out
 
 
+# Ports probed over UDP IN ADDITION to every UDP port any machine reports listening on.
+# UDP scanning is slow and, through a DROP firewall, every closed port reads "open|filtered" -
+# so it is aimed, not exhaustive. 623 is IPMI: a BMC answering on the enclave network would be
+# a management plane nobody has accounted for.
+UDP_ALWAYS = [53, 67, 68, 69, 123, 137, 138, 161, 162, 500, 514, 520, 623, 1900, 4500, 5353]
+
+
+def run_scan(targets, udp_ports, xml_out):
+    """nmap from THIS machine: every TCP port, and the chosen UDP ports, on every enclave
+    address. Needs root (SYN and UDP scans). Returns the XML path."""
+    import shutil, subprocess
+    if os.geteuid() != 0:
+        sys.exit("--scan needs root: sudo %s ..." % sys.argv[0])
+    nmap = shutil.which("nmap")
+    if not nmap:
+        sys.exit("nmap is not installed on this machine - it is in the enclave mirror: sudo apt-get install nmap")
+    ports = "T:1-65535,U:" + ",".join(str(p) for p in sorted(set(udp_ports)))
+    cmd = [nmap, "-Pn", "-n", "-sS", "-sU", "-p", ports, "--max-retries", "2",
+           "--min-rate", "500", "-T4", "--reason", "-oX", xml_out] + sorted(targets)
+    print("running: " + " ".join(cmd), file=sys.stderr)
+    print("(every TCP port on %d machines plus %d UDP ports - several minutes)" % (len(targets), len(set(udp_ports))),
+          file=sys.stderr)
+    r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    if r.returncode != 0 or not os.path.exists(xml_out):
+        sys.exit("nmap failed (exit %d):\n%s" % (r.returncode, r.stderr))
+    # Hand the evidence back to the operator - written under sudo it is root's, and the
+    # next unprivileged regeneration could not read it.
+    uid, gid = os.environ.get("SUDO_UID"), os.environ.get("SUDO_GID")
+    if uid and gid:
+        os.chown(xml_out, int(uid), int(gid))
+    os.chmod(xml_out, 0o640)
+    return xml_out
+
+
 # ---------------------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser()
@@ -222,7 +256,9 @@ def main():
     ap.add_argument("--services", default=os.path.join(HERE, "ppsm-services.tsv"))
     ap.add_argument("--tailor", default=os.path.join(HERE, "stig-tailor.sh"))
     ap.add_argument("--addresses", default=os.path.join(HERE, "enclave-addresses.env"))
-    ap.add_argument("--nmap", default=None, help="nmap -oX output from svc-obs-01 (optional)")
+    ap.add_argument("--nmap", default=None, help="an existing nmap -oX result to use (optional)")
+    ap.add_argument("--scan", action="store_true",
+                    help="run the reachability scan now (needs root and nmap); XML is written beside --out")
     ap.add_argument("--out", default=None, help="write the CLSA here (default: stdout)")
     a = ap.parse_args()
 
@@ -243,6 +279,15 @@ def main():
              for r in prom(a.prometheus, "time() - enclave_facts_generated_seconds")}
 
     machines = sorted(addr_of)
+    if a.scan:
+        if not a.out:
+            sys.exit("--scan needs --out, so the scan XML has somewhere to live beside the report")
+        udp = UDP_ALWAYS + [int(r["metric"]["port"]) for r in socks if r["metric"]["proto"] == "udp"]
+        xml_out = re.sub(r"\.md$", "", a.out) + "-nmap.xml"
+        scan = read_nmap(run_scan(set(addr_of.values()), udp, xml_out))
+        scan_file = xml_out
+    else:
+        scan_file = a.nmap
     rules_by = collections.defaultdict(list)
     for r in live_rules:
         rules_by[r["metric"]["machine"]].append(parse_live_rule(r["metric"]["rule"]))
@@ -288,8 +333,14 @@ def main():
             if svc is None:
                 finding("UNIDENTIFIED", m, "%s/%s (%s, bind %s) matches no row in ppsm-services.tsv" % (port, proto, proc, bind))
             if bind != "loopback":
-                if proc != "docker-proxy" and not active.get(m):
-                    finding("UNFILTERED", m, "%s/%s (%s) is reachable from the enclave and ufw is not enforcing" % (port, proto, proc))
+                # WHEN A SCAN EXISTS IT WINS OVER THE ASSUMPTION. ss says what is bound; only the
+                # scan says what answers. A systemd IPAddressDeny filter, for one, is invisible to
+                # ss - calling that port "reachable" would be a false finding.
+                blocked = reach is not None and reach not in ("open", "open|filtered")
+                if proc != "docker-proxy" and not active.get(m) and blocked:
+                    finding("BOUND BUT NOT REACHABLE", m, "%s/%s (%s) binds %s but the scan got '%s' - filtered by something other than ufw; record what" % (port, proto, proc, bind, reach))
+                elif proc != "docker-proxy" and not active.get(m):
+                    finding("UNFILTERED", m, "%s/%s (%s) is %s from the enclave and ufw is not enforcing" % (port, proto, proc, "reachable" if reach in ("open", "open|filtered") else "assumed reachable (no scan)"))
                 elif proc != "docker-proxy" and active.get(m) and not lv:
                     finding("DEAD LISTENER", m, "%s/%s (%s) listens but ufw has no rule - remove the service or add the rule" % (port, proto, proc))
                 if dz is None and proc != "docker-proxy":
@@ -313,6 +364,14 @@ def main():
     for d in design:
         if d["machine"] in machines and (d["machine"], d["port"], d["proto"]) not in listening:
             finding("NOT LISTENING", d["machine"], "%s/%s is in the ufw design table but nothing listens on it" % (d["port"], d["proto"]))
+    # REACHABLE BUT NOT IN THE FACTS: something answers on the network that no machine
+    # reported listening. Docker-published ports, a BMC, a forgotten service - or a machine
+    # whose facts are stale. Either way it is surface nobody has accounted for.
+    if scan is not None:
+        for m in machines:
+            for (proto, port), state in sorted(scan.get(addr_of.get(m, ""), {}).items()):
+                if state == "open" and (m, port, proto) not in listening:
+                    finding("OPEN, NOT IN FACTS", m, "%s/%s answers from svc-obs-01 but no listener was reported for it" % (port, proto))
     for m in machines:
         for r in rules_by.get(m, []):
             if r["action"] == "?":
@@ -338,6 +397,10 @@ def main():
     if scan is None:
         L.append("")
         L.append("⚠️ **No reachability scan supplied** — the *Reachable* column is empty. Listening is not the same as reachable.")
+    else:
+        L.append("")
+        L.append("Reachability: nmap from svc-obs-01, every TCP port plus aimed UDP ports — `%s`. UDP `open|filtered` is"
+                 " ambiguous by nature; the listener facts are what make a UDP row trustworthy." % os.path.basename(scan_file or ""))
     L.append("")
     kinds = collections.Counter(k for k, _, _ in findings)
     L.append("## Summary")
@@ -357,7 +420,7 @@ def main():
         L.append("| Kind | Machine | Detail |")
         L.append("|---|---|---|")
         order = ["NOT ASSESSED", "STALE", "PROHIBITED", "UNIDENTIFIED", "UNFILTERED", "DEAD LISTENER",
-                 "NO DESIGN RECORD", "CAL MISMATCH", "RULE WITHOUT SERVICE", "NOT LISTENING", "UNPARSED RULE", "AO APPROVAL"]
+                 "NO DESIGN RECORD", "OPEN, NOT IN FACTS", "BOUND BUT NOT REACHABLE", "CAL MISMATCH", "RULE WITHOUT SERVICE", "NOT LISTENING", "UNPARSED RULE", "AO APPROVAL"]
         for k, m, t in sorted(findings, key=lambda f: (order.index(f[0]) if f[0] in order else 99, f[1])):
             L.append("| %s | %s | %s |" % (k, m, t.replace("|", "/")))
     else:
@@ -388,6 +451,9 @@ def main():
         with open(a.out, "w") as fh:
             fh.write(text)
         os.chmod(a.out, 0o640)
+        uid, gid = os.environ.get("SUDO_UID"), os.environ.get("SUDO_GID")
+        if uid and gid and os.geteuid() == 0:
+            os.chown(a.out, int(uid), int(gid))
         print("wrote %s - %d listeners, %d findings" % (a.out, len(rows), len(findings)), file=sys.stderr)
     else:
         sys.stdout.write(text)

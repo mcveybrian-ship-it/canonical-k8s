@@ -1,0 +1,41 @@
+# ppsm-services.tsv - what each listening socket IS, for the PPSM CLSA (backlog 6a.22).
+#
+# HAND-MAINTAINED, and the only hand-written input to ppsm.py. Everything else - what is
+# listening, where, the firewall state - is measured every 15 minutes by `monitoring.sh facts`.
+# Built 2026-09-19 from the listeners all eight machines actually reported, not from memory.
+#
+# Columns, TAB-separated:
+#   proto     tcp or udp
+#   port      the port, or * for a service whose port is ephemeral (random at each start)
+#   process   as ss reports it. THE KERNEL TRUNCATES NAMES TO 15 CHARACTERS - the libvirt
+#             exporter is "prometheus-libv", the contracts server is "contracts-airga".
+#   cal       the EXACT service name in the PPSM CAL at that port and protocol, or - when the
+#             CAL has no entry (then it needs a local CLSA entry and AO approval)
+#   purpose   one line, for the CLSA. Firewall justifications live in stig-tailor.sh ufw_rules();
+#             this says what the service is, not why the port is open.
+#
+# A listener that matches no row is reported as UNIDENTIFIED - add a row, or remove the service.
+proto	port	process	cal	purpose
+tcp	22	sshd,systemd	SSH	OpenSSH - administrative access. FIPS ciphers, key auth, DoD banner
+tcp	22	sshd	SSH	OpenSSH - administrative access. FIPS ciphers, key auth, DoD banner
+tcp	53	named	DNS	BIND 9 - authoritative for enclave.internal and its reverse zone, recursion off (svc-mgmt-01)
+udp	53	named	DNS	BIND 9 - authoritative for enclave.internal and its reverse zone, recursion off (svc-mgmt-01)
+udp	123	chronyd	NTP	chrony serving time to the enclave - host-4 is the reference (local stratum 5), svc-mgmt-01 syncs from it and serves on
+tcp	80	nginx	HTTP	nginx - 301 redirect to HTTPS only; no content is served in clear
+tcp	443	nginx	HTTPS	nginx TLS front end: apt mirror (svc-repo-01), Grafana (svc-obs-01), Ubuntu Pro contracts server proxied to 127.0.0.1:8484 (svc-mgmt-01)
+tcp	80	docker-proxy	HTTP	Harbor registry, published by Docker - redirect to HTTPS. Docker bypasses ufw for this port
+tcp	443	docker-proxy	HTTPS	Harbor container registry over TLS, published by Docker. Docker bypasses ufw for this port
+tcp	8484	contracts-airga	-	Ubuntu Pro air-gapped contracts server. Runbook says loopback-only via systemd IPAddressDeny, which ss cannot see - verify with the reachability scan
+tcp	9100	prometheus-node	-	Prometheus node-exporter - host metrics, scraped only by svc-obs-01
+tcp	9177	prometheus-libv	-	Prometheus libvirt exporter - per-guest metrics on hypervisors, scraped only by svc-obs-01
+tcp	25	master	SMTP-25	Postfix local delivery - loopback only
+tcp	53	systemd-resolve	DNS	systemd-resolved stub resolver - loopback only
+udp	53	systemd-resolve	DNS	systemd-resolved stub resolver - loopback only
+udp	323	chronyd	-	chrony command socket - loopback only
+tcp	953	named	-	BIND rndc control channel - loopback only
+tcp	5432	postgres	PGDG-POSTGRESQL-DB	PostgreSQL on svc-mgmt-01 - loopback only; backlog: confirm unused and remove
+tcp	3000	grafana	-	Grafana - loopback only, published through nginx 443
+tcp	9090	prometheus	-	Prometheus - loopback only
+tcp	9093	prometheus-aler	-	Alertmanager - loopback only
+tcp	1514	docker-proxy	-	Harbor internal syslog - loopback only
+tcp	*	containerd	-	containerd API on an ephemeral port - loopback only

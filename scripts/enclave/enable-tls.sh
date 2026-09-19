@@ -222,7 +222,7 @@ say "nginx $NGINX_VER - http2 via $( [ -n "$H2_LISTEN" ] && echo 'listen directi
   echo "    listen 443 ssl$H2_LISTEN;"
   echo "    listen [::]:443 ssl$H2_LISTEN;"
   [ -n "$H2_DIRECTIVE" ] && echo "$H2_DIRECTIVE"
-  echo "    server_name $NAME ${NAME}.\${ENCLAVE_DOMAIN:-enclave.internal} _;"
+  echo "    server_name $NAME ${NAME}.${ENCLAVE_DOMAIN:-enclave.internal} _;"
   echo ""
   echo "    ssl_certificate     /etc/ssl/enclave/$NAME.fullchain.crt;"
   echo "    ssl_certificate_key $KEY;"

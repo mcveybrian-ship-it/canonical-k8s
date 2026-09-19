@@ -3385,8 +3385,9 @@ $(printf '%s\n' "$cand" | sed 's/^/        /')"
 #
 # MACHINES DELIBERATELY ABSENT FROM THIS TABLE:
 #
-#   svc-mgmt-01 - MAAS opens ~30 ports (5239-5284, 3128, 8000, 53, 67/udp, 69/udp, 5353) and
-#                 getting it wrong breaks PXE and deploy, which is how host-1..3 get built.
+#   svc-mgmt-01 - WAS absent: MAAS opened ~30 ports and getting them wrong broke PXE. MAAS was
+#                 removed 2026-09-18, and its table below was written 2026-09-19 from the
+#                 MEASURED listeners (ppsm.py, backlog 6a.22), not from a port list in a doc.
 #   host-4      - it BRIDGES guest traffic over br0, and ufw's default FORWARD policy is DROP.
 #                 Enabling ufw on the hypervisor can cut off every VM depending on
 #                 br_netfilter. Same class of risk as MAAS, and it takes the whole enclave
@@ -3419,7 +3420,13 @@ host-2	9177/tcp	limit	__SVC_OBS_01__	prometheus-libvirt-exporter. Added 2026-09-
 host-3	22/tcp	limit	any	ssh - same reasoning as host-1
 host-3	9100/tcp	limit	__SVC_OBS_01__	node-exporter, source-restricted to the collector. LIMIT not allow (2026-09-19): the only permitted source scrapes every 15 s, ~2 connections per 30 s, well under ufw's 6-per-30 s threshold - and ufw_rate_limit fails on ANY listening port left at allow
 host-3	9177/tcp	limit	__SVC_OBS_01__	prometheus-libvirt-exporter. Added 2026-09-18 when host-3 became a virtualisation host - per-guest CPU, disk and network for every VM it runs. Source-restricted to the collector, always: this is the most revealing port on the machine. LIMIT not allow (2026-09-19): the only permitted source scrapes every 15 s, ~2 connections per 30 s, well under ufw's 6-per-30 s threshold - and ufw_rate_limit fails on ANY listening port left at allow
-svc-mgmt-01	9100/tcp	allow	__SVC_OBS_01__	node-exporter, source-restricted to the collector. MAAS was removed 2026-09-18, so the reason this machine had no rule table (~30 MAAS ports, unconfirmed) is gone - backlog 3.1
+svc-mgmt-01	22/tcp	limit	any	ssh - administrative access; limit is safe here, as everywhere
+svc-mgmt-01	53/tcp	allow	__ENCLAVE_CIDR__	BIND - authoritative for enclave.internal and its reverse zone, recursion off. TCP for large answers and zone checks. allow not limit: every machine resolves through this box, and a rate limit on DNS fails resolution enclave-wide
+svc-mgmt-01	53/udp	allow	__ENCLAVE_CIDR__	BIND over UDP - the normal query path. Enclave subnet only; recursion is off, so it answers nothing outside enclave.internal anyway
+svc-mgmt-01	123/udp	allow	__ENCLAVE_CIDR__	chrony serving time on to the enclave - it syncs from host-4 (the reference) and serves the subnet
+svc-mgmt-01	80/tcp	allow	__ENCLAVE_CIDR__	nginx 301 to https only, so a plaintext client gets a redirect rather than a timeout
+svc-mgmt-01	443/tcp	allow	__ENCLAVE_CIDR__	nginx TLS in front of the Ubuntu Pro contracts server on 127.0.0.1:8484 - every machine's `pro` client talks to it. 8484 itself is NOT in this table: it is loopback-only by systemd IPAddressDeny, proven by the 2026-09-19 scan (filtered)
+svc-mgmt-01	9100/tcp	limit	__SVC_OBS_01__	node-exporter, source-restricted to the collector; limit for the same reason as host-1/2/3
 EOF
 }
 
@@ -3480,7 +3487,6 @@ cmd_ufw() {
   if [ -z "$mine" ]; then
     die "no ufw rule table for '$me'.
       This machine is deliberately not covered - see the comment above ufw_rules().
-      svc-mgmt-01: MAAS port list unconfirmed; breaking it breaks PXE and deploy.
       host-4:      bridges guest traffic; ufw FORWARD policy can cut off every VM.
       Add a table entry only after the port list is confirmed AND tested."
   fi

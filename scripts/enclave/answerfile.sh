@@ -332,16 +332,22 @@ $live = @(bash -c $c_live) | Where-Object { $_ -ne "" }
 $hw   = @(bash -c $c_hw)   | Where-Object { $_ -ne "" }
 $blk  = @(bash -c $c_blk)  | Where-Object { $_ -ne "" }
 $load = @(bash -c $c_load) | Where-Object { $_ -ne "" }
-if ($hw.Count -eq 0 -and $live.Count -eq 0 -and $load.Count -eq 0) {
+# A FRAMEWORK MODULE IS NOT A RADIO. cfg80211, mac80211 and the bluetooth core load with no
+# adapter present - measured 2026-09-19: cfg80211 resident, used by nothing, on every service
+# VM, none of which has a radio. Counting it made this check report "A RADIO IS PRESENT" with
+# an EMPTY hardware list on four machines. Only real hardware or a DRIVER module is evidence.
+$drv  = @($load | Where-Object { $_ -notmatch '^(cfg80211|mac80211|bluetooth)$' })
+$fw   = @($load | Where-Object { $_ -match '^(cfg80211|mac80211|bluetooth)$' })
+if ($hw.Count -eq 0 -and $live.Count -eq 0 -and $drv.Count -eq 0) {
     $V.Valid = $true
-    $V.Results = "NOT A FINDING - THERE IS NO RADIO IN THIS MACHINE. DISA's CheckText was executed verbatim and returned nothing; no interface exposes phy80211; no PCI device reports class 0x0280 (network controller, other), which is what an 802.11 adapter reports; and no wireless or Bluetooth module is resident. This is a virtual guest with no physical radio, so the CheckText's own note - 'not applicable for systems that do not have physical wireless network radios' - is satisfied ON THE HARDWARE, not merely on the absence of a bound driver."
+    $V.Results = "NOT A FINDING - THERE IS NO RADIO IN THIS MACHINE. DISA's CheckText was executed verbatim and returned nothing; no interface exposes phy80211; no PCI device reports class 0x0280 (network controller, other), which is what an 802.11 adapter reports; and no wireless or Bluetooth module is resident. This is a virtual guest with no physical radio, so the CheckText's own note - 'not applicable for systems that do not have physical wireless network radios' - is satisfied ON THE HARDWARE, not merely on the absence of a bound driver." + $(if ($fw.Count -gt 0) { " Wireless FRAMEWORK module(s) resident with no driver or adapter using them: " + ($fw -join '; ') + " - generic kernel plumbing, not a radio." } else { "" })
 }
 elseif ($live.Count -eq 0 -and $blk.Count -gt 0) {
     $V.Valid = $true
     $V.Results = "NOT A FINDING - THE RADIO IS PRESENT AND DELIBERATELY DISABLED. Physical radio(s) detected: " + ($hw -join '; ') + ". DISA's CheckText returns " + $(if ($disa.Count -eq 0) { "nothing" } else { $disa -join '; ' }) + " and no interface exposes phy80211, so no wireless interface is configured. That state is ENFORCED rather than incidental: /etc/modprobe.d/99-stig-radio.conf carries " + ($blk -join '; ') + ", written by scripts/enclave/stig-tailor.sh radio disable and applied to the initramfs as well as to /etc, so the driver cannot bind at boot. Residual modules still resident from before the block, if any: " + $(if ($load.Count -eq 0) { "none" } else { $load -join '; ' }) + ". The enclave is air-gapped and a radio is the one component that can cross that gap without a cable being moved, so this is disabled at the kernel rather than documented as an accepted interface."
 }
 elseif ($live.Count -eq 0) {
-    $V.Results = "OPEN - A RADIO IS PRESENT AND NOTHING IS BLOCKING IT. Physical radio(s): " + ($hw -join '; ') + ". No interface exposes phy80211 and DISA's glob returns nothing, which is why a scanner scores this NOT APPLICABLE - but that is an accident of no driver being bound, not a control. Nothing in /etc/modprobe.d/99-stig-radio.conf blocks the driver, so a kernel update, a firmware package or a manual modprobe brings the adapter up. Remediate with: sudo ./scripts/enclave/stig-tailor.sh radio disable"
+    $V.Results = "OPEN - A RADIO IS PRESENT AND NOTHING IS BLOCKING IT. Physical radio(s): " + $(if ($hw.Count -gt 0) { $hw -join '; ' } else { "none on PCI" }) + ". Radio driver module(s) resident: " + $(if ($drv.Count -gt 0) { $drv -join '; ' } else { "none" }) + ". No interface exposes phy80211 and DISA's glob returns nothing, which is why a scanner scores this NOT APPLICABLE - but that is an accident of no driver being bound, not a control. Nothing in /etc/modprobe.d/99-stig-radio.conf blocks the driver, so a kernel update, a firmware package or a manual modprobe brings the adapter up. Remediate with: sudo ./scripts/enclave/stig-tailor.sh radio disable"
 }
 else {
     $V.Results = "OPEN. Live 802.11 interface(s) configured: " + ($live -join '; ') + ". DISA's CheckText returns: " + $(if ($disa.Count -eq 0) { "nothing - the WEXT directory is absent, but the interface is real" } else { $disa -join '; ' }) + ". Physical radio(s): " + ($hw -join '; ') + ". Modules resident: " + ($load -join '; ') + "."

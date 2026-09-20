@@ -1319,8 +1319,14 @@ cmd_second_copy() {
       say "key already exists: $SECOND_KEY"
     else
       install -d -m 0700 "$(dirname "$SECOND_KEY")"
-      ssh-keygen -t ed25519 -N '' -C "vm-backup second copy from $(hostname -s)" -f "$SECOND_KEY" >/dev/null \
-        || die "ssh-keygen failed"
+      # RSA, NOT ed25519. These hosts run FIPS and ssh-keygen refuses outright:
+      #   "ED25519 keys are not allowed in FIPS mode"   (measured on host-4, 2026-09-20)
+      # The FIPS-approved choices are RSA and ECDSA P-256/384; RSA 4096 is the least surprising
+      # and matches the keys the build already uses. BACKUP_SECOND_KEYTYPE overrides.
+      local kt="${BACKUP_SECOND_KEYTYPE:-rsa}" kb=()
+      [ "$kt" = rsa ] && kb=(-b 4096)
+      ssh-keygen -t "$kt" "${kb[@]}" -N '' -C "vm-backup second copy from $(hostname -s)" -f "$SECOND_KEY" >/dev/null \
+        || die "ssh-keygen failed for type $kt - on a FIPS host try rsa or ecdsa"
       ok "created $SECOND_KEY"
     fi
     local myaddr; myaddr="$(ip -4 -br addr | awk '{print $3}' | cut -d/ -f1 | grep -v '^127' | head -1)"

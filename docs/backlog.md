@@ -212,6 +212,9 @@ server, node-exporter. 13 packages and 10 services gone.
 
 ## 9. Recently closed — append only, newest first
 
+**2026-09-20**
+- ✅ **FIPS refuses ed25519 for SSH keys** — `ssh-keygen -t ed25519` on host-4: *"ED25519 keys are not allowed in FIPS mode"*. Approved types are RSA and ECDSA P-256/384. `vm-backup.sh second-copy --setup` now makes RSA 4096 (`BACKUP_SECOND_KEYTYPE` overrides). Worth remembering for the CAC/PIV work (6a.23) and any new key in the boundary
+
 **2026-09-19**
 - ✅ **2.2 Move `svc-repo-01` off host-4 and 2.3 Rebuild host-4 — SUPERSEDED by 2.6** (Brian: *"can this not be addressed when we rebuild the whole system from scratch"*). 2.3 existed to clear host-4's built-before-the-fix gaps — since fixed in place by fixups — and to prove the host build reproducible, which the from-scratch build proves better. 2.2 existed only to make 2.3 safe. Neither is worth an outage on the host carrying the mirror, DNS, Harbor, monitoring and the backup drive
 - ✅ **Collector placement decided (recorded late; decided 2026-09-18): `svc-obs-01` stays on host-4.** Moving it to host-1 for AU-9(2) changes *which* four machines fail, not how many (host-4 + 3 guests vs host-1 + 3 guests at full build). On four hosts with everything virtualised no placement fully satisfies AU-9(2); the residual is a stated exception. Don't re-open without a fifth physical box

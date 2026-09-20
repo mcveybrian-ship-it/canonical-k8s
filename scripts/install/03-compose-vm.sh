@@ -240,9 +240,10 @@ if [ "$DESTROY" -eq 1 ]; then
   ok "$VM removed"; exit 0
 fi
 
-[ "$DRY" -eq 1 ] || [ "$(id -u)" -eq 0 ] || die "run with sudo"
-
 # ---- refuse to compose a guest anywhere but its declared home ----------------------------
+# CHECKED BEFORE THE ROOT CHECK, DELIBERATELY: being on the wrong machine needs no
+# privilege to discover, and an operator on the wrong host should be told THAT rather
+# than being asked for a sudo password first.
 # backlog 2.7. THIS WAS A WARNING, AND IT NAMED host-4 UNCONDITIONALLY - which is exactly how
 # every service VM came to live on one machine (red flag 1.2). A warning refuses nothing, and
 # the composer had no idea where a guest was supposed to live. The placement map in
@@ -260,6 +261,9 @@ if [ "$DRY" -eq 0 ] && [ "$ME" != "$PLACE" ] \
        Either run it on $PLACE, or change PLACE_$KEY_NAME in vm-specs.env and say why."
 fi
 [ "$DRY" -eq 1 ] || ok "placement: $VM -> $PLACE (this machine)"
+
+[ "$DRY" -eq 1 ] || [ "$(id -u)" -eq 0 ] || die "run with sudo"
+
 
 # These describe the target host, so they are checked for a real run only. A dry run must be
 # usable anywhere - reviewing the rendered cloud-init is exactly what it is for.

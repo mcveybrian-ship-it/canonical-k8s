@@ -1348,7 +1348,10 @@ cmd_second_copy() {
   local -a doms=() skipped=()
   local d
   for d in $(find "$DEST" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort); do
-    [ -d "$DEST/$d" ] || continue
+    # A DIRECTORY AT THE TOP OF THE VOLUME IS NOT A DOMAIN. The filesystem's own lost+found is
+    # one, and the first dry run duly offered to replicate it. A domain directory is one that
+    # holds at least one backup SET, and a set is a directory with an INFO file in it.
+    [ -n "$(find "$DEST/$d" -mindepth 2 -maxdepth 2 -name INFO -print -quit 2>/dev/null)" ] || continue
     if [ "$all" -eq 0 ] && printf '%s\n' $SECOND_SKIP | grep -qx "$d"; then skipped+=("$d"); continue; fi
     doms+=("$d")
   done
@@ -1357,7 +1360,9 @@ cmd_second_copy() {
   say "domains    : ${doms[*]}"
   [ "${#skipped[@]}" -eq 0 ] || say "excluded   : ${skipped[*]} (rebuildable - see BACKUP_SECOND_SKIP)"
 
-  local SSH=(ssh -i "$SECOND_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10)
+  # LogLevel=ERROR silences the login BANNER - which OpenSSH prints at INFO and which otherwise
+  # repeats its full DoD text once per rsync - WITHOUT hiding errors, which are logged above it.
+  local SSH=(ssh -i "$SECOND_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o LogLevel=ERROR)
   local -a RS=(rsync -a --partial --human-readable -e "${SSH[*]}")
   [ "$dry" -eq 1 ] && RS+=(--dry-run --itemize-changes)
 

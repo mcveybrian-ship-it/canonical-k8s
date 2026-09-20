@@ -11,6 +11,9 @@
 #     sudo ./vm-backup.sh verify                 check what ARRIVED, not what was sent
 #     sudo ./vm-backup.sh prune                  drop chains beyond BACKUP_KEEP_CHAINS
 #     sudo ./vm-backup.sh restore-plan <vm>      print the restore steps - never automatic
+#     sudo ./vm-backup.sh second-copy            push completed sets to the host the placement
+#                                                map names - a copy that does not die with this
+#                                                machine (red flag 1.2). --setup makes the key
 #     sudo ./vm-backup.sh restore-test <vm>      REHEARSE one: rebuild the chain into its own
 #                                                directory, boot it as restore-test-<vm> with
 #                                                no NIC, prove it, remove it. Touches nothing live
@@ -62,12 +65,24 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=/dev/null
 [ -f "$HERE/vm-specs.env" ] && . "$HERE/vm-specs.env"
+# Addresses, so the second copy can resolve the host the placement map names. Optional: every
+# other subcommand works without it.
+# shellcheck source=/dev/null
+[ -f "$HERE/enclave-addresses.env" ] && . "$HERE/enclave-addresses.env"
 
 DEST="${VM_BACKUP_DEST:-${BACKUP_DEST:-}}"
 KEEP="${BACKUP_KEEP_CHAINS:-2}"
 LUKS_UUID="${BACKUP_LUKS_UUID:-}"
 LUKS_NAME="${BACKUP_LUKS_NAME:-vmbackup}"
 KEYFILE="${BACKUP_KEYFILE:-/etc/enclave/vmbackup.key}"
+SECOND_DIR="${BACKUP_SECOND_DIR:-/var/lib/libvirt/images-data/backup-copy}"
+SECOND_KEY="${BACKUP_SECOND_KEY:-/etc/enclave/backup-copy.key}"
+SECOND_STATE="${BACKUP_SECOND_STATE:-/var/lib/enclave-backup-second.state}"
+# THE MIRROR IS EXCLUDED BY DEFAULT, AND IT IS A MEASUREMENT THAT SAYS SO. svc-repo-01 is
+# 332 GB and took 1 h 11 m to restore on 2026-09-20, against 3 m 34 s for the next largest -
+# and every byte of it is an apt mirror, rebuildable from the transfer bundle. Copying it a
+# second time costs the most and protects the least. --all overrides.
+SECOND_SKIP="${BACKUP_SECOND_SKIP:-svc-repo-01}"
 ACCEPT_PLAIN=0
 ALLOW_NONMOUNT=0
 DETACH=0
@@ -1242,6 +1257,134 @@ cmd_restore_plan() {
 PLAN
 }
 
+# ---------------------------------------------------------------- second copy
+# A COPY THAT DOES NOT DIE WITH THIS MACHINE - red flag 1.2.
+#
+#     sudo ./vm-backup.sh second-copy --setup    make the key, print what to authorise
+#     sudo ./vm-backup.sh second-copy [-n] [--all]
+#
+# Today the only copy of every guest is on a drive attached to the host that runs them. Lose
+# host-4 and you lose the guests AND the way back - two mechanisms, one failure. This pushes
+# completed sets to the host the placement map names, over SSH on 22 (already on the CAL and
+# in the PPSM entry, so it opens no new port and needs no new approval).
+#
+# WHAT THIS IS NOT: an offsite copy. Both machines are in one room, so red flag 1.3 - a site
+# event - is untouched by it. Say that in the SSP rather than letting a second copy imply it.
+#
+# THE KEY IS RESTRICTED ON THE RECEIVING SIDE, not trusted on this one: `rrsync -wo` allows
+# rsync to WRITE INTO one directory and nothing else - no shell, no reading back, no other
+# path. A compromise of this host can still overwrite what it has already sent; defending
+# against that needs media it cannot reach, which is the same answer as 1.3.
+second_host() {   # the host the placement map sends this machine's copies to
+  local want="${BACKUP_SECOND_HOST:-${PLACE_BACKUP_SECOND:-}}" me; me="$(hostname -s)"
+  case "$want" in
+    "")   printf '' ;;
+    ring) # next host in the map that runs guests, wrapping - see vm-specs.env
+          local -a ring=(); local v h
+          for v in $(compgen -A variable PLACE_ 2>/dev/null); do
+            case "$v" in PLACE_BACKUP_SECOND) continue ;; esac
+            [ -n "${!v}" ] && ring+=("${!v}")
+          done
+          mapfile -t ring < <(printf '%s\n' "${ring[@]}" | sort -u)
+          local i
+          for i in "${!ring[@]}"; do
+            [ "${ring[$i]}" = "$me" ] || continue
+            printf '%s' "${ring[$(( (i+1) % ${#ring[@]} ))]}"; return
+          done
+          printf '' ;;
+    *)    [ "$want" = "$me" ] && printf '' || printf '%s' "$want" ;;
+  esac
+}
+
+cmd_second_copy() {
+  local setup=0 dry=0 all=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --setup) setup=1; shift ;;
+      -n|--dry-run) dry=1; shift ;;
+      --all) all=1; shift ;;
+      *) die "second-copy: unknown argument $1" ;;
+    esac
+  done
+  need_root
+  local target addr
+  target="$(second_host)"
+  [ -n "$target" ] || die "no second-copy target. Set PLACE_BACKUP_SECOND in vm-specs.env (or BACKUP_SECOND_HOST) -
+       empty means every backup lives only on this machine, which IS red flag 1.2."
+  local avar; avar="$(echo "$target" | tr 'a-z-' 'A-Z_')"; addr="${!avar:-}"
+  [ -n "$addr" ] || die "$target has no address in enclave-addresses.env"
+
+  if [ "$setup" -eq 1 ]; then
+    if [ -s "$SECOND_KEY" ]; then
+      say "key already exists: $SECOND_KEY"
+    else
+      install -d -m 0700 "$(dirname "$SECOND_KEY")"
+      ssh-keygen -t ed25519 -N '' -C "vm-backup second copy from $(hostname -s)" -f "$SECOND_KEY" >/dev/null \
+        || die "ssh-keygen failed"
+      ok "created $SECOND_KEY"
+    fi
+    local myaddr; myaddr="$(ip -4 -br addr | awk '{print $3}' | cut -d/ -f1 | grep -v '^127' | head -1)"
+    printf '\n  ON %s (%s), run this ONCE - it authorises a WRITE-ONLY rsync into one directory:\n\n' "$target" "$addr"
+    # ONE PASTEABLE LINE PER STEP. An earlier version built the authorized_keys line with
+    # `printf %s\n`, which the pasting shell collapses to the format "%sn" - it would have
+    # appended a stray "n" to the key and produced an authorisation that silently never matched.
+    printf '    sudo install -d -m 0750 -o root -g root %s\n' "$SECOND_DIR"
+    printf '    sudo install -d -m 0700 /root/.ssh\n'
+    printf '    echo %s | sudo tee -a /root/.ssh/authorized_keys >/dev/null\n' \
+      "'from=\"$myaddr\",restrict,command=\"/usr/bin/rrsync -wo $SECOND_DIR\" $(cut -d" " -f1-2 "$SECOND_KEY.pub")'"
+    printf '    sudo chmod 600 /root/.ssh/authorized_keys\n\n'
+    say "then:  sudo $0 second-copy -n"
+    return 0
+  fi
+
+  [ -r "$SECOND_KEY" ] || die "no key at $SECOND_KEY - run: sudo $0 second-copy --setup"
+  check_dest
+  local -a doms=() skipped=()
+  local d
+  for d in $(find "$DEST" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort); do
+    [ -d "$DEST/$d" ] || continue
+    if [ "$all" -eq 0 ] && printf '%s\n' $SECOND_SKIP | grep -qx "$d"; then skipped+=("$d"); continue; fi
+    doms+=("$d")
+  done
+  [ "${#doms[@]}" -gt 0 ] || die "nothing to copy - every domain is excluded by BACKUP_SECOND_SKIP"
+  say "second copy: $(hostname -s) -> $target ($addr):$SECOND_DIR"
+  say "domains    : ${doms[*]}"
+  [ "${#skipped[@]}" -eq 0 ] || say "excluded   : ${skipped[*]} (rebuildable - see BACKUP_SECOND_SKIP)"
+
+  local SSH=(ssh -i "$SECOND_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10)
+  local -a RS=(rsync -a --partial --human-readable -e "${SSH[*]}")
+  [ "$dry" -eq 1 ] && RS+=(--dry-run --itemize-changes)
+
+  local t0 bytes=0 rc=0; t0="$(date +%s)"
+  for d in "${doms[@]}"; do
+    say "  $d ..."
+    if ! "${RS[@]}" "$DEST/$d/" "root@$addr:$d/"; then
+      warn "$d: rsync FAILED - see the error above"; rc=1; continue
+    fi
+    # VERIFY WHAT ARRIVED, NOT WHAT WAS SENT - the same rule as `verify`. --checksum re-reads
+    # the far end and compares content; anything listed here differs, and a clean run prints
+    # nothing at all. It works through the restricted rrsync because the receiver does the work.
+    if [ "$dry" -eq 0 ]; then
+      local diff; diff="$(rsync -a --dry-run --itemize-changes --checksum -e "${SSH[*]}" "$DEST/$d/" "root@$addr:$d/" 2>&1 | grep -vE '^$|^sending|^total|^sent ' || true)"
+      if [ -n "$diff" ]; then
+        warn "$d: the copy DIFFERS from the source after transfer:"; printf '%s\n' "$diff" | head -5 >&2; rc=1
+      else
+        ok "$d: copied and verified byte-for-byte"
+      fi
+      bytes=$(( bytes + $(du -sb "$DEST/$d" | cut -f1) ))
+    fi
+  done
+  local t1; t1="$(date +%s)"
+  [ "$dry" -eq 1 ] && { say "DRY RUN - nothing was transferred"; return 0; }
+
+  # State for the facts below: a second copy that silently stopped is the failure mode here.
+  printf 'host=%s\nseconds=%s\nbytes=%s\ndomains=%s\nrc=%s\nduration=%s\n' \
+    "$target" "$(date +%s)" "$bytes" "${#doms[@]}" "$rc" "$((t1-t0))" > "$SECOND_STATE"
+  chmod 0644 "$SECOND_STATE"
+  [ "$rc" -eq 0 ] || die "second copy finished WITH ERRORS in $((t1-t0))s"
+  ok "second copy complete: ${#doms[@]} domain(s), $(numfmt --to=iec "$bytes" 2>/dev/null || echo "$bytes")B, $((t1-t0))s"
+}
+
 # ---------------------------------------------------------------- restore TEST
 # PROVING A RESTORE, WITHOUT RISKING THE THING BEING RESTORED. backlog 2.1, control CP-4.
 #
@@ -1631,6 +1774,27 @@ cmd_facts() {
     printf '# HELP enclave_backup_total_bytes newest complete set summed across all domains\n'
     printf '# TYPE enclave_backup_total_bytes gauge\n'
     printf 'enclave_backup_total_bytes %s\n' "$total"
+
+    # THE SECOND COPY - red flag 1.2. A copy that quietly stopped is indistinguishable from one
+    # that never ran, and both look like "we have backups" until the day host-4 is gone. The
+    # metric is emitted even when it is NOT configured, as a 0, because a missing series reads
+    # as "no data" on a dashboard and that is the one answer that must never look like silence.
+    local sec_host sec_when sec_bytes sec_rc
+    sec_host="$(second_host)"
+    if [ -n "$sec_host" ]; then
+      sec_when="$(awk -F= '/^seconds=/{print $2}' "$SECOND_STATE" 2>/dev/null)"
+      sec_bytes="$(awk -F= '/^bytes=/{print $2}' "$SECOND_STATE" 2>/dev/null)"
+      sec_rc="$(awk -F= '/^rc=/{print $2}' "$SECOND_STATE" 2>/dev/null)"
+    fi
+    printf '# HELP enclave_backup_second_configured 1 if a second copy target is set\n'
+    printf '# TYPE enclave_backup_second_configured gauge\n'
+    printf 'enclave_backup_second_configured{target="%s"} %s\n' "${sec_host:-none}" "$([ -n "$sec_host" ] && echo 1 || echo 0)"
+    printf '# HELP enclave_backup_second_last_success_seconds unix time the second copy last completed cleanly\n'
+    printf '# TYPE enclave_backup_second_last_success_seconds gauge\n'
+    [ -n "${sec_when:-}" ] && [ "${sec_rc:-1}" = 0 ] && printf 'enclave_backup_second_last_success_seconds %s\n' "$sec_when"
+    printf '# HELP enclave_backup_second_last_bytes bytes held in the second copy at the last run\n'
+    printf '# TYPE enclave_backup_second_last_bytes gauge\n'
+    [ -n "${sec_bytes:-}" ] && printf 'enclave_backup_second_last_bytes %s\n' "$sec_bytes"
     printf '# HELP enclave_backup_facts_generated_seconds unix time these facts were written\n'
     printf '# TYPE enclave_backup_facts_generated_seconds gauge\n'
     printf 'enclave_backup_facts_generated_seconds %s\n' "$(date +%s)"
@@ -1668,5 +1832,6 @@ case "${1:-status}" in
   unschedule)   cmd_unschedule ;;
   restore-plan) shift || true; cmd_restore_plan "${1:-}" ;;
   restore-test) shift || true; cmd_restore_test "$@" ;;
-  *) printf 'usage: %s {status|facts|full [vm]|incr [vm]|progress|verify [--all]|prune [--dry-run]|keyfile|reattach|schedule [HH:MM]|unschedule|restore-plan <vm>|restore-test <vm> [--set S] [--keep] [-n]}\n' "$0" >&2; exit 2 ;;
+  second-copy)  shift || true; cmd_second_copy "$@" ;;
+  *) printf 'usage: %s {status|facts|full [vm]|incr [vm]|progress|verify [--all]|prune [--dry-run]|keyfile|reattach|schedule [HH:MM]|unschedule|restore-plan <vm>|restore-test <vm> [--set S] [--keep] [-n]|second-copy [--setup] [-n] [--all]}\n' "$0" >&2; exit 2 ;;
 esac

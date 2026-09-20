@@ -183,6 +183,20 @@ databases on `host-1..3` sit healthy and unrecoverable to any point but their ow
 A sharper statement than the site-event caveat above, and it deserves its own sentence. Source:
 runbook §9a.1 correction 1 · suggested control CP-9.
 
+🔄 **Reduced, not closed — 2026-09-20.** `vm-backup.sh second-copy` now pushes completed sets to
+`host-1` after every nightly run: **84 GB copied and verified byte-for-byte in 877 s**, covering
+the three guests holding state nothing can regenerate (`svc-mgmt-01`'s issuing CA key and DNS,
+`svc-harbor-01`'s images, `svc-obs-01`'s monitoring history). The mirror is deliberately excluded
+— 332 GB that took **1 h 11 m** to restore and is rebuildable from the transfer bundle
+(`contingency-plan.md` §9.2). The receiving key is restricted to a write-only `rsync` into one
+directory, and the copy is verified by re-reading the far end rather than by trusting an exit
+status.
+
+**What remains true.** The WAL archive is still unbuilt and still destined for `host-4`
+(`poam.md` ENG-04), so the *roll-forward* half of this finding is untouched — and it is the half
+that should be designed off `host-4` before `pg-01..03` exist, while it costs nothing. Both
+copies also remain in one room, so §3.1 is unaffected: a second copy is not an offsite copy.
+
 ### 3.3 Backups are verified, and the verification has a known blind spot
 
 > **Every backup set carries a SHA-256 manifest. Changed sets are verified nightly; the whole

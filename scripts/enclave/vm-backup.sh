@@ -1121,6 +1121,10 @@ ExecStart=${self} incr
 # question - see ${VERIFY_SVC}.timer, installed alongside this one.
 ExecStart=${self} verify
 ExecStart=${self} prune
+# The off-host copy, LAST and non-fatal: a network or a far-end problem must not make the
+# night's backup look failed when the backup itself succeeded. It reports through
+# enclave_backup_second_* - an ageing timestamp there is the signal, not this unit's status.
+ExecStart=-${self} second-copy
 EOF
 
   cat > "/etc/systemd/system/${SVC_NAME}.timer" <<EOF
@@ -1178,12 +1182,12 @@ EOF
   ok "scheduled: ${SVC_NAME}.timer at ${at} ${BACKUP_TZ} daily -> ${DEST}"
   ok "scheduled: ${VERIFY_SVC}.timer '${weekly_cal}' - deep verify, reads every byte"
   say ""
-  say "   nightly: incr + verify (changed sets only) + prune   - minutes"
+  say "   nightly: incr + verify (changed sets only) + prune + second-copy   - minutes"
   say "   weekly : verify --all                                - reads the whole volume"
   say ""
   systemctl list-timers "${SVC_NAME}.timer" "${VERIFY_SVC}.timer" --no-pager | sed 's/^/       /'
   printf '\n'
-  say "each run does: incr (falls back to full with no checkpoint), verify, prune"
+  say "each run does: incr (falls back to full with no checkpoint), verify, prune, second-copy"
   say "watch it with:   journalctl -u ${SVC_NAME}.service -n 50"
 
   # SAY THE REBOOT PROBLEM OUT LOUD, EVERY TIME, IF IT APPLIES.

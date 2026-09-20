@@ -25,7 +25,7 @@ These are the ones an assessor reads first. All four are architectural, not pape
 | | Item | Why it matters | Status |
 |---|---|---|---|
 | **1.1** | **No remote recovery path of any kind** — LUKS prompts at a physical console on every host | A power event, kernel panic or failed boot needs a human at the rack. Proven on host-4 2026-09-16: one reboot took the whole enclave down until somebody typed a passphrase | 🔴 open · `ssp-inputs.md` §2.1a |
-| **1.2** | **Both recovery paths terminate on host-4** | host-4 runs all four service VMs *and* holds the backup drive. It is the single point of failure for the thing meant to survive a failure | 🔴 open · §3.2 |
+| **1.2** | **Both recovery paths terminate on host-4** | host-4 runs all four service VMs *and* holds the backup drive. It is the single point of failure for the thing meant to survive a failure 🔄 **BACKUP HALF REDUCED 2026-09-20:** `vm-backup.sh second-copy` pushes sets to host-1 after every nightly run — **84 GB, verified byte-for-byte, 877 s**, covering the three guests holding irreplaceable state; the 332 GB mirror is excluded as rebuildable (it alone takes 1 h 11 m to restore). Key restricted to write-only rsync into one directory; RSA 4096 because FIPS refuses ed25519. **The roll-forward half is untouched** — the WAL archive is unbuilt and still aimed at host-4 (`poam.md` ENG-04); design it off host-4 before pg-01..03 exist, while it is free. ⚠️ Both copies are still in one room — §1.3 unaffected | 🔄 backup half done · WAL half open |
 | **1.3** | **Survives one host failure, not a site event** | Replica-3 across three hosts cannot self-heal, and every copy is in one room | 🔴 open · §3.1 |
 | **1.4** | **The cryptographic-boundary exception has to be won, not assumed** | The FIPS posture is strong and measured (§1.1), but the boundary claim is a negotiation, not a measurement | 🔴 open · §1.3 |
 
@@ -213,6 +213,8 @@ server, node-exporter. 13 packages and 10 services gone.
 ## 9. Recently closed — append only, newest first
 
 **2026-09-20**
+- ✅ **Second backup copy is live and in the nightly timer** — host-4 → host-1 over SSH 22 (already on the CAL, no new port), `rrsync -wo` restricted key, verified by re-reading the far end. First run 84 GB / 877 s. Appended to the nightly unit as a NON-FATAL last step (`ExecStart=-`): a far-end problem must not make a good backup look failed; `enclave_backup_second_*` is the signal instead
+- ✅ **Guest restore proven, all four service guests** — see 2.1. CP-4 had no evidence of any kind before this; `poam.md` ENG-01 moves to partially satisfied
 - ✅ **FIPS refuses ed25519 for SSH keys** — `ssh-keygen -t ed25519` on host-4: *"ED25519 keys are not allowed in FIPS mode"*. Approved types are RSA and ECDSA P-256/384. `vm-backup.sh second-copy --setup` now makes RSA 4096 (`BACKUP_SECOND_KEYTYPE` overrides). Worth remembering for the CAC/PIV work (6a.23) and any new key in the boundary
 
 **2026-09-19**

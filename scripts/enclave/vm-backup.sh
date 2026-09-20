@@ -1457,6 +1457,7 @@ PY
     virsh destroy "$tname" >/dev/null 2>&1 || true
     virsh undefine "$tname" --nvram >/dev/null 2>&1 || true
     rm -rf "$work"
+    rmdir "$(dirname "$work")" 2>/dev/null || true   # leave nothing behind, not even an empty dir
     ok "$tname removed and $work cleaned up"
   fi
   [ "$booted" -eq 1 ] || die "the restore did not boot - that is the finding, not a script error"

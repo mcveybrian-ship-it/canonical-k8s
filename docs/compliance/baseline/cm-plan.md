@@ -670,6 +670,15 @@ snapshot.
 | Live software versions | `enclave_*` facts published every 15 minutes by the monitoring stack |
 | Package provenance | **Every package's origin is known, because everything entered through one audited mirror.** Snaps are served as verified files; Harbor is the only image source |
 | Per-machine assessment state | CKL / CKLB files collected to the staging machine by `stig-tools.sh collect` |
+| Ports, protocols and services | `enclave_listen_socket` and `enclave_ufw_rule` facts, joined with `scripts/enclave/ppsm-services.tsv` and the DISA CAL by `scripts/enclave/ppsm.py` — the PPSM CLSA is generated, never typed (backlog 6a.22) |
+| Guest placement | `PLACE_*` in `scripts/enclave/vm-specs.env`; `03-compose-vm.sh plan` verifies it against measured hardware and **refuses** to compose a guest away from its declared host (backlog 2.7) |
+
+**Two tools entered the boundary for assessment and are components in their own right:**
+
+| Tool | Where | Why it is here, and what it can do |
+|---|---|---|
+| `nmap` 7.94 | `svc-obs-01`, from the enclave mirror (`universe`, so `esm-apps` covers it) | The reachability half of the PPSM assessment: listening is not the same as reachable, and a `systemd` address filter is invisible to `ss`. **It is an active scanner inside the boundary** — it trips `ufw`'s rate limiting, which is why scan results and monitoring results must be read together rather than one overriding the other |
+| Root-owned runtime copy | `/usr/local/lib/enclave` on every machine, installed by `scripts/enclave/install-runtime.sh` | systemd timers must execute only code root can change. The repository checkout is writable by `encadmin`, so timers running from it were a privilege-escalation path (backlog 3.11). **The copy goes stale deliberately** — refreshing what root runs on a schedule requires `sudo` and leaves the same record as any other privileged act |
 
 **The inventory has not yet been extracted into a deliverable format** (`poam.md` ENG-63).
 

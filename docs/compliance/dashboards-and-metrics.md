@@ -271,6 +271,16 @@ and the per-domain families vanish. After a reboot that is the normal state, for
 reasons: `usb-storage` is STIG-blocked, LUKS is locked, and nothing types the passphrase.
 `vm-backup.sh reattach` is the fix.
 
+**The second copy has its own family, and it reports even when it is not configured.**
+`enclave_backup_second_configured{target=...}` is emitted as `0` when no target is set, because
+a *missing* series reads as "no data" on a dashboard and that is indistinguishable from silence —
+the same trap as the unmounted destination above. When a copy has run,
+`enclave_backup_second_last_success_seconds` and `enclave_backup_second_last_bytes` follow, and
+only a run that completed **and verified** updates them. A copy that quietly stopped therefore
+shows as an ageing timestamp rather than as nothing at all. Added 2026-09-20 with
+`vm-backup.sh second-copy` (red flag 1.2 — the only copy of every guest lived on the host that
+runs them).
+
 ### Row: Hypervisor — host-4 and the guests it runs
 
 `libvirt_up`, guests running, host-4 CPU and memory, then per-guest state, vCPU, memory, block

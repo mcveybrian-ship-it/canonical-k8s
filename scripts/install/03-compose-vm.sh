@@ -26,7 +26,7 @@ set -euo pipefail
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENCLAVE_DIR="${ENCLAVE_DIR:-$SELF/../enclave}"
-DRY=0; DESTROY=0; VM=""
+DRY=0; DESTROY=0; VM=""; PLAN_ARG=""
 
 say()  { printf '  %s\n' "$*"; }
 ok()   { printf '  [ok] %s\n' "$*"; }
@@ -34,10 +34,159 @@ warn() { printf '  [!!] %s\n' "$*" >&2; }
 die()  { printf '\n  [x] %s\n\n' "$*" >&2; exit 1; }
 run()  { if [ "$DRY" -eq 1 ]; then echo "  DRY: $*"; else "$@"; fi; }
 
+
+# =========================================================================================
+# plan - what runs where, and does it fit.  backlog 2.7.
+#
+#     ./03-compose-vm.sh plan            VERIFY: measures THIS host, checks its guests fit
+#     ./03-compose-vm.sh plan --spec     SPEC:   no hardware needed, prints the requirement
+#
+# VERIFY is the gate before composing anything: it reads threads, RAM and free space FROM THE
+# MACHINE and refuses a layout that does not fit, instead of finding out on the fourth guest.
+# SPEC runs anywhere, including before the hardware exists - it turns the map into the BOM
+# argument (RAM per host, devices per host) rather than an estimate.
+#
+# IT RECOMMENDS AND VERIFIES. It never moves a guest or rewrites the map: an algorithm quietly
+# reshuffling guests between sites is the opposite of a repeatable build.
+# =========================================================================================
+plan_hosts() {   # every host named by the map, in order
+  local v; for v in $(compgen -A variable PLACE_ 2>/dev/null); do
+    case "$v" in PLACE_BACKUP_SECOND) continue ;; esac
+    printf '%s\n' "${!v}"
+  done | sort -u
+}
+plan_guests_on() {  # guests the map places on $1
+  local host="$1" v g; for v in $(compgen -A variable PLACE_ 2>/dev/null); do
+    case "$v" in PLACE_BACKUP_SECOND) continue ;; esac
+    [ "${!v}" = "$host" ] || continue
+    g="$(echo "${v#PLACE_}" | tr 'A-Z_' 'a-z-')"
+    [ -n "${!v}" ] && printf '%s\n' "$g"
+  done | sort
+}
+plan_sum() {  # <host> -> "vcpu ram_mb disk_gb data_gb count", from the specs
+  local host="$1" g sv vc rm dk dt; local tv=0 tr=0 td=0 tdd=0 n=0
+  for g in $(plan_guests_on "$host"); do
+    sv="VM_$(echo "$g" | tr 'a-z-' 'A-Z_')"; [ -n "${!sv:-}" ] || continue
+    IFS=: read -r vc rm dk dt <<< "${!sv}"
+    tv=$((tv+vc)); tr=$((tr+rm)); td=$((td+dk)); tdd=$((tdd+${dt:-0})); n=$((n+1))
+  done
+  printf '%s %s %s %s %s' "$tv" "$tr" "$td" "$tdd" "$n"
+}
+
+cmd_plan() {
+  local spec=0; [ "${1:-}" = --spec ] && spec=1
+  local me; me="$(hostname -s)"
+  local reserve="${HOST_RESERVE_MB:-4096}" fail=0
+  printf '\n  PLACEMENT PLAN - VM_PROFILE=%s\n\n' "$VM_PROFILE"
+
+  local h vc rm dk dt n
+  printf '  %-8s %-5s %-9s %-10s %-9s %s\n' HOST GUESTS vCPU RAM DISK "guests"
+  for h in $(plan_hosts); do
+    read -r vc rm dk dt n <<< "$(plan_sum "$h")"
+    printf '  %-8s %-5s %-9s %-10s %-9s %s\n' "$h" "$n" "$vc" \
+      "$(( (rm + reserve) / 1024 )) GiB" "$(( dk + dt )) GB" "$(plan_guests_on "$h" | tr '\n' ' ')"
+  done
+  printf '\n  RAM includes %s MiB reserved for each host itself.\n' "$reserve"
+  printf '  DISK is the qcow2 CEILING, deliberately over-committed - the disks are sparse.\n'
+
+  # ---- rules that hold whatever the hardware is -----------------------------------------
+  printf '\n  RULES\n'
+  local grp m seen dup
+  IFS='|' read -ra GRPS <<< "${ANTI_AFFINITY:-}"
+  for grp in "${GRPS[@]:-}"; do
+    [ -n "$grp" ] || continue
+    seen=""; dup=""
+    for m in $grp; do
+      h="$(vm_place "$m")"; [ -n "$h" ] || continue
+      case " $seen " in *" $h "*) dup="$dup $m@$h" ;; esac
+      seen="$seen $h"
+    done
+    if [ -n "$dup" ]; then
+      warn "anti-affinity BROKEN for [$grp ] -$dup"; fail=1
+    else
+      ok "anti-affinity holds: $grp"
+    fi
+  done
+  local second="${PLACE_BACKUP_SECOND:-}"
+  if [ -z "$second" ]; then
+    warn "no PLACE_BACKUP_SECOND - the backups have no copy off their own host (red flag 1.2)"; fail=1
+  elif [ "$second" = ring ]; then
+    # Each host's second copy goes to the next host, the last wrapping to the first. Every
+    # guest then has a copy on a machine that is not the one running it.
+    local -a ring=(); while read -r h; do [ -n "$(plan_guests_on "$h")" ] && ring+=("$h"); done < <(plan_hosts)
+    if [ "${#ring[@]}" -lt 2 ]; then
+      warn "PLACE_BACKUP_SECOND=ring needs at least two hosts running guests - name a host instead"; fail=1
+    else
+      local i nxt line=""
+      for i in "${!ring[@]}"; do
+        nxt="${ring[$(( (i+1) % ${#ring[@]} ))]}"
+        line="$line ${ring[$i]}->$nxt"
+      done
+      ok "backup ring:$line"
+    fi
+  else
+    local stranded; stranded="$(plan_guests_on "$second" | tr '\n' ' ')"
+    if [ -n "$stranded" ]; then
+      warn "second backup copy is on $second, which also RUNS: $stranded - those guests have no off-host copy"; fail=1
+    else
+      ok "second backup copy on $second, which runs no guests"
+    fi
+  fi
+
+  [ "$spec" -eq 1 ] && { printf '\n  SPEC MODE - no hardware was measured. Per host, the design needs:\n'
+    printf '    RAM     the figure above, and the drives below are a CHASSIS decision:\n'
+    printf '    devices OS (mirrored pair) - etcd - database data - one per Ceph OSD - VM pool\n'
+    printf '            ~6 drives per host; see backlog 2.8\n\n'; return 0; }
+
+  # ---- verify against THIS machine ------------------------------------------------------
+  read -r vc rm dk dt n <<< "$(plan_sum "$me")"
+  printf '\n  VERIFY - %s, measured now\n' "$me"
+  if [ "$n" -eq 0 ]; then
+    say "the map places no guest on $me - nothing to check here"; printf '\n'; return 0
+  fi
+  local have_threads have_ram_mb
+  have_threads="$(nproc)"
+  have_ram_mb="$(awk '/MemTotal/{printf "%d", $2/1024}' /proc/meminfo)"
+  local need_ram=$(( rm + reserve ))
+  if [ "$need_ram" -le "$have_ram_mb" ]; then
+    ok "RAM: need $((need_ram/1024)) GiB (guests + reserve), have $((have_ram_mb/1024)) GiB"
+  else
+    warn "RAM: need $((need_ram/1024)) GiB, have only $((have_ram_mb/1024)) GiB - THIS LAYOUT DOES NOT FIT"; fail=1
+  fi
+  # vCPU over-subscription is a choice, not a fault - the lab runs 2:1 deliberately. Report it.
+  if [ "$vc" -le "$have_threads" ]; then
+    ok "vCPU: $vc assigned, $have_threads threads"
+  else
+    say "[--] vCPU: $vc assigned on $have_threads threads - $(( (vc*10+have_threads/2) / have_threads ))/10 : 1 over-subscription (deliberate in the lab)"
+  fi
+  # || true: df fails when the pool is not there, and under `set -e` an unguarded assignment
+  # from a failing pipeline ENDS THE SCRIPT SILENTLY - which it did on 2026-09-20, skipping
+  # every check after this line and still exiting 0. A missing pool must be reported, not fatal.
+  local pool_avail; pool_avail="$(df -BG --output=avail "$POOL" 2>/dev/null | tail -1 | tr -dc 0-9 || true)"
+  if [ -n "$pool_avail" ]; then
+    # The ceiling is over-committed on purpose; what matters is that today's guests fit.
+    if [ "$dk" -le "$pool_avail" ]; then
+      ok "pool $POOL: ${pool_avail} GB free, ${dk} GB of ceilings - fits even unsparse"
+    else
+      warn "pool $POOL: ${pool_avail} GB free vs ${dk} GB of ceilings - sparse today, and it CAN fill. Watch it or grow the pool"
+    fi
+  else
+    warn "cannot measure $POOL - is it mounted?"
+  fi
+  if [ "$dt" -gt 0 ]; then
+    local dpool="${VM_POOL_DATA:-}"
+    [ -n "$dpool" ] || { warn "guests here want ${dt} GB of data disk and VM_POOL_DATA is unset"; fail=1; }
+  fi
+  printf '\n'
+  [ "$fail" -eq 0 ] || die "the plan does not hold on $me - fix the map or the hardware before composing"
+  ok "plan holds on $me"
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
     -n|--dry-run) DRY=1; shift ;;
     --destroy)    DESTROY=1; shift ;;
+    --spec)       PLAN_ARG=--spec; shift ;;
     -h|--help)    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     -*)           die "unknown option $1" ;;
     *)            VM="$1"; shift ;;
@@ -45,12 +194,18 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$VM" ] || { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
 
+
 [ -r "$ENCLAVE_DIR/enclave-addresses.env" ] || die "no enclave-addresses.env in $ENCLAVE_DIR"
 [ -r "$ENCLAVE_DIR/vm-specs.env" ]          || die "no vm-specs.env in $ENCLAVE_DIR"
 # shellcheck disable=SC1090
 . "$ENCLAVE_DIR/enclave-addresses.env"
 # shellcheck disable=SC1090
 . "$ENCLAVE_DIR/vm-specs.env"
+
+# `plan` answers "what runs where, and does it fit" and composes nothing. It needs the two
+# env files above and nothing else - no root, no libvirt - so it runs before any of the
+# machine-specific checks below, and on a machine that holds no guests at all.
+if [ "$VM" = plan ]; then POOL="${VM_POOL:-}"; cmd_plan "$PLAN_ARG"; exit 0; fi
 
 # svc-mgmt-01 -> SVC_MGMT_01
 KEY_NAME="$(echo "$VM" | tr 'a-z-' 'A-Z_')"
@@ -87,12 +242,24 @@ fi
 
 [ "$DRY" -eq 1 ] || [ "$(id -u)" -eq 0 ] || die "run with sudo"
 
-# ---- refuse to run on the wrong machine --------------------------------------------------
-# Same guard as 03-host-services.sh: the VM's own host is identified by which address this
-# machine holds, so a pasted command in the wrong window stops here.
-if [ "$DRY" -eq 0 ] && ! ip -br addr | grep -qw "${HOST_4%%/*}"; then
-  warn "this machine does not hold $HOST_4 - composing $VM somewhere unexpected?"
+# ---- refuse to compose a guest anywhere but its declared home ----------------------------
+# backlog 2.7. THIS WAS A WARNING, AND IT NAMED host-4 UNCONDITIONALLY - which is exactly how
+# every service VM came to live on one machine (red flag 1.2). A warning refuses nothing, and
+# the composer had no idea where a guest was supposed to live. The placement map in
+# vm-specs.env is now the authority, and putting a guest somewhere else is an EDIT TO THE MAP,
+# reviewable in git, rather than a decision made at a keyboard at 2am.
+PLACE="$(vm_place "$VM")"
+[ -n "$PLACE" ] || die "$VM has no declared home.
+       Add PLACE_$KEY_NAME='host-N' to vm-specs.env - nothing is composed without one.
+       Check the layout first:  $0 plan --spec"
+PLACE_ADDR_VAR="$(echo "$PLACE" | tr 'a-z-' 'A-Z_')"; PLACE_ADDR="${!PLACE_ADDR_VAR:-}"
+ME="$(hostname -s)"
+if [ "$DRY" -eq 0 ] && [ "$ME" != "$PLACE" ] \
+   && ! { [ -n "$PLACE_ADDR" ] && ip -br addr | grep -qw "${PLACE_ADDR%%/*}"; }; then
+  die "$VM belongs on $PLACE (VM_PROFILE=$VM_PROFILE) and this machine is $ME.
+       Either run it on $PLACE, or change PLACE_$KEY_NAME in vm-specs.env and say why."
 fi
+[ "$DRY" -eq 1 ] || ok "placement: $VM -> $PLACE (this machine)"
 
 # These describe the target host, so they are checked for a real run only. A dry run must be
 # usable anywhere - reviewing the rendered cloud-init is exactly what it is for.

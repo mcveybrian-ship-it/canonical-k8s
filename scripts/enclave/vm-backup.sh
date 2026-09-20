@@ -1364,10 +1364,22 @@ cmd_second_copy() {
   say "domains    : ${doms[*]}"
   [ "${#skipped[@]}" -eq 0 ] || say "excluded   : ${skipped[*]} (rebuildable - see BACKUP_SECOND_SKIP)"
 
+  # IdentitiesOnly=yes offers ONLY the key below. Without it ssh also offers root's default
+  # identities and an agent's, and if one of those matched an unrestricted entry on the far end
+  # the forced rrsync command would not apply - the transfer would succeed while silently
+  # landing outside the one directory this key is confined to.
   # LogLevel=ERROR silences the login BANNER - which OpenSSH prints at INFO and which otherwise
   # repeats its full DoD text once per rsync - WITHOUT hiding errors, which are logged above it.
-  local SSH=(ssh -i "$SECOND_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o LogLevel=ERROR)
+  local SSH=(ssh -i "$SECOND_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o LogLevel=ERROR -o IdentitiesOnly=yes)
+  # --delete MIRRORS THE SOURCE, and without it the copy only ever grows. `prune` removes old
+  # chains here, nothing removes them there, and each new full adds ~84 GB to a 196 GB volume -
+  # so the far end fills and then silently stops being a copy at all. Measured on the first run,
+  # 2026-09-20: 84 GB landed, 103 GB free. The trade is stated rather than hidden: a mistake on
+  # THIS machine propagates to the copy, which is why the copy is not the only control - the
+  # weekly deep verify and the restore test are what make it trustworthy. BACKUP_SECOND_DELETE=0
+  # keeps everything and accepts the growth.
   local -a RS=(rsync -a --partial --human-readable -e "${SSH[*]}")
+  [ "${BACKUP_SECOND_DELETE:-1}" = 0 ] || RS+=(--delete)
   [ "$dry" -eq 1 ] && RS+=(--dry-run --itemize-changes)
 
   local t0 bytes=0 rc=0; t0="$(date +%s)"

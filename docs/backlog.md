@@ -213,6 +213,7 @@ server, node-exporter. 13 packages and 10 services gone.
 ## 9. Recently closed — append only, newest first
 
 **2026-09-20**
+- ⚠️ **The second copy needed `--delete`, found by measuring it** — 84 GB landed on host-1 (103 GB free of 196 GB). Without `--delete` the far end NEVER shrinks: `prune` drops old chains on host-4, nothing drops them there, and each new full adds ~84 GB until the volume fills and the copy silently stops. Now mirrors the source (`BACKUP_SECOND_DELETE=0` opts out). The trade — a mistake here propagates there — is why the copy is not the only control: the weekly deep verify and `restore-test` are what make it trustworthy
 - ✅ **Second backup copy is live and in the nightly timer** — host-4 → host-1 over SSH 22 (already on the CAL, no new port), `rrsync -wo` restricted key, verified by re-reading the far end. First run 84 GB / 877 s. Appended to the nightly unit as a NON-FATAL last step (`ExecStart=-`): a far-end problem must not make a good backup look failed; `enclave_backup_second_*` is the signal instead
 - ✅ **Guest restore proven, all four service guests** — see 2.1. CP-4 had no evidence of any kind before this; `poam.md` ENG-01 moves to partially satisfied
 - ✅ **FIPS refuses ed25519 for SSH keys** — `ssh-keygen -t ed25519` on host-4: *"ED25519 keys are not allowed in FIPS mode"*. Approved types are RSA and ECDSA P-256/384. `vm-backup.sh second-copy --setup` now makes RSA 4096 (`BACKUP_SECOND_KEYTYPE` overrides). Worth remembering for the CAC/PIV work (6a.23) and any new key in the boundary

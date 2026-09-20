@@ -18,7 +18,7 @@
 | Boot-secret custodian | «who holds the LUKS passphrase and the GRUB password, and where» |
 | Alternate processing site | **«NONE or the alternate processing site and its agreement reference»** |
 | Alternate storage site | **«NONE or the alternate storage site for backup media»** |
-| Last contingency test | **«NONE - no contingency test has ever been run»** |
+| Last contingency test | **2026-09-20 — guest restore from backup, all 4 service guests, all booted (§9.2). No host-failure, failover or Ceph test yet** |
 | Test cadence | «how often the plan is exercised» |
 | ISSM | «ISSM_NAME» |
 | ISSO | «ISSO_NAME» |
@@ -644,21 +644,24 @@ gap.
 | Sustained throughput | 107 MB/s on the bench platter; 4–5× faster on the SSD it was replaced with |
 | **Human latency at the rack** | **Non-zero and non-negotiable** while LUKS unlock is a console passphrase and three hosts have no BMC (§3.3) |
 | Guest rebuild time | For most of the enclave, rebuild is faster and better-evidenced than restore (§2.4) |
-| Prerequisite | **No test has ever measured an actual recovery** (§9), so every figure above is an input, not a result |
+| Measured guest restore | **2026-09-20 (§9.2): 56 s for a 13 GB guest, 3 m 34 s for 35 GB, from a five-set chain — rebuild plus boot, on a healthy host.** A per-guest figure, not a recovery of the enclave |
+| Prerequisite | **No test has yet measured recovery from a HOST loss** (§9.1), so every figure above is still an input, not a commitment |
 
 Do not commit to an RTO or RPO before ENG-01 in the POA&M has been run. The numbers above are
 what the test should confirm or refute.
 
 ---
 
-## 9. CP-4 — testing. There is no evidence.
+## 9. CP-4 — testing. One test has been run; four have not.
 
-**No contingency test of any kind has ever been performed on this system.**
+**Until 2026-09-20 no contingency test of any kind had ever been performed. The guest-restore
+test has now been run and is recorded in §9.2. Everything else below is still untested, and
+one passing test is not a tested plan.**
 
 | Test | State |
 |---|---|
 | Host-failure rehearsal (runbook §10) | **Never run** |
-| Guest restore from a backup set | **Never run**. `restore-plan` prints the steps; nobody has executed them |
+| Guest restore from a backup set | ✅ **Run 2026-09-20** — all 4 service guests rebuilt from a 5-set chain and booted (§9.2). Slowest: `svc-repo-01`, 1 h 11 m |
 | PostgreSQL / Patroni failover | **Never run**, planned or unplanned |
 | Ceph degraded-state and recovery behaviour | **Never exercised** on four nodes |
 | Tabletop walkthrough | **Never held** |
@@ -667,10 +670,63 @@ what the test should confirm or refute.
 **An untested recovery plan is an assumption**, and this design exists in its current shape
 precisely because an untested failover already lost a database once (`ato-package.md` §1).
 
-Two things have been *proved* incidentally and should not be mistaken for a test: backup sets
-verify against their manifests, and host 4 has been rebooted once with all four guests
-returning. Neither is a recovery exercise. The reboot is the closest thing to one and its own
+One thing has been *proved* incidentally and should not be mistaken for a test: host 4 has been
+rebooted once with all four guests returning. That is not a recovery exercise, and its own
 write-up says plainly that its success **cannot be explained** (§5.2).
+
+### 9.2 Test record — guest restore from backup, 2026-09-20
+
+**Method.** `vm-backup.sh restore-test <guest>`, run on `host-4` against the live nightly sets
+on the encrypted backup volume. For each guest it walks the chain back to the full it was built
+on, verifies every set against its `sha256` manifest, rebuilds the disk **into its own
+directory**, runs `qemu-img check`, defines a separate domain `restore-test-<guest>` **with no
+network interface**, boots it, and watches a captured serial console for a login prompt. The
+live guest is never stopped and never written to; the copy cannot take its address.
+
+**Chain restored:** one full (2026-09-16) plus four nightly incrementals — five sets per guest.
+
+| Guest | Disk | Checksums | `qemu-img check` | Booted | Rebuild | Boot | Total |
+|---|---|---|---|---|---|---|---|
+| `svc-obs-01` | 13 GB | verified | passed | **yes** | 39 s | 17 s | **56 s** |
+| `svc-harbor-01` | 15 GB | verified | passed | **yes** | 65 s | 38 s | **1 m 43 s** |
+| `svc-mgmt-01` | 35 GB | verified | passed | **yes** | 192 s | 22 s | **3 m 34 s** |
+| `svc-repo-01` | 332 GB | verified | passed | **yes** | 4261 s | 27 s | **1 h 11 m** |
+
+**Data age at test time: 14 hours** — the newest set was 07:00 UTC, the test ran at 21:30 UTC.
+That is a measured recovery point for a single guest, and it is consistent with the ~24 hour
+unmitigated floor in §8 rather than a replacement for it.
+
+Evidence: `/srv/stig-evidence/restore-test-<guest>-<stamp>.txt` on `host-4`, one file per run.
+
+**What the test found, which is the part worth keeping:**
+
+1. **The backup sets did not contain the domain definition.** Only the disks were stored. A
+   restore onto a rebuilt host would have meant writing the VM's XML — CPU, memory, machine
+   type, firmware, disk and network layout — by hand, under pressure, from memory. Every set
+   now stores `virsh dumpxml --inactive` and checksums it. **The sets that this test restored
+   predate that fix**, so the test used the live definition and said so; that is weaker
+   evidence than it appears and the next set is the one that closes it.
+2. **Reassembling an incremental chain was the undocumented step.** `restore-plan` says "apply
+   incrementals in order" and stops there. A libvirt push-mode incremental holds only changed
+   clusters and carries no reference to what it was built on, so on its own it is unreadable.
+   The procedure is now executed rather than described.
+3. **The mirror is the recovery-time problem, and by a wide margin.** `svc-repo-01` took
+   **1 h 11 m** against 3 m 34 s for the next largest — 332 GB versus 35 GB. The rebuild reads
+   the whole chain off the backup volume and then flattens it, so ~332 GB of guest costs
+   roughly double that in I/O, on a USB-attached source. **Restoring all four guests
+   sequentially is ~1 h 20 m**, and that figure is dominated by one machine whose contents are
+   an apt mirror — rebuildable from the transfer bundle, which §2.4 already argues is better
+   evidence than a restore. The decision this measurement forces: **is the mirror worth
+   restoring at all, or is it rebuilt while the guests that hold irreplaceable state are
+   restored first?**
+4. **Chain depth grows by one every night** — five on the day of the test. Restore time and the
+   number of links that must all be intact grow with it. The full-backup cadence is a decision
+   this measurement now informs.
+
+**What it does NOT prove.** One guest at a time, onto a healthy host, from a volume attached to
+that same host. It does not test losing `host-4` (§3.2), a site event (§3.1), database failover,
+or Ceph. Those remain untested, and the §8 objectives stay uncommitted until the host-failure
+rehearsal in §9.1 has been run.
 
 ### 9.1 The test that should be run first, and why early
 

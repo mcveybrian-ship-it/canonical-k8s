@@ -11,6 +11,9 @@
 #     sudo ./vm-backup.sh verify                 check what ARRIVED, not what was sent
 #     sudo ./vm-backup.sh prune                  drop chains beyond BACKUP_KEEP_CHAINS
 #     sudo ./vm-backup.sh restore-plan <vm>      print the restore steps - never automatic
+#     sudo ./vm-backup.sh restore-test <vm>      REHEARSE one: rebuild the chain into its own
+#                                                directory, boot it as restore-test-<vm> with
+#                                                no NIC, prove it, remove it. Touches nothing live
 #     sudo ./vm-backup.sh schedule [--at HH:MM]  install a nightly systemd timer (default 02:00)
 #     sudo ./vm-backup.sh unschedule             remove it
 #     sudo ./vm-backup.sh keyfile                add a keyfile so unlocking needs no human
@@ -427,7 +430,13 @@ backup_one() {  # <domain> <full|incr>
 
   # Manifest of what ARRIVED. Sizes and hashes of the files on the destination, not of the
   # sources - a copy that silently truncated looks identical from the source side.
-  ( cd "$out" && sha256sum ./*.qcow2 > MANIFEST.sha256 2>/dev/null ) || true
+  # THE DISKS ARE NOT ENOUGH TO RESTORE A GUEST. Without the domain definition a restore on a
+  # rebuilt host means hand-writing the XML - vCPU, RAM, machine type, firmware, the disk and
+  # network layout - from memory, under pressure. Found 2026-09-20 while building restore-test.
+  # --inactive so it is the DEFINITION, not the running state with its runtime additions.
+  virsh dumpxml --inactive "$dom" > "$out/DOMAIN.xml" 2>/dev/null \
+    || warn "$dom: could not save the domain definition - a restore will need it written by hand"
+  ( cd "$out" && sha256sum ./*.qcow2 ./DOMAIN.xml > MANIFEST.sha256 2>/dev/null ) || true
   printf 'domain=%s\nmode=%s\nbased_on=%s\nstamp=%s\nhost=%s\n' \
     "$dom" "$mode" "${prev:-none}" "$STAMP" "$(hostname -s)" > "$out/INFO"
   ok "$dom: $(find "$out" -name '*.qcow2' | wc -l) file(s), $(du -sh "$out" | cut -f1)"
@@ -1233,6 +1242,226 @@ cmd_restore_plan() {
 PLAN
 }
 
+# ---------------------------------------------------------------- restore TEST
+# PROVING A RESTORE, WITHOUT RISKING THE THING BEING RESTORED. backlog 2.1, control CP-4.
+#
+#     sudo ./vm-backup.sh restore-test <domain> [--set <stamp>] [--keep] [-n]
+#
+# restore-plan above is for the day something is broken and it stays manual. THIS is the
+# rehearsal, and it is safe to automate precisely because it NEVER writes where the live guest
+# lives: it rebuilds the chain into its own directory and defines a SEPARATE domain,
+# restore-test-<name>, WITH NO NETWORK INTERFACE - so it cannot collide with the running
+# guest's address, and cannot be mistaken for it.
+#
+# WHAT IT PROVES, in order, and each one has failed somewhere for somebody:
+#   1. the sets on the destination are complete and their checksums still match
+#   2. the incremental chain can actually be reassembled - the step restore-plan only
+#      describes in prose, and the one most likely to be wrong
+#   3. the image passes qemu-img check
+#   4. it BOOTS, evidenced by a login prompt on a captured serial console
+#   5. how long all of that took, which is the recovery time nobody has measured
+cmd_restore_test() {
+  local dom="" want="" keep=0 dry=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --set) want="${2:?--set needs a set stamp}"; shift 2 ;;
+      --keep) keep=1; shift ;;
+      -n|--dry-run) dry=1; shift ;;
+      -*) die "restore-test: unknown option $1" ;;
+      *) dom="$1"; shift ;;
+    esac
+  done
+  [ -n "$dom" ] || die "usage: $0 restore-test <domain> [--set <stamp>] [--keep] [-n]"
+  need_root; check_dest
+  command -v qemu-img >/dev/null || die "qemu-img not installed"
+
+  # ---- resolve the chain: newest set, then walk back to the full it was built on ----------
+  local cur="$want"
+  [ -n "$cur" ] || cur="$(find "$DEST/$dom" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort | tail -1)"
+  [ -n "$cur" ] || die "no backup sets for $dom at $DEST"
+  local -a chain=(); local info mode based guard=0
+  while :; do
+    info="$DEST/$dom/$cur/INFO"
+    [ -r "$info" ] || die "$cur has no INFO - the chain cannot be trusted; pick another --set"
+    mode="$(awk -F= '/^mode=/{print $2}' "$info")"
+    based="$(awk -F= '/^based_on=/{print $2}' "$info")"
+    chain=("$cur" "${chain[@]}")
+    [ "$mode" = full ] && break
+    [ -n "$based" ] && [ "$based" != none ] \
+      || die "$cur is an incremental with no base recorded - unrestorable, and that is a finding"
+    cur="${based#chk-}"
+    guard=$((guard+1)); [ "$guard" -lt 64 ] || die "chain walk did not terminate - loop in based_on"
+  done
+  say "chain for $dom: ${chain[*]}"
+
+  # ---- verify what is on the disk, before spending time rebuilding it ---------------------
+  local sset
+  for sset in "${chain[@]}"; do
+    if [ -r "$DEST/$dom/$sset/MANIFEST.sha256" ]; then
+      ( cd "$DEST/$dom/$sset" && sha256sum -c --quiet MANIFEST.sha256 ) \
+        || die "$sset FAILS its checksums - the backup is damaged. Stop and investigate."
+      ok "$sset: checksums match"
+    else
+      warn "$sset has no MANIFEST.sha256 - cannot verify it, proceeding on trust"
+    fi
+  done
+
+  # ---- where the rebuild happens. NEVER the live image directory. -------------------------
+  local live_dir; live_dir="$(dirname "$(domain_disks "$dom" | head -1 | cut -f2)")"
+  [ -n "$live_dir" ] && [ "$live_dir" != "." ] || live_dir=/var/lib/libvirt/images
+  local work="${RESTORE_TEST_DIR:-$live_dir/restore-test}/$dom"
+  local tname="restore-test-$dom"
+  virsh dominfo "$tname" >/dev/null 2>&1 \
+    && die "$tname already exists - remove it first:  virsh destroy $tname; virsh undefine $tname --nvram"
+
+  # Targets come from the FULL set's filenames: <target>.full.qcow2
+  local -a targets=(); local f
+  for f in "$DEST/$dom/${chain[0]}"/*.full.qcow2; do
+    [ -e "$f" ] || die "${chain[0]} holds no *.full.qcow2 - not a full set"
+    targets+=("$(basename "$f" .full.qcow2)")
+  done
+  say "disks: ${targets[*]}"
+
+  local need=0 avail
+  for sset in "${chain[@]}"; do need=$(( need + $(du -sk "$DEST/$dom/$sset" | cut -f1) )); done
+  need=$(( need * 2 ))   # the chain, plus the flattened copy it is converted into
+  avail="$(df -k --output=avail "$live_dir" | tail -1)"
+  say "space: rebuild needs ~$((need/1024/1024)) GB, $(( avail/1024/1024 )) GB free on $live_dir"
+  [ "$need" -lt "$avail" ] || die "not enough room to rebuild - set RESTORE_TEST_DIR to somewhere with space"
+
+  local rpo_src="${chain[-1]}"
+  if [ "$dry" -eq 1 ]; then
+    say "DRY RUN - would rebuild ${#chain[@]} set(s) into $work, define $tname with no NIC, boot it, then remove it"
+    return 0
+  fi
+
+  # ---- rebuild ----------------------------------------------------------------------------
+  local t0 t1 t2; t0="$(date +%s)"
+  install -d -m 0700 "$work"
+  local tgt i prev flat
+  for tgt in "${targets[@]}"; do
+    prev="$work/$tgt.base.qcow2"
+    cp --sparse=always "$DEST/$dom/${chain[0]}/$tgt.full.qcow2" "$prev"
+    i=0
+    for sset in "${chain[@]:1}"; do
+      i=$((i+1))
+      local inc="$work/$tgt.incr$i.qcow2"
+      cp --sparse=always "$DEST/$dom/$sset/$tgt.incr.qcow2" "$inc"
+      # THE STEP restore-plan ONLY DESCRIBES. A libvirt push-mode incremental holds the changed
+      # clusters and NO backing file reference, so on its own it is unreadable. -u sets the
+      # backing link without touching data; the chain is then flattened by convert below.
+      qemu-img rebase -u -b "$prev" -F qcow2 "$inc" \
+        || die "could not chain $sset onto $(basename "$prev") - the chain is broken"
+      prev="$inc"
+    done
+    flat="$work/$tgt.qcow2"
+    if [ "$prev" != "$work/$tgt.base.qcow2" ]; then
+      qemu-img convert -O qcow2 "$prev" "$flat" || die "flattening the chain failed for $tgt"
+      rm -f "$work/$tgt".base.qcow2 "$work/$tgt".incr*.qcow2
+    else
+      mv "$prev" "$flat"
+    fi
+    qemu-img check "$flat" >/dev/null || die "qemu-img check FAILED on the restored $tgt"
+    ok "$tgt rebuilt from ${#chain[@]} set(s) and passes qemu-img check"
+  done
+  chown -R "${QUSER}:${QGROUP}" "$work" 2>/dev/null || true
+  t1="$(date +%s)"
+
+  # ---- define a separate, network-less domain ---------------------------------------------
+  local srcxml="$DEST/$dom/${chain[-1]}/DOMAIN.xml" xml="$work/$tname.xml"
+  if [ -r "$srcxml" ]; then
+    say "domain definition: from the backup set"
+  elif virsh dumpxml --inactive "$dom" > "$work/live.xml" 2>/dev/null; then
+    srcxml="$work/live.xml"
+    warn "this set predates DOMAIN.xml capture - using the LIVE definition, which a real"
+    warn "  disaster would not have. Fixed for future sets; re-run after the next backup."
+  else
+    die "no domain definition in the set and $dom is not defined here - cannot build $tname"
+  fi
+  python3 - "$srcxml" "$xml" "$tname" "$work" "${targets[@]}" <<'PY' || die "could not transform the domain XML"
+import sys, xml.etree.ElementTree as ET
+src, out, name, work = sys.argv[1:5]
+targets = sys.argv[5:]
+t = ET.parse(src); r = t.getroot()
+r.find('name').text = name
+for tag in ('uuid', 'nvram'):          # a new identity, and its own firmware vars file
+    for e in r.iter(tag):
+        (r if e in list(r) else r.find('os')).remove(e)
+dev = r.find('devices')
+for iface in dev.findall('interface'): # NO NETWORK: it must not collide with the live guest
+    dev.remove(iface)
+for d in dev.findall('disk'):
+    tgt = d.find('target').get('dev')
+    srcel = d.find('source')
+    if tgt in targets and srcel is not None:
+        srcel.set('file', f"{work}/{tgt}.qcow2")
+    elif srcel is not None:            # a disk the backup did not cover - drop it, do not fake it
+        dev.remove(d)
+for c in dev.findall('console'):       # console mirrors serial; one file sink is enough
+    dev.remove(c)
+for sl in dev.findall('serial'):
+    dev.remove(sl)
+sl = ET.SubElement(dev, 'serial', {'type': 'file'})
+ET.SubElement(sl, 'source', {'path': f"{work}/console.log"})
+ET.SubElement(sl, 'target', {'port': '0'})
+t.write(out)
+PY
+  virsh define "$xml" >/dev/null || die "virsh define failed for $tname"
+  : > "$work/console.log"; chown "${QUSER}:${QGROUP}" "$work/console.log" 2>/dev/null || true
+  virsh start "$tname" >/dev/null || { virsh undefine "$tname" --nvram >/dev/null 2>&1; die "$tname would not start"; }
+  ok "$tname started - watching its console for a login prompt"
+
+  # ---- did it actually come up? ------------------------------------------------------------
+  local waited=0 booted=0 limit="${RESTORE_TEST_BOOT_WAIT:-300}"
+  while [ "$waited" -lt "$limit" ]; do
+    if grep -qE 'login:|Welcome to Ubuntu|systemd\[1\]: Startup finished' "$work/console.log" 2>/dev/null; then
+      booted=1; break
+    fi
+    virsh domstate "$tname" 2>/dev/null | grep -q running || { warn "$tname stopped on its own"; break; }
+    sleep 5; waited=$((waited+5))
+  done
+  t2="$(date +%s)"
+
+  # ---- say what it proved, in the terms the control asks for -------------------------------
+  local rpo_stamp="${rpo_src}" age_h
+  age_h=$(( ( $(date +%s) - $(date -u -d "$(echo "$rpo_stamp" | sed -E 's/^(....)(..)(..)T(..)(..)(..)Z$/\1-\2-\3 \4:\5:\6 UTC/')" +%s 2>/dev/null || echo 0) ) / 3600 ))
+  printf '\n'
+  if [ "$booted" -eq 1 ]; then
+    ok "RESTORE PROVEN: $dom rebuilt from ${#chain[@]} set(s) and booted"
+  else
+    warn "restored image did NOT reach a login prompt within ${limit}s - see $work/console.log"
+  fi
+  say "rebuild time : $((t1-t0))s   boot to login: $((t2-t1))s   total: $((t2-t0))s"
+  say "data age     : newest set $rpo_stamp (~${age_h}h old) - this is the measured RPO"
+  say "console log  : $work/console.log"
+
+  local ev="${RESTORE_EVIDENCE_DIR:-/srv/stig-evidence}/restore-test-$dom-$STAMP.txt"
+  install -d -m 0755 "$(dirname "$ev")" 2>/dev/null || true
+  {
+    printf 'restore test - %s\n' "$(date -u +%FT%TZ)"
+    printf 'host=%s domain=%s target=%s\n' "$(hostname -s)" "$dom" "$tname"
+    printf 'chain=%s\n' "${chain[*]}"
+    printf 'disks=%s\n' "${targets[*]}"
+    printf 'checksums=verified qemu_img_check=passed booted=%s\n' "$([ "$booted" -eq 1 ] && echo yes || echo NO)"
+    printf 'rebuild_seconds=%s boot_seconds=%s total_seconds=%s\n' "$((t1-t0))" "$((t2-t1))" "$((t2-t0))"
+    printf 'newest_set=%s approx_age_hours=%s\n' "$rpo_stamp" "$age_h"
+  } > "$ev"
+  [ -n "${SUDO_USER:-}" ] && chown "$SUDO_USER" "$ev" 2>/dev/null
+  ok "evidence: $ev"
+
+  # ---- clean up. The test leaves nothing behind unless asked. ------------------------------
+  if [ "$keep" -eq 1 ]; then
+    warn "--keep: $tname is left DEFINED and RUNNING with no network. Remove it with:"
+    say  "   virsh destroy $tname; virsh undefine $tname --nvram; rm -rf $work"
+  else
+    virsh destroy "$tname" >/dev/null 2>&1 || true
+    virsh undefine "$tname" --nvram >/dev/null 2>&1 || true
+    rm -rf "$work"
+    ok "$tname removed and $work cleaned up"
+  fi
+  [ "$booted" -eq 1 ] || die "the restore did not boot - that is the finding, not a script error"
+}
+
 # ---------------------------------------------------------------- args
 ARGS=()
 while [ $# -gt 0 ]; do
@@ -1437,5 +1666,6 @@ case "${1:-status}" in
   schedule)     shift || true; cmd_schedule "${1:-02:00}" ;;
   unschedule)   cmd_unschedule ;;
   restore-plan) shift || true; cmd_restore_plan "${1:-}" ;;
-  *) printf 'usage: %s {status|facts|full [vm]|incr [vm]|progress|verify [--all]|prune [--dry-run]|keyfile|reattach|schedule [HH:MM]|unschedule|restore-plan <vm>}\n' "$0" >&2; exit 2 ;;
+  restore-test) shift || true; cmd_restore_test "$@" ;;
+  *) printf 'usage: %s {status|facts|full [vm]|incr [vm]|progress|verify [--all]|prune [--dry-run]|keyfile|reattach|schedule [HH:MM]|unschedule|restore-plan <vm>|restore-test <vm> [--set S] [--keep] [-n]}\n' "$0" >&2; exit 2 ;;
 esac

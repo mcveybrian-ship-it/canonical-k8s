@@ -1734,11 +1734,38 @@ EOF
 # it included what we needed.
 # Is a path already inside the RUNNING kernel's initramfs? Returns 2 when it CANNOT TELL,
 # so "could not verify" never reads as "verified".
+# MEASURED 2026-09-21 on host-3, and it corrects two earlier conclusions.
+#
+# The image DOES carry both /etc/modprobe.d/99-stig-radio.conf and
+# /usr/lib/modprobe.d/99-stig-radio.conf - verified by hand with `lsinitramfs | grep -c
+# stig-radio` = 2 - while this function had just reported the file absent and `radio disable`
+# warned that "the rebuild did not pick it up". So:
+#
+#   - the file was never missing. /etc/modprobe.d IS packed, contrary to what the kmod hook
+#     alone suggests, and the warning on all four hosts on 2026-09-17 was a FALSE ALARM.
+#   - the failure is in the CHECK: listing a 77 MB multi-segment zstd initrd straight after
+#     update-initramfs returns can come back short, and `2>/dev/null` hid whatever it said.
+#
+# So: sync first, retry, accept EITHER path, and on failure SHOW the error instead of hiding
+# it. A check that reports a false negative on a correct machine is worse than no check - it
+# was ignored for four days because it always said the same thing.
 initramfs_has() {
-  local want="$1" initrd="/boot/initrd.img-$(uname -r)"
+  local want="$1" initrd="/boot/initrd.img-$(uname -r)" out rc i
   [ -r "$initrd" ] || return 2
   command -v lsinitramfs >/dev/null 2>&1 || return 2
-  lsinitramfs "$initrd" 2>/dev/null | grep -q "$want"
+  for i in 1 2 3; do
+    sync
+    out="$(lsinitramfs "$initrd" 2>&1)"; rc=$?
+    if [ "$rc" -eq 0 ] && printf '%s\n' "$out" | grep -q -e "$want" -e "etc/modprobe.d/$(basename "$want")"; then
+      return 0
+    fi
+    [ "$i" -lt 3 ] && sleep 2
+  done
+  # Only reached when it is genuinely not there, or lsinitramfs failed - say which.
+  if [ "${rc:-1}" -ne 0 ]; then
+    warn "lsinitramfs could not read $initrd: $(printf '%s' "$out" | head -2 | tr '\n' ' ')"
+  fi
+  return 1
 }
 
 rebuild_initramfs() {

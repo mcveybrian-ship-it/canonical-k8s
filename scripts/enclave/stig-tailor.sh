@@ -11,6 +11,7 @@
 #     sudo ./stig-tailor.sh fixups --apply    # ... and apply it
 #     ./stig-tailor.sh aide status            # what AIDE would hash here - RUN BEFORE usg fix
 #     sudo ./stig-tailor.sh aide exclude --apply
+#     sudo ./stig-tailor.sh luksenroll        # TPM unlock via clevis (proven; runbook 6.3i.1)
 #     sudo ./stig-tailor.sh radio status      # what radios this machine has
 #     sudo ./stig-tailor.sh radio disable     # ... and block them
 #
@@ -3700,15 +3701,127 @@ cmd_ufw() {
 # would be stronger, but it CHANGES ON EVERY KERNEL UPDATE - and this enclave takes FIPS
 # kernel updates. Sealing to 11 turns "always needs a human" into "needs a human
 # unpredictably, after a patch, at 02:00", which is worse than what it replaced.
+# luks_os_device - echo "<name> <device>" for the volume that PROMPTS at the console.
+# Shared by both enrolment methods. The OS volume is the crypttab entry whose key field is
+# `none`; the data volume already has a keyfile and never asks anybody anything.
+luks_os_device() {
+  local cname cuuid _rest keyfield dev=""
+  while read -r cname cuuid _rest; do
+    case "$cname" in ''|\#*) continue ;; esac
+    case "$cuuid" in UUID=*) : ;; *) continue ;; esac
+    keyfield="$(awk -v n="$cname" '$1==n{print $3}' /etc/crypttab)"
+    if [ "$keyfield" = none ]; then dev="/dev/disk/by-uuid/${cuuid#UUID=}"; printf '%s %s' "$cname" "$dev"; return 0; fi
+  done < /etc/crypttab
+  return 1
+}
+
+# ------------------------------------------------------------------- luksenroll, clevis
+# THE METHOD THAT ACTUALLY WORKS ON THIS STACK - measured on host-3, 2026-09-21.
+#
+# `systemd-cryptenroll` is blocked twice over here and the sibling path below records why:
+# libtss2-rc0 is not in the mirror (systemd DLOPENS the TPM2 stack, so one absent library
+# reports as an absent feature), and this initrd is cryptsetup-initramfs, which has no TPM2
+# token support at all - which is why host-4's `tpm2-device=auto` only ever produced
+# "ignoring unknown option" on every rebuild.
+#
+# clevis stores its own LUKS2 token and ships an initramfs hook that unlocks before the
+# passphrase prompt is answered. All four packages are in the mirror and tpm2-tools is the
+# FIPS build. PCR 7 only, for the same reason as the systemd path: PCR 11 changes on every
+# kernel update, which converts "always needs a human" into "needs a human unpredictably at
+# 02:00 after a patch".
+cmd_luksenroll_clevis() {
+  local force="$1"
+  local cname dev
+  read -r cname dev <<<"$(luks_os_device || true)"
+  [ -n "${dev:-}" ] || die "no crypttab entry with key 'none' - nothing here prompts for a
+       passphrase, so there is nothing to enrol. Check /etc/crypttab."
+  [ -b "$dev" ] || die "$dev is not a block device"
+  ok "OS volume: $cname -> $(readlink -f "$dev")"
+
+  # THE PASSPHRASE FALLBACK MUST EXIST BEFORE ANYTHING IS ADDED. Worst case then is "it
+  # prompts like it does today", never "bricked".
+  local slots; slots="$(cryptsetup luksDump "$dev" 2>/dev/null | grep -cE '^[[:space:]]+[0-9]+: luks2' || true)"
+  [ "${slots:-0}" -ge 1 ] || die "cannot see a usable key slot on $dev - refusing to touch it"
+  ok "$slots existing key slot(s) - the passphrase fallback survives this"
+
+  local need="clevis clevis-luks clevis-tpm2 clevis-initramfs tpm2-tools" miss="" p
+  for p in $need; do dpkg -s "$p" >/dev/null 2>&1 || miss="$miss $p"; done
+  if [ -n "$miss" ]; then
+    say "installing:$miss"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $miss >/dev/null 2>&1 \
+      || die "could not install:$miss - is the mirror reachable?"
+  fi
+  for p in $need; do dpkg -s "$p" >/dev/null 2>&1 || die "$p still missing - nothing changed"; done
+  ok "clevis and tpm2-tools present"
+
+  # DOES THE TPM ANSWER, UNDER FIPS? Asked before anything is written, because a TPM that
+  # cannot read a PCR cannot release a key either, and the answer is the whole feasibility
+  # question for this platform.
+  local pcr; pcr="$(tpm2_pcrread sha256:7 2>&1 || true)"
+  case "$pcr" in
+    *0x*) ok "TPM answers under FIPS: PCR 7 = $(printf '%s' "$pcr" | grep -oE '0x[0-9A-F]+' | head -1 | cut -c1-18)..." ;;
+    *) warn "tpm2_pcrread failed - the TPM cannot be used for this:"
+       printf '%s\n' "$pcr" | head -3 | sed 's/^/       /' >&2
+       die "nothing has been changed" ;;
+  esac
+
+  if clevis luks list -d "$dev" 2>/dev/null | grep -q tpm2; then
+    ok "already bound: $(clevis luks list -d "$dev" 2>/dev/null | head -1)"
+  else
+    [ "$force" -eq 1 ] || say ""
+    say "binding to PCR 7 - you will be asked for the EXISTING LUKS passphrase once, so a new"
+    say "   slot can be added. Keyslot 0 and that passphrase are NOT touched."
+    clevis luks bind -d "$dev" tpm2 '{"pcr_bank":"sha256","pcr_ids":"7"}' \
+      || die "bind failed - nothing changed, the passphrase still works"
+    ok "bound: $(clevis luks list -d "$dev" 2>/dev/null | head -1)"
+  fi
+
+  # CLEVIS DOES NOT USE crypttab OPTIONS, AND A STALE tpm2-device= IS WORSE THAN NOTHING:
+  # cryptsetup-initramfs prints "ignoring unknown option 'tpm2-device'" on every rebuild and
+  # the line reads as if TPM unlock were configured. host-4 has carried exactly that since
+  # 2026-09-16. Remove it where it appears, and back the file up first - it is the boot path.
+  if grep -q 'tpm2-device=' /etc/crypttab; then
+    cp -a /etc/crypttab "/var/backups/crypttab.$(date +%Y%m%dT%H%M%S)"
+    sed -i -e 's/,tpm2-device=auto//g' -e 's/tpm2-device=auto,//g' -e 's/[[:space:]]tpm2-device=auto$//' /etc/crypttab
+    ok "removed the inert tpm2-device= option from /etc/crypttab (clevis does not use it)"
+  fi
+
+  # The hook has to be IN the running kernel's initrd, and `update-initramfs -u` without -k
+  # targets the newest by version sort - where `generic` sorts after `fips`. That cost a day
+  # on host-4; rebuild_initramfs names the kernel and proves the file moved.
+  rebuild_initramfs clevis \
+    || warn "the binding exists but the running initrd may not carry clevis - it will fall
+       back to the passphrase, which is safe. Re-run before relying on unattended boot."
+  say ""
+  ok "enrolled. THE TEST IS A REBOOT: the console shows the passphrase prompt briefly and then"
+  say "   continues without input. If it waits, type the passphrase - nothing is lost."
+  say "   Undo with:  clevis luks unbind -d $dev -s <slot> && update-initramfs -u -k all"
+  say ""
+  warn "SCOPE: Secure Boot is off on this hardware, so PCR 7 does not bind the boot chain."
+  say  "   This defeats a stolen DISK, not a stolen CHASSIS, and it does nothing for a FAILED"
+  say  "   boot - seeing that still needs a BMC (backlog 1.1, 2.8)."
+}
+
 cmd_luksenroll() {
   need_root
-  local force=0 dev slot_count
+  local force=0 dev slot_count method=clevis
   while [ $# -gt 0 ]; do
     case "$1" in
       --force) force=1; shift ;;
+      # DEFAULT IS clevis BECAUSE IT IS THE ONE THAT WORKS HERE - proven on host-3
+      # 2026-09-21. --method=systemd keeps the original path for a stack where
+      # systemd-cryptsetup is in the initrd and libtss2-rc0 is available.
+      --method=*) method="${1#--method=}"; shift ;;
+      --method) method="${2:?--method needs clevis or systemd}"; shift 2 ;;
       *) die "unknown argument: $1" ;;
     esac
   done
+
+  case "$method" in
+    clevis)  cmd_luksenroll_clevis "$force"; return $? ;;
+    systemd) say "method=systemd - the original path. See runbook 6.3i.1 for why clevis is the default." ;;
+    *) die "--method must be clevis or systemd, got '$method'" ;;
+  esac
 
   # ---- 1. a TPM has to exist, and be the right version --------------------------------
   [ -c /dev/tpmrm0 ] || die "no /dev/tpmrm0 - this machine has no usable TPM.
@@ -3953,5 +4066,5 @@ case "${1:-}" in
   luksenroll) shift; cmd_luksenroll "$@" ;;
   audit)    shift; cmd_audit "$@" ;;
   show)     shift; cmd_show "$@" ;;
-  *) printf 'usage: %s {generate|audit|show|preflight|aide {status|exclude [--apply]|init}|v1r6 [--apply|--verify]|grubpw {status|prep|set}|luksenroll [--force]|fixups [...]|ufw [--apply]|usb {status|enable|disable}|radio {status|disable|enable}}\n' "$0" >&2; exit 2 ;;
+  *) printf 'usage: %s {generate|audit|show|preflight|aide {status|exclude [--apply]|init}|v1r6 [--apply|--verify]|grubpw {status|prep|set}|luksenroll [--method=clevis|systemd] [--force]|fixups [...]|ufw [--apply]|usb {status|enable|disable}|radio {status|disable|enable}}\n' "$0" >&2; exit 2 ;;
 esac

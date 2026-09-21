@@ -232,8 +232,16 @@ say "nginx $NGINX_VER - http2 via $( [ -n "$H2_LISTEN" ] && echo 'listen directi
   echo "    # expensive to diagnose. Revisit at step 05 with the STIG in hand."
   echo "    ssl_protocols       TLSv1.2 TLSv1.3;"
   echo "    ssl_prefer_server_ciphers off;"
+  # SV-206412: "minimize the identity of the web server ... in warning and error messages".
+  # nginx advertises "Server: nginx/1.24.0 (Ubuntu)" until told not to, and the stock
+  # nginx.conf ships the directive COMMENTED OUT. Set it here, in generated config, rather
+  # than by editing a packaged file that an upgrade will replace.
+  echo "    server_tokens off;"
   echo "    ssl_session_cache   shared:SSL:10m;"
-  echo "    ssl_session_timeout 1d;"
+  # SV-206414: "an absolute session timeout value of eight hours or less". The generator wrote
+  # 1d, which fails by three hours. A parameter, because a site may want it tighter - and the
+  # traffic here is machine-to-machine and short-lived, so shortening costs a few handshakes.
+  echo "    ssl_session_timeout ${TLS_SESSION_TIMEOUT:-8h};"
   echo "    ssl_session_tickets off;"
   echo ""
   echo "    access_log /var/log/nginx/$NAME-tls.access.log;"
@@ -248,31 +256,49 @@ say "nginx $NGINX_VER - http2 via $( [ -n "$H2_LISTEN" ] && echo 'listen directi
     echo "    }"
   else
     echo "    root $DOCROOT;"
-    echo "    autoindex on;"
-    echo "    autoindex_exact_size off;"
+    # SV-206411 is NOT "turn autoindex off" - DISA's fix text is "Place a default web page in
+    # every web document directory". A listing tells an unauthenticated caller the exact
+    # inventory of a mirror; a default page tells them nothing. apt never needs a listing, it
+    # requests explicit paths from the Release file. Humans lose browsing, which is the trade
+    # the rule intends. index.html files are written below.
+    echo "    autoindex off;"
+    echo "    index index.html;"
     echo "    location ~* \\.(deb|udeb|tar\\.(gz|xz|zst)|ddeb)\$ {"
     echo "        default_type application/vnd.debian.binary-package;"
     echo "    }"
-    echo "    location ^~ /keys/ { alias ${DOCROOT%/mirror}/keys/; autoindex on; }"
-    echo "    location ^~ /debs/ { alias ${DOCROOT%/mirror}/debs/; autoindex on;"
+    echo "    location ^~ /keys/ { alias ${DOCROOT%/mirror}/keys/; autoindex off; }"
+    echo "    location ^~ /debs/ { alias ${DOCROOT%/mirror}/debs/; autoindex off;"
     echo "                         default_type application/vnd.debian.binary-package; }"
     # Snaps over TLS too. Omitting this from the 443 block while keeping it on 80 is exactly
     # the kind of asymmetry that survives until :80 is closed and then breaks the cluster
     # build with a 404 nobody expects.
-    echo "    location ^~ /snaps/ { alias ${DOCROOT%/mirror}/snaps/; autoindex on;"
+    echo "    location ^~ /snaps/ { alias ${DOCROOT%/mirror}/snaps/; autoindex off;"
     echo "                          default_type application/octet-stream; }"
     # STIG tooling over TLS, for the same reason as /snaps/ - and this one was learned the
     # hard way twenty lines below the warning. /tools/ was added to the :80 vhost on
     # 2026-09-11 and omitted here, so every fetch got a 404 from a server that looked
     # correctly configured because the grep found the location in the OTHER file.
-    echo "    location ^~ /tools/ { alias ${DOCROOT%/mirror}/tools/; autoindex on;"
-    echo "                          autoindex_exact_size off;"
+    echo "    location ^~ /tools/ { alias ${DOCROOT%/mirror}/tools/; autoindex off;"
     echo "                          default_type application/octet-stream; }"
     echo "    location / { try_files \$uri \$uri/ =404; }"
   fi
   echo "}"
 } > "/etc/nginx/conf.d/$NAME-tls.conf"
 chmod 0644 "/etc/nginx/conf.d/$NAME-tls.conf"
+
+# SV-206411's fix text, performed: a default page in every document directory this server
+# publishes. Written only where one is absent, so a site that wrote its own keeps it. The page
+# says what the directory is FOR and nothing about what is in it or what serves it.
+if [ -z "$PROXY" ] && [ -n "${DOCROOT:-}" ]; then
+  for d in "$DOCROOT" "${DOCROOT%/mirror}/keys" "${DOCROOT%/mirror}/debs" \
+           "${DOCROOT%/mirror}/snaps" "${DOCROOT%/mirror}/tools"; do
+    [ -d "$d" ] || continue
+    [ -e "$d/index.html" ] && continue
+    printf '<!doctype html><title>Enclave repository</title>\n<h1>Enclave repository</h1>\n<p>Machine-readable content. Paths are documented in the enclave runbook; directory listing is disabled.</p>\n' > "$d/index.html"
+    chmod 0644 "$d/index.html"
+    say "wrote default page $d/index.html (SV-206411)"
+  done
+fi
 ok "wrote /etc/nginx/conf.d/$NAME-tls.conf"
 
 nginx -t || die "nginx config is invalid - NOT reloading. The site is still serving on :80."

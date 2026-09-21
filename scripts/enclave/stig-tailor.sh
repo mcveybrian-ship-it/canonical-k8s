@@ -1778,6 +1778,20 @@ rebuild_initramfs() {
 }
 
 RADIO_BLOCK=/etc/modprobe.d/99-stig-radio.conf
+# THE INITRAMFS COPY, AND WHY IT IS A SECOND FILE RATHER THAN THE SAME ONE.
+#
+# initramfs-tools packs ONLY /usr/lib/modprobe.d/* into the image - read it in
+# /usr/share/initramfs-tools/hooks/kmod, which copies that directory and nothing else. It
+# NEVER copies /etc/modprobe.d. So the old check ("is /etc/modprobe.d/99-stig-radio.conf inside
+# the initrd?") could not pass no matter how many times update-initramfs ran, and it warned
+# after every single `radio disable` - including the one on host-3 on 2026-09-21, which
+# rebuilt the initramfs and then reported its own work as failed. A check that cannot succeed
+# teaches the operator to ignore warnings, which is worse than not checking.
+#
+# /etc keeps the authoritative copy: it is where an admin looks, where DISA's CheckText points,
+# and it wins at runtime. /usr/lib carries an identical copy purely so the block is present
+# before the real root is mounted.
+RADIO_BLOCK_INITRD=/usr/lib/modprobe.d/99-stig-radio.conf
 RADIO_LOG=/var/log/stig-radio.log
 # Bluetooth has no STIG rule to name its modules, so the family is a parameter. btusb is the
 # transport, bluetooth is the core, the bt*{rtl,intel,bcm,mtk} pieces are vendor firmware
@@ -1939,7 +1953,7 @@ cmd_radio() {
       # left in on 2026-09-17, and nothing in this output would have shown it.
       # `|| src=$?` and not a bare call: initramfs_has returns 2 when it cannot tell, and a
       # bare non-zero command is fatal under set -e before `case` ever runs.
-      local src=0; initramfs_has "${RADIO_BLOCK#/}" || src=$?
+      local src=0; initramfs_has "${RADIO_BLOCK_INITRD#/}" || src=$?
       case "$src" in
         0) ok "  and it is inside the RUNNING kernel's initramfs ($(uname -r))" ;;
         2) say "  (cannot read /boot/initrd.img-$(uname -r) to check - run this as root)" ;;
@@ -2009,6 +2023,14 @@ cmd_radio() {
         rm -f "$tmp"
         ok "wrote $RADIO_BLOCK"
       fi
+      # The initramfs copy, kept byte-identical to the one in /etc.
+      install -d -m 0755 "$(dirname "$RADIO_BLOCK_INITRD")"
+      if [ -f "$RADIO_BLOCK_INITRD" ] && cmp -s "$tmp" "$RADIO_BLOCK_INITRD"; then
+        ok "$RADIO_BLOCK_INITRD already correct (initramfs copy)"
+      else
+        install -m 0644 -o root -g root "$tmp" "$RADIO_BLOCK_INITRD"
+        ok "wrote $RADIO_BLOCK_INITRD - the only modprobe.d path initramfs-tools packs"
+      fi
 
       # THE INITRAMFS CHECK IS DRIVEN BY STATE, NOT BY WHETHER THE FILE CHANGED.
       #
@@ -2023,14 +2045,14 @@ cmd_radio() {
       # because the rebuild had gone to the -generic kernel. Re-running took the "already
       # correct" branch and skipped the rebuild, so a second run CONFIRMED the bug instead of
       # fixing it. A remediation that cannot repair a half-applied state is not a remediation.
-      local irc=0; initramfs_has "${RADIO_BLOCK#/}" || irc=$?
+      local irc=0; initramfs_has "${RADIO_BLOCK_INITRD#/}" || irc=$?
       case "$irc" in
         0) ok "block is already inside the running kernel's initramfs" ;;
         2) warn "cannot read the running kernel's initramfs to check - rebuilding anyway"
-           rebuild_initramfs "${RADIO_BLOCK#/}" \
+           rebuild_initramfs "${RADIO_BLOCK_INITRD#/}" \
              || warn "the block is live in /etc but NOT verified in the running initramfs" ;;
         *) say "  the running kernel's initramfs does not carry the block - rebuilding"
-           rebuild_initramfs "${RADIO_BLOCK#/}" \
+           rebuild_initramfs "${RADIO_BLOCK_INITRD#/}" \
              || warn "the block is live in /etc but NOT in the running kernel's initramfs" ;;
       esac
 

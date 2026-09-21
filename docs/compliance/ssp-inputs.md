@@ -354,6 +354,16 @@ had simply never been enabled; switching it on revealed three pending security u
 in the enclave could previously see. What remained was the genuinely uncovered third-party set:
 Docker, the Harbor components, and anything carried in as a `.deb`.
 
+⚠️ **"Enabled" was only true of the service VMs until 2026-09-21.** `host-1`, `host-2` and
+`host-3` had `esm-apps` **and** `esm-infra` switched off, so on the machines that run every
+guest the `universe` bucket was uncovered in practice while this document called it covered.
+Enabling them surfaced three security updates immediately — `opensc`, `opensc-pkcs11` and
+`prometheus-node-exporter`, all `+esm` builds — which are now installed. **All eight machines
+report `esm-apps`, `esm-infra`, `fips-updates` and `usg` enabled as of 2026-09-21**, read from
+`pro status --format=json` rather than parsed by column. The mirror was confirmed to carry all
+four ESM suites *before* enabling anything, because enabling a service whose source is not
+mirrored only breaks `apt`.
+
 The AO's answer has two parts, and both matter:
 
 1. **There IS a route.** A technician carrying the OS patch bundle can carry third-party

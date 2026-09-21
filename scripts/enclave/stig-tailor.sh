@@ -2743,8 +2743,20 @@ RULES
       say "   answered - V-270757 forbids the setgid bit journald needed. runbook 10.1."
     fi
   fi
+  # THE DECLARATION IS PART OF THE CONDITION, NOT JUST THE SYMPTOM. Found 2026-09-21 on
+  # svc-mgmt-01: its directories were already 0640, so this whole block was skipped and the
+  # machine kept the STALE TWO-LINE file from 2026-09-11 - the version that manufactured
+  # V-270762. It measured compliant with nothing declaring it: journald resets those modes on
+  # restart and the four-line file is what puts them back. A control whose value is correct by
+  # accident re-opens the first time something touches it, and the scan in between reads clean.
+  local jtf_stale=0
+  if [ ! -f "$V1R6_JOURNAL_TMPFILES" ] \
+     || [ "$(grep -c '^[zZ] ' "$V1R6_JOURNAL_TMPFILES" 2>/dev/null || echo 0)" -ne 4 ]; then
+    jtf_stale=1
+    say "   $V1R6_JOURNAL_TMPFILES is missing or not DISA's four-line FixText - it will be rewritten"
+  fi
   if v1r6_journal_dirs | awk '{print $1}' | grep -qv '^640$' || [ -n "$jreal" ] \
-     || [ -n "$(v1r6_journal_subbad)" ]; then
+     || [ "$jtf_stale" -eq 1 ] || [ -n "$(v1r6_journal_subbad)" ]; then
     n_todo=$((n_todo+1))
     if [ "$apply" -eq 1 ]; then
       # DISA names this exact filename. MEASURED on svc-mgmt-01: it wins over

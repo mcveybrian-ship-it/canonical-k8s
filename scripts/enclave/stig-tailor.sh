@@ -2014,13 +2014,14 @@ cmd_radio() {
         printf '# explicit modprobe by name is refused too, not only autoload.\n'
         for m in $mods; do printf 'install %s /bin/true\nblacklist %s\n' "$m" "$m"; done
       } > "$tmp"
+      # BOTH copies are written from $tmp, so it is removed ONCE, after both - the first
+      # version of this deleted it in each branch above and the initramfs copy then failed
+      # with "install: cannot stat /tmp/tmp.XXXX" while still reporting the /etc write as ok.
       if [ -f "$RADIO_BLOCK" ] && cmp -s "$tmp" "$RADIO_BLOCK"; then
         ok "$RADIO_BLOCK already correct"
-        rm -f "$tmp"
       else
         [ -f "$RADIO_BLOCK" ] && backup_file "$RADIO_BLOCK"
         install -m 0644 -o root -g root "$tmp" "$RADIO_BLOCK"
-        rm -f "$tmp"
         ok "wrote $RADIO_BLOCK"
       fi
       # The initramfs copy, kept byte-identical to the one in /etc.
@@ -2031,6 +2032,7 @@ cmd_radio() {
         install -m 0644 -o root -g root "$tmp" "$RADIO_BLOCK_INITRD"
         ok "wrote $RADIO_BLOCK_INITRD - the only modprobe.d path initramfs-tools packs"
       fi
+      rm -f "$tmp"
 
       # THE INITRAMFS CHECK IS DRIVEN BY STATE, NOT BY WHETHER THE FILE CHANGED.
       #

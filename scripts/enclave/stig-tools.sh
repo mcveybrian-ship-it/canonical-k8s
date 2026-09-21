@@ -200,16 +200,25 @@ cmd_publish() {
        Bare ssh from stage-01 into the gap is not authorised - build01 is the key that is.
        Override with REPO_PUSH_KEY=<path>."
 
-  rsync -a --delete --info=progress2 -e "ssh -i $SSH_KEY" \
-    "$STAGING/Evaluate-STIG" "$MIRROR_USER@$MIRROR:$STAGE_REMOTE/" \
-    || die "Evaluate-STIG transfer failed"
+  # THE TREE BECOMES A TARBALL HERE - backlog 6a.25. --sort=name and fixed ownership so the
+  # same input produces the same bytes, which makes the published checksum meaningful rather
+  # than a record of when tar happened to run.
+  local ES_TARBALL=Evaluate-STIG.tar.gz
+  say "  packing $ES_TARBALL ..."
+  tar -czf "$STAGING/$ES_TARBALL" -C "$STAGING" \
+      --sort=name --owner=0 --group=0 --numeric-owner Evaluate-STIG \
+    || die "could not pack $STAGING/$ES_TARBALL"
+  say "  $ES_TARBALL   $(du -sh "$STAGING/$ES_TARBALL" | cut -f1) (was $(du -sh "$STAGING/Evaluate-STIG" | cut -f1) as a tree)"
+  rsync -a --info=progress2 -e "ssh -i $SSH_KEY" \
+    "$STAGING/$ES_TARBALL" "$MIRROR_USER@$MIRROR:$STAGE_REMOTE/" \
+    || die "$ES_TARBALL transfer failed"
   rsync -a --info=progress2 -e "ssh -i $SSH_KEY" \
     "$STAGING/$PWSH_TARBALL" "$MIRROR_USER@$MIRROR:$STAGE_REMOTE/" \
     || die "$PWSH_TARBALL transfer failed"
 
   # The checksum is generated HERE, on the source, so `fetch` verifies against what was
   # published and not against whatever happens to be sitting on the mirror.
-  ( cd "$STAGING" && sha256sum "$PWSH_TARBALL" ) \
+  ( cd "$STAGING" && sha256sum "$PWSH_TARBALL" "$ES_TARBALL" ) \
     | rsh "$MIRROR_USER@$MIRROR" "cat > '$STAGE_REMOTE/SHA256SUMS'" \
     || die "could not write SHA256SUMS"
 
@@ -217,7 +226,8 @@ cmd_publish() {
   say "installing into $REPO_ROOT/tools - this asks for the sudo password on $MIRROR:"
   rsh_t "$MIRROR_USER@$MIRROR" \
     "sudo install -d -m 0755 '$REPO_ROOT/tools' \
-     && sudo rsync -a --delete '$STAGE_REMOTE/Evaluate-STIG' '$REPO_ROOT/tools/' \
+     && sudo install -m 0644 '$STAGE_REMOTE/$ES_TARBALL' '$REPO_ROOT/tools/' \
+     && sudo rm -rf '$REPO_ROOT/tools/Evaluate-STIG' \
      && sudo install -m 0644 '$STAGE_REMOTE/$PWSH_TARBALL' '$REPO_ROOT/tools/' \
      && sudo install -m 0644 '$STAGE_REMOTE/SHA256SUMS' '$REPO_ROOT/tools/' \
      && sudo chown -R root:root '$REPO_ROOT/tools' \
@@ -234,21 +244,27 @@ cmd_publish() {
   # 2026-09-11 when the location was present and correct. restore-mirror.sh already carries a
   # wait for the same reason. A check that races the thing it is checking reports a failure
   # that never happened.
-  local code tries=0
-  while :; do
-    code=$(curl_v -sI -o /dev/null -w '%{http_code}' "https://$MIRROR/tools/$PWSH_TARBALL" || echo 000)
-    [ "$code" = 200 ] && break
-    tries=$((tries + 1)); [ "$tries" -ge 5 ] && break
-    say "  serving check: $code - retrying (nginx reload is asynchronous) $tries/5"
-    sleep 2
+  # EVERY published artefact is checked, not just one. The Evaluate-STIG tarball is what
+  # `fetch` now depends on, so a 404 on it is the failure that matters most.
+  local code tries=0 f bad=""
+  for f in "$PWSH_TARBALL" "$ES_TARBALL" SHA256SUMS; do
+    tries=0
+    while :; do
+      code=$(curl_v -sI -o /dev/null -w '%{http_code}' "https://$MIRROR/tools/$f" || echo 000)
+      [ "$code" = 200 ] && break
+      tries=$((tries + 1)); [ "$tries" -ge 5 ] && break
+      say "  serving check $f: $code - retrying (nginx reload is asynchronous) $tries/5"
+      sleep 2
+    done
+    if [ "$code" = 200 ]; then ok "https://$MIRROR/tools/$f -> 200"; else bad="$bad $f($code)"; fi
   done
-  if [ "$code" = 200 ]; then
-    ok "https://$MIRROR/tools/$PWSH_TARBALL -> $code"
-  else
-    warn "https://$MIRROR/tools/$PWSH_TARBALL -> $code"
+  if [ -n "$bad" ]; then
+    warn "NOT SERVED:$bad"
     warn "  the files are on disk but nginx is not serving them. The vhost needs:"
-    warn "    location ^~ /tools/ { alias $REPO_ROOT/tools/; autoindex on; }"
-    warn "  see scripts/transfer/nginx-apt-mirror.conf, then: sudo nginx -t && systemctl reload nginx"
+    warn "    location ^~ /tools/ { alias $REPO_ROOT/tools/; }"
+    warn "  NOTE: no autoindex is required any more - every artefact is fetched by exact name"
+    warn "  (backlog 6a.25). see scripts/transfer/nginx-apt-mirror.conf, then:"
+    warn "    sudo nginx -t && systemctl reload nginx"
     return 1
   fi
   code=$(curl_v -sI -o /dev/null -w '%{http_code}' \
@@ -503,15 +519,41 @@ cmd_fetch() {
   # files landed flat in /srv/stig-tools/ and the scanner was "installed" in a layout nothing
   # could use. Counting path components in a flag is exactly the kind of arithmetic that is
   # wrong once and then wrong everywhere; staging and checking the result is not.
-  command -v wget >/dev/null 2>&1 || die "wget is not installed - apt-get install -y wget"
   local TMPD; TMPD="$(mktemp -d "$DEST/.fetch.XXXXXX")"
   # shellcheck disable=SC2064
   trap "rm -rf '$TMPD'" RETURN
-  ( cd "$TMPD" && wget -q --show-progress --no-verbose \
-      --ca-certificate="$CA" \
-      -r -np -nH --cut-dirs=1 -R 'index.html*' \
-      "https://$MIRROR/tools/Evaluate-STIG/" ) \
-    || die "Evaluate-STIG fetch failed - nothing was written to $DEST"
+
+  # ONE CHECKSUMMED TARBALL, NOT 390 REQUESTS UP A DIRECTORY LISTING - backlog 6a.25.
+  #
+  # This used `wget -r` against https://$MIRROR/tools/Evaluate-STIG/, which discovers files by
+  # FOLLOWING LINKS IN nginx's AUTOINDEX. That made a STIG requirement and a build step
+  # mutually exclusive: SV-206411 says serve a default page instead of a listing, and turning
+  # listings off killed this fetch outright (measured on the host-3 rebuild, 2026-09-21).
+  # A tarball needs no listing, transfers once, and either verifies against the checksum
+  # written at publish time or is refused - which the walk could never do for 390 files.
+  if curl_v -fsS -o "$TMPD/Evaluate-STIG.tar.gz" "https://$MIRROR/tools/Evaluate-STIG.tar.gz"; then
+    curl_v -fsS -o "$TMPD/SHA256SUMS" "https://$MIRROR/tools/SHA256SUMS" \
+      || die "SHA256SUMS fetch failed - refusing to extract an unverified tarball"
+    ( cd "$TMPD" && sha256sum -c --ignore-missing SHA256SUMS ) \
+      || die "CHECKSUM MISMATCH on Evaluate-STIG.tar.gz - not extracting. Re-publish from stage-01."
+    ok "Evaluate-STIG.tar.gz checksum verified"
+    tar -xzf "$TMPD/Evaluate-STIG.tar.gz" -C "$TMPD" \
+      || die "Evaluate-STIG.tar.gz did not extract"
+    rm -f "$TMPD/Evaluate-STIG.tar.gz"
+  else
+    # A MIRROR PUBLISHED BEFORE 6a.25 has the tree and no tarball. Fall back rather than
+    # failing, and say plainly which path ran - the fallback needs a directory listing and so
+    # carries the SV-206411 deviation with it.
+    warn "no Evaluate-STIG.tar.gz on the mirror - falling back to the directory walk"
+    warn "  that path needs autoindex ON for /tools/ (the SV-206411 deviation). Re-publish"
+    warn "  from stage-01 with: ./scripts/enclave/stig-tools.sh publish"
+    command -v wget >/dev/null 2>&1 || die "wget is not installed - apt-get install -y wget"
+    ( cd "$TMPD" && wget -q --show-progress --no-verbose \
+        --ca-certificate="$CA" \
+        -r -np -nH --cut-dirs=1 -R 'index.html*' \
+        "https://$MIRROR/tools/Evaluate-STIG/" ) \
+      || die "Evaluate-STIG fetch failed - nothing was written to $DEST"
+  fi
   [ -f "$TMPD/Evaluate-STIG/Evaluate-STIG_Bash.sh" ] \
     || die "fetched, but Evaluate-STIG_Bash.sh is not where it should be. Got:
 $(find "$TMPD" -maxdepth 2 | head -12 | sed 's/^/       /')

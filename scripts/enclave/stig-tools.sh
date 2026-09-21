@@ -154,9 +154,14 @@ preflight_ssh() {
   return 1
 }
 
-rsh()    { ssh "${MUX[@]}" -i "$SSH_KEY" -o ConnectTimeout=10 "$@"; }
-rsh_t()  { ssh -t "${MUX[@]}" -i "$SSH_KEY" -o ConnectTimeout=10 "$@"; }
-rscp()   { scp -q "${MUX[@]}" -i "$SSH_KEY" -o ConnectTimeout=10 "$@"; }
+# LogLevel=ERROR silences the login BANNER, which OpenSSH prints at INFO. `publish` opens
+# several connections and the full DoD text scrolled once per connection, burying the transfer
+# progress and the sudo prompt in it. Errors are logged ABOVE this level, so nothing real is
+# hidden - and rsync -e below gets the same treatment for the same reason.
+SSH_QUIET=(-o LogLevel=ERROR)
+rsh()    { ssh "${MUX[@]}" "${SSH_QUIET[@]}" -i "$SSH_KEY" -o ConnectTimeout=10 "$@"; }
+rsh_t()  { ssh -t "${MUX[@]}" "${SSH_QUIET[@]}" -i "$SSH_KEY" -o ConnectTimeout=10 "$@"; }
+rscp()   { scp -q "${MUX[@]}" "${SSH_QUIET[@]}" -i "$SSH_KEY" -o ConnectTimeout=10 "$@"; }
 
 say()  { printf '  %s\n' "$*"; }
 ok()   { printf '  [ok] %s\n' "$*"; }
@@ -209,10 +214,10 @@ cmd_publish() {
       --sort=name --owner=0 --group=0 --numeric-owner Evaluate-STIG \
     || die "could not pack $STAGING/$ES_TARBALL"
   say "  $ES_TARBALL   $(du -sh "$STAGING/$ES_TARBALL" | cut -f1) (was $(du -sh "$STAGING/Evaluate-STIG" | cut -f1) as a tree)"
-  rsync -a --info=progress2 -e "ssh -i $SSH_KEY" \
+  rsync -a --info=progress2 -e "ssh -i $SSH_KEY -o LogLevel=ERROR" \
     "$STAGING/$ES_TARBALL" "$MIRROR_USER@$MIRROR:$STAGE_REMOTE/" \
     || die "$ES_TARBALL transfer failed"
-  rsync -a --info=progress2 -e "ssh -i $SSH_KEY" \
+  rsync -a --info=progress2 -e "ssh -i $SSH_KEY -o LogLevel=ERROR" \
     "$STAGING/$PWSH_TARBALL" "$MIRROR_USER@$MIRROR:$STAGE_REMOTE/" \
     || die "$PWSH_TARBALL transfer failed"
 

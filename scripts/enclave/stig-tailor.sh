@@ -4011,6 +4011,9 @@ cmd_luksenroll() {
   # initramfs carries it too. A rebuild that omits it succeeds silently and the host simply
   # falls back to the passphrase, which looks like a wrong PCR seal and is not.
   if command -v lsinitramfs >/dev/null 2>&1; then
+    # sync first: listing a large initrd straight after a rebuild can come back short, which
+    # is what made the radio and clevis checks cry wolf. Same trap, unused path, one line.
+    sync
     local inside; inside="$(lsinitramfs "$initrd" 2>/dev/null | grep -cE 'libtss2-(rc|esys|mu)' || true)"
     case "$inside" in ''|*[!0-9]*) inside=0 ;; esac
     if [ "$inside" -gt 0 ]; then

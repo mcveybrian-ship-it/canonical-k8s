@@ -1795,7 +1795,13 @@ rebuild_initramfs() {
   fi
   ok "initramfs rebuilt for every installed kernel (running: $kver)"
   if [ -n "$want" ] && command -v lsinitramfs >/dev/null 2>&1; then
-    if lsinitramfs "$initrd" 2>/dev/null | grep -q "$want"; then
+    # USE THE RETRYING HELPER, not a bare lsinitramfs|grep. This function had its own inline
+    # copy that ran the instant update-initramfs returned, which is the race that made the
+    # radio check cry wolf on four hosts since 09-17 - and then did it AGAIN on 2026-09-21
+    # for clevis, reporting "NOT inside" when the image demonstrably held 11 clevis files.
+    # Fixing the helper and leaving a second copy here fixed nothing: the same bug, twice,
+    # in one file.
+    if initramfs_has "$want"; then
       ok "verified: $want is inside $initrd"
     else
       warn "$want is NOT inside $initrd - the rebuild did not pick it up"

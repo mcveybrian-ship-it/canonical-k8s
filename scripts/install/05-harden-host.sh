@@ -181,6 +181,29 @@ step_hostprep() {
   "$SELF/03-host-services.sh" hosts
   "$SELF/03-host-services.sh" trustca
   "$SELF/03-host-services.sh" apt
+
+  # THE TOOLS LATER STEPS NEED, INSTALLED WHILE THE MIRROR IS KNOWN GOOD - not discovered
+  # missing halfway through hardening.
+  #
+  # xmllint (libxml2-utils) is the one that mattered: `stig-tailor.sh tailor` validates the
+  # generated USG tailoring file with it and SKIPS the check when it is absent. It has been
+  # absent on every host ever built - so a generated 1500-line XML that nothing validates has
+  # been handed to `usg` five times. Seen again on the host-3 rebuild, 2026-09-21, which is
+  # exactly the kind of "nobody noticed for weeks" gap a from-scratch build is supposed to find.
+  #
+  # lshw, dmidecode and bc were installed at step 13 - too late to help steps 8-12 and no
+  # reason to wait. Installing them here makes the hardening steps independent of each other.
+  local _need="libxml2-utils lshw dmidecode bc"
+  local _miss=""
+  for _p in $_need; do dpkg -s "$_p" >/dev/null 2>&1 || _miss="$_miss $_p"; done
+  if [ -n "$_miss" ]; then
+    say "installing tools later steps need:$_miss"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $_miss >/dev/null 2>&1 \
+      || warn "could not install:$_miss - the mirror may be unreachable"
+  fi
+  for _p in $_need; do
+    dpkg -s "$_p" >/dev/null 2>&1 && ok "$_p present" || warn "$_p STILL MISSING - checks that need it will be skipped, not failed"
+  done
   mark_step hostprep
 }
 
@@ -457,6 +480,8 @@ step_final_audit() {
 step_evalstig() {
   done_step evalstig && return 0
   hdr "13. Evaluate-STIG - the second scanner, DISA V1R6 content"
+  # Installed at step 1 now; kept here as a belt-and-braces for a machine hardened before
+  # that change, and it is a no-op when they are present.
   apt-get install -y lshw dmidecode bc >/dev/null 2>&1 || warn "could not install lshw/dmidecode/bc"
   "$ENC/stig-tools.sh" fetch || die "stig-tools fetch failed"
 

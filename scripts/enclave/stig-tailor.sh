@@ -652,10 +652,21 @@ cmd_fixups() {
     # (systemd.conf < zzz-...), and on a global run it does not. I am not going to assert a
     # mechanism I have not proven - the targeted call demonstrably works and the global one
     # demonstrably does not, and that is enough to make the fix correct.
-    local jtf; jtf="$(ls /etc/tmpfiles.d/*stig*.conf 2>/dev/null | head -1)"
+    # `|| true` IS LOAD-BEARING. Without it this line ENDS THE SCRIPT on a machine that has no
+    # stig tmpfiles config yet: the glob matches nothing, `ls` exits 2, `pipefail` propagates it
+    # past `head`, and `set -e` kills the run - with NO MESSAGE, immediately after the journalctl
+    # line above. Measured on the freshly rebuilt host-3, 2026-09-21: hardening stopped dead at
+    # step 8 and `tailor` was never marked done. Every host built before that survived only
+    # because it already had the file from an earlier hand-run, so a clean build had never once
+    # exercised this path. Same shape as the `df` crash in 03-compose-vm.sh the day before.
+    local jtf; jtf="$(find /etc/tmpfiles.d -maxdepth 1 -name '*stig*.conf' 2>/dev/null | sort | head -1 || true)"
     if [ -z "$jtf" ]; then
-      warn "no stig tmpfiles config in /etc/tmpfiles.d - run 'v1r6 --apply' first, it writes it"
-      failed=$((failed+1))
+      # NOT counted as a failure during a first build: `v1r6 --apply` writes this file at
+      # hardening step 12 and re-applies it, which is four steps after this one runs. Saying
+      # "run v1r6 first" and failing would stop a sequence that is already going to fix it.
+      # The gap is not hidden either way - `fixups --verify` re-checks the directories.
+      say "no stig tmpfiles config in /etc/tmpfiles.d yet - the journal machine-id directories"
+      say "     stay at journald's default until 'v1r6 --apply' writes it (hardening step 12)."
     elif systemd-tmpfiles --create "$jtf" >/dev/null 2>&1; then
       local still=0
       for jdir in /var/log/journal/* /run/log/journal/*; do
@@ -1353,7 +1364,10 @@ fixups_verify() {
     fi
   fi
   local offenders
-  offenders="$(find /var/log -type f -perm /0137 -printf '%M %U:%G %p\n' 2>/dev/null | sort -k3)"
+  # `|| true`: find exits non-zero after ANY permission-denied even when its output is complete,
+  # and with pipefail that status reaches the assignment and set -e ends the run. Same class of
+  # bug as the tmpfiles glob above.
+  offenders="$(find /var/log -type f -perm /0137 -printf '%M %U:%G %p\n' 2>/dev/null | sort -k3 || true)"
   if [ -n "$offenders" ]; then
     warn "files under /var/log more permissive than $LOGMODE - file_permissions_var_log_stig"
     warn "will keep failing until each is dealt with:"

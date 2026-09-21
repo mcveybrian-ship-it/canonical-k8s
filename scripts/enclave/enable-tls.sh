@@ -263,6 +263,22 @@ say "nginx $NGINX_VER - http2 via $( [ -n "$H2_LISTEN" ] && echo 'listen directi
     # the rule intends. index.html files are written below.
     echo "    autoindex off;"
     echo "    index index.html;"
+    # A DEFAULT PAGE FOR EVERY DIRECTORY, in one directive, and it is not optional politeness:
+    # with listings off and no index, nginx answers a directory URL with 403 - and
+    # `pro enable fips-updates` VERIFIES REPOSITORY ACCESS BY FETCHING ".../pool/", a directory.
+    # Measured 2026-09-21 on a freshly rebuilt host-3: "403 Forbidden ... Could not enable FIPS
+    # Updates". apt was unaffected - it requests explicit paths from the Release file - so the
+    # regression passed every check made the night before. SV-206411 asks for a default page in
+    # every document directory; this gives one to ALL of them, including directories a later
+    # mirror sync creates, which scattered index.html files would miss.
+    DIRPAGE="'<!doctype html><title>Enclave repository</title><h1>Enclave repository</h1><p>Machine-readable content. Directory listing is disabled; paths are documented in the enclave runbook.</p>'"
+    echo "    location ~ /\$ {"
+    echo "        try_files \$uri/index.html @dirdefault;"
+    echo "    }"
+    echo "    location @dirdefault {"
+    echo "        default_type text/html;"
+    echo "        return 200 $DIRPAGE;"
+    echo "    }"
     echo "    location ~* \\.(deb|udeb|tar\\.(gz|xz|zst)|ddeb)\$ {"
     echo "        default_type application/vnd.debian.binary-package;"
     echo "    }"

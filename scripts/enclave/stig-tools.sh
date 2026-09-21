@@ -272,10 +272,14 @@ cmd_publish() {
     warn "    sudo nginx -t && systemctl reload nginx"
     return 1
   fi
-  code=$(curl_v -sI -o /dev/null -w '%{http_code}' \
-           "https://$MIRROR/tools/Evaluate-STIG/Evaluate-STIG_Bash.sh" || echo 000)
-  [ "$code" = 200 ] && ok "https://$MIRROR/tools/Evaluate-STIG/ -> $code" \
-                    || warn "Evaluate-STIG_Bash.sh -> $code"
+  # The old check probed a file INSIDE the published tree. The tree is gone as of 6a.25 - the
+  # tarball replaced it - so that probe returned 404 on a completely healthy publish. Verify
+  # what is actually published instead: the tarball's checksum line exists and the pair match.
+  if curl_v -fsS "https://$MIRROR/tools/SHA256SUMS" 2>/dev/null | grep -q "$ES_TARBALL"; then
+    ok "SHA256SUMS carries a line for $ES_TARBALL"
+  else
+    warn "SHA256SUMS has no line for $ES_TARBALL - fetch will refuse to extract it"
+  fi
   say ""
   ok "any in-gap machine can now run:  sudo ./stig-tools.sh fetch"
 }

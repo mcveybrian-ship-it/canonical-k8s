@@ -294,15 +294,13 @@ say "nginx $NGINX_VER - http2 via $( [ -n "$H2_LISTEN" ] && echo 'listen directi
     # hard way twenty lines below the warning. /tools/ was added to the :80 vhost on
     # 2026-09-11 and omitted here, so every fetch got a 404 from a server that looked
     # correctly configured because the grep found the location in the OTHER file.
-    # ⚠️ /tools/ KEEPS ITS LISTING, and it is the one exception on this server.
-    # `stig-tools.sh fetch` mirrors the 390-file Evaluate-STIG tree with `wget -r`, which
-    # DISCOVERS FILES BY FOLLOWING LINKS IN THE AUTOINDEX. With listings off there are no links,
-    # so the fetch fails outright - measured on the host-3 rebuild 2026-09-21, hardening dead at
-    # step 13. This is a scoped deviation from SV-206411 on ONE path, not a decision to allow
-    # listings: the path is reachable only from inside the enclave, behind ufw, and serves a
-    # public DISA download. **The real fix is to stop walking HTTP** - publish the tree as one
-    # checksummed tarball and fetch that (backlog 6a.25), after which this line goes back to off.
-    echo "    location ^~ /tools/ { alias ${DOCROOT%/mirror}/tools/; autoindex on;"
+    # /tools/ NO LONGER NEEDS A LISTING, and this is the line that proves 6a.25 closed.
+    # It carried `autoindex on` for a few hours on 2026-09-21 because `stig-tools.sh fetch`
+    # discovered its 390 files by following links in the autoindex, so SV-206411 and the build
+    # were mutually exclusive. Publishing Evaluate-STIG as ONE CHECKSUMMED TARBALL removed the
+    # dependency: every artefact under /tools/ is now fetched by exact name and verified against
+    # SHA256SUMS. The deviation is gone rather than documented.
+    echo "    location ^~ /tools/ { alias ${DOCROOT%/mirror}/tools/; autoindex off;"
     echo "                          autoindex_exact_size off;"
     echo "                          default_type application/octet-stream; }"
     echo "    location / { try_files \$uri \$uri/ =404; }"

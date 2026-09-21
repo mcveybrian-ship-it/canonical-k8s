@@ -527,6 +527,22 @@ fixups_plan() {
     say "        on a temp file BEFORE install, and the whole set re-checked after."
   fi
 
+  # ITEMS 0b-0d RUN ON --apply AND WERE NEVER LISTED HERE. Found 2026-09-20 reading this plan
+  # on svc-mgmt-01: the numbered list above starts at 1, `fixups_plan` returns before the 0*
+  # items, and the operator therefore approved a change set that was not the change set. The
+  # state is measured here rather than described, so the line is true on the machine reading it.
+  printf '\n  ALSO ON --apply, and not numbered above:\n'
+  local f0b="" svc
+  for svc in sssd openipmi fwupd-refresh; do
+    case "$(systemctl is-enabled "$svc" 2>/dev/null)" in
+      enabled|enabled-runtime|static) f0b="$f0b $svc($(systemctl is-active "$svc" 2>/dev/null))" ;;
+    esac
+  done
+  printf '     0b. disable units with nothing to serve, PROVEN case by case - no domain for sssd,\n'
+  printf '         no /dev/ipmi* for openipmi, no route for fwupd-refresh. Packages stay installed.\n'
+  printf '         state: enabled here:%s\n' "${f0b:- none}"
+  printf '     0c. re-set the controls a package upgrade reverts and only `usg fix` ever set\n'
+  printf '     0d. /var/log/journal/<machine-id> back to 0640 - journald resets it on restart\n'
   printf '\n  nothing above has been changed. re-run with --apply\n\n'
 }
 

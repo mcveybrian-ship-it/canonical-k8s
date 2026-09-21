@@ -688,6 +688,7 @@ live guest is never stopped and never written to; the copy cannot take its addre
 | Guest | Disk | Checksums | `qemu-img check` | Booted | Rebuild | Boot | Total |
 |---|---|---|---|---|---|---|---|
 | `svc-obs-01` | 13 GB | verified | passed | **yes** | 39 s | 17 s | **56 s** |
+| `svc-obs-01` re-test, 6 sets, definition **from the backup** | 13 GB | verified | passed | **yes** | 43 s | 12 s | **55 s** |
 | `svc-harbor-01` | 15 GB | verified | passed | **yes** | 65 s | 38 s | **1 m 43 s** |
 | `svc-mgmt-01` | 35 GB | verified | passed | **yes** | 192 s | 22 s | **3 m 34 s** |
 | `svc-repo-01` | 332 GB | verified | passed | **yes** | 4261 s | 27 s | **1 h 11 m** |
@@ -703,9 +704,14 @@ Evidence: `/srv/stig-evidence/restore-test-<guest>-<stamp>.txt` on `host-4`, one
 1. **The backup sets did not contain the domain definition.** Only the disks were stored. A
    restore onto a rebuilt host would have meant writing the VM's XML — CPU, memory, machine
    type, firmware, disk and network layout — by hand, under pressure, from memory. Every set
-   now stores `virsh dumpxml --inactive` and checksums it. **The sets that this test restored
-   predate that fix**, so the test used the live definition and said so; that is weaker
-   evidence than it appears and the next set is the one that closes it.
+   now stores `virsh dumpxml --inactive` and checksums it.
+
+   ✅ **Closed by re-test 2026-09-21 15:56 UTC.** The 07:00 set was the first to contain
+   `DOMAIN.xml`, and `svc-obs-01` was restored from a **six-set** chain using **the definition
+   from the backup, not the live domain** — the tool reports which it used, and this run said
+   *"domain definition: from the backup set"*. Rebuild 43 s, boot 12 s, **total 55 s**, data age
+   8 h. Evidence: `restore-test-svc-obs-01-20260921T155646Z.txt`. **The backup volume alone is
+   now sufficient to reconstruct a guest**, which is what this control has to be able to claim.
 2. **Reassembling an incremental chain was the undocumented step.** `restore-plan` says "apply
    incrementals in order" and stops there. A libvirt push-mode incremental holds only changed
    clusters and carries no reference to what it was built on, so on its own it is unreadable.

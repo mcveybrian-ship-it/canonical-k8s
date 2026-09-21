@@ -112,8 +112,26 @@ cleanup() {
 trap cleanup EXIT
 SSH_OPTS=(-i "$KEY" -o BatchMode=yes -o ConnectTimeout=10
           -o ControlMaster=auto -o ControlPath="$CTL" -o ControlPersist=60)
-ssh "${SSH_OPTS[@]}" "$USER_NAME@$TARGET" true 2>/dev/null \
-  || die "cannot ssh to $USER_NAME@$TARGET with $KEY"
+# 2>&1 CAPTURED, NOT DISCARDED. This said only "cannot ssh" for every cause - wrong key,
+# machine down, or the one that actually happens: a REBUILT host presents a new host key and
+# ssh refuses on the stale known_hosts entry. That is expected after every rebuild (host-3,
+# 2026-09-21) and it will happen four times during the from-scratch run, so the message names
+# the fix instead of sending someone to go and find it.
+if ! _ssh_err="$(ssh "${SSH_OPTS[@]}" "$USER_NAME@$TARGET" true 2>&1)"; then
+  case "$_ssh_err" in
+    *"REMOTE HOST IDENTIFICATION HAS CHANGED"*|*"Host key verification failed"*)
+      die "$TARGET presents a DIFFERENT host key than known_hosts records.
+       Expected after a rebuild of that machine. Drop the stale entries and retry:
+         ssh-keygen -R $TARGET
+       If that machine was NOT rebuilt, stop and find out why its identity changed." ;;
+    *"Permission denied"*)
+      die "$TARGET refused $KEY (publickey). Is the key in its authorized_keys?
+       A freshly installed host gets them from the seed - check the seed carried both keys." ;;
+    *)
+      die "cannot ssh to $USER_NAME@$TARGET with $KEY. ssh said:
+       ${_ssh_err:-<no output>}" ;;
+  esac
+fi
 
 N=$(git archive --format=tar HEAD | tar -t | grep -cv '/$')
 HEAD_SHA=$(git rev-parse --short HEAD)

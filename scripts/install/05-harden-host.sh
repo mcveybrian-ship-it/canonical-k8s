@@ -552,7 +552,13 @@ cmd_run() {
   need_root; assert_enclave_host
   install -d -m 0755 "$STATE_DIR"; touch "$STATE" "$LOG"
   step_preflight; step_hostprep; step_pro; step_fips; step_patch; step_usg; step_baseline
-  step_prechecks; step_usgfix; step_tailor; step_grub; step_v1r6
+  # step_radio WAS MISSING FROM THIS LIST while appearing in `status` as a step - so it read
+  # "[ ] radio" forever and never ran. Found 2026-09-21 on the host-3 rebuild: the machine came
+  # up with its RTL8821CE driver loaded, bluetooth loaded, wlp2s0 present and no blacklist, and
+  # V-270755 landed Not Reviewed with "a wireless interface is configured". host-1/2/4 have no
+  # radio only because someone disabled theirs BY HAND on 2026-09-17. A step that is displayed
+  # but never dispatched is worse than a missing step: the status board says it is accounted for.
+  step_prechecks; step_usgfix; step_tailor; step_radio; step_grub; step_v1r6
   step_verify; step_final_audit; step_evalstig; step_done
 }
 

@@ -245,6 +245,28 @@ cmd_exporter() {
     esac
   done
 
+  # ---- THE THING THIS REPLACES, REMOVED ONCE IT IS PROVEN WORKING -------------------------
+  #
+  # sysstat collects CPU, disk, memory and load - all of which node-exporter now publishes -
+  # and it writes /var/log/sysstat/sa<DD> WORLD-READABLE every 10 minutes, which re-opens
+  # V-270756 daily. The enclave decided on 2026-09-16 to purge it, and that decision was
+  # applied BY HAND to all eight machines. It was never put in the build: the host-3 rebuild
+  # came back with sysstat installed while every other machine had none (2026-09-21).
+  #
+  # It is purged HERE rather than during hardening because this is the point where the
+  # replacement is installed AND VERIFIED above - removing a collector before its replacement
+  # works is how a machine ends up with neither.
+  if dpkg -s sysstat >/dev/null 2>&1; then
+    say ""
+    say "purging sysstat - node-exporter publishes what it collected, and its daily 0644"
+    say "   /var/log/sysstat file re-opens V-270756 (decided 2026-09-16)"
+    if DEBIAN_FRONTEND=noninteractive apt-get purge -y sysstat >/dev/null 2>&1; then
+      ok "sysstat purged"
+    else
+      warn "could not purge sysstat - V-270756 will re-open daily until it is gone"
+    fi
+  fi
+
   say ""
   warn "9100 IS NOT FIREWALLED BY THIS SCRIPT, deliberately."
   say "   It exposes every mount, interface, process count and kernel version on this box."

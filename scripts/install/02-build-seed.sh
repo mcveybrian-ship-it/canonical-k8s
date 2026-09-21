@@ -177,6 +177,10 @@ done
 # leaves the remainder UNPARTITIONED for Ceph to own (host-1..3). Validated here rather than
 # discovered by subiquity: a storage error surfaces 40 seconds into an unattended install,
 # on a console that on these machines does not exist remotely.
+# PRINTED IN THE SUMMARY TOO, not just validated. On 2026-09-21 this dry run showed every LV
+# size and said nothing about DATA_VG_SIZE - the one parameter being changed for that host, and
+# the one whose silent default cost a build on 2026-09-17. A summary that omits the value under
+# review invites approval of something nobody looked at.
 DATA_VG_SIZE="${DATA_VG_SIZE:--1}"
 case "$DATA_VG_SIZE" in
   -1) : ;;
@@ -333,6 +337,8 @@ ${KEY_SUMMARY%$'\n'}
   OS disk    id_path *-ata-*   (SATA; never USB)
   data disk  id_path *-nvme-*  (NVMe)
   LV sizes   root=$LV_ROOT home=$LV_HOME var=$LV_VAR varlog=$LV_VARLOG audit=$LV_VARLOGAUDIT tmp=$LV_TMP
+  data VG    $(if [ "$DATA_VG_SIZE" = -1 ]; then printf 'the WHOLE data disk (nothing left raw for a Ceph OSD)'; else printf '%s - the remainder of the data disk is left UNPARTITIONED' "$DATA_VG_SIZE"; fi)
+  unlock     $LUKS_UNLOCK$([ "$LUKS_UNLOCK" = passphrase ] && printf ' (a human types it at the console on every boot)')
 
 PREFLIGHT
 

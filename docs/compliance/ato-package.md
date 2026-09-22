@@ -46,7 +46,7 @@ three-month one.
 |---|---|
 | **PPSM registration** (ports, protocols, services) | ⬜ Not started. Inputs exist: `stig-tailor.sh ufw` holds the rule set, and every listening port has a justification in the runbook. §9a.3 adds `:8008`, `:2379`, `:2380` |
 | **Interconnection Security Agreements (ISA/MOU)** | ✅ **Almost certainly none — and say so affirmatively.** The enclave has no external connections; `stage-01` is outside the boundary and physically unplugged at cutover. *"No interconnections"* is a strong statement, not an omission |
-| **Privacy (PTA / PIA)** | ⬜ Depends entirely on the application data — the same unanswered question as Q22. Ask |
+| **Privacy (PTA / PIA)** | ⬜ **A PIA is required — settled 2026-09-22.** `DATA_TYPES` records PII of staff and operators, **PII of members of the public**, **PHI** and recorded human call records, so the screening outcome is not in doubt. Backlog **D-7**; ⚠️ whether a health-information regime applies on top of 800-53 is still open (**Q-PHI**) |
 | **Cybersecurity Strategy** | ⬜ Acquisition-programme artifact. Ask whether it applies |
 
 ---

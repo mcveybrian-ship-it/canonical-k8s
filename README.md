@@ -25,6 +25,7 @@ reference material you will be sent to from it.
 | [`docs/01-pathfinder.md`](docs/01-pathfinder.md) | Step 01: Ubuntu Pro validation on the pathfinder |
 | [`docs/02-host-install.md`](docs/02-host-install.md) | Step 02: bare-metal host build |
 | [`docs/03-host-services.md`](docs/03-host-services.md) | Step 03: hypervisor services and guest composition |
+| [`docs/lab-network.md`](docs/lab-network.md) | The lab network as built: FortiGate topology, the two WANs, where the air gap is, and how to verify it |
 | [`docs/compliance/dashboards-and-metrics.md`](docs/compliance/dashboards-and-metrics.md) | The OS and compliance dashboards: every metric, where it comes from, and how to rebuild the stack |
 | [`docs/open-questions.md`](docs/open-questions.md) | What is unanswered, grouped by who answers it |
 | [`docs/runbook.md`](docs/runbook.md) | Reference architecture — *why* the design is what it is, with sources. Not a step list |

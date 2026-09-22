@@ -168,6 +168,33 @@ and this risk. State both — an assessor who reads only the favourable half wil
 | Why the controls are RIGHT | `unlock_time=0` is the requirement — an administrator, not a timer, clears a lockout. `passwd_tries=1` is a deliberate hardening choice. **Nothing here should be relaxed**, and this section does not request a deviation |
 | Why it is still a finding | The controls are sound; the **architecture around them** has a single point of failure. One account, one credential, no out-of-band console. The control assumes an administrator can reach the machine to clear the lock — and on `host-1/2/3` that assumption is false without a drive to the rack |
 
+#### ✅ CORRECTED 2026-09-22 — a lockout does NOT survive a reboot, and that halves the finding
+
+**Measured on host-1:** `faillock.conf` has no `dir =` line, so records land in the compiled
+default `/run/faillock` — and `/run` is **tmpfs**. **A reboot erases every strike.**
+
+**This is compliant, not a loophole.** V-270690's check verifies `audit`, `silent`, `deny = 3`,
+`fail_interval = 900` and `unlock_time = 0`. It says nothing about where the records are stored,
+and the default location is what DISA's own fix text produces.
+
+**And since 2026-09-21/22 every host is TPM-enrolled (§2.1), so it returns unattended.** The
+recovery for a locked-out machine is therefore: **power-cycle it.** No GRUB password, no root
+credential, no rescue mode, no reinstall.
+
+**What remains, and it is a smaller and more honest statement:**
+
+| | |
+|---|---|
+| **The real cost is on `host-4`** | A power cycle there stops **all four service guests ungracefully**, because the ordered shutdown (`vm-power.sh`) needs a login. Databases must be checked afterwards. On host-1/2/3 nothing is running and the cost is zero |
+| **Physical presence is still required** | Someone must press the button. That is the BMC argument (CUST-14) restated: with one, recovery is remote and takes a minute |
+| **The control is untouched** | An attacker guessing passwords is still stopped until an administrator intervenes — and a deliberate, physical power cycle **is** that intervention |
+
+**So the emergency-account and sealed-root measures below are no longer the floor** — the floor
+is a power cycle, which works today on every machine. They remain worth doing as the *fast*
+path (a console login beats a hard power cycle on a hypervisor), but this finding should be
+recorded at **moderate** severity: a recoverable operational event with a stated cost, not a
+machine that has to be rebuilt.
+
 **What is defensible, and what is not.** Four measures, none of which weakens a control:
 
 1. **A second named administrator account per admin-capable human.** `faillock` counts per

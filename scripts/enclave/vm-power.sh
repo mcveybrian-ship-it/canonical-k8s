@@ -207,6 +207,13 @@ cmd_guests_down() {
   fi
   local left; left="$(virsh list --state-running --name 2>/dev/null | awk 'NF' | tr '\n' ' ')"
   if [ -z "${left// /}" ]; then
+    # LEAVE PROOF IN THE JOURNAL. `after-boot` reads the PREVIOUS boot's libvirt-guests log to
+    # spot guests that were killed rather than stopped - but after a correct `host-reboot` that
+    # log ALWAYS says "Can't connect to default. Skipping.", because we already stopped
+    # everything and libvirtd was gone by the time it ran. The check could not tell a clean
+    # shutdown from the 2026-09-17 disaster, so it warned after every correct one (measured
+    # 2026-09-22). This marker is what makes the two distinguishable.
+    logger -t vm-power -p daemon.notice "guests-down complete - all target guests shut off cleanly by vm-power.sh" 2>/dev/null || true
     ok "all target guests are shut off"
   else
     die "still running after the shutdown pass: $left"
@@ -361,8 +368,18 @@ cmd_after_boot() {
   journalctl -b -1 -u libvirt-guests --no-pager 2>/dev/null | tail -4 \
     || say "no previous boot recorded"
   say ""
-  say "  \"Can't connect to default. Skipping.\" means it shut down NOTHING and every guest"
-  say "  was killed. Check each database before trusting it."
+  # READ OUR OWN MARKER FIRST. With it, the libvirt-guests line above is expected and means
+  # nothing; without it, the guests were killed and the databases need checking.
+  if journalctl -b -1 -t vm-power --no-pager 2>/dev/null | grep -q 'guests-down complete'; then
+    ok "vm-power stopped the guests cleanly before that reboot - the line above is EXPECTED"
+    say "  libvirt-guests found nothing to do because this script had already done it."
+  else
+    warn "no vm-power 'guests-down complete' marker in the previous boot."
+    say  "  If the line above says \"Can't connect to default. Skipping.\", it shut down NOTHING"
+    say  "  and every guest was killed - check each database before trusting it. That is the"
+    say  "  2026-09-17 failure, and the fix is to reboot via: vm-power.sh host-reboot"
+    say  "  (A reboot ordered any other way - systemctl reboot, a power event - lands here.)"
+  fi
 
   say ""
   [ "$bad" -eq 0 ] && ok "host is back and complete" || warn "items above need attention"

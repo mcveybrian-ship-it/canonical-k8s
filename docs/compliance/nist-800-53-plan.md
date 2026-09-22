@@ -4,11 +4,20 @@
 [`ato-package.md`](ato-package.md) (the containers). This is the engineering plan: which
 controls, how they get satisfied, and what is actually left to do.
 
-> 🔴 **The control baseline is the AO's determination, not ours.** IL5 generally corresponds to
-> a High-equivalent baseline plus DoD overlays for CUI, but *"generally"* is not something to
-> build a package on. **Get the baseline and the overlay set in writing** — it changes the
-> control count by hundreds and it is the first question in
-> [`ato-package.md`](ato-package.md) §2.
+> ✅ **SET 2026-09-22 — provisionally.** `CONTROL_BASELINE='800-53 Rev 5 High'` and
+> `OVERLAYS='CUI, NSS, Privacy'` in
+> [`baseline/facility-profile.env`](baseline/facility-profile.env), recorded by the **acting**
+> AO with a tailoring note and the **Moderate** alternative written beside it.
+>
+> 🔴 **It is still the engagement AO's determination, not ours.** IL5 generally corresponds to a
+> High-equivalent baseline plus DoD overlays for CUI, but *"generally"* is not something to build
+> a package on — it changes the control count by hundreds. **The note travels with every document
+> that cites these values, and the real AO's answer supersedes them without argument.** Phase 1
+> item 1 below is therefore *provisionally* done, not done.
+>
+> ⚠️ **Two consequences of the overlays chosen.** **NSS** expands scope beyond the CUI-only case.
+> **Privacy** pulls the privacy artifacts into the package, which makes `DATA_TYPES` load-bearing
+> where it had been optional — backlog **D-7** and **Q-DT**.
 
 ---
 

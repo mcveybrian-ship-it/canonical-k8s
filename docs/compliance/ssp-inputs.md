@@ -86,6 +86,45 @@ from a power event, a kernel update or a hardware fault without a human physical
 Acceptable for a lab with one operator on site. A materially different proposition for
 production hardware in a facility somebody has to be escorted into.
 
+#### ✅ IMPLEMENTED 2026-09-21/22 — TPM unlock is in place on all four hosts, and here is exactly what it does and does not buy
+
+**Measured, not planned.** All four hosts are enrolled with **clevis bound to TPM 2.0, PCR 7**,
+and all four now boot **with no passphrase typed**: `host-3` 23:36, `host-1` 23:58, `host-2`
+00:06, and **`host-4` at 00:19 — the machine whose console prompt took the entire enclave down
+on 2026-09-17.** After that reboot: FIPS still enabled, all four service guests running, DNS,
+the apt mirror, the Ubuntu Pro contracts server and Harbor (all components healthy) back, and
+15 of 15 monitoring targets up within two minutes.
+
+**The mechanism, because the obvious one does not work here.** `systemd-cryptenroll` is not
+usable on this platform: `libtss2-rc0` — which systemd **dlopens** for TPM2 — is not in the
+enclave mirror, and the initrd is `cryptsetup-initramfs`, which has **no TPM2 token support at
+all**. That is why a `tpm2-device=auto` line in `crypttab` only ever produced *"ignoring unknown
+option"*. `clevis` stores its own LUKS2 token and ships an initramfs hook; its packages are
+mirrored and `tpm2-tools` is the **FIPS build**. `tpm2_pcrread` returns a PCR value with
+`fips_enabled=1`, which answers the open question about whether any of this works under FIPS.
+
+**The passphrase is retained.** Enrolment **adds** a keyslot; keyslot 0 and its passphrase are
+untouched, so the fallback is a property of the design rather than a promise. If the TPM refuses,
+the machine prompts exactly as it did before.
+
+| What changes | What does NOT change |
+|---|---|
+| A **planned or unplanned reboot** no longer needs a human at the rack | **A FAILED boot is still invisible.** No BMC on `host-1/2/3`, so a machine that stops early cannot be seen or reached — hardware, not software (CUST-14) |
+| Recovery from a power event is unattended | **Chassis theft.** Secure Boot is **disabled**, so PCR 7 does not bind the boot chain: an attacker who can boot their own kernel is handed the key. **This defeats a stolen DISK, not a stolen MACHINE** |
+| The 2026-09-17 failure mode — one reboot, whole enclave down — is closed | The **two-factor** posture. Passphrase unlock was disk + a human; TPM unlock is disk + this motherboard. **One factor**, deliberately, per Q20 |
+
+**Control effect:** none of the 194 DISA V1R6 rules mention TPM, and V-270747 asks only that
+every persistent partition has a `crypttab` entry, not how the key is supplied. The volumes stay
+LUKS and every encryption control evaluates identically. **This is a risk decision, not a
+compliance change** — and the risk it accepts is chassis theft, which the facility's physical
+controls (PE family) are the compensating answer to. State it that way rather than as a security
+improvement, because in one respect it is a reduction.
+
+**Secure Boot is the thing that would make PCR 7 meaningful**, and it is disabled on all four
+hosts. Enabling it is cheap at purchase and expensive to retrofit, so it belongs in the hardware
+specification (CUST-14, `backlog.md` 2.8) alongside the BMC requirement — not in a later
+remediation cycle.
+
 ### 2.1a 🔴 There is no remote recovery path of any kind
 
 > **A console LUKS passphrase combined with no out-of-band management means a power event,
@@ -99,6 +138,12 @@ production hardware in a facility somebody has to be escorted into.
 | Lab vs production | Acceptable on a bench with the operator in the room. In a facility requiring an escort it is the difference between a ten-minute fix and a scheduled visit |
 | Source | `docs/02-host-install.md` §4c · runbook §6.3i.1 · suggested controls CP-10, MA-4 |
 
+🔄 **HALF CLOSED 2026-09-21/22, and only half.** TPM unlock (§2.1) removed the human from the
+**unlock**: all four hosts now boot unattended, measured. What remains is the other half of this
+finding, and it is the half hardware answers: **nobody can SEE a machine that fails to boot.**
+There is no console, no power control and no way to know whether a host is wedged in firmware, in
+GRUB, or in a failed `fsck`. A BMC with serial-over-LAN is the only thing that closes it.
+
 **Two BOM requirements follow, cheap at purchase and expensive to retrofit:** production hosts
 need a **BMC with IPMI/Redfish and serial-over-LAN**. ⚠️ **Updated 2026-09-18: MAAS was removed
 from the boundary**, so network redeploy is no longer available at all — which makes a BMC the
@@ -109,6 +154,54 @@ is a prerequisite rather than a deferrable nicety.
 
 *(MA-4 note: "no nonlocal maintenance capability" is simultaneously a strong control statement
 and this risk. State both — an assessor who reads only the favourable half will find the other.)*
+
+### 2.1b 🔴 Account lockout has no break-glass, and the lock never expires
+
+> **`deny=3`, `unlock_time=0`, `passwd_tries=1`, `pam_faillock` in the ACCOUNT stack, one admin
+> account, and no BMC on three of four hosts. Three mistyped sudo passwords inside fifteen
+> minutes make a host unreachable — including by SSH key — until somebody stands in front of
+> it.**
+
+| | |
+|---|---|
+| Evidence | Measured 2026-09-21: `/etc/security/faillock.conf` → `deny = 3`, `fail_interval = 900`, **`unlock_time = 0`**; `Defaults passwd_tries=1` in sudoers, so **one typo is one strike**; `pam_faillock` is present in `common-auth` **and `common-account`**, so a locked account is refused **key-based SSH as well**. Two of three strikes were reached in normal work that day |
+| Why the controls are RIGHT | `unlock_time=0` is the requirement — an administrator, not a timer, clears a lockout. `passwd_tries=1` is a deliberate hardening choice. **Nothing here should be relaxed**, and this section does not request a deviation |
+| Why it is still a finding | The controls are sound; the **architecture around them** has a single point of failure. One account, one credential, no out-of-band console. The control assumes an administrator can reach the machine to clear the lock — and on `host-1/2/3` that assumption is false without a drive to the rack |
+
+**What is defensible, and what is not.** Four measures, none of which weakens a control:
+
+1. **A second named administrator account per admin-capable human.** `faillock` counts per
+   account, so a lockout on one leaves the other usable. This is what AC-2 asks for anyway
+   (individual accountability) and costs nothing. **In a one-operator lab it is the weakest of
+   the four**, because both credentials live in the same head.
+2. **A documented emergency ("break-glass") local administrator account.** Unique name, a long
+   random password held **offline under dual custody** (sealed envelope in the facility safe, or
+   a split credential), **console-only** — denied SSH explicitly — every session audited by an
+   `auditd` rule keyed to that UID, **password rotated after each use**, and each use recorded as
+   an incident. This is the classic construction and the one an AO recognises: emergency accounts
+   are explicitly contemplated by **AC-2**, and the compensating controls are physical custody
+   (**PE** family) plus audit (**AU-2, AU-12**).
+3. **The physical recovery path, written down before it is needed.** GRUB is password-protected
+   and the root volume is LUKS, so console recovery requires the **GRUB superuser password** and
+   the **LUKS passphrase** — both of which must be in the same custody as (2), or the break-glass
+   account is unreachable at the moment it is needed. Recovery is: console → GRUB → recovery
+   shell → `faillock --user <u> --reset`.
+4. **A BMC with serial-over-LAN in the production hardware specification** (CUST-14). With one,
+   a lockout is cleared over the network in minutes and this finding degrades from
+   "architectural" to "operational".
+
+**Explicitly NOT acceptable, and named here so nobody proposes them later:** relaxing
+`unlock_time`; a timer or cron job that resets `faillock` automatically (that is a brute-force
+window wearing a convenience label); `NOPASSWD` sudo; a shared administrator account; or
+disabling `pam_faillock` in the account stack.
+
+**Procedural mitigation available today, at no cost:** authenticate once per session
+(`sudo -i`) rather than per command — `passwd_tries=1` makes a long chain of individual `sudo`
+calls the single largest source of strikes — and keep `faillock --user <u> --reset` in the
+runbook's lockout procedure rather than looking it up while locked out.
+
+Source: `backlog.md` 3.15 · suggested controls **AC-2, AC-6, AC-7, AU-2, AU-12, IA-5, MA-4,
+PE-3, CP-2**.
 
 ### 2.2 pbkdf2 was chosen explicitly over the LUKS2 default
 

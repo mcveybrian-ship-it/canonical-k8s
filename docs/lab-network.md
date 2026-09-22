@@ -161,7 +161,16 @@ Rule 4 therefore moves **internet-bound traffic only**.
 |---|---|---|---|---|
 | 3 | Office to WAN | `VLAN 20` | `wan1` | all/all, NAT. **Unchanged** — every other VLAN 20 machine stays on wan1 |
 | 19 | Lab to WAN | `lab` | `wan2` | all/all, NAT |
+| **21** | **DENY enclave to WAN** | `lab` | `wan1` + `wan2` | source `10.2.20.0/24`, **action deny**, `logtraffic all`. Sequenced **above** policy 19 |
 | *(new)* | stage-01 to Starlink | `VLAN 20` | `wan2` | source `stage-01` (`10.0.20.160/32`) only, NAT |
+
+**Policy 21 is the layer-3 guarantee.** If an enclave host ever gained a route out - someone typing
+`ip route add` on `host-4` - its packets arrive on `lab` with a `10.2.20.x` source and are dropped
+and logged by a device the enclave does not administer. Stated honestly, it is not what stops that
+traffic *today*: there is no `lab -> wan1` permit policy, so it already hit the implicit deny. Its
+value is that the deny is **explicit, logged and auditable**, and that it **survives someone later
+adding a broad `lab -> wan` policy** - which would otherwise re-open the path with no sign. The
+retired travel router could not express this rule at all.
 
 There is **no policy between `lab` and any office interface**, and FortiOS denies by default. So
 the lab cannot reach the office network and the office network cannot reach the lab. That
@@ -349,7 +358,6 @@ answers, the deny is working.
 | | |
 |---|---|
 | **3.17** | `build-01` holds a DHCP lease *on top of* its static `10.2.10.124`, because `dhcp4: true` is still set in its netplan. It works — on-subnet traffic sources from `.124` — but a build procedure should not depend on what a pool hands out |
-| **3.18** | There is no `deny 10.2.20.0/24 -> wan1` policy yet. The enclave's isolation currently rests on host-side facts it asserts about itself (no gateway, `ip_forward=0`). The FortiGate can now enforce it independently; the travel router could not |
 | **3.16** | Hosts 1–3 are NIC-limited at 1 GbE on a 2.5 GbE switch, pending USB adapters, and the management/storage NIC split is unbuilt |
 
 ---

@@ -528,6 +528,30 @@ fixups_plan() {
     say "        on a temp file BEFORE install, and the whole set re-checked after."
   fi
 
+  printf '\n  7. V-270816 - the audit allocation must hold a WEEK at THIS machine rate\n'
+  say "     auditd ships max_log_file=8 x num_logs=5 = 40MB. That is a fixed number on a"
+  say "     machine whose audit rate is not fixed - measured 2026-09-22, host-1 wrote"
+  say "     39.3MB in 37.6h (~25MB/day), so 40MB held 1.6 DAYS against a 7-day control,"
+  say "     with 19GB free on the volume. svc-mgmt-01 once ran 176x svc-harbor-01's rate."
+  if [ -r /etc/audit/auditd.conf ]; then
+    local pm pn ph ps
+    pm="$(awk -F= '/^max_log_file[[:space:]]*=/{gsub(/ /,"",$2); print $2}' /etc/audit/auditd.conf | head -1)"
+    pn="$(awk -F= '/^num_logs[[:space:]]*=/{gsub(/ /,"",$2); print $2}' /etc/audit/auditd.conf | head -1)"
+    ph="$(stat -c %s /var/log/audit/audit.log* 2>/dev/null | awk '{t+=$1} END{print t+0}')"
+    ps="$(stat -c %Y /var/log/audit/audit.log* 2>/dev/null | sort -n | awk 'NR==1{f=$1} {l=$1} END{print (l-f)+0}')"
+    if [ "${ps:-0}" -ge 3600 ] && [ "${ph:-0}" -gt 0 ]; then
+      say "   state: allocation $(( ${pm:-0} * ${pn:-0} ))MB, measured $(( ph * 86400 / ps / 1048576 ))MB/day over $(( ps / 3600 ))h"
+    else
+      say "   state: allocation $(( ${pm:-0} * ${pn:-0} ))MB, not enough history to measure a rate yet"
+    fi
+  else
+    say "   state: /etc/audit/auditd.conf not readable as this user"
+  fi
+  say "   fix: size max_log_file x num_logs from the MEASURED rate (a week, doubled), only"
+  say "        when the volume has room for twice that, then SIGHUP auditd. It refuses a"
+  say "        manual restart, and killing it would drop records."
+  say "   NOT this: audit OFFLOAD (V-270817) still needs the collector and three AO answers."
+
   # ITEMS 0b-0d RUN ON --apply AND WERE NEVER LISTED HERE. Found 2026-09-20 reading this plan
   # on svc-mgmt-01: the numbered list above starts at 1, `fixups_plan` returns before the 0*
   # items, and the operator therefore approved a change set that was not the change set. The
@@ -1309,6 +1333,67 @@ SUDOERS
       failed=1
     fi
     rm -f "$tf"
+  fi
+
+  # ---- 7. V-270816 - the audit allocation must hold a WEEK at THIS machine's rate --------
+  #
+  # MEASURED 2026-09-22, and it is a real finding rather than a scanner quirk. auditd ships
+  # `max_log_file 8` x `num_logs 5` = 40 MB. On host-1 the audit trail grew 39.3 MB in 37.6
+  # hours - about 25 MB/day - so 40 MB holds **1.6 days** against a control that requires
+  # seven. The volume has 19 GB free. The allocation is not sized to the machine.
+  #
+  # SIZE IT FROM MEASUREMENT, NEVER A CONSTANT. The rate is not a property of the enclave:
+  # svc-mgmt-01 once ran 430 MB/day against svc-harbor-01's 2.44 MB/day, 176x apart, because
+  # MAAS invoked sudo about 1.7 times a second and auditd recorded every one. A number
+  # measured on one machine and pasted onto another is how a control passes on paper.
+  #
+  # This does NOT solve audit offload (V-270817) - that needs the collector and three AO
+  # answers. It makes the local buffer honest in the meantime.
+  local ACONF=/etc/audit/auditd.conf
+  if [ ! -r "$ACONF" ]; then
+    warn "7. cannot read $ACONF - skipping the audit allocation check"
+  else
+    local cur_max cur_num alloc_mb held span rate_day need_mb free_mb
+    cur_max="$(awk -F= '/^max_log_file[[:space:]]*=/{gsub(/ /,"",$2); print $2}' "$ACONF" | head -1)"
+    cur_num="$(awk -F= '/^num_logs[[:space:]]*=/{gsub(/ /,"",$2); print $2}' "$ACONF" | head -1)"
+    alloc_mb=$(( ${cur_max:-0} * ${cur_num:-0} ))
+    # Rate from the files themselves: total bytes over the span between oldest and newest.
+    held="$(stat -c %s /var/log/audit/audit.log* 2>/dev/null | awk '{t+=$1} END{print t+0}')"
+    span="$(stat -c %Y /var/log/audit/audit.log* 2>/dev/null | sort -n | awk 'NR==1{f=$1} {l=$1} END{print (l-f)+0}')"
+    if [ "${span:-0}" -lt 3600 ] || [ "${held:-0}" -le 0 ]; then
+      say "7. audit allocation is ${alloc_mb}MB; too little history to measure a rate yet"
+      say "     (need at least an hour spanning two files - re-run later)"
+    else
+      rate_day=$(( held * 86400 / span ))
+      need_mb=$(( rate_day * 7 * 2 / 1048576 ))   # one week, doubled for burst headroom
+      [ "$need_mb" -lt 64 ] && need_mb=64
+      free_mb="$(df -PBM /var/log/audit 2>/dev/null | awk 'NR==2{gsub(/M/,"",$4); print $4+0}')"
+      say "7. audit: $((rate_day/1048576))MB/day measured over $((span/3600))h; allocation ${alloc_mb}MB holds $(( alloc_mb * 1048576 / (rate_day>0?rate_day:1) )) day(s)"
+      if [ "$alloc_mb" -ge "$need_mb" ]; then
+        ok "7. allocation already covers a week with headroom (${alloc_mb}MB >= ${need_mb}MB)"
+      elif [ "${free_mb:-0}" -lt $(( need_mb * 2 )) ]; then
+        warn "7. needs ${need_mb}MB but only ${free_mb}MB free on /var/log/audit - NOT changing it"
+        warn "   grow the volume first; silently filling the audit partition is worse than the finding"
+        failed=1
+      elif [ "$apply" -eq 0 ]; then
+        say "     fix: max_log_file=$(( need_mb / 8 )) num_logs=8  (=${need_mb}MB), then reload auditd"
+      else
+        local new_max=$(( need_mb / 8 ))
+        [ "$new_max" -lt 8 ] && new_max=8
+        cp -a "$ACONF" "/var/backups/auditd.conf.$(date +%Y%m%dT%H%M%S)"
+        sed -i -e "s/^max_log_file[[:space:]]*=.*/max_log_file = ${new_max}/" \
+               -e "s/^num_logs[[:space:]]*=.*/num_logs = 8/" "$ACONF"
+        # auditd re-reads its configuration on SIGHUP. `systemctl restart auditd` is REFUSED
+        # on Ubuntu (RefuseManualStop), and killing it would drop records.
+        if systemctl kill -s HUP auditd 2>/dev/null; then
+          ok "7. audit allocation now $(( new_max * 8 ))MB (max_log_file=${new_max}, num_logs=8) - auditd reloaded"
+          say "     that is $(( new_max * 8 * 1048576 / (rate_day>0?rate_day:1) )) days at the measured rate"
+        else
+          warn "7. config written but auditd did not accept SIGHUP - check: systemctl status auditd"
+          failed=1
+        fi
+      fi
+    fi
   fi
 
   say ""

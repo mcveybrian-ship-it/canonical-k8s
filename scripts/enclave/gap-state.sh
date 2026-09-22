@@ -18,10 +18,10 @@
 #       an address per machine, and there will be fourteen.
 #
 # WHAT STATE A IS AND IS NOT
-#   State A is a BUILD convenience. While port 4 is connected the enclave is isolated from the
+#   State A is a BUILD convenience. While the umbilical is connected the enclave is isolated from the
 #   office network and from the internet, but it is NOT air-gapped - isolation rests on absent
 #   routes and on ip_forward being 0. Nothing built in State A should be called accredited.
-#   State B is the cable out of GS105E port 4, and that is the only claim worth making to an
+#   State B is the cable out of the FortiGate dmz port, and that is the only claim worth making to an
 #   assessor.
 # =========================================================================================
 set -euo pipefail
@@ -80,14 +80,14 @@ cmd_status() {
   say "nic      : $(ip -br addr show "$NIC" 2>/dev/null | awk '{$1="";$2="";print}' | xargs)"
   if [ "$has_foot" = "yes" ]; then
     say "state    : A (BUILD) - stage-01 has a foot at ${ENCLAVE_FOOT%/*}"
-    say "           the enclave is NOT air-gapped while port 4 is connected"
+    say "           the enclave is NOT air-gapped while the dmz cable is connected"
   else
     say "state    : B (GAPPED) - no enclave address on stage-01"
   fi
   check_forwarding || true
   printf '  reach    : '
   if ping -c1 -W2 "$HOST_4" >/dev/null 2>&1; then
-    echo "host-4 REACHABLE (cable in port 4 is connected)"
+    echo "host-4 REACHABLE (FortiGate dmz cable is connected)"
   else
     echo "host-4 unreachable (cable out, or foot removed)"
   fi
@@ -99,7 +99,7 @@ cmd_open() {
   write_netplan yes
   ok "stage-01 now holds $ENCLAVE_FOOT on $NIC"
   say ""
-  say "  NOW PLUG IN GS105E PORT 4."
+  say "  NOW PLUG THE ENCLAVE SWITCH INTO THE FORTIGATE dmz PORT."
   say "  Then:  ./gap-state.sh status   - host-4 should become reachable"
   say ""
   say "  While in State A the enclave is NOT air-gapped. Nothing built now is accredited."
@@ -113,7 +113,7 @@ cmd_close() {
   write_netplan no
   ok "removed the enclave foot from $NIC"
   say ""
-  say "  NOW UNPLUG GS105E PORT 4. That cable is the air gap."
+  say "  NOW UNPLUG THE FORTIGATE dmz CABLE. That cable is the air gap."
   say "  Then verify - FAILURE is the pass:"
   say "      ping -c2 -W2 $HOST_4     # must fail"
 }

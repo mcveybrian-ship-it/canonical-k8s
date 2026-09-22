@@ -200,8 +200,42 @@ disabling `pam_faillock` in the account stack.
 calls the single largest source of strikes — and keep `faillock --user <u> --reset` in the
 runbook's lockout procedure rather than looking it up while locked out.
 
+#### The STIG interaction, checked rule by rule rather than assumed — and it decides the wording
+
+**Adding a recovery account can CREATE findings. Two rules touch it, and only one is a problem.**
+
+| Rule | What it actually checks | Effect |
+|---|---|---|
+| **V-270683** — disable identifiers after 35 days of inactivity | `grep INACTIVE /etc/default/useradd` — **one global setting**, not per-account state | **No impact.** The setting stays at 35; adding an account does not fail it |
+| **V-270682** — remove or disable **emergency accounts** after 72 hours | `chage -l <temporary_account_name>`, looking for an expiry **within 72 hours** | **Impact depends on CLASSIFICATION.** A documented "emergency account" invites this rule directly |
+
+**So the account is documented as a PERMANENT, CONSOLE-ONLY LOCAL ADMINISTRATOR ACCOUNT FOR
+RECOVERY — not as an emergency or temporary account.** That is not word games: V-270682's subject
+is the account you provision *during* a crisis and must expire afterwards. This one is
+provisioned *in advance*, precisely because the failure it covers prevents you from creating
+anything. No temporary or crisis-provisioned accounts exist on these systems, so V-270682
+continues to pass, and the Answer File entry for it must say so **in those terms**.
+
+⚠️ **The trap neither rule catches, and it is the dangerous one.** With `INACTIVE=35` and 60-day
+password aging, **an account nobody logs into silently stops working** — the password expires,
+the identifier goes inactive, and the recovery path is dead while every scan still passes. A
+recovery mechanism that decays on a timer is worse than none, because it is trusted.
+
+**Mitigation, and it earns its keep twice: EXERCISE IT MONTHLY.** One console login inside every
+35-day window keeps the account live, forces any password change before an incident rather than
+during one, and **re-tests the console recovery procedure as a by-product**. Record each exercise
+— that is the CP-4 / IR evidence for this path, in the same way the restore test is for backups.
+
+**What this does and does not buy the AO.** It changes **no** STIG result: nothing passes that
+did not pass before, and `deny=3` / `unlock_time=0` / `passwd_tries=1` are untouched. What it
+changes is the **finding's disposition**: an unmitigated single point of failure — a locked
+account on a host with no console — becomes a documented, audited recovery path with custody,
+rotation and a monthly proof that it works. That is the difference between "open, no plan" and
+"accepted risk with compensating controls", which is the decision an AO is actually being asked
+to make.
+
 Source: `backlog.md` 3.15 · suggested controls **AC-2, AC-6, AC-7, AU-2, AU-12, IA-5, MA-4,
-PE-3, CP-2**.
+PE-3, CP-2** · STIG interaction: **V-270682 (classification), V-270683 (no impact)**.
 
 ### 2.2 pbkdf2 was chosen explicitly over the LUKS2 default
 

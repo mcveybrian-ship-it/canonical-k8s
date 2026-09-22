@@ -340,6 +340,71 @@ into, it is the difference between a ten-minute fix and a scheduled visit.
 > Both belong in `docs/compliance/ssp-inputs.md` §2.1 as stated limitations of the lab, and in
 > the production BOM as requirements.
 
+#### If a machine genuinely has no BMC — what you can and cannot do
+
+Written 2026-09-22 because the question keeps coming back. **This is knowledge for a lab or a
+retrofit. It is not a production option** — see the verdict at the end.
+
+**First, check for the free answer. There usually isn't one on small form-factor hardware.**
+Intel **vPro/AMT** and AMD **DASH** are real out-of-band management built into some CPUs, and
+where present they give serial-over-LAN and remote KVM at no extra cost. But DASH is on **Ryzen
+PRO** parts only, and AMT on **vPro** parts only — consumer mini PCs almost never carry either.
+This lab is the normal case: `host-1`/`host-2` are **Ryzen 3 4300U** (non-PRO, so no DASH),
+`host-3` is a **Ryzen Embedded R2544**. Nothing to enable.
+
+```bash
+### MACHINE: any host ###
+lscpu | grep -i 'model name'          # then check the exact SKU for PRO / vPro
+ls -l /dev/ttyS* 2>/dev/null          # is there a serial port at all
+sudo dmidecode -t 8 | grep -iA3 'serial\|DB-9'
+```
+
+**Second, separate the two capabilities — they cost very different amounts.**
+
+| | What it gives | What it costs |
+|---|---|---|
+| **Power control** | Recover a lockout, a hung service, a wedged kernel | Cheap |
+| **Console visibility** | See *why* it did not come up — firmware vs GRUB vs failed `fsck` | The expensive half |
+
+**Power control closes more than it appears to.** `pam_faillock` records live in `/run/faillock`
+on **tmpfs**, so a reboot clears an account lockout; and with TPM unlock (§6.3i.1) the machine
+returns with nobody typing a passphrase. So a remote power cycle alone resolves the most common
+"I cannot get in" cases without anyone seeing a screen.
+
+**Serial console is the cheap route and usually is not available.** It needs a physical COM
+header *and* BIOS serial redirection. Consumer firmware rarely does the second, so even where it
+works you get GRUB and Linux but **not POST** — which is exactly the failure that matters. Check
+it, do not plan around it. Where it *is* available, `console=ttyS0,115200` on the kernel command
+line plus a USB-serial adapter on a separate always-on machine is a genuine out-of-band path.
+
+**The real substitute is a KVM-over-IP dongle** — HDMI capture plus USB HID emulation, so you see
+the screen from POST and can type into it. Priced 2026-09-22; **re-check before buying**:
+
+| Device | Price | Note |
+|---|---|---|
+| Sipeed NanoKVM | ~$75 | Cheapest; less polished software |
+| **JetKVM** | ~$103 (PoE ~$119) | Best price/performance, and its **expansion port does DC power cycling for mini PCs** — so one device covers *both* capabilities |
+| PiKVM V4 Mini | ~$300-310 | Most mature, most expensive |
+
+One unit plus a 4-port HDMI/USB KVM switch covers four hosts, at the cost of seeing one at a time.
+
+> ### ⚠️ Why this is NOT a production answer
+>
+> A KVM-over-IP device inside the enclave is a networked box with firmware, a web UI,
+> credentials, **keystroke injection and virtual-media mounting**. It is an out-of-band path
+> *into* the boundary — the same objection that retired the GS105E from the network path on
+> 2026-09-22 (`lab-network.md` §6). Deployed, it would have to sit on the enclave segment without
+> bridging, carry a PPSM entry, be credentialed, and be patched through the air gap.
+>
+> A real BMC carries the same attack surface, but it is an **expected** component with vendor
+> support, firmware signing and DoD precedent. A hundred-dollar open-source dongle is a far
+> harder conversation with an AO, for the identical capability.
+>
+> **So: acceptable as a LAB convenience, documented as one. The BOM requirement above does not
+> move.** This is the same shape as the lab's air gap being a firewall port while the customer
+> design specifies a physical break — the lab makes the best of what it has, and the design does
+> not inherit the compromise.
+
 ### Secure Boot: enable it, and make `host-1` the pathfinder
 
 **Recommendation: ON.** Three reasons:

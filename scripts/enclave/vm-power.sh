@@ -197,7 +197,20 @@ cmd_guests_down() {
 
   say ""
   virsh list --all
-  ok "all target guests are shut off"
+  # NEVER CLAIM IT IN DRY MODE. This printed "all target guests are shut off" while all four
+  # were demonstrably running two lines above it, because the line ran regardless of whether
+  # anything had been done (measured on host-4, 2026-09-21). A dry run that reports success is
+  # worse than one that reports nothing - it is the shape of every false pass in this project.
+  if [ "$DRY" -eq 1 ]; then
+    say "DRY RUN - nothing was shut down; the list above is the CURRENT state"
+    return 0
+  fi
+  local left; left="$(virsh list --state-running --name 2>/dev/null | awk 'NF' | tr '\n' ' ')"
+  if [ -z "${left// /}" ]; then
+    ok "all target guests are shut off"
+  else
+    die "still running after the shutdown pass: $left"
+  fi
 }
 
 # ---- up -----------------------------------------------------------------------------------
@@ -258,8 +271,30 @@ host_power() {  # <reboot|poweroff>
   hdr "this will $action $(hostname -s), which is the hypervisor"
   say "Every guest goes with it. On host-4 that is the whole enclave."
   say ""
-  say "And when it comes back, the OS volume prompts for a LUKS passphrase at the console -"
-  say "so somebody has to be AT the machine. Confirmed on host-4 2026-09-17."
+  # WHAT THIS HOST WILL ACTUALLY DO, READ FROM THE DISK - not a fixed sentence. Until
+  # 2026-09-21 this always said "it prompts for a passphrase", which was true of every host
+  # then and is now false on the three enrolled with clevis + TPM (backlog 2.4). A warning
+  # that is wrong in the reassuring direction is the dangerous kind; so is one that is wrong
+  # in the alarming direction, because it trains people to ignore it.
+  local osdev=""
+  if [ -r /etc/crypttab ]; then
+    local _n _u _k
+    while read -r _n _u _k _rest; do
+      case "$_n" in ''|\#*) continue ;; esac
+      case "$_u" in UUID=*) : ;; *) continue ;; esac
+      [ "$_k" = none ] && { osdev="/dev/disk/by-uuid/${_u#UUID=}"; break; }
+    done < /etc/crypttab
+  fi
+  if [ -n "$osdev" ] && command -v clevis >/dev/null 2>&1 \
+     && clevis luks list -d "$osdev" 2>/dev/null | grep -q tpm2; then
+    say "The OS volume is TPM-enrolled (clevis, PCR 7), so it should come back with NO"
+    say "passphrase. If the TPM refuses, it falls back to the prompt - which still works,"
+    say "and on this hardware that means somebody has to be AT the machine."
+  else
+    say "And when it comes back, the OS volume prompts for a LUKS passphrase at the console -"
+    say "so somebody has to be AT the machine. Confirmed on host-4 2026-09-17."
+    say "  (enrol the TPM first and this changes: stig-tailor.sh luksenroll --force)"
+  fi
   say ""
 
   if [ "$YES" -eq 0 ] && [ "$DRY" -eq 0 ]; then
@@ -273,6 +308,12 @@ host_power() {  # <reboot|poweroff>
   # THE GUARD THAT MATTERS. cmd_guests_down already dies on a stuck guest, but re-check
   # here: this is the last moment before the host goes down, and a domain that came back
   # up between then and now must stop this.
+  if [ "$DRY" -eq 1 ]; then
+    say ""
+    say "DRY: would now unmount /mnt/vmbackup if mounted, then $action the host."
+    ok "DRY RUN complete - nothing was changed"
+    return 0
+  fi
   local still; still="$(virsh list --state-running --name 2>/dev/null | awk 'NF' | tr '\n' ' ')"
   [ -z "${still// /}" ] || die "domains are STILL running: $still
        refusing to $action the host. Nothing has been done to the host."

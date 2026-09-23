@@ -75,7 +75,7 @@ Status is honest, not aspirational. **✅** implemented with evidence · **⚠�
 | **PS** Personnel Security | ↗ | Programme |
 | **PE** Physical and Environmental | ↗ | Facility's existing ATO, presumably. Confirm — and note the enclave's **single-site, no-DR** posture is a PE-adjacent risk statement |
 | **PM** Program Management | ↗ | Programme |
-| **PT** PII Processing | ⬜ | ✅ **Scoped 2026-09-22 — no longer an unknown.** `DATA_TYPES`: PII of staff and operators, **PII of members of the public**, **PHI**, and recorded human call records. **The family is fully in scope and a PIA is required** (backlog D-7). Access to those records is expected to be auditable per record, against an audit trail that is currently 40 MB rolling with no offload — backlog 3.20 |
+| **PT** PII Processing | ⬜ | ✅ **Scoped 2026-09-22 — no longer an unknown.** `DATA_TYPES`: PII of staff and operators, **PII of members of the public**, incidental health information, and call records (**metadata only, no audio**). **The family is fully in scope and a PIA is required** (backlog D-7); a Privacy Act **SORN exists** and must be cited by identifier. ✅ The health data is incidental — **not** a health care component, so HIPAA/DoDM 6025.18 do not apply. Access to these records is expected to be auditable after the fact, against an audit trail that is currently 40 MB rolling with no offload — backlog 3.20 |
 | **SA** System and Services Acquisition | ⚠️ | The platform bake-off is genuine SA-4 evidence: a documented, sourced comparison behind the Canonical selection |
 
 ---

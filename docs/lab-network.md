@@ -357,7 +357,6 @@ answers, the deny is working.
 
 | | |
 |---|---|
-| **3.17** | `build-01` holds a DHCP lease *on top of* its static `10.2.10.124`, because `dhcp4: true` is still set in its netplan. It works — on-subnet traffic sources from `.124` — but a build procedure should not depend on what a pool hands out |
 | **3.16** | Hosts 1–3 are NIC-limited at 1 GbE on a 2.5 GbE switch, pending USB adapters, and the management/storage NIC split is unbuilt |
 
 ---

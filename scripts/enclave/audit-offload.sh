@@ -152,14 +152,24 @@ cmd_plan() {
     ok "key       : $KEY present"
     # PROVE THE PATH BEFORE THE TIMER DOES. A weekly job that fails every Sunday at 03:00
     # is discovered by its absence, which is the worst way to discover anything about an
-    # audit trail. rrsync refuses a shell, so a working key answers with a non-zero exit
-    # and no output - that is SUCCESS here, and only a connection failure is a failure.
-    if ssh "${SSH_OPTS[@]}" -i "$KEY" "root@$COLLECTOR" true 2>/dev/null; then
-      ok "delivery  : ssh to $COLLECTOR accepted the key"
-    elif ssh "${SSH_OPTS[@]}" -i "$KEY" -o ConnectTimeout=5 "root@$COLLECTOR" true 2>&1 | grep -qi 'rrsync\|refus'; then
-      ok "delivery  : key accepted and confined by the forced rrsync command"
+    # audit trail.
+    #
+    # THE FIRST VERSION OF THIS CHECK CRIED WOLF, 2026-09-23. It matched rrsync's error
+    # TEXT - text I guessed at - and reported "could NOT reach" on host-1 against a path
+    # that then delivered a 1.6 MB bundle on the very next command. A check that reports
+    # failure on a working system is worse than no check: this repository already lost five
+    # days to a false initramfs warning on four hosts.
+    #
+    # ssh's EXIT CODE is the fact, not the remote command's output. 255 means ssh itself
+    # failed - no route, refused key, bad host key. Anything else means we connected AND
+    # authenticated, and the forced rrsync command then rejected `true`, which is exactly
+    # what a correctly confined key is supposed to do.
+    local rc=0
+    ssh "${SSH_OPTS[@]}" -i "$KEY" "root@$COLLECTOR" true >/dev/null 2>&1 || rc=$?
+    if [ "$rc" -eq 255 ]; then
+      warn "delivery  : ssh to root@$COLLECTOR FAILED with $KEY - authorize it before installing the timer"
     else
-      warn "delivery  : could NOT reach root@$COLLECTOR with $KEY - authorize it before installing the timer"
+      ok "delivery  : key accepted by $COLLECTOR and confined by the forced rrsync command"
     fi
   else
     warn "key       : $KEY MISSING - run 'agent-init' here, then paste its line on $COLLECTOR"

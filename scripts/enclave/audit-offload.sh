@@ -9,7 +9,8 @@
 #     sudo ./audit-offload.sh run        # one offload now
 #     sudo ./audit-offload.sh install    # weekly systemd timer
 #     ./audit-offload.sh status
-#     sudo ./audit-offload.sh collector-init   # ON THE COLLECTOR - drop dir + the key line
+#     sudo ./audit-offload.sh agent-init       # ON A SENDER - key + its authorized_keys line
+#     sudo ./audit-offload.sh collector-init   # ON THE COLLECTOR - create the drop directory
 #     sudo ./audit-offload.sh prune            # ON THE COLLECTOR - enforce retention
 #     ./audit-offload.sh verify                # ON THE COLLECTOR - re-check every checksum
 #
@@ -149,8 +150,19 @@ cmd_plan() {
     say "key       : not needed - this machine IS the collector"
   elif [ -r "$KEY" ]; then
     ok "key       : $KEY present"
+    # PROVE THE PATH BEFORE THE TIMER DOES. A weekly job that fails every Sunday at 03:00
+    # is discovered by its absence, which is the worst way to discover anything about an
+    # audit trail. rrsync refuses a shell, so a working key answers with a non-zero exit
+    # and no output - that is SUCCESS here, and only a connection failure is a failure.
+    if ssh "${SSH_OPTS[@]}" -i "$KEY" "root@$COLLECTOR" true 2>/dev/null; then
+      ok "delivery  : ssh to $COLLECTOR accepted the key"
+    elif ssh "${SSH_OPTS[@]}" -i "$KEY" -o ConnectTimeout=5 "root@$COLLECTOR" true 2>&1 | grep -qi 'rrsync\|refus'; then
+      ok "delivery  : key accepted and confined by the forced rrsync command"
+    else
+      warn "delivery  : could NOT reach root@$COLLECTOR with $KEY - authorize it before installing the timer"
+    fi
   else
-    warn "key       : $KEY MISSING - run 'collector-init' on $COLLECTOR, then authorize this machine"
+    warn "key       : $KEY MISSING - run 'agent-init' here, then paste its line on $COLLECTOR"
   fi
 
   if systemctl list-timers --all 2>/dev/null | grep -q "$UNIT"; then
@@ -180,6 +192,32 @@ cmd_collector_init() {
   say "RSA 4096 deliberately - FIPS refuses ed25519 ('ED25519 keys are not allowed in FIPS mode')."
   say "restrict + a forced 'rrsync -wo' means that key can only WRITE, only into $DROP,"
   say "and only from the named address. It cannot read or delete another machine's records."
+  printf '\n'
+}
+
+# -----------------------------------------------------------------------------------------
+# agent-init exists so the authorized_keys line is never hand-assembled. `collector-init`
+# prints a template with "<THAT MACHINE ADDR>" in it, and across seven machines that is
+# seven chances to restrict a key to the wrong address - which fails closed and looks like
+# a network fault. Here the machine fills in its own address and its own public key.
+cmd_agent_init() {
+  need_root
+  is_collector && die "agent-init runs on a SENDING machine; this is the collector"
+  local addr; addr="$(my_addr)"
+  [ -n "$addr" ] || die "cannot determine this machine's enclave address"
+  install -d -m 0700 "$(dirname "$KEY")"
+  if [ -r "$KEY" ]; then
+    ok "key already present at $KEY - not regenerating"
+  else
+    # RSA 4096: FIPS refuses ed25519 ("ED25519 keys are not allowed in FIPS mode").
+    ssh-keygen -t rsa -b 4096 -N "" -f "$KEY" -C "audit-offload $ME" >/dev/null
+    ok "generated $KEY (RSA 4096)"
+  fi
+  chmod 600 "$KEY"
+  printf '\n  PASTE THIS LINE ON THE COLLECTOR (%s), as root:\n\n' "$COLLECTOR"
+  printf '    echo '\''from="%s",restrict,command="/usr/bin/rrsync -wo %s" %s'\'' | sudo tee -a /root/.ssh/authorized_keys >/dev/null\n\n' \
+    "$addr" "$DROP" "$(cut -d' ' -f1-2 "$KEY.pub")"
+  say "then, once every machine's line is in:  sudo chmod 600 /root/.ssh/authorized_keys"
   printf '\n'
 }
 
@@ -372,8 +410,9 @@ case "${1:-plan}" in
   run)            shift; cmd_run "$@" ;;
   install)        shift; cmd_install "$@" ;;
   collector-init) shift; cmd_collector_init "$@" ;;
+  agent-init)     shift; cmd_agent_init "$@" ;;
   prune)          shift; cmd_prune "$@" ;;
   verify)         shift; cmd_verify "$@" ;;
   status)         shift; cmd_status "$@" ;;
-  *) die "unknown subcommand: $1 (plan|run|install|collector-init|prune|verify|status)" ;;
+  *) die "unknown subcommand: $1 (plan|run|install|agent-init|collector-init|prune|verify|status)" ;;
 esac

@@ -46,6 +46,12 @@ AF="${STIG_ANSWERFILE:-/srv/bundle-staging/tools/answerfiles/Ubuntu24_AnswerFile
 # check re-applies it on every machine at every scan. Add an account and the control
 # re-opens until this list is updated deliberately.
 AF_ADMINS="${AF_ADMINS:-encadmin}"
+# THE EMERGENCY ("break glass") ACCOUNT(S), kept apart from AF_ADMINS because the answers say
+# different things about them: V-270682's own discussion exempts emergency accounts from
+# scheduled expiration, and an answer that calls one a "permanent administrator, not an
+# emergency account" would be false. Created by `stig-tailor.sh accounts` (backlog 3.15).
+# The site's SECOND named admin (ADMIN2_USER there) goes in AF_ADMINS - it is a person.
+AF_EMERGENCY="${AF_EMERGENCY:-breakglass}"
 XSD="${STIG_AF_XSD:-/srv/bundle-staging/tools/Evaluate-STIG/xml/Schema_AnswerFile.xsd}"
 DRY=0
 
@@ -358,15 +364,19 @@ EOF
   V-270748) cat <<'EOF'
 $V = @{ Valid = $false; Results = "" }
 $approved = @(__AF_ADMINS__)
+$emergency = @(__AF_EMERGENCY__)
 $line = (bash -c "getent group sudo") -join ""
 $members = @()
 if ($line -match "^sudo:[^:]*:[^:]*:(.*)$") {
     $members = @($Matches[1] -split "," | Where-Object { $_ -ne "" })
 }
-$extra = @($members | Where-Object { $approved -notcontains $_ })
+$extra = @($members | Where-Object { ($approved -notcontains $_) -and ($emergency -notcontains $_) })
+$bg = @($members | Where-Object { $emergency -contains $_ })
+$bgNote = ""
+if ($bg.Count -gt 0) { $bgNote = " The emergency (break-glass) account(s) " + ($bg -join ", ") + " hold sudo because recovering a locked-out administrator requires it; they are console-only (refused by sshd), their credentials are sealed offline under dual custody per machine, every use is an incident record, and every command they run is audited by UID. They are listed separately in AF_EMERGENCY." }
 if ($extra.Count -eq 0) {
     $V.Valid = $true
-    $V.Results = "NOT A FINDING. DISA's CheckText was executed verbatim at scan time: getent group sudo returned '" + $line.Trim() + "'. Members: " + (($members -join ", ") + ".") + " Every member is a named enclave administrator account whose role IS the administration of security functions on this system, so by the control's own wording each one needs that access. The approved list is held in one place - AF_ADMINS in scripts/enclave/answerfile.sh - and this check re-applies it on every machine at every scan, so adding an account to the sudo group re-opens this control until the list is changed deliberately. Note also that the blanket 'ALL=(ALL) NOPASSWD:ALL' grant was removed during hardening; membership of this group confers no unauthenticated privilege."
+    $V.Results = "NOT A FINDING. DISA's CheckText was executed verbatim at scan time: getent group sudo returned '" + $line.Trim() + "'. Members: " + (($members -join ", ") + ".") + " Every member is a named enclave administrator account whose role IS the administration of security functions on this system, so by the control's own wording each one needs that access. The approved list is held in one place - AF_ADMINS in scripts/enclave/answerfile.sh - and this check re-applies it on every machine at every scan, so adding an account to the sudo group re-opens this control until the list is changed deliberately. Note also that the blanket 'ALL=(ALL) NOPASSWD:ALL' grant was removed during hardening; membership of this group confers no unauthenticated privilege." + $bgNote
 }
 else {
     $V.Results = "OPEN. The sudo group contains account(s) not on the approved administrator list: " + ($extra -join ", ") + ". Full group line: " + $line.Trim()
@@ -431,6 +441,7 @@ EOF
   V-270682) cat <<'EOF'
 $V = @{ Valid = $false; Results = "" }
 $approved = @(__AF_ADMINS__)
+$emergency = @(__AF_EMERGENCY__)
 # DISA asks for the expiry on each TEMPORARY account. The prior question is which accounts
 # are temporary at all - so enumerate every interactive account and show the set.
 # AN INTERACTIVE ACCOUNT IS DEFINED BY ITS LOGIN SHELL, NOT BY ITS UID.
@@ -445,12 +456,15 @@ $probe = @'
 awk -F: '$3>=1000 && $3<65534 && $7 !~ /(nologin|false|sync)$/ {print $1}' /etc/passwd
 '@
 $accts = @(bash -c $probe) | Where-Object { $_ -ne "" }
-$unexpected = @($accts | Where-Object { $approved -notcontains $_ })
+$unexpected = @($accts | Where-Object { ($approved -notcontains $_) -and ($emergency -notcontains $_) })
+$bg = @($accts | Where-Object { $emergency -contains $_ })
+$bgNote = ""
+if ($bg.Count -gt 0) { $bgNote = " The set includes the emergency (break-glass) account(s) " + ($bg -join ", ") + ", held in AF_EMERGENCY and NOT among the administrators above: this STIG's own discussion for this control states that emergency accounts 'are not subject to manual removal or scheduled expiration requirements', so the 72-hour expiry does not apply to them either. They are console-only, sealed offline per machine under dual custody, rotated after every use, and audited by UID." }
 if ($unexpected.Count -eq 0) {
     $rows = @()
     foreach ($a in $accts) { $rows += ($a + ": " + ((bash -c "chage -l $a 2>/dev/null | grep -i 'account expires'") -join "")) }
     $V.Valid = $true
-    $V.Results = "NOT APPLICABLE AS WRITTEN - there are no temporary accounts on this system. Every interactive account - UID >= 1000, below 65534, and holding a real login shell rather than nologin/false - was enumerated at scan time and the full set is: " + ($accts -join ", ") + ". Each is a permanent, named enclave administrator account on the approved list held in AF_ADMINS, provisioned for the life of the system and not as a temporary or emergency account, so the 72-hour expiry requirement has nothing to apply to. Reported expiry for each, for completeness: " + ($rows -join " | ") + ". This answer re-evaluates on every scan: provisioning any account outside the approved list re-opens the control, at which point that account's expiry must be set within 72 hours or it must be documented."
+    $V.Results = "NOT APPLICABLE AS WRITTEN - there are no temporary accounts on this system. Every interactive account - UID >= 1000, below 65534, and holding a real login shell rather than nologin/false - was enumerated at scan time and the full set is: " + ($accts -join ", ") + ". Accounts on the approved list held in AF_ADMINS are permanent, named enclave administrator accounts, provisioned for the life of the system and not as temporary accounts, so the 72-hour expiry requirement has nothing to apply to." + $bgNote + " Reported expiry for each, for completeness: " + ($rows -join " | ") + ". This answer re-evaluates on every scan: provisioning any account outside the approved list re-opens the control, at which point that account's expiry must be set within 72 hours or it must be documented."
 }
 else {
     $V.Results = "OPEN. Interactive account(s) exist that are not on the approved permanent-administrator list: " + ($unexpected -join ", ") + ". Full set of interactive accounts (UID >= 1000, below 65534, with a real login shell): " + ($accts -join ", ") + ". Each unexpected account must either be documented as permanent or carry an expiry within 72 hours."
@@ -570,6 +584,7 @@ cmd_generate() {
     # file is self-contained and an assessor can read the list in the artefact.
     af_code "$id" \
       | sed "s/__AF_ADMINS__/$(printf '%s' "$AF_ADMINS" | tr ',' ' ' | xargs -n1 printf '\"%s\",' | sed 's/,$//')/" \
+      | sed "s/__AF_EMERGENCY__/$(printf '%s' "$AF_EMERGENCY" | tr ',' ' ' | xargs -n1 printf '\"%s\",' | sed 's/,$//')/" \
       > "$tmpdir/$id.ps1"
     printf '%s\n' "$why" > "$tmpdir/$id.why"
     # EXPECTED STATUS IS NOT ALWAYS "Open". An answer only fires when the control's current

@@ -4160,10 +4160,13 @@ cmd_luksenroll() {
 #              the other working. Same groups as the reference admin, same SSH key login.
 #   BREAKGLASS console-only emergency account. Password only, NO key, refused by sshd. Its
 #              password is chosen by two custodians, typed here, sealed offline per machine,
-#              and rotated after every use AND every 60 days - the STIG max age (60) plus
-#              INACTIVE (35) would otherwise kill a sealed password at ~95 days, and a dead
-#              break-glass account is worse than none. Every command it runs is audited by
-#              UID (key: breakglass).
+#              and rotated after EVERY USE. It does NOT expire: V-270682's own text says
+#              emergency ("break glass") accounts "are not subject to manual removal or
+#              scheduled expiration requirements", and a sealed password that silently ages
+#              out (max 60 + INACTIVE 35 = dead at ~95 days) is worse than none. Decided by
+#              the acting AO 2026-09-23 - an earlier 60-day rotation choice rested on my
+#              wrong claim that an exemption would be a deviation. Every command it runs is
+#              audited by UID (key: breakglass).
 #
 # PASSWORDS NEVER TOUCH THIS REPOSITORY. Read with `read -rsp`, fed to chpasswd on STDIN (not
 # argv, where ps would show it), which runs through PAM common-password - so the STIG hashing
@@ -4183,7 +4186,6 @@ BREAKGLASS_USER="${BREAKGLASS_USER:-breakglass}"
 REFERENCE_ADMIN="${REFERENCE_ADMIN:-encadmin}"
 BG_SSHD_DROPIN=/etc/ssh/sshd_config.d/10-enclave-breakglass.conf
 BG_AUDIT_RULES=/etc/audit/rules.d/65-enclave-breakglass.rules
-BG_WARN_DAYS=14
 
 acct_days_left() {   # days until the password expires; "never" if no max age
   local u="$1" sh last max
@@ -4232,9 +4234,10 @@ acct_status() {
     left="$(acct_days_left "$u" 2>/dev/null || echo '?')"
     fails="$(faillock --user "$u" 2>/dev/null | grep -cE '^[0-9]{4}-' || true)"
     say "$u ($role): groups=[$(id -nG "$u")]  password expires in: ${left} day(s)  failed tries: ${fails:-?}/3"
-    if [ "$u" = "$BREAKGLASS_USER" ] && [ "$left" != never ] && [ "$left" != '?' ] && [ "$left" -le "$BG_WARN_DAYS" ]; then
-      warn "  $u expires in $left day(s) - ROTATE NOW (two custodians, new sealed envelope):"
-      warn "    sudo $0 accounts rotate $u"
+    # The emergency account must NOT expire. Any number here is drift - a sealed password
+    # counting down to a dead account. Re-running create resets it.
+    if [ "$u" = "$BREAKGLASS_USER" ] && [ "$left" != never ] && [ "$left" != '?' ]; then
+      warn "  $u HAS AN EXPIRY ($left day(s)) - it must not. Fix: sudo $0 accounts create"
     fi
   done
   if getent passwd "$BREAKGLASS_USER" >/dev/null; then
@@ -4299,9 +4302,10 @@ cmd_accounts() {
         say "   TWO CUSTODIANS: choose it, type it, seal it for THIS machine ($(hostname -s)) only."
         acct_set_password "$BREAKGLASS_USER" "${BREAKGLASS_PASSWORD_HASH:-}"
       fi
-      # Explicit, rather than trusting login.defs - an account created before the defaults
-      # were set carries "never" (encadmin on host-1 did, measured 2026-09-23).
-      chage -M 60 -m 1 -I 35 -W "$BG_WARN_DAYS" "$BREAKGLASS_USER"
+      # NO EXPIRY, explicitly. useradd applied login.defs (max 60) and useradd's INACTIVE (35)
+      # at creation; left alone, the sealed password dies at ~95 days. V-270682 exempts
+      # emergency accounts from scheduled expiration - see the header.
+      chage -M 99999 -I -1 -E -1 "$BREAKGLASS_USER"
       local bh; bh="$(getent passwd "$BREAKGLASS_USER" | cut -d: -f6)"
       if [ -s "$bh/.ssh/authorized_keys" ]; then
         warn "$bh/.ssh/authorized_keys is NOT empty - an emergency account must have no key. Emptying it."
@@ -4347,7 +4351,7 @@ cmd_accounts() {
       getent passwd "$u" >/dev/null || die "$u does not exist here"
       [ "$u" = "$BREAKGLASS_USER" ] && say "   TWO CUSTODIANS: new password, new envelope for $(hostname -s); destroy the old one."
       acct_set_password "$u"
-      [ "$u" = "$BREAKGLASS_USER" ] && chage -M 60 -m 1 -I 35 -W "$BG_WARN_DAYS" "$u"
+      [ "$u" = "$BREAKGLASS_USER" ] && chage -M 99999 -I -1 -E -1 "$u"
       ok "$u: password expires in $(acct_days_left "$u") day(s)"
       ;;
 

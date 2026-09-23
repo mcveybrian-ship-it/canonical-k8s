@@ -94,6 +94,7 @@ cat <<'EOF'
 host-4	deselect	rule_chronyd_server_directive	-	__STIG_ID__ / chronyd_server_directive. THIS MACHINE IS THE ENCLAVE'S TIME MASTER, AND A MASTER IN AN AIR GAP HAS NO UPSTREAM TO POINT AT. The rule requires a `server` directive naming an authorised time source. host-4 has none by design: `time-sync.sh master` gives it `local stratum 5` and `allow 10.2.20.0/24`, so it serves the enclave subnet from its own hardware clock. Every OTHER machine carries `server 10.2.20.158 iburst maxpoll 16` and passes this rule unmodified - the hierarchy is real and measured: `chronyc sources` on svc-repo-01 shows `^* host-4` with reach 377. THE ALTERNATIVE WOULD BE WORSE. Pointing the master at a public pool it cannot reach produces a machine that never synchronises while appearing configured, which is the failure mode this rule exists to prevent. AND THE CHECK IS NOT ABANDONED: `time-sync.sh status` verifies the master is serving and that every client is actually locked to it, which is a stronger test than the presence of a directive. Scoped to host-4 only; if the time master moves, this deviation moves with it.
 host-4	deselect	rule_chronyd_specify_remote_server	-	__STIG_ID__ / chronyd_specify_remote_server. Same cause as chronyd_server_directive above, and the same scope. The `*` set-value deviation in this table already retargets value_var_multiple_time_servers to __TIME_MASTER__ so that every CLIENT passes by naming the enclave's authoritative source instead of DISA's 0.us.pool.ntp.mil. That retarget cannot help the master itself, which would have to name itself as its own remote server. The intent - synchronise only to an organisation-approved source - is met in full across the enclave; the master is the source.
 *	deselect	rule_file_groupowner_system_journal	-	__STIG_ID__ / file_groupowner_system_journal. THIS RULE CONFLICTS WITH UBTU-24-700020, WHICH IS ALSO IN THIS PROFILE. 700020 requires the journal DIRECTORIES at 640 or less permissive, and the scanner implements that as `find -perm /7137` - which includes the SETGID bit (verified: 0640 passes, 2640 fails, systemd's own 2750 fails). Setgid on the directory is exactly what made journald create new files owned by group systemd-journal. Removing it, as 700020 requires, makes journald write new files with the creating process's group, which is root. The two controls cannot both be continuously satisfied. MEASURED: DISA's complete FixText (the four-line /etc/tmpfiles.d/zzz-systemd-stig.conf) corrects existing files at every boot and every systemd-tmpfiles run, and a journal rotation immediately produces new root-group files again. THE RESULT IS THEREFORE NON-DETERMINISTIC - it passes or fails depending on how long since the last tmpfiles run, which is why it failed on svc-obs-01 at 02:34 and passed on svc-repo-01 the same day. WHAT WE ACTUALLY HAVE IS STRICTER THAN THE RULE ASKS: root:root 0640 is readable by root alone; root:systemd-journal 0640 is readable by every member of that group. AND THE CHECK IS NOT ABANDONED - `stig-tailor.sh v1r6` verifies this on every run and FAILS on any journal file that is neither systemd-journal nor root at 0640-or-tighter, which is a stronger check than the rule performs. Full write-up and the measurements: runbook 10.1.
+*	deselect	rule_display_login_attempts	-	__STIG_ID__ / display_login_attempts. THE MODULE IT REQUIRES DOES NOT EXIST ON UBUNTU 24.04, AND THE LINE IT WRITES BREAKS EVERY CONSOLE LOGIN. The fix adds `session required pam_lastlog.so showfailed` to /etc/pam.d/login. libpam-modules 1.5.3-5ubuntu5.7 ships no pam_lastlog.so and no package in the noble archive provides one (checked on all eight machines and against the enclave mirror, 2026-09-23), so a REQUIRED session module that cannot load fails the session AFTER the password is accepted - "Module is unknown" and straight back to login:, for every account including the break-glass account. SSH is unaffected because its PAM stack does not include that line, which is why this went unseen from the first `usg fix` until the break-glass console test on svc-obs-01. DISA has already dropped the requirement: UBTU-24-300024 has no row in the V1R6 checklist; the usg stig-v1r1 profile predates that. Deselecting stops `usg fix` re-adding the line; `fixups` item 8 removes the one already written. Backlog 3.28.
 EOF
 }
 #
@@ -406,6 +407,18 @@ postfix_external() {
     | grep -vE '^(127\.|\[::1\])' | grep -v '%lo:' | grep -qE '[:.]25$'
 }
 
+# Is a PAM module actually installed? PAM searches the multiarch directory; check the usual
+# places rather than one path, so a merged-/usr or non-x86 layout does not read as "missing".
+pam_module_present() {
+  local d
+  for d in /lib/x86_64-linux-gnu/security /usr/lib/x86_64-linux-gnu/security /lib/security /usr/lib/security; do
+    [ -e "$d/$1" ] && return 0
+  done
+  return 1
+}
+PAM_LOGIN=/etc/pam.d/login
+pam_lastlog_line() { grep -nE '^[[:space:]]*session[[:space:]].*pam_lastlog\.so' "$PAM_LOGIN" 2>/dev/null || true; }
+
 fixups_plan() {
   printf '\n  STIG fixups - what `usg fix` does not fix\n'
   local stray_list
@@ -551,6 +564,21 @@ fixups_plan() {
   say "        when the volume has room for twice that, then SIGHUP auditd. It refuses a"
   say "        manual restart, and killing it would drop records."
   say "   NOT this: audit OFFLOAD (V-270817) still needs the collector and three AO answers."
+
+  printf '\n  8. pam_lastlog - a REQUIRED module that does not exist breaks every console login\n'
+  local pll; pll="$(pam_lastlog_line)"
+  if [ -z "$pll" ]; then
+    say "   state: no pam_lastlog line in $PAM_LOGIN - nothing to do"
+  elif pam_module_present pam_lastlog.so; then
+    say "   state: line present AND pam_lastlog.so installed - left alone"
+  else
+    say "   state: $PAM_LOGIN line $pll"
+    say "          pam_lastlog.so is NOT installed. The session fails after the password is"
+    say "          accepted: 'Module is unknown', back to login:. SSH is unaffected; the"
+    say "          CONSOLE - the break-glass and at-the-rack path - is dead for every account."
+    say "   fix: comment the line out (backup kept). usg wrote it; the tailoring now deselects"
+    say "        display_login_attempts so the next usg fix does not put it back."
+  fi
 
   # ITEMS 0b-0d RUN ON --apply AND WERE NEVER LISTED HERE. Found 2026-09-20 reading this plan
   # on svc-mgmt-01: the numbered list above starts at 1, `fixups_plan` returns before the 0*
@@ -1396,6 +1424,41 @@ SUDOERS
     fi
   fi
 
+  # ---- 8. pam_lastlog: a REQUIRED module that does not exist on 24.04 -------------------
+  #
+  # FOUND 2026-09-23 testing the break-glass account at svc-obs-01's serial console: the
+  # password was accepted, the MOTD printed, then "Module is unknown" and back to login:.
+  # usg's display_login_attempts wrote `session required pam_lastlog.so showfailed` into
+  # /etc/pam.d/login; 24.04's libpam-modules does not ship that module and nothing in the
+  # archive provides it. `required` + unloadable = every console session fails, every
+  # account, all eight machines. SSH never noticed - its stack does not include the line.
+  #
+  # Only act when the module is genuinely absent: if a future libpam ships it again, the
+  # line is correct and stays.
+  local pll8; pll8="$(pam_lastlog_line)"
+  if [ -z "$pll8" ]; then
+    say "8. no pam_lastlog line in $PAM_LOGIN"
+  elif pam_module_present pam_lastlog.so; then
+    say "8. pam_lastlog.so is installed here - line left alone"
+  else
+    backup_file "$PAM_LOGIN"
+    sed -i -E 's|^([[:space:]]*session[[:space:]].*pam_lastlog\.so.*)$|# removed by stig-tailor.sh fixups 8 (backlog 3.28): pam_lastlog.so does not exist on 24.04\n# \1|' "$PAM_LOGIN"
+    # PROVE IT: the live line is gone AND the rest of the stack is intact. A bad sed on a PAM
+    # file is a machine nobody can log in to by ANY route that uses it.
+    if [ -n "$(pam_lastlog_line)" ]; then
+      [ -n "${LAST_BACKUP:-}" ] && cp -a "$LAST_BACKUP" "$PAM_LOGIN"
+      warn "8. the pam_lastlog line is still live after the edit - RESTORED $PAM_LOGIN"
+      failed=1
+    elif ! grep -q '^@include common-auth' "$PAM_LOGIN" || ! grep -q '^@include common-session' "$PAM_LOGIN"; then
+      [ -n "${LAST_BACKUP:-}" ] && cp -a "$LAST_BACKUP" "$PAM_LOGIN"
+      warn "8. $PAM_LOGIN lost its common-auth/common-session includes - RESTORED"
+      failed=1
+    else
+      ok "8. pam_lastlog line commented out in $PAM_LOGIN (backup: ${LAST_BACKUP:-none})"
+      warn "   VERIFY AT A CONSOLE: log in. SSH cannot prove this - it never used the line."
+    fi
+  fi
+
   say ""
   [ "$failed" -eq 0 ] || warn "one or more fixups did not complete - see above"
   say ""
@@ -1511,6 +1574,12 @@ fixups_verify() {
   else
     warn "sudo passwd_tries NOT set - one fumbled password locks this account permanently"
     fail=1
+  fi
+  if [ -n "$(pam_lastlog_line)" ] && ! pam_module_present pam_lastlog.so; then
+    warn "$PAM_LOGIN requires pam_lastlog.so, which is NOT installed - console login is BROKEN (fixups 8)"
+    fail=1
+  else
+    say "console PAM: no required module missing from $PAM_LOGIN (pam_lastlog)"
   fi
   if command -v postconf >/dev/null 2>&1; then
     if postfix_external; then

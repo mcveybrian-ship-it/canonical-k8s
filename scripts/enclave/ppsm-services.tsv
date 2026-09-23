@@ -39,7 +39,7 @@ tcp	53	systemd-resolve	DNS	systemd-resolved stub resolver - loopback only
 udp	53	systemd-resolve	DNS	systemd-resolved stub resolver - loopback only
 udp	323	chronyd	-	chrony command socket - loopback only
 tcp	953	named	-	BIND rndc control channel - loopback only
-tcp	5432	postgres	PGDG-POSTGRESQL-DB	PostgreSQL on svc-mgmt-01 - loopback only; backlog: confirm unused and remove
+tcp	5432	postgres	PGDG-POSTGRESQL-DB	PostgreSQL on pg-01..03 (Patroni, backlog B-06a) - NOT loopback: replication crosses hosts. Nothing listens until B-06a is built. svc-mgmt-01's MAAS instance was purged 2026-09-23 (backlog 6b.2)
 tcp	3000	grafana	-	Grafana - loopback only, published through nginx 443
 tcp	9090	prometheus	-	Prometheus - loopback only
 tcp	9093	prometheus-aler	-	Alertmanager - loopback only

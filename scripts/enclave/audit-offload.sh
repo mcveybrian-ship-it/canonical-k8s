@@ -73,6 +73,7 @@ RETENTION_DAYS="${AUDIT_RETENTION_DAYS:-365}"
 STATE="${AUDIT_STATE:-/var/local/enclave-metrics/audit-offload.state}"
 UNIT="enclave-audit-offload"
 ROTATE_WAIT="${AUDIT_ROTATE_WAIT:-10}"
+RUN_TMP=""            # staging dir for `run`; global so the EXIT trap can still see it
 
 say()  { printf '  %s\n' "$*"; }
 ok()   { printf '  [ok] %s\n' "$*"; }
@@ -201,11 +202,18 @@ cmd_run() {
   [ -n "$files" ] || { warn "no rotated audit files to offload"; return 0; }
 
   # 2. Build the bundle in a staging directory.
-  local stamp bundle tmp
+  #
+  # RUN_TMP IS DELIBERATELY NOT `local`. An EXIT trap fires after the function has returned,
+  # so a `local tmp` is out of scope by then: under `set -u` the trap itself died with
+  # "tmp: unbound variable" and the staging directory was NEVER cleaned up - every run
+  # leaking a full copy of the bundle into /tmp. Measured on svc-obs-01 2026-09-23.
+  # The `:-` guard means the trap is also safe if `run` exits before this line.
+  local stamp bundle
   stamp="$(date -u +%Y%m%dT%H%M%SZ)"
   bundle="${ME}-audit-${stamp}"
-  tmp="$(mktemp -d)"
-  trap 'rm -rf "$tmp"' EXIT
+  RUN_TMP="$(mktemp -d)"
+  trap '[ -n "${RUN_TMP:-}" ] && rm -rf "${RUN_TMP}"' EXIT
+  local tmp="$RUN_TMP"
   install -d -m 0700 "$tmp/$bundle"
 
   local f first last

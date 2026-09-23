@@ -234,7 +234,7 @@ cmd_run() {
     printf 'newest-file-mtime-utc: %s\n' "$(date -u -Is -d "@$(stat -c %Y "$first" 2>/dev/null || echo 0)")"
     printf 'auditd-allocation-mb: %s\n' "$(alloc_mb)"
     printf 'file-count: %s\n' "$(printf '%s\n' "$files" | grep -c . || true)"
-    printf 'script-revision: %s\n' "$(head -1 "$HOME/canonical-k8s/.pushed-from" 2>/dev/null || echo unknown)"
+    printf 'script-revision: %s\n' "$(head -1 "$SELF/../../.pushed-from" 2>/dev/null || echo unknown)"
     printf 'signature: none\n'
     printf 'signature-note: checksums only, decided 2026-09-23. Signing needs a key custody answer (backlog 3.7). Detached signatures may be added beside SHA256SUMS without reformatting this manifest.\n'
   } > "$tmp/$bundle/MANIFEST"
@@ -312,6 +312,13 @@ cmd_prune() {
 cmd_verify() {
   is_collector || die "verify runs on the COLLECTOR ($COLLECTOR); this is $ME"
   [ -d "$DROP" ] || die "$DROP does not exist"
+  # A VERIFIER THAT CANNOT READ THE STORE MUST NOT REPORT SUCCESS.
+  # Measured 2026-09-23: run unprivileged against a 0750 root:root store, `find` returned
+  # nothing and this printed "[ok] 0 bundle(s) verified, no mismatches" - a false pass on
+  # the one command whose whole job is to detect tampering. Root is now required, and an
+  # empty store is reported as empty rather than as clean.
+  need_root
+  [ -r "$DROP" ] && [ -x "$DROP" ] || die "$DROP is not readable - cannot verify, and will not claim to"
   local bad=0 total=0 t want got
   while IFS= read -r t; do
     [ -n "$t" ] || continue
@@ -330,7 +337,10 @@ cmd_verify() {
       warn "CHECKSUM MISMATCH: $t"; bad=$((bad+1))
     fi
   done <<< "$(find "$DROP" -type f -name '*.tar.gz' 2>/dev/null | sort || true)"
-  if [ "$bad" -eq 0 ]; then
+  if [ "$total" -eq 0 ]; then
+    warn "NO BUNDLES FOUND in $DROP - nothing was verified. This is not a pass."
+    return 1
+  elif [ "$bad" -eq 0 ]; then
     ok "$total bundle(s) verified, no mismatches"
   else
     die "$bad of $total bundle(s) FAILED verification"

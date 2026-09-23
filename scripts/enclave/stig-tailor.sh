@@ -4147,6 +4147,29 @@ cmd_luksenroll() {
   say  "            then remove tpm2-device=auto from /etc/crypttab and update-initramfs -u"
 }
 
+# ---- say WHICH COPY is running, before it says anything else (backlog 3.22) ------------
+# A stale copy does not error - it offers a shorter menu. On 2026-09-23 `fixups` on three
+# service VMs listed items 1-6 and never mentioned item 7, because their copy predated it; the
+# output was truthful and still read as "covered". Nothing in a plan can reveal a missing
+# item, so the only defence is to show the revision and let it be compared with the repo.
+# Same precedence as install-runtime.sh. To stderr, so `show` stays clean when piped.
+script_revision() {
+  if command -v git >/dev/null 2>&1 && git -C "$HERE" rev-parse --short HEAD >/dev/null 2>&1; then
+    printf '%s%s (git working copy)\n' "$(git -C "$HERE" rev-parse --short HEAD)" \
+      "$(git -C "$HERE" diff --quiet HEAD -- "$HERE" 2>/dev/null || echo '-dirty')"
+  elif [ -r "$HERE/../../.pushed-from" ]; then
+    head -1 "$HERE/../../.pushed-from"
+  elif [ -r "$HERE/.source" ]; then
+    printf '%s (runtime copy)\n' "$(head -1 "$HERE/.source")"
+  fi
+}
+_rev="$(script_revision || true)"
+if [ -n "$_rev" ]; then
+  printf '  stig-tailor.sh %s  [%s]\n' "$_rev" "$HERE" >&2
+else
+  printf '  [!]  stig-tailor.sh revision UNKNOWN - no .pushed-from, no git. Re-push before trusting a plan from this copy.  [%s]\n' "$HERE" >&2
+fi
+
 case "${1:-}" in
   generate) shift; cmd_generate "$@" ;;
   fixups)   shift; cmd_fixups "$@" ;;

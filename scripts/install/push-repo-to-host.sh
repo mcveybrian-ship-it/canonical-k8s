@@ -7,6 +7,7 @@
 #     ./push-repo-to-host.sh 10.0.20.158
 #     ./push-repo-to-host.sh 10.0.20.155 -k ~/.ssh/build01 -d ~/canonical-k8s
 #     ./push-repo-to-host.sh 10.2.20.162 --allow-dirty   # send HEAD even with local edits
+#     ./push-repo-to-host.sh 10.2.20.162 --allow-untracked   # leave uncommitted new scripts behind
 #
 # WHY THIS EXISTS RATHER THAN 'rsync -a' OR 'git clone':
 #
@@ -25,7 +26,7 @@
 set -euo pipefail
 
 TARGET=""; KEY="${REPO_PUSH_KEY:-$HOME/.ssh/build01}"; DEST="canonical-k8s"; USER_NAME="encadmin"
-ALLOW_DIRTY=0
+ALLOW_DIRTY=0; ALLOW_UNTRACKED=0
 
 usage() { sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
 die()   { printf '\n  [x] %s\n\n' "$*" >&2; exit 1; }
@@ -36,6 +37,7 @@ while [ $# -gt 0 ]; do
     -d) DEST="$2"; shift 2 ;;
     -u) USER_NAME="$2"; shift 2 ;;
     --allow-dirty) ALLOW_DIRTY=1; shift ;;
+    --allow-untracked) ALLOW_UNTRACKED=1; shift ;;
     -h|--help) usage ;;
     -*) die "unknown option $1" ;;
     *)  TARGET="$1"; shift ;;
@@ -43,6 +45,11 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$TARGET" ] || usage
 [ -r "$KEY" ] || die "no ssh key at $KEY (use -k, or set REPO_PUSH_KEY)"
+# For display only. -d takes a path relative to the remote home OR an absolute one; printing
+# "~/$DEST" for an absolute path showed "~//home/encadmin/..." (2026-09-23), which reads like
+# the files went somewhere wrong. They had not - but a message that looks wrong costs a check.
+# shellcheck disable=SC2088  # the tilde is text for the reader, never expanded
+case "$DEST" in /*) DEST_SHOW="$DEST" ;; *) DEST_SHOW="~/$DEST" ;; esac
 
 cd "$(git rev-parse --show-toplevel)" || die "not inside a git repository"
 
@@ -92,6 +99,28 @@ $(echo "$DIRTY" | sed 's/^/       /')
   fi
 fi
 
+# ---- and refuse to LEAVE BEHIND a script git has never seen -----------------------------
+# The second face of the same fault (backlog 3.22). A brand-new, uncommitted script is not
+# tracked, so git archive does not carry it - and every line below still says [ok]. Caught
+# 2026-09-23 pushing audit-offload.sh to svc-obs-01: the push succeeded, the file was not there.
+# --allow-dirty does NOT cover this. It sends HEAD despite edits; it cannot send what git has
+# never seen. Only scripts/ refuses - that is what the targets execute.
+UNTRACKED=$(git ls-files --others --exclude-standard -- scripts/ 2>/dev/null || true)
+if [ -n "$UNTRACKED" ]; then
+  if [ "$ALLOW_UNTRACKED" -eq 1 ]; then
+    echo "  [!]  $(echo "$UNTRACKED" | wc -l) untracked file(s) under scripts/ NOT SENT (--allow-untracked):"
+    echo "$UNTRACKED" | sed 's/^/         /'
+  else
+    die "$(echo "$UNTRACKED" | wc -l) untracked file(s) under scripts/ WILL NOT BE SENT - git archive ships tracked files only:
+$(echo "$UNTRACKED" | sed 's/^/       /')
+
+       commit them and re-push, or re-run with --allow-untracked to leave them behind.
+       --allow-dirty does not send these."
+  fi
+fi
+OTHER=$(git ls-files --others --exclude-standard -- . ':!scripts/' 2>/dev/null | wc -l)
+[ "$OTHER" -eq 0 ] || echo "  [i]  $OTHER untracked file(s) outside scripts/ not sent - 'git status' lists them"
+
 # ONE TCP CONNECTION FOR THE WHOLE RUN, because the targets are firewalled now.
 #
 # This script makes five separate ssh calls: reachability, the tar stream, the file count,
@@ -136,7 +165,7 @@ fi
 N=$(git archive --format=tar HEAD | tar -t | grep -cv '/$')
 HEAD_SHA=$(git rev-parse --short HEAD)
 HEAD_WHEN=$(git log -1 --format=%cd --date=format-local:'%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo unknown)
-echo "  sending $N tracked file(s) at $HEAD_SHA ($HEAD_WHEN UTC) to $USER_NAME@$TARGET:~/$DEST"
+echo "  sending $N tracked file(s) at $HEAD_SHA ($HEAD_WHEN UTC) to $USER_NAME@$TARGET:$DEST_SHOW"
 
 git archive --format=tar HEAD \
   | ssh "${SSH_OPTS[@]}" "$USER_NAME@$TARGET" \
@@ -153,11 +182,11 @@ echo "  [ok] $GOT file(s) on $TARGET"
 # you what it is running without trusting anyone's memory of when they last pushed.
 ssh "${SSH_OPTS[@]}" "$USER_NAME@$TARGET" \
   "printf '%s  %s  from %s by %s\\n' '$HEAD_SHA' '$HEAD_WHEN' \"$(hostname -s)\" '$USER' > '$DEST/.pushed-from'" \
-  && echo "  [ok] target stamped: $HEAD_SHA -> ~/$DEST/.pushed-from"
+  && echo "  [ok] target stamped: $HEAD_SHA -> $DEST_SHOW/.pushed-from"
 ssh "${SSH_OPTS[@]}" "$USER_NAME@$TARGET" \
   "test -x '$DEST/scripts/install/03-host-services.sh'" \
   && echo "  [ok] scripts are executable on the target"
 echo
 echo "  next, ON $TARGET:"
-echo "    cd ~/$DEST/scripts/install"
+echo "    cd $DEST_SHOW/scripts/install"
 echo "    cp 03-host-services/services-params.env.example 03-host-services/services-params.env"

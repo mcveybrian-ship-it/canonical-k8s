@@ -4147,6 +4147,214 @@ cmd_luksenroll() {
   say  "            then remove tpm2-device=auto from /etc/crypttab and update-initramfs -u"
 }
 
+# =========================================================================================
+# accounts - a second named admin and a console-only emergency account (backlog 3.15)
+# =========================================================================================
+#
+# WHY: one admin account plus pam_faillock (deny=3, unlock_time=0, and in common-account so a
+# locked account is refused SSH PUBKEY logins too) means three typos is a trip to the rack.
+# It reached 2 of 3 on 2026-09-21. The lockout is the control and stays exactly as it is -
+# the fix is the single point of failure around it. Approved by the acting AO 2026-09-23:
+#
+#   ADMIN2     a second NAMED admin. faillock counts per account, so a lockout on one leaves
+#              the other working. Same groups as the reference admin, same SSH key login.
+#   BREAKGLASS console-only emergency account. Password only, NO key, refused by sshd. Its
+#              password is chosen by two custodians, typed here, sealed offline per machine,
+#              and rotated after every use AND every 60 days - the STIG max age (60) plus
+#              INACTIVE (35) would otherwise kill a sealed password at ~95 days, and a dead
+#              break-glass account is worse than none. Every command it runs is audited by
+#              UID (key: breakglass).
+#
+# PASSWORDS NEVER TOUCH THIS REPOSITORY. Read with `read -rsp`, fed to chpasswd on STDIN (not
+# argv, where ps would show it), which runs through PAM common-password - so the STIG hashing
+# (SHA512) and pwquality rules apply exactly as for any password change. For the unattended
+# build, ADMIN2_PASSWORD_HASH / BREAKGLASS_PASSWORD_HASH may carry a pre-made SHA512 crypt
+# instead; nothing else is ever read from a file.
+#
+# PARAMETERS (environment):
+#   ADMIN2_USER          required for create - the second admin's username. No default: it
+#                        is a person, and guessing a person is how shared accounts happen.
+#   ADMIN2_KEY           path to that person's SSH PUBLIC key (optional; without it the
+#                        account works at the console and over SSH only once a key is added)
+#   BREAKGLASS_USER      default: breakglass
+#   REFERENCE_ADMIN      default: encadmin - ADMIN2 gets this account's supplementary groups
+#   ADMIN2_PASSWORD_HASH / BREAKGLASS_PASSWORD_HASH   unattended only, SHA512 crypt ($6$)
+BREAKGLASS_USER="${BREAKGLASS_USER:-breakglass}"
+REFERENCE_ADMIN="${REFERENCE_ADMIN:-encadmin}"
+BG_SSHD_DROPIN=/etc/ssh/sshd_config.d/10-enclave-breakglass.conf
+BG_AUDIT_RULES=/etc/audit/rules.d/65-enclave-breakglass.rules
+BG_WARN_DAYS=14
+
+acct_days_left() {   # days until the password expires; "never" if no max age
+  local u="$1" sh last max
+  # Unprivileged, getent shadow returns NOTHING - which would parse as "no max age" and
+  # print "never". Unreadable is '?', not a pass.
+  sh="$(getent shadow "$u" 2>/dev/null)" || { echo '?'; return; }
+  last="$(echo "$sh" | cut -d: -f3)"; max="$(echo "$sh" | cut -d: -f5)"
+  if [ -z "$max" ] || [ "$max" -ge 99999 ] 2>/dev/null; then echo never; return; fi
+  echo $(( last + max - $(date +%s) / 86400 ))
+}
+
+acct_set_password() {   # $1 user, $2 optional pre-made hash
+  local u="$1" hash="${2:-}" P P2
+  if [ -n "$hash" ]; then
+    case "$hash" in '$6$'*) ;; *) die "the hash for $u is not SHA512 crypt (\$6\$) - refusing" ;; esac
+    printf '%s:%s\n' "$u" "$hash" | chpasswd -e || die "chpasswd -e failed for $u"
+    ok "password set for $u from a pre-made hash (unattended path)"
+    return 0
+  fi
+  # No terminal and no hash (an unattended run missing its parameter): read would hit EOF and
+  # set -e would end the script with no message at all. Say what is missing instead.
+  [ -t 0 ] || die "no terminal to read a password for $u, and no pre-made hash was given"
+  read -rsp "  new password for $u: " P; echo
+  read -rsp "  again: " P2; echo
+  [ -n "$P" ] || die "empty password - nothing changed for $u"
+  [ "$P" = "$P2" ] || { P=""; P2=""; die "the two entries do not match - nothing changed for $u"; }
+  # STDIN, through PAM. A pwquality rejection comes back here as a non-zero exit with its reason.
+  local out rc=0
+  out="$(printf '%s:%s\n' "$u" "$P" | chpasswd 2>&1)" || rc=$?
+  P=""; P2=""
+  [ "$rc" -eq 0 ] || die "chpasswd refused the password for $u (exit $rc): $out"
+  ok "password set for $u (not shown)"
+}
+
+acct_status() {
+  local me; me="$(hostname -s)"
+  printf '\n  admin and emergency accounts on %s\n\n' "$me"
+  [ "$(id -u)" -eq 0 ] || warn "not root: shadow, faillock and the audit rules are unreadable, so the
+       password-age and lockout lines below would read EMPTY - which looks like 'fine'. Use sudo."
+  local u role
+  for u in "$REFERENCE_ADMIN" "${ADMIN2_USER:-}" "$BREAKGLASS_USER"; do
+    [ -n "$u" ] || continue
+    role="admin"; [ "$u" = "$BREAKGLASS_USER" ] && role="EMERGENCY"
+    if ! getent passwd "$u" >/dev/null; then warn "$u ($role): does not exist"; continue; fi
+    local left fails
+    left="$(acct_days_left "$u" 2>/dev/null || echo '?')"
+    fails="$(faillock --user "$u" 2>/dev/null | grep -cE '^[0-9]{4}-' || true)"
+    say "$u ($role): groups=[$(id -nG "$u")]  password expires in: ${left} day(s)  failed tries: ${fails:-?}/3"
+    if [ "$u" = "$BREAKGLASS_USER" ] && [ "$left" != never ] && [ "$left" != '?' ] && [ "$left" -le "$BG_WARN_DAYS" ]; then
+      warn "  $u expires in $left day(s) - ROTATE NOW (two custodians, new sealed envelope):"
+      warn "    sudo $0 accounts rotate $u"
+    fi
+  done
+  if getent passwd "$BREAKGLASS_USER" >/dev/null; then
+    local deny; deny="$(sshd -T 2>/dev/null | awk '$1=="denyusers"{print $2}')"
+    case ",$deny," in
+      *",$BREAKGLASS_USER,"*) ok "sshd refuses $BREAKGLASS_USER (denyusers: $deny)" ;;
+      *) warn "sshd does NOT refuse $BREAKGLASS_USER - it is not console-only" ;;
+    esac
+    local n; n="$(auditctl -l 2>/dev/null | grep -c 'key=breakglass' || true)"
+    if [ "${n:-0}" -ge 2 ]; then ok "audit: $n live rule(s) keyed breakglass"
+    else warn "audit: ${n:-0} live rule(s) keyed breakglass (want 2) - see 'accounts create' output"; fi
+  fi
+  echo
+  say "RECOVERY, if an admin is locked out (from any other admin, or $BREAKGLASS_USER at the console):"
+  say "    sudo faillock --user <locked-user> --reset"
+  say "  and record it. Every use of $BREAKGLASS_USER is an incident record; rotate its password after."
+  echo
+}
+
+cmd_accounts() {
+  local action="${1:-status}"; shift || true
+  case "$action" in
+    status) acct_status ;;
+
+    create)
+      need_root
+      [ -n "${ADMIN2_USER:-}" ] || die "ADMIN2_USER is not set. It is a PERSON - name them:
+       sudo ADMIN2_USER=<username> ADMIN2_KEY=<path/to/key.pub> $0 accounts create"
+      getent passwd "$REFERENCE_ADMIN" >/dev/null || die "reference admin $REFERENCE_ADMIN does not exist here"
+      [ "$ADMIN2_USER" != "$REFERENCE_ADMIN" ] && [ "$ADMIN2_USER" != "$BREAKGLASS_USER" ] \
+        || die "ADMIN2_USER must differ from $REFERENCE_ADMIN and $BREAKGLASS_USER"
+      if [ -n "${ADMIN2_KEY:-}" ]; then
+        [ -r "$ADMIN2_KEY" ] || die "ADMIN2_KEY=$ADMIN2_KEY is not readable"
+        ssh-keygen -l -f "$ADMIN2_KEY" >/dev/null 2>&1 || die "$ADMIN2_KEY is not an SSH public key"
+      fi
+
+      # ---- ADMIN2: same supplementary groups as the reference admin --------------------
+      local groups; groups="$(id -nG "$REFERENCE_ADMIN" | tr ' ' '\n' | grep -vx "$REFERENCE_ADMIN" | paste -sd, -)"
+      if getent passwd "$ADMIN2_USER" >/dev/null; then
+        ok "$ADMIN2_USER exists - groups and key re-applied, password left alone (use: accounts rotate)"
+        usermod -aG "$groups" "$ADMIN2_USER"
+      else
+        useradd -m -s /bin/bash -G "$groups" "$ADMIN2_USER" || die "useradd $ADMIN2_USER failed"
+        ok "created $ADMIN2_USER with groups $groups"
+        acct_set_password "$ADMIN2_USER" "${ADMIN2_PASSWORD_HASH:-}"
+      fi
+      if [ -n "${ADMIN2_KEY:-}" ]; then
+        local h; h="$(getent passwd "$ADMIN2_USER" | cut -d: -f6)"
+        install -d -m 700 -o "$ADMIN2_USER" -g "$ADMIN2_USER" "$h/.ssh"
+        grep -qxF "$(cat "$ADMIN2_KEY")" "$h/.ssh/authorized_keys" 2>/dev/null \
+          || cat "$ADMIN2_KEY" >> "$h/.ssh/authorized_keys"
+        chown "$ADMIN2_USER:$ADMIN2_USER" "$h/.ssh/authorized_keys"; chmod 600 "$h/.ssh/authorized_keys"
+        ok "$ADMIN2_USER key: $(ssh-keygen -l -f "$ADMIN2_KEY" | awk '{print $2, $NF}')"
+      fi
+
+      # ---- BREAKGLASS: sudo only, no key, console only, audited -------------------------
+      if getent passwd "$BREAKGLASS_USER" >/dev/null; then
+        ok "$BREAKGLASS_USER exists - controls re-applied, password left alone (use: accounts rotate)"
+      else
+        useradd -m -s /bin/bash -G sudo "$BREAKGLASS_USER" || die "useradd $BREAKGLASS_USER failed"
+        ok "created $BREAKGLASS_USER (group: sudo)"
+        say "   TWO CUSTODIANS: choose it, type it, seal it for THIS machine ($(hostname -s)) only."
+        acct_set_password "$BREAKGLASS_USER" "${BREAKGLASS_PASSWORD_HASH:-}"
+      fi
+      # Explicit, rather than trusting login.defs - an account created before the defaults
+      # were set carries "never" (encadmin on host-1 did, measured 2026-09-23).
+      chage -M 60 -m 1 -I 35 -W "$BG_WARN_DAYS" "$BREAKGLASS_USER"
+      local bh; bh="$(getent passwd "$BREAKGLASS_USER" | cut -d: -f6)"
+      if [ -s "$bh/.ssh/authorized_keys" ]; then
+        warn "$bh/.ssh/authorized_keys is NOT empty - an emergency account must have no key. Emptying it."
+        backup_file "$bh/.ssh/authorized_keys"; : > "$bh/.ssh/authorized_keys"
+      fi
+
+      # sshd: refuse it outright. Checked with sshd -t BEFORE reload - a bad drop-in plus a
+      # reload is how a remote machine loses SSH for everyone.
+      printf '# backlog 3.15 - the emergency account is console-only. Written by stig-tailor.sh accounts.\nDenyUsers %s\n' \
+        "$BREAKGLASS_USER" > "$BG_SSHD_DROPIN.new"
+      chmod 600 "$BG_SSHD_DROPIN.new"; mv "$BG_SSHD_DROPIN.new" "$BG_SSHD_DROPIN"
+      if ! sshd -t 2>/dev/null; then
+        sshd -t 2>&1 | sed 's/^/       /'
+        rm -f "$BG_SSHD_DROPIN"
+        die "sshd -t failed with the drop-in - REMOVED it, sshd not reloaded"
+      fi
+      systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || warn "sshd reload failed - reload it by hand"
+      case ",$(sshd -T 2>/dev/null | awk '$1=="denyusers"{print $2}')," in
+        *",$BREAKGLASS_USER,"*) ok "sshd now refuses $BREAKGLASS_USER" ;;
+        *) warn "sshd -T does NOT list $BREAKGLASS_USER in denyusers - the drop-in did not take effect. Check sshd_config.d and do not rely on console-only." ;;
+      esac
+
+      # audit: every command it runs, keyed by its UID.
+      local uid; uid="$(id -u "$BREAKGLASS_USER")"
+      printf '%s\n' "## backlog 3.15 - every command run by the emergency account, by login UID" \
+        "-a always,exit -F arch=b64 -S execve -F auid=$uid -k breakglass" \
+        "-a always,exit -F arch=b32 -S execve -F auid=$uid -k breakglass" > "$BG_AUDIT_RULES"
+      chmod 640 "$BG_AUDIT_RULES"
+      # IMMUTABLE AUDIT (-e 2) REFUSES NEW RULES UNTIL REBOOT, and says so only as an error from
+      # augenrules. Name it rather than let it read as a failure.
+      if auditctl -s 2>/dev/null | grep -q '^enabled 2'; then
+        warn "audit rules are IMMUTABLE (enabled 2): the breakglass rule is written but goes live only"
+        warn "  at the next reboot. Until then the account is NOT audited - reboot before relying on it."
+      else
+        local ar; ar="$(augenrules --load 2>&1)" || { printf '%s\n' "$ar" | sed 's/^/       /'; warn "augenrules --load failed - output above"; }
+      fi
+      acct_status
+      ;;
+
+    rotate)
+      need_root
+      local u="${1:-$BREAKGLASS_USER}"
+      getent passwd "$u" >/dev/null || die "$u does not exist here"
+      [ "$u" = "$BREAKGLASS_USER" ] && say "   TWO CUSTODIANS: new password, new envelope for $(hostname -s); destroy the old one."
+      acct_set_password "$u"
+      [ "$u" = "$BREAKGLASS_USER" ] && chage -M 60 -m 1 -I 35 -W "$BG_WARN_DAYS" "$u"
+      ok "$u: password expires in $(acct_days_left "$u") day(s)"
+      ;;
+
+    *) die "usage: $0 accounts {status|create|rotate [user]}" ;;
+  esac
+}
+
 # ---- say WHICH COPY is running, before it says anything else (backlog 3.22) ------------
 # A stale copy does not error - it offers a shorter menu. On 2026-09-23 `fixups` on three
 # service VMs listed items 1-6 and never mentioned item 7, because their copy predated it; the
@@ -4181,7 +4389,8 @@ case "${1:-}" in
   v1r6)     shift; cmd_v1r6 "$@" ;;
   grubpw)   shift; cmd_grubpw "$@" ;;
   luksenroll) shift; cmd_luksenroll "$@" ;;
+  accounts) shift; cmd_accounts "$@" ;;
   audit)    shift; cmd_audit "$@" ;;
   show)     shift; cmd_show "$@" ;;
-  *) printf 'usage: %s {generate|audit|show|preflight|aide {status|exclude [--apply]|init}|v1r6 [--apply|--verify]|grubpw {status|prep|set}|luksenroll [--method=clevis|systemd] [--force]|fixups [...]|ufw [--apply]|usb {status|enable|disable}|radio {status|disable|enable}}\n' "$0" >&2; exit 2 ;;
+  *) printf 'usage: %s {generate|audit|show|preflight|aide {status|exclude [--apply]|init}|v1r6 [--apply|--verify]|grubpw {status|prep|set}|luksenroll [--method=clevis|systemd] [--force]|accounts {status|create|rotate [user]}|fixups [...]|ufw [--apply]|usb {status|enable|disable}|radio {status|disable|enable}}\n' "$0" >&2; exit 2 ;;
 esac

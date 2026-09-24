@@ -807,6 +807,20 @@ Source: `docs/open-questions.md` Q25 · suggested controls **AU-11**, AU-4, AU-9
 Importing 137 rules to catch three would bury them; assessing the three directly keeps them
 visible. Source: backlog 6a.18, 6a.19 · suggested controls AU-12(1), AC-12(1), AC-3(7).
 
+### 4.1l ⬜ `service_sssd_enabled` is an open finding by design until CAC login exists (2026-09-24)
+
+> **`sssd` is installed and deliberately disabled on every machine. The STIG rule that wants it
+> enabled stays OPEN — it is not deselected — because the control it serves, smart-card
+> (CAC/PIV) authentication, is real and not yet built.**
+
+| | |
+|---|---|
+| Why disabled | `sssd` has **no identity domain to serve** in this enclave: accounts are local. `stig-tailor.sh fixups` item 0b disables units with nothing to serve, **proven case by case**; left enabled, `sssd` fails at every boot and shows as a failed unit. Package kept installed. |
+| Why not deselected | `service_sssd_enabled` / `sssd_enable_user_cert` belong to the smart-card family (V-270663/735/736/722/745, incl. the only remaining HIGH). Deselecting would hide a real gap rather than justify a choice. |
+| Where it closes | **Backlog 6a.23 (CAC/PIV access)** — a **go-live gate** since 2026-09-24, because the published SORN for these records states that CAC authenticates users (`HANDOFF.md` §3). |
+| Measured | `systemctl is-enabled sssd` → `disabled` on host-1, host-2, host-3, 2026-09-24. |
+| Source | backlog B-05a, 6a.23 · `poam.md` AO-06 · suggested controls IA-2(12), IA-5(2) |
+
 ### 4.2 ⬜ Third-party packages no subscription tier covers
 
 > **Between 24 and 46 packages per machine are covered by no subscription at any tier.**

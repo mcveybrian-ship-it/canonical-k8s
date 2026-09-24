@@ -490,9 +490,14 @@ cmd_resolver_install() {
 
   # PROVE ALL THREE TIERS, not just that something resolved.
   local viahosts wildcard outside
-  viahosts="$(getent hosts "svc-repo-01.$ENCLAVE_DOMAIN" | awk '{print $1}')"
-  wildcard="$(getent hosts "test.apps.$ENCLAVE_DOMAIN" | awk '{print $1}')"
-  outside="$(getent hosts nosuchname.example.invalid 2>/dev/null | awk '{print $1}')"
+  # `|| true` ON EVERY LOOKUP. getent exits 2 for "not found", and under pipefail that failed
+  # assignment ended the script SILENTLY - on the third lookup, whose whole point is to find
+  # nothing. So these three proofs never printed on any machine, and resolver-install exited
+  # non-zero after doing its job (found 2026-09-24 on host-3, backlog 6b.1e). A lookup that
+  # fails must reach its warning below, not end the script before it.
+  viahosts="$(getent hosts "svc-repo-01.$ENCLAVE_DOMAIN" | awk '{print $1}' || true)"
+  wildcard="$(getent hosts "test.apps.$ENCLAVE_DOMAIN" | awk '{print $1}' || true)"
+  outside="$(getent hosts nosuchname.example.invalid 2>/dev/null | awk '{print $1}' || true)"
   [ -n "$viahosts" ] && ok "hosts-file name still resolves: svc-repo-01 -> $viahosts" \
                      || warn "svc-repo-01 no longer resolves - THIS IS A REGRESSION"
   [ -n "$wildcard" ] && ok "wildcard now resolves via DNS: test.apps -> $wildcard" \

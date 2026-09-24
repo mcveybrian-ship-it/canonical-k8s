@@ -339,6 +339,37 @@ exactly one label. Source: runbook §2.9b · suggested controls SC-12, SC-8.
 | Owed at build (B-06a) | Verify that the `pg-01..03` system **and data** disks are allocated from the encrypted pool: `lsblk -s` of the backing LV must show `crypt`. Record it as the evidence for the three rules. |
 | Source | runbook §9a (pgcrypto note) · backlog 6a.9 · suggested controls **SC-28**, SC-28(1), SC-13 |
 
+### 2.8 🔄 Records are destroyed on schedule — in the application AND in every copy — DESIGN DECIDED 2026-09-24
+
+> **The operating agency's published SORN (named in `HANDOFF.md` §3, not here) sets the schedule:
+> non-criminal records destroyed 1 year after the case is closed; criminal records destroyed 15
+> years after cut-off. A record deleted from the database but alive in a backup is still
+> retained, so the schedule applies to every copy.**
+
+**Measured 2026-09-24, and it is why this section exists:** the nightly backup is **incremental only** —
+a full is taken only when no checkpoint exists — and `BACKUP_KEEP_CHAINS=2` deletes a chain only
+after new fulls. **Backup retention was therefore unbounded**: a deleted record would have lived in
+the backups, and in the mirrored second copy, indefinitely.
+
+| Copy | Mechanism | State |
+|---|---|---|
+| Live database | **The CAD application's own retention/purge**, keyed to case closure and the criminal/non-criminal flag, honouring holds. The enclave does not write deletes against a vendor schema. | ⬜ vendor must **demonstrate** it — an acceptance requirement |
+| Nightly VM backups | A **full backup whenever the newest full is older than 30 days** (`BACKUP_FULL_MAX_DAYS`), **2 chains kept** → a deleted record leaves every backup within **~60 days** | ⬜ build in `vm-backup.sh` |
+| Second copy (host-1) | mirrors the primary with `rsync --delete` — inherits the same bound | ✅ |
+| WAL archive | retained only back to the oldest retained base backup | ⬜ B-06a |
+| Offsite copy (backlog 3.29) | media rotated at most every 60 days; retired media sanitised (3.19, MP-6) | ⬜ 3.29 |
+| Legal / litigation hold | per-record hold in the application; for backups, a **hold switch that suspends pruning** (backups cannot hold one record, so they hold all), logged with who and why | ⬜ build |
+| Drift | alert when the oldest backup exceeds ~70 days, or a hold outlives its review date | ⬜ build (alert path proven, B-09a) |
+| Evidence | every prune appends to a **disposal log**: which sets were destroyed, when, by which run | ⬜ build |
+
+**The disposal lag is stated, not hidden:** a record is destroyed in the application on schedule
+and leaves the last backup up to ~60 days later. Sizing (Q22, <500 GB usable) was confirmed by
+the AO to include 15 years of criminal records.
+
+Decided by the acting AO 2026-09-24: application-side purge · ~60-day backup lag · legal holds supported ·
+sizing includes 15 years. Source: backlog 3.27 · suggested controls **SI-12**, **MP-6**, AU-11,
+CP-9, PT-2.
+
 ## 3. Availability and recovery — what is and is not claimed
 
 ### 3.1 🔴 The design survives a single host failure. It does not survive a site event.

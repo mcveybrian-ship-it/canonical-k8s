@@ -346,6 +346,119 @@
       ]
     },
     {
+      "type": "table",
+      "title": "What is firing - checked by the SA on duty at the start of every duty day",
+      "description": "Every firing alert, from Prometheus' ALERTS series. This panel IS the enclave's alert notification (no email leaves the air gap - AO decision Q26, backlog B-09a). Each alert's 'action' annotation says what to do; see it in Alertmanager or on the rules page. Test the path with 'sudo ./monitoring.sh alert-test on' on svc-obs-01.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "enclave-prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 24,
+        "x": 0,
+        "y": 5
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "enclave-prometheus"
+          },
+          "expr": "ALERTS{alertstate=\"firing\"}",
+          "instant": true,
+          "format": "table",
+          "refId": "A"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "Value": true,
+              "__name__": true,
+              "alertstate": true,
+              "enclave": true
+            },
+            "indexByName": {
+              "severity": 0,
+              "alertname": 1,
+              "machine": 2,
+              "instance": 3,
+              "job": 4,
+              "role": 5
+            },
+            "renameByName": {
+              "alertname": "Alert",
+              "machine": "Machine",
+              "severity": "Severity",
+              "instance": "Instance",
+              "job": "Job",
+              "role": "Role"
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "Nothing firing",
+          "custom": {
+            "align": "auto"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Severity"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background"
+                }
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "critical": {
+                        "color": "red",
+                        "index": 0
+                      },
+                      "warning": {
+                        "color": "orange",
+                        "index": 1
+                      },
+                      "info": {
+                        "color": "blue",
+                        "index": 2
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "sortBy": [
+          {
+            "displayName": "Severity",
+            "desc": false
+          }
+        ]
+      }
+    },
+    {
       "type": "row",
       "title": "Operating system - host and guests",
       "collapsed": false,
@@ -353,7 +466,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 5
+        "y": 12
       },
       "panels": []
     },
@@ -369,7 +482,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 6
+        "y": 13
       },
       "fieldConfig": {
         "defaults": {
@@ -424,7 +537,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 15
+        "y": 22
       },
       "fieldConfig": {
         "defaults": {
@@ -479,7 +592,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 24
+        "y": 31
       },
       "fieldConfig": {
         "defaults": {
@@ -533,7 +646,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 33
+        "y": 40
       },
       "fieldConfig": {
         "defaults": {
@@ -584,7 +697,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 42
+        "y": 49
       },
       "panels": []
     },
@@ -600,7 +713,7 @@
         "h": 12,
         "w": 24,
         "x": 0,
-        "y": 43
+        "y": 50
       },
       "fieldConfig": {
         "defaults": {
@@ -705,7 +818,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 55
+        "y": 62
       },
       "fieldConfig": {
         "defaults": {
@@ -760,7 +873,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 64
+        "y": 71
       },
       "fieldConfig": {
         "defaults": {
@@ -815,7 +928,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 73
+        "y": 80
       },
       "fieldConfig": {
         "defaults": {
@@ -874,7 +987,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 82
+        "y": 89
       },
       "panels": []
     },
@@ -890,7 +1003,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 83
+        "y": 90
       },
       "fieldConfig": {
         "defaults": {
@@ -945,7 +1058,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 92
+        "y": 99
       },
       "fieldConfig": {
         "defaults": {
@@ -1000,7 +1113,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 101
+        "y": 108
       },
       "fieldConfig": {
         "defaults": {
@@ -1063,7 +1176,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 110
+        "y": 117
       },
       "fieldConfig": {
         "defaults": {

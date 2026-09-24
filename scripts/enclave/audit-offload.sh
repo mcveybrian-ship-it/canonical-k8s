@@ -293,7 +293,9 @@ cmd_run() {
     printf 'newest-file-mtime-utc: %s\n' "$(date -u -Is -d "@$(stat -c %Y "$first" 2>/dev/null || echo 0)")"
     printf 'auditd-allocation-mb: %s\n' "$(alloc_mb)"
     printf 'file-count: %s\n' "$(printf '%s\n' "$files" | grep -c . || true)"
-    printf 'script-revision: %s\n' "$(head -1 "$SELF/../../.pushed-from" 2>/dev/null || echo unknown)"
+    # A repo copy has ../../.pushed-from; the root-owned runtime copy the timer runs has .source
+    # instead (3.31 #1) - read either, so a bundle never records "unknown".
+    printf 'script-revision: %s\n' "$(head -1 "$SELF/../../.pushed-from" 2>/dev/null || head -1 "$SELF/.source" 2>/dev/null || echo unknown)"
     printf 'signature: none\n'
     printf 'signature-note: checksums only, decided 2026-09-23. Signing needs a key custody answer (backlog 3.7). Detached signatures may be added beside SHA256SUMS without reformatting this manifest.\n'
   } > "$tmp/$bundle/MANIFEST"
@@ -332,6 +334,18 @@ cmd_run() {
 # `run`. The "weekly" in UBTU-24-900950's check text is this timer.
 cmd_install() {
   need_root
+  # RUN THE ROOT-OWNED COPY, NOT THIS ONE (backlog 3.31 #1). This unit runs as root; pointing
+  # it at ${SELF} - the repo copy, which encadmin can edit - made the weekly offload a way to
+  # run anything as root: the same sudo bypass 3.11 closed for every other enclave timer.
+  # install-runtime.sh puts a root:root copy in /usr/local/lib/enclave; point the unit THERE,
+  # exactly as audit-volume.sh does. Re-run `install` after pushing a new version.
+  "$SELF/install-runtime.sh" || die "could not install the root-owned runtime copy"
+  local rt; rt="$("$SELF/install-runtime.sh" --print-dir)/audit-offload.sh"
+  [ -x "$rt" ] || die "$rt missing after install-runtime.sh"
+  case "$(stat -c '%U %a' "$rt")" in
+    "root "[0-7][0-5][0-5]) ;;
+    *) die "$rt is not root-owned and non-writable by others ($(stat -c '%U %a' "$rt")) - refusing" ;;
+  esac
   cat > "/etc/systemd/system/${UNIT}.service" <<UNIT_EOF
 [Unit]
 Description=Weekly audit-record offload to the enclave collector
@@ -339,7 +353,7 @@ Documentation=man:auditd.conf(5)
 
 [Service]
 Type=oneshot
-ExecStart=${SELF}/audit-offload.sh run
+ExecStart=${rt} run
 UNIT_EOF
   cat > "/etc/systemd/system/${UNIT}.timer" <<TIMER_EOF
 [Unit]

@@ -9,7 +9,8 @@
 # NOTE: 'push' needs PASSWORDLESS sudo on the targets. The enclave hosts deliberately do not
 # have it, so on those run 'apply' locally instead - same result, one step per machine. VMs
 # built by 03-compose-vm.sh get this block from cloud-init and need neither.
-#   ./apply-addresses.sh verify          check every node resolves every name
+#   ./apply-addresses.sh verify          check every node resolves every name AND uses the DNS
+#   ./apply-addresses.sh resolver-check  print the DNS server, exit 0 only if it answers
 #
 #   ./apply-addresses.sh zone            print the BIND zone files, change nothing
 #   ./apply-addresses.sh zone-install    write them and reload named   (sudo, DNS host only)
@@ -96,9 +97,21 @@ k8s-wk-04:K8S_WK_04
 ZONE_DIR="${ZONE_DIR:-/etc/bind/enclave}"
 ZONE_NS="${ZONE_NS:-svc-mgmt-01}"          # which machine serves it
 # The reverse zone is derived, not typed: 10.2.20.x -> 20.2.10.in-addr.arpa
+# THE DNS SERVER'S ADDRESS, from ZONE_NS - ONE implementation (backlog 6b.1e).
+#
+# The four copies this replaced turned `svc-mgmt-01` into `svc_mgmt_01` - LOWERCASE - while
+# enclave-addresses.env defines `SVC_MGMT_01`. The lookup therefore ALWAYS came back empty and
+# fell through to a hardcoded SVC_MGMT_01, so ZONE_NS never did anything: set it to another
+# machine, or to one that does not exist, and every consumer still silently used svc-mgmt-01.
+# Found 2026-09-24 only because resolver-check was tested against machines that must FAIL.
+# Now: upper-case the key, and an unknown ZONE_NS is an error, never a fallback.
+zone_ns_addr() {
+  local key; key="$(printf '%s' "$ZONE_NS" | tr '[:lower:]-' '[:upper:]_')"
+  printf '%s' "${!key:-}"
+}
 zone_rev_prefix() {
-  local a; a="$(eval "printf '%s' \"\${${ZONE_NS//-/_}}\"" 2>/dev/null)"
-  a="${a:-$(eval "printf '%s' \"\${SVC_MGMT_01:-}\"")}"
+  local a; a="$(zone_ns_addr)"
+  [ -n "$a" ] || die "ZONE_NS='$ZONE_NS' has no address in $ADDRS"
   printf '%s' "$(printf '%s' "$a" | awk -F. '{print $3"."$2"."$1}')"
 }
 
@@ -326,7 +339,9 @@ verify() {
     # 10.x before 127.x and quietly destroys the only signal being measured.
     local got
     got="$(ssh -n -i "$KEY" -o BatchMode=yes "$USER_NAME@$ip" \
-          "for n in$names; do printf '%s ' \"\${n%%.*}\"; getent ahostsv4 \"\$n\" 2>/dev/null | awk '!s[\$1]++ {print \$1}' | tr '\\n' ' '; echo; done" 2>/dev/null)" || true
+          "for n in$names; do printf '%s ' \"\${n%%.*}\"; getent ahostsv4 \"\$n\" 2>/dev/null | awk '!s[\$1]++ {print \$1}' | tr '\\n' ' '; echo; done;
+           printf '__DNS__ '; resolvectl dns 2>/dev/null | awk '/^Global/ {for(i=2;i<=NF;i++) printf \"%s \", \$i}'; echo;
+           printf '__WILD__ '; getent ahostsv4 test.apps.$ENCLAVE_DOMAIN 2>/dev/null | awk 'NR==1 {print \$1}'; echo" 2>/dev/null)" || true
     if [ -z "$got" ]; then warn "$ip UNREADABLE - ssh returned nothing"; rc=1; continue; fi
 
     local bad="" shadowed="" checked=0 want first
@@ -349,6 +364,15 @@ verify() {
 
     if [ -z "$bad" ]; then ok "$ip resolves all $checked name(s)"
     else warn "$ip MISSING:$bad"; rc=1; fi
+    # AND IS IT USING THE DNS AT ALL. Every name above is also in /etc/hosts, so all of them
+    # resolve on a machine with NO resolver - which is how host-3 passed this check for three
+    # days after its rebuild had dropped the drop-in (6b.1e). A *.apps name has no hosts
+    # entry and can ONLY come from DNS, so it is the one lookup that tells the two apart.
+    local gdns wild
+    gdns="$(printf '%s\n' "$got" | awk '$1=="__DNS__" {$1=""; sub(/^ /,""); print}')"
+    wild="$(printf '%s\n' "$got" | awk '$1=="__WILD__" {print $2}')"
+    if [ -n "$wild" ]; then ok "$ip uses the enclave DNS (resolver: ${gdns:-?}; test.apps -> $wild)"
+    else warn "$ip does NOT resolve *.apps - no enclave DNS (resolver: ${gdns:-none}). Fix ON $ip: sudo ./apply-addresses.sh resolver-install"; rc=1; fi
     [ -z "$shadowed" ] || say "       note: 127.0.1.1 answers first for:$shadowed"
   done
   return $rc
@@ -447,8 +471,7 @@ cmd_zone_install() {
 RESOLVED_DROPIN=/etc/systemd/resolved.conf.d/10-enclave-dns.conf
 
 resolver_render() {
-  local dns; dns="$(eval "printf '%s' \"\${${ZONE_NS//-/_}:-}\"")"
-  dns="${dns:-${SVC_MGMT_01:-}}"
+  local dns; dns="$(zone_ns_addr)"
   printf '# Enclave DNS. Written by apply-addresses.sh - do not edit.\n'
   printf '#\n'
   printf '# /etc/hosts STILL WINS - nsswitch is "hosts: files dns". This server only answers\n'
@@ -462,22 +485,37 @@ resolver_render() {
   printf 'Cache=yes\n'
 }
 
+# Print the enclave DNS server's address and exit 0 ONLY if it answers for an enclave name.
+# Shared by resolver-install and 03-compose-vm.sh, so "never point a machine at a server
+# that is not serving" is one rule in one place (backlog 6b.1e).
+cmd_resolver_check() {
+  local dns; dns="$(zone_ns_addr)"
+  [ -n "$dns" ] || { printf 'no address for the DNS server (%s) in %s\n' "$ZONE_NS" "$ADDRS" >&2; return 2; }
+  command -v dig >/dev/null 2>&1 || { printf 'dig absent - apt install dnsutils\n' >&2; return 3; }
+  # AN ADDRESS, NOT "ANY OUTPUT". `dig +short` prints ";; communications error ... timed out"
+  # on STDOUT when nothing answers, so a test for non-empty output passed against a machine
+  # running no DNS server at all - this guard, and the copy in resolver-install before it,
+  # could never refuse anything. Found 2026-09-24 by testing against svc-repo-01 (no named).
+  dig +short +time=3 +tries=1 "@$dns" "svc-repo-01.$ENCLAVE_DOMAIN" 2>/dev/null \
+    | grep -qE '^[0-9]+(\.[0-9]+){3}$' \
+    || { printf '%s did not answer for svc-repo-01.%s\n' "$dns" "$ENCLAVE_DOMAIN" >&2; return 1; }
+  printf '%s\n' "$dns"
+}
+
 cmd_resolver_install() {
   [ "$(id -u)" -eq 0 ] || die "run with sudo"
-  local dns; dns="$(eval "printf '%s' \"\${${ZONE_NS//-/_}:-}\"")"
-  dns="${dns:-${SVC_MGMT_01:-}}"
-  [ -n "$dns" ] || die "no address for the DNS server ($ZONE_NS) in $ADDRS"
-
   # DO NOT POINT AT A SERVER THAT IS NOT ANSWERING. A resolver configured at a dead address
   # adds a timeout to every lookup that /etc/hosts does not already cover - which is the exact
-  # failure this whole design exists to avoid.
-  command -v dig >/dev/null 2>&1 || die "dig absent - apt install dnsutils"
-  local probe; probe="$(dig +short +time=3 "@$dns" "svc-repo-01.$ENCLAVE_DOMAIN" 2>/dev/null)"
-  [ -n "$probe" ] || die "$dns did not answer for svc-repo-01.$ENCLAVE_DOMAIN.
+  # failure this whole design exists to avoid. ONE probe, shared with 03-compose-vm.sh.
+  local dns why
+  if ! dns="$(cmd_resolver_check 2>/tmp/.resolver-check.$$)"; then
+    why="$(cat /tmp/.resolver-check.$$ 2>/dev/null)"; rm -f /tmp/.resolver-check.$$
+    die "${why:-the DNS server did not answer}.
        REFUSING to point this machine at a server that is not serving. Run
-       'apply-addresses.sh zone-install' on $ZONE_NS first, and check it from here with
-       'dig @$dns svc-repo-01.$ENCLAVE_DOMAIN'."
-  ok "$dns answers (svc-repo-01 -> $probe)"
+       'apply-addresses.sh zone-install' on $ZONE_NS first."
+  fi
+  rm -f /tmp/.resolver-check.$$
+  ok "$dns answers (svc-repo-01 -> $(dig +short +time=3 +tries=1 "@$dns" "svc-repo-01.$ENCLAVE_DOMAIN" 2>/dev/null | head -1))"
 
   install -d -m 0755 "$(dirname "$RESOLVED_DROPIN")"
   [ -f "$RESOLVED_DROPIN" ] && cp -a "$RESOLVED_DROPIN" "$RESOLVED_DROPIN.bak-$(date +%Y%m%dT%H%M%S)"
@@ -514,6 +552,7 @@ case "${1:-}" in
   zone)   cmd_zone ;;
   zone-install) cmd_zone_install ;;
   resolver)     resolver_render ;;
+  resolver-check) cmd_resolver_check ;;
   resolver-install) cmd_resolver_install ;;
   *)      sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

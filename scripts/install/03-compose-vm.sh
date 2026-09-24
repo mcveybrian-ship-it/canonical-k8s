@@ -346,6 +346,22 @@ fi
 # The hosts block comes from apply-addresses.sh so there is exactly one renderer. A VM that
 # writes its own copy is a second source of truth waiting to disagree.
 HOSTS_BLOCK="$("$ENCLAVE_DIR/apply-addresses.sh" render | sed 's/^/      /')"
+# THE RESOLVER, FROM THE SAME RENDERER (backlog 6b.1e). Without it every VM is born with no
+# enclave DNS - hosts-file names work, *.apps and CoreDNS forwarding do not. Included ONLY if
+# the DNS server answers now: a resolver pointed at a dead server adds a timeout to every
+# lookup the hosts file does not cover, which is worse than no resolver.
+RESOLVER_WF=""; RESOLVER_RUN=""
+if DNS_ADDR="$("$ENCLAVE_DIR/apply-addresses.sh" resolver-check 2>/dev/null)"; then
+  RESOLVER_WF="  - path: /etc/systemd/resolved.conf.d/10-enclave-dns.conf
+    permissions: '0644'
+    content: |
+$("$ENCLAVE_DIR/apply-addresses.sh" resolver | sed 's/^/      /')"
+  RESOLVER_RUN="  - [ systemctl, restart, systemd-resolved ]"
+  ok "resolver  : enclave DNS $DNS_ADDR answers - the VM will use it from first boot"
+else
+  warn "resolver  : enclave DNS is NOT answering - this VM gets /etc/hosts only."
+  warn "            Afterwards, ON the VM: sudo ./apply-addresses.sh resolver-install"
+fi
 # Shared operator tmux config, same file the bare-metal hosts get.
 TMUX_CONF=""
 [ -r "$ENCLAVE_DIR/tmux.conf" ] && TMUX_CONF="$(sed 's/^/      /' "$ENCLAVE_DIR/tmux.conf")"
@@ -522,12 +538,14 @@ $TMUX_CONF
       127.0.1.1       $VM $VM.$DOMAIN
       ::1             localhost ip6-localhost ip6-loopback
 $HOSTS_BLOCK
+$RESOLVER_WF
 
 package_update: true
 packages: [$(echo "${VM_EXTRA_PACKAGES:-}" | tr ' ' '\n' | sed '/^$/d' | paste -sd, -)]
 
 runcmd:
   - [ systemctl, enable, --now, ssh ]
+$RESOLVER_RUN
   - [ sh, -c, "ip route | grep -q '^default' && echo 'WARNING: this VM has a default route' >> /etc/enclave-build-info || echo 'gateway=none-airgapped-no-default-route' >> /etc/enclave-build-info" ]
   - [ sh, -c, "echo \"composed=\$(date -Is) by 03-compose-vm.sh\" >> /etc/enclave-build-info" ]
 

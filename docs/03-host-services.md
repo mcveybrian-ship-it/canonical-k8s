@@ -407,7 +407,7 @@ that order, and the order is load-bearing at the front:
 
 | step | why it comes before `apt` |
 |---|---|
-| `hosts` | writes `/etc/hosts` from `enclave-addresses.env`. `MIRROR_URL` names `svc-repo-01` rather than an IP, so without this apt points at a host the machine cannot resolve. Nothing tracked used to do this — host-4's entry was added by hand, which worked and was not reproducible. |
+| `hosts` | writes `/etc/hosts` from `enclave-addresses.env`. `MIRROR_URL` names `svc-repo-01` rather than an IP, so without this apt points at a host the machine cannot resolve. Nothing tracked used to do this — host-4's entry was added by hand, which worked and was not reproducible. **Since 2026-09-24 it also points the host at the enclave DNS** (`apply-addresses.sh resolver-install`) when that server answers, and warns rather than fails when it does not yet (host-4 is built before svc-mgmt-01). Without it a rebuilt host has no `*.apps` resolution — host-3, 2026-09-21 (backlog 6b.1e). |
 | `trustca` | installs every `.crt` in `scripts/enclave/trust-anchors/` into the system trust store. The mirror is HTTPS; a machine that does not trust the anchor cannot fetch a single package, and the error reads as a problem with the *server*. |
 
 `all` used to run `apt` first and the CA sixth. That worked only while the mirror was

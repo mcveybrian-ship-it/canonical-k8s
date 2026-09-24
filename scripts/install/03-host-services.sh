@@ -496,6 +496,17 @@ cmd_hosts() {
   local aa="$SELF/../enclave/apply-addresses.sh"
   [ -x "$aa" ] || die "no apply-addresses.sh at $aa"
   "$aa" apply
+  # AND THE RESOLVER (backlog 6b.1e). This step wrote /etc/hosts and nothing else, so a rebuilt
+  # host came back with no enclave DNS: host-3, 2026-09-21, unnoticed for three days because
+  # every name it needed was ALSO in /etc/hosts. Only *.apps exposed it.
+  # WARN, DO NOT DIE, if the DNS server is not up yet: host-4 is built before svc-mgmt-01
+  # exists. `apply-addresses.sh verify` reports any machine left without it.
+  if "$aa" resolver-check >/dev/null 2>&1; then
+    "$aa" resolver-install || warn "resolver-install failed - see above"
+  else
+    warn "enclave DNS not answering yet - resolver NOT set on this host. Once svc-mgmt-01 serves:"
+    warn "  sudo ./scripts/install/03-host-services.sh hosts     (or: apply-addresses.sh resolver-install)"
+  fi
 }
 
 cmd_trustca() {

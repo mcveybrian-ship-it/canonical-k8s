@@ -1695,6 +1695,16 @@ fixups_verify() {
   fi
   say ""
   [ "$fail" -eq 0 ] && ok "all checks passed" || warn "some checks failed - see above"
+  # THE EXIT CODE MUST CARRY THE RESULT (backlog 3.31 #3). This returned 0 unconditionally, so
+  # `fixups --verify || ...` in 05-harden-host.sh could never fire - a check that cannot fail.
+  #   0 = every check passed, run as root      1 = at least one check failed
+  #   2 = nothing failed, but NOT run as root  - several checks could not read their files, so
+  #       "passed" would be a false pass (the 2026-09-24 hidden-Permission-denied lesson).
+  [ "$fail" -eq 0 ] || return 1
+  if [ "$(id -u)" -ne 0 ]; then
+    warn "NOT ROOT - some checks could not read what they check; this is not evidence. Use sudo."
+    return 2
+  fi
   return 0
 }
 

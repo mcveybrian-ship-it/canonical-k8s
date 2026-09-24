@@ -97,7 +97,7 @@ V-278917	UBTU-24-700400	the release IS vendor supported - 24.04 LTS with an unex
 V-270748	UBTU-24-600130	the sudo group holds only the enclave administrator account(s) named in AF_ADMINS; the scanner cannot judge "who needs access" and leaves it NR	NR
 V-270816	UBTU-24-900920	the audit allocation holds far more than one week at the MEASURED growth rate, and free space exceeds the whole allocation	NR
 V-270694	UBTU-24-200680	/etc/profile.d/ssh_confirm.sh IS present and prompts for acknowledgement; the scanner cannot read a script and decide, so it leaves it NR	NR
-V-270817	UBTU-24-900930	no cron.weekly script offloads the audit trail, because audit offload is not implemented in this enclave yet - the scanner finds man-db in cron.weekly and cannot decide, leaving NR where every other machine is honestly Open	NR
+V-270817	UBTU-24-900930	DISA's own check text says this control is not applicable to an interconnected system; every enclave machine ships its audit records over the network to the collector weekly (backlog N-2), and the answer VERIFIES that offload - timer enabled, root-owned runtime copy, last run within 8 days, last result success - rather than asserting it. The scanner reports O on most machines and NR on host-4 (a man-db script in cron.weekly it cannot judge), so the answer fires on both	O,NR
 V-270682	UBTU-24-200250	there are NO temporary accounts on any enclave machine - every interactive account, meaning UID >= 1000 with a real login shell, is a permanent named administrator. Service accounts such as libvirt-qemu hold nologin and are not interactive	NR
 V-270755	UBTU-24-600230	the machine HAS a radio, so the scanner's NOT APPLICABLE is false whenever no driver happens to be bound; this answers NF only when a modprobe block is actually in place, and leaves it OPEN when the radio is merely unbound	NA
 V-270650	UBTU-24-100110	DISA's check is a FULL aide --check, which does not finish inside Evaluate-STIG's 15-minute per-rule timeout on a host with bulk data - it aborted on host-1 and host-2 and completed on host-3, same configuration. The nightly dailyaidecheck.timer IS the integrity check, and its result is better evidence than making the scanner re-run one	NR
@@ -429,36 +429,44 @@ EOF
   ;;
   V-270817) cat <<'EOF'
 $V = @{ Valid = $false; Results = "" }
-# THIS ANSWER EXISTS TO TURN "NOBODY LOOKED" INTO "WE LOOKED, AND IT IS OPEN".
-#
-# DISA wants a weekly cron job that off-loads audit records to external media. This enclave
-# does not do that yet - auditd_offload_logs is an open finding on every machine and the
-# destination is an AO decision, not an engineering one. Every machine except host-4 reports
-# this control Open, which is correct. host-4 alone comes back NOT REVIEWED because it has a
-# script in /etc/cron.weekly (man-db) and the scanner cannot tell whether that script offloads
-# audit logs, so it declines to decide.
-#
-# NR is the one status that means nothing. This makes host-4 agree with the rest of the
-# enclave, and the answer re-evaluates: the day a real offload job is installed, the check
-# finds it and the control closes on its own.
-# LABELLED LINES, NOT POSITIONAL ONES. The first version separated the two answers with a
-# bare "|" line and then read $out[1] - which is the separator, not the value. There is no
-# pwsh on stage-01 to run this against, so the parsing has to be right by construction:
-# each line names itself and is selected by its own prefix.
+# DISA'S CHECK TEXT OPENS WITH ITS OWN EXEMPTION: "If this is an interconnected system, this
+# is not applicable." The control is for STANDALONE machines that must carry audit records off
+# by hand. Every enclave machine is networked and ships its records to the collector weekly
+# (backlog N-2, proven 2026-09-23) - so the honest answer is NOT APPLICABLE, but ONLY while
+# that offload actually works. This checks the four things that make it work; any one failing
+# returns false and the control re-opens with the reason. (Rewritten 2026-09-24, backlog 3.31
+# #5: the old version looked only in cron directories, never saw the systemd timer, and was
+# gated on NR so it never ran where the scanner said Open.)
 $probe = @'
-printf 'SCRIPTS:%s\n' "$(ls -1 /etc/cron.weekly/ 2>/dev/null | tr '\n' ' ')"
-printf 'HITS:%s\n' "$(grep -rlE '/var/log/audit|auditd|aureport|ausearch|audisp' /etc/cron.weekly/ /etc/cron.d/ /etc/cron.daily/ 2>/dev/null | tr '\n' ' ')"
+u=enclave-audit-offload
+printf 'TIMER:%s\n'  "$(systemctl is-enabled $u.timer 2>/dev/null || echo absent)"
+printf 'EXEC:%s\n'   "$(systemctl show $u.service -p ExecStart --value 2>/dev/null | grep -o 'path=[^ ;]*' | head -1 | sed 's/^path=//')"
+printf 'RESULT:%s\n' "$(systemctl show $u.service -p Result --value 2>/dev/null)"
+st=/var/local/enclave-metrics/audit-offload.state
+last="$(tail -1 "$st" 2>/dev/null | cut -d' ' -f1)"
+printf 'LAST:%s\n' "${last:-never}"
+if [ -n "$last" ]; then printf 'AGE:%s\n' "$(( ( $(date +%s) - $(date -d "$last" +%s 2>/dev/null || echo 0) ) / 86400 ))"; else printf 'AGE:-1\n'; fi
 '@
 $out = @(bash -c $probe)
-$scripts = ((($out | Where-Object { $_ -like 'SCRIPTS:*' }) -join '') -replace '^SCRIPTS:','').Trim()
-$hits    = ((($out | Where-Object { $_ -like 'HITS:*' })    -join '') -replace '^HITS:','').Trim()
-
-if ($hits -ne "") {
+function Get-Field([string]$name) { ((($out | Where-Object { $_ -like "${name}:*" }) -join '') -replace "^${name}:",'').Trim() }
+$timer = Get-Field 'TIMER'; $exec = Get-Field 'EXEC'; $result = Get-Field 'RESULT'
+$last = Get-Field 'LAST'; $age = [int](Get-Field 'AGE')
+$okTimer  = ($timer -eq 'enabled')
+$okExec   = ($exec -eq '/usr/local/lib/enclave/audit-offload.sh')
+$okRecent = ($age -ge 0 -and $age -le 8)
+$okResult = ($result -eq 'success')
+$facts = "timer: " + $timer + "; runs: " + $exec + "; last run: " + $last + " (" + $age + " day(s) ago); last result: " + $result
+if ($okTimer -and $okExec -and $okRecent -and $okResult) {
     $V.Valid = $true
-    $V.Results = "NOT A FINDING - a scheduled job referencing the audit trail is present: " + $hits + ". Scripts in /etc/cron.weekly at scan time: " + $scripts + ". Verify that this job off-loads records to media outside this system before accepting it as sufficient."
+    $V.Results = "NOT APPLICABLE AS WRITTEN - DISA's CheckText begins: 'If this is an interconnected system, this is not applicable.' This machine is interconnected: a weekly systemd timer ships its rotated audit records over the enclave network to the audit collector on svc-obs-01 (1-year retention), which produces the enclave's checksummed weekly export bundle - the external-media path this control intends. Verified at scan time rather than asserted: " + $facts + ". The unit runs the root-owned runtime copy, not an editable one. This answer re-evaluates every scan: a disabled timer, a changed path, a failed run or no run for more than 8 days re-opens the control."
 }
 else {
-    $V.Results = "OPEN, and known. No job under /etc/cron.weekly, /etc/cron.daily or /etc/cron.d references the audit trail. Scripts present in /etc/cron.weekly are: " + $scripts + " - these are stock Ubuntu maintenance jobs (man-db rebuilds the manual page index) and have nothing to do with auditing. THE SCANNER LEFT THIS NOT REVIEWED because it found a script there and could not tell what it does; that is the only reason this machine differed from the rest of the enclave, where the same control is already Open. Audit off-load is not implemented anywhere in this enclave: auditd_offload_logs is open on all five machines and the destination is an outstanding AO decision, not an engineering gap. This answer re-evaluates on every scan and closes the control by itself once a real off-load job exists."
+    $why = @()
+    if (-not $okTimer)  { $why += "timer not enabled" }
+    if (-not $okExec)   { $why += "unit does not run /usr/local/lib/enclave/audit-offload.sh" }
+    if (-not $okRecent) { $why += "no successful run recorded in the last 8 days" }
+    if (-not $okResult) { $why += "last run did not succeed" }
+    $V.Results = "OPEN - the weekly network offload that makes this machine interconnected is not working (" + ($why -join '; ') + "). " + $facts + ". Fix with scripts/enclave/audit-offload.sh install and check a bundle reaches svc-obs-01."
 }
 return $V
 EOF
@@ -664,16 +672,20 @@ for vid in managed:
     k = ET.SubElement(v, 'AnswerKey'); k.set('Name', 'DEFAULT')
     expf = os.path.join(tmpd, vid + '.exp')
     expected = open(expf).read().strip() if os.path.exists(expf) else 'O'
-    a = ET.SubElement(k, 'Answer'); a.set('Index', '1'); a.set('ExpectedStatus', expected)
-    ET.SubElement(a, 'ValidationCode').text = "\n" + code + "\n"
-    ET.SubElement(a, 'ValidTrueStatus').text = 'NF'
-    ET.SubElement(a, 'ValidTrueComment').text = (
-        "Answered by scripts/enclave/answerfile.sh. DISA's CheckText was executed verbatim at "
-        "scan time and the result is recorded in the Results field above.")
-    ET.SubElement(a, 'ValidFalseStatus').text = 'O'
-    ET.SubElement(a, 'ValidFalseComment').text = (
-        "The condition that justified this answer is no longer true. This is a real finding; "
-        "see the Results field for the files involved.")
+    # ONE Answer PER EXPECTED STATUS (backlog 3.31 #5). An Answer fires only when the scanner's
+    # own status equals its ExpectedStatus, and the same control can come back O on one machine
+    # and NR on another - V-270817 does. The 4th column may list several, comma-separated.
+    for idx, exp_status in enumerate([e.strip() for e in expected.split(',') if e.strip()], 1):
+        a = ET.SubElement(k, 'Answer'); a.set('Index', str(idx)); a.set('ExpectedStatus', exp_status)
+        ET.SubElement(a, 'ValidationCode').text = "\n" + code + "\n"
+        ET.SubElement(a, 'ValidTrueStatus').text = 'NF'
+        ET.SubElement(a, 'ValidTrueComment').text = (
+            "Answered by scripts/enclave/answerfile.sh. DISA's CheckText was executed verbatim at "
+            "scan time and the result is recorded in the Results field above.")
+        ET.SubElement(a, 'ValidFalseStatus').text = 'O'
+        ET.SubElement(a, 'ValidFalseComment').text = (
+            "The condition that justified this answer is no longer true. This is a real finding; "
+            "see the Results field for the files involved.")
 
 ET.indent(tree, space='  ')
 if dry:

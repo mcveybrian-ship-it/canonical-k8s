@@ -4505,6 +4505,11 @@ acct_status() {
     local n; n="$(auditctl -l 2>/dev/null | grep -c 'key=breakglass' || true)"
     if [ "${n:-0}" -ge 2 ]; then ok "audit: $n live rule(s) keyed breakglass"
     else warn "audit: ${n:-0} live rule(s) keyed breakglass (want 2) - see 'accounts create' output"; fi
+    # THE FILE'S MODE TOO: usg fails file_permissions_etc_audit_rulesd on anything but 0600,
+    # which this script itself got wrong until 2026-09-24 (backlog 3.31 #2).
+    local bm; bm="$(stat -c %a "$BG_AUDIT_RULES" 2>/dev/null || echo '?')"
+    if [ "$bm" = 600 ]; then ok "audit rules file is 0600 ($BG_AUDIT_RULES)"
+    else warn "audit rules file mode is $bm, want 600 (file_permissions_etc_audit_rulesd). Fix: sudo $0 accounts create"; fi
   fi
   echo
   say "RECOVERY, if an admin is locked out (from any other admin, or $BREAKGLASS_USER at the console):"
@@ -4602,7 +4607,11 @@ cmd_accounts() {
       printf '%s\n' "## backlog 3.15 - every command run by the emergency account, by login UID" \
         "-a always,exit -F arch=b64 -S execve -F auid=$uid -k breakglass" \
         "-a always,exit -F arch=b32 -S execve -F auid=$uid -k breakglass" > "$BG_AUDIT_RULES"
-      chmod 640 "$BG_AUDIT_RULES"
+      # 0600, NOT 0640 - USG's file_permissions_etc_audit_rulesd wants 0600 on every rules.d
+      # file (see the v1r6 note above). This line said 640 until 2026-09-24 and the rescan
+      # failed that rule on all eight machines (backlog 3.31 #2). Re-running `accounts create`
+      # rewrites the file, so it also repairs a machine built with the old mode.
+      chmod 600 "$BG_AUDIT_RULES"
       # IMMUTABLE AUDIT (-e 2) REFUSES NEW RULES UNTIL REBOOT, and says so only as an error from
       # augenrules. Name it rather than let it read as a failure.
       if auditctl -s 2>/dev/null | grep -q '^enabled 2'; then

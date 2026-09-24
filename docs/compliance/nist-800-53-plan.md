@@ -120,5 +120,5 @@ An air gap is normally described in terms of what it costs. It buys these outrig
 ## And three it cannot satisfy without an AO decision
 
 - **AU-4 / AU-5** — notification at 75% audit capacity, with no path for a notification to leave (Q26).
-- **SC-13** — no CMVP certificates exist for 24.04; the posture is measured and strong, but the exception is argued, not evidenced (Q13/Q14/Q15).
+- **SC-13** — *corrected 2026-09-24:* the OS modules are FIPS 140-3 validated (#5115, #5215) and run as `fips-updates` patched builds by AO decision; the residual is components with their own crypto — Kubernetes via `core22`, container images (`ssp-inputs.md` §1.3).
 - **CP-4** — until the contingency test is actually run, this control has no evidence of any kind.

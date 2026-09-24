@@ -40,29 +40,37 @@ a dated measurement, it belongs in `docs/open-questions.md` instead.
 the question an assessor would otherwise ask. Claiming "the system uses FIPS-validated
 cryptography" without the mechanism invites exactly the follow-up you cannot answer on the spot.
 
-### 1.2 There are no CMVP certificate numbers for 24.04, and this is what substitutes
+### 1.2 ✅ The modules are FIPS 140-3 validated; what runs are the security-patched builds
 
-> **The modules are submitted to NIST and pending validation. The language is "submitted and
-> pending validation" — never "validated".**
+> **Say exactly this: "FIPS 140-3 validated modules (CMVP certificates #5115 and #5215), operated as Canonical's security-patched builds of those modules (`fips-updates`)." Never "the running binaries are validated" — they are not
+> bit-identical to the certified ones, and that is a deliberate, recorded choice.**
 
-Cite Canonical's own framing rather than making a validation claim: `fips-preview` exists for
-modules *"submitted to NIST for review but not yet certified"*, and Canonical states *"the
-latest FedRAMP guidelines... do allow you to use pre-approved packages that are awaiting NIST
-certification."*
+| | |
+|---|---|
+| Certificates | CMVP **#5115** (Ubuntu 24.04 OpenSSL Cryptographic Module, FIPS 140-3, validated 2026-01-06, sunset 2031-01-05) and **#5215** (Ubuntu 24.04 Kernel Crypto API, FIPS 140-3, validated 2026-03-27, sunset 2031-03-26). GnuTLS for 24.04 also holds #5163 (2026-02-20, not examined further). |
+| Validated vs running | OpenSSL module: validated `3.0.13-0ubuntu3+Fips1`, running `3.0.13-0ubuntu3.15+Fips1`. Kernel: validated `6.8.0-38-fips`, running `6.8.0-138-fips`. Measured on host-1, host-4 and svc-obs-01, 2026-09-24. |
+| Why the patched builds | `fips` would be the exact certified binaries with **no security fixes since certification**; `fips-updates` is the same modules with Canonical's security patches. **The acting AO chose `fips-updates` on 2026-09-24** as the stronger security posture. The `fips` stream reports `n/a` on this enclave's machines. |
+| Evidence an assessor can re-run | the certificate pages and Security Policies (140sp5115.pdf, 140sp5215.pdf) · `openssl list -providers` (§1.1) · `dpkg-query -W openssl-fips-module-3` · `uname -r` · `pro status` showing `fips-updates enabled` |
+| Correction | **Until 2026-09-24 this section said 24.04 had no certificates and must be described as "submitted and pending validation". That was already out of date when first written** — #5115 was issued 2026-01-06, and the project relied on Canonical's 2025-09-09 "in the NIST queue" post. Found only because the claim was re-checked before being restated. |
+| Source | `HANDOFF.md` §3 · NIST CMVP certificates #5115 and #5215 · suggested control SC-13 |
 
-**The evidence that stands in for a certificate number is the package version string** —
-`openssl-fips-module-3 3.0.13-0ubuntu3.15+Fips1` — plus `dpkg -l | grep -i fips`, which on
-`host-4` lists 15 packages from the FIPS stream. Source: runbook §2.3, `docs/open-questions.md`
-Q15 · suggested control SC-13.
+### 1.3 The remaining boundary question is narrow: components that bring their OWN cryptography
 
-### 1.3 🔴 The cryptographic-boundary exception has to be won, not assumed
+> *"Is every cryptographic module in the boundary validated?"* — for the operating system's
+> modules, **yes** (§1.2). What is left are components that do not use them.
 
-> *"Is every cryptographic module in the boundary validated?"* — the honest answer is no, and
-> **this cannot be pre-cleared. It is argued in the SSP.**
+~~The single largest accreditation risk in the build~~ — **closed as such 2026-09-24** (backlog 1.4):
+it rested on 24.04 having no certificates. What an assessor can still ask, and what must be
+inventoried rather than assumed:
 
-This is the single largest accreditation risk in the build and it is not a technical problem —
-no amount of engineering changes it while 24.04 has no certificates. Source: runbook §2.2,
-`HANDOFF.md`, `docs/open-questions.md` Q13/Q14/Q15 · suggested control SC-13.
+- **Kubernetes** takes its cryptography from its `core22` base snap — **22.04**'s FIPS build, not
+  the host's 24.04 modules (backlog 3.25). Whether that build maps to an active 22.04 certificate
+  is **Canonical question Q-CORE (b)**; do not claim it until answered.
+- **Container images** (Harbor on `svc-harbor-01`, and every workload image) carry their own
+  userland libraries, which are **not** the host's validated modules. Their crypto must be listed
+  and either justified or kept off the data path.
+
+Source: backlog 1.4 / 3.25 / Q-CORE · `HANDOFF.md` §3 · suggested control SC-13.
 
 ---
 
@@ -771,7 +779,7 @@ superseded: **Q11 established that `fips-preview` is unavailable on 24.04**, the
 `fips-updates`, and 2026-09-17's measurement confirms `fips-updates` enabled with the FIPS
 provider active (§1.1 above). Following that instruction would enable the wrong stream.
 
-⬜ **Fix the runbook text.** Recorded here because it was found while collecting SSP inputs and
+✅ **Fixed 2026-09-24** — runbook §6.2 now instructs `fips-updates` and cites the certificates. Recorded here because it was found while collecting SSP inputs and
 is exactly the class of error this register exists to surface — a claim repeated in a document
 long after the fact changed.
 

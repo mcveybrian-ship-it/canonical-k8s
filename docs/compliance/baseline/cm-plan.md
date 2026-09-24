@@ -112,11 +112,13 @@ kernel is `6.8.0-138-fips`; and fifteen packages come from the FIPS stream. `ope
 crypto is `openssl-fips-module-3` from `esm.ubuntu.com/fips-updates` (`ssp-inputs.md` §1.1,
 HANDOFF §3).
 
-**No CMVP certificate numbers exist for Ubuntu 24.04.** The package version string is the
-evidence that substitutes for one, and the correct language is "submitted and pending
-validation" — never "validated" (`ssp-inputs.md` §1.2). The boundary exception this creates is
-argued in the SSP, not resolved here, and it is the largest single accreditation risk in the
-build (`poam.md` AO-01).
+**The modules are FIPS 140-3 validated — CMVP #5115 (OpenSSL) and #5215 (Kernel Crypto API) —
+and the enclave runs Canonical's security-patched `fips-updates` builds of them**, by the acting
+AO's decision of 2026-09-24 (`ssp-inputs.md` §1.2, `poam.md` AO-01). **Configuration consequence:** the
+module and kernel versions change with every patch cycle, so the baseline records the stream
+(`fips-updates`) and the certificates, and each cycle's `dpkg-query -W openssl-fips-module-3` and
+`uname -r` are captured as evidence. *(Until 2026-09-24 this paragraph said no certificates existed —
+already out of date when written.)*
 
 Two packaging decisions in this enclave exist **because of** that posture, and they are
 configuration-management facts rather than preferences. A snap takes its cryptography from its

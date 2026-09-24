@@ -28,14 +28,16 @@ plan for that on the production hosts.
 
 - The OS decision was argued on `fips-preview` covering submitted-but-uncertified modules.
   That stream is not offered on 24.04. `fips-updates` is what you get, and since 24.04 has no
-  CMVP certificates it cannot mean what it means on 22.04. **Open question 17** — get Canonical
+  CMVP certificates it cannot mean what it means on 22.04. *(2026-09-24: that premise was already out
+  of date when written — #5115 was issued 2026-01-06. `fips-updates` here is the patched build
+  of validated modules; see `ssp-inputs.md` §1.2.)* **Open question 17** — get Canonical
   to state what it actually delivers, because that sentence goes in the SSP.
 - USG ships benchmark **V1R1** and `usg list --all` offers nothing newer, while DISA has
   published later revisions. **Open question 18** — settle with your assessor which revision
   you are held to.
 
 The FIPS package list is large; retrieve it with `dpkg -l | grep -i fips` when the SSP needs
-it. That list is what you cite in place of certificate numbers.
+it. *(Superseded 2026-09-24: cite certificates #5115 and #5215, plus that list as the running versions.)*
 
 ### Hardware baseline
 

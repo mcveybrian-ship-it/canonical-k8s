@@ -92,6 +92,7 @@ Worth knowing, because these are where a programme office normally struggles:
 
 - **No contingency test has ever been run.**
 - **No notification path exists** for the two controls that require one (Q26).
-- **No CMVP certificate numbers exist for 24.04**, so the cryptographic-boundary exception has to
-  be argued rather than evidenced (Q13/Q14/Q15). [`ssp-inputs.md`](ssp-inputs.md) §1 has the
-  measured posture that makes the argument as strong as it can be.
+- ~~No CMVP certificate numbers exist for 24.04~~ — **corrected 2026-09-24: they do** (#5115 OpenSSL,
+  #5215 Kernel Crypto API, FIPS 140-3). The enclave runs the security-patched `fips-updates` builds
+  by AO decision. What remains is narrow — components carrying their own crypto
+  ([`ssp-inputs.md`](ssp-inputs.md) §1.2–1.3).

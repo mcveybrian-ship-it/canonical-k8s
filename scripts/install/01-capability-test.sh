@@ -172,8 +172,10 @@ Enabling is deliberate and needs an AO position on record first (open question 1
     cat /proc/sys/crypto/fips_enabled # expect 1
     uname -r                          # expect the FIPS kernel
 
-Record the posture as "submitted and pending NIST validation", never "FIPS 140-3
-validated". There are no CMVP certificate numbers for 24.04 yet.
+Record the posture as "FIPS 140-3 validated modules (CMVP #5115 OpenSSL, #5215 Kernel
+Crypto API), operated as Canonical's security-patched fips-updates builds". Never say the
+running binaries are validated - they are patched builds. Record the running versions too:
+dpkg-query -W openssl-fips-module-3 ; uname -r   (ssp-inputs.md 1.2)
 EOF
 
 echo

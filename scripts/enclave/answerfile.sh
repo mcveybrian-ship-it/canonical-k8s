@@ -45,13 +45,22 @@ AF="${STIG_ANSWERFILE:-/srv/bundle-staging/tools/answerfiles/Ubuntu24_AnswerFile
 # security functions - a judgement, so the judgement is written down HERE, once, and the
 # check re-applies it on every machine at every scan. Add an account and the control
 # re-opens until this list is updated deliberately.
-AF_ADMINS="${AF_ADMINS:-encadmin}"
+# The site's second admin and emergency account come from facility-profile.env (backlog 3.15),
+# the same file stig-tailor.sh accounts reads - so the approved list cannot drift from the
+# accounts a rebuild actually creates. Environment still overrides for a one-off.
+_FP="$(dirname "$(readlink -f "$0")")/../../docs/compliance/baseline/facility-profile.env"
+_A2=""; _BG=""
+if [ -r "$_FP" ]; then
+  _A2="$(sed -n "s/^ADMIN2_USER='\([^']*\)'.*/\1/p" "$_FP" | head -1)"
+  _BG="$(sed -n "s/^BREAKGLASS_USER='\([^']*\)'.*/\1/p" "$_FP" | head -1)"
+fi
+AF_ADMINS="${AF_ADMINS:-encadmin${_A2:+,$_A2}}"
 # THE EMERGENCY ("break glass") ACCOUNT(S), kept apart from AF_ADMINS because the answers say
 # different things about them: V-270682's own discussion exempts emergency accounts from
 # scheduled expiration, and an answer that calls one a "permanent administrator, not an
 # emergency account" would be false. Created by `stig-tailor.sh accounts` (backlog 3.15).
 # The site's SECOND named admin (ADMIN2_USER there) goes in AF_ADMINS - it is a person.
-AF_EMERGENCY="${AF_EMERGENCY:-breakglass}"
+AF_EMERGENCY="${AF_EMERGENCY:-${_BG:-breakglass}}"
 XSD="${STIG_AF_XSD:-/srv/bundle-staging/tools/Evaluate-STIG/xml/Schema_AnswerFile.xsd}"
 DRY=0
 

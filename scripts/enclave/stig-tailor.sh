@@ -4244,13 +4244,21 @@ cmd_luksenroll() {
 # instead; nothing else is ever read from a file.
 #
 # PARAMETERS (environment):
-#   ADMIN2_USER          required for create - the second admin's username. No default: it
-#                        is a person, and guessing a person is how shared accounts happen.
+#   ADMIN2_USER          required for create - the second admin's username. Read from
+#                        facility-profile.env (a site fact); environment overrides. No script
+#                        default: it is a person, and guessing a person is how shared accounts happen.
 #   ADMIN2_KEY           path to that person's SSH PUBLIC key (optional; without it the
 #                        account works at the console and over SSH only once a key is added)
 #   BREAKGLASS_USER      default: breakglass
 #   REFERENCE_ADMIN      default: encadmin - ADMIN2 gets this account's supplementary groups
 #   ADMIN2_PASSWORD_HASH / BREAKGLASS_PASSWORD_HASH   unattended only, SHA512 crypt ($6$)
+# SITE VALUES FROM facility-profile.env, so a rebuild creates the same accounts the answer file
+# expects. Environment wins; only these two names are read from the file (grep, not source).
+_FP="$HERE/../../docs/compliance/baseline/facility-profile.env"
+if [ -r "$_FP" ]; then
+  [ -n "${ADMIN2_USER:-}" ]     || ADMIN2_USER="$(sed -n "s/^ADMIN2_USER='\([^']*\)'.*/\1/p" "$_FP" | head -1)"
+  [ -n "${BREAKGLASS_USER:-}" ] || BREAKGLASS_USER="$(sed -n "s/^BREAKGLASS_USER='\([^']*\)'.*/\1/p" "$_FP" | head -1)"
+fi
 BREAKGLASS_USER="${BREAKGLASS_USER:-breakglass}"
 REFERENCE_ADMIN="${REFERENCE_ADMIN:-encadmin}"
 BG_SSHD_DROPIN=/etc/ssh/sshd_config.d/10-enclave-breakglass.conf
@@ -4333,7 +4341,8 @@ cmd_accounts() {
 
     create)
       need_root
-      [ -n "${ADMIN2_USER:-}" ] || die "ADMIN2_USER is not set. It is a PERSON - name them:
+      [ -n "${ADMIN2_USER:-}" ] || die "ADMIN2_USER is not set. It is a PERSON - name them in
+       docs/compliance/baseline/facility-profile.env (ADMIN2_USER=...), or for one run:
        sudo ADMIN2_USER=<username> ADMIN2_KEY=<path/to/key.pub> $0 accounts create"
       getent passwd "$REFERENCE_ADMIN" >/dev/null || die "reference admin $REFERENCE_ADMIN does not exist here"
       [ "$ADMIN2_USER" != "$REFERENCE_ADMIN" ] && [ "$ADMIN2_USER" != "$BREAKGLASS_USER" ] \

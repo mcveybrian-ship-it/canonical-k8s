@@ -18,6 +18,9 @@
 #
 # HTTP IS LEFT RUNNING. Switching a service to HTTPS-only in one step breaks every client
 # between the server changing and each client being reconfigured. Migrate, then remove :80.
+#
+# Runbook 2.9a (the HTTP-to-HTTPS cutover). The generated 443 block carries three web-server
+# STIG rules - SV-206411, SV-206412, SV-206414 (backlog 6a.13) - each explained where it is set.
 # =========================================================================================
 set -euo pipefail
 
@@ -124,6 +127,8 @@ NGINX
   exit 0
 }
 
+# --restore-http: the undo for --redirect-http - remove the redirect, move the parked :80
+# sites back into sites-enabled, test and reload.
 restore_http() {
   [ "$(id -u)" -eq 0 ] || die "run with sudo"
   rm -f "$REDIR_CONF"
@@ -137,6 +142,8 @@ restore_http() {
   exit 0
 }
 
+# The two :80 modes are whole runs of their own and exit; everything below is the
+# <name> <fullchain> form that writes the 443 block.
 case "${1:-}" in
   --redirect-http) shift; redirect_http "$@" ;;
   --restore-http)  restore_http ;;
@@ -200,6 +207,7 @@ if [ "$(readlink -f "$CHAIN")" = "$(readlink -f "/etc/ssl/enclave/$NAME.fullchai
 else
   install -m 0644 "$CHAIN" "/etc/ssl/enclave/$NAME.fullchain.crt"
 fi
+# The key: readable by root and group www-data (0640), never by other users.
 chgrp www-data "$KEY" 2>/dev/null || true
 chmod 0640 "$KEY"
 ok "installed /etc/ssl/enclave/$NAME.fullchain.crt"
@@ -328,6 +336,8 @@ nginx -t || die "nginx config is invalid - NOT reloading. The site is still serv
 systemctl reload nginx
 ok "nginx reloaded - :80 still serving, :443 now available"
 
+# Prove it by the FQDN clients use, for up to ~15 s - the reload is asynchronous. No -k: any
+# HTTP code means the handshake validated against this machine's trust store.
 for i in $(seq 1 15); do
   c=$(curl -s -o /dev/null -w '%{http_code}' --max-time 4 "https://$NAME.${ENCLAVE_DOMAIN:-enclave.internal}/" || true)
   case "${c:-000}" in 000|"") sleep 1 ;; *) ok "https responds (HTTP $c)"; break ;; esac

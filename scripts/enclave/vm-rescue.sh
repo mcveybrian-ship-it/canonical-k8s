@@ -8,6 +8,9 @@
 #   sudo ./vm-rescue.sh fix-console <vm> give a pre-2026-09-11 VM a real pty console
 #   sudo ./vm-rescue.sh nopasswd <vm>    restore NOPASSWD sudo - last resort, see below
 #
+# MACHINE: the host running the guest (`virsh list --all` there names it) - host-4 for the
+# service VMs today. Runbook 6.3a (lockout) and 6.3j (console).
+#
 # WHY THIS EXISTS:
 #
 #   On 2026-09-08, applying the DISA STIG to svc-harbor-01 locked the only sudo-capable
@@ -60,6 +63,8 @@ need_guestfs() {
   die  "install it and run this again"
 }
 
+# Graceful ACPI shutdown, polled every 5 s for 120 s, then a forced `virsh destroy` (a power
+# pull, not a delete - the domain and its disks are untouched).
 ensure_off() {
   local vm="$1" state i
   state=$(virsh domstate "$vm" 2>/dev/null || true)
@@ -82,6 +87,8 @@ ensure_off() {
   ok "forced off"
 }
 
+# status: read-only. Domain state, its disks, whether the offline-edit tooling is present, and
+# where the serial console log is.
 cmd_status() {
   local vm="${1:?usage: $0 status <vm>}"
   say "state:  $(virsh domstate "$vm" 2>/dev/null || echo 'no such VM')"
@@ -90,6 +97,8 @@ cmd_status() {
   say "console log: $(ls -1 /var/lib/libvirt/images/console/"$vm"-console.log 2>/dev/null || echo none)"
 }
 
+# password: set ADMIN_USER's password inside the guest image while it is off, then start it.
+# The fix for the 2026-09-08 lockout above; it leaves the STIG sudo control intact.
 cmd_password() {
   need_root; need_guestfs
   local vm="${1:?usage: sudo $0 password <vm>}"
@@ -126,6 +135,8 @@ cmd_password() {
   say "  Put that password in your password manager - after STIG it is the only route to root."
 }
 
+# nopasswd: write a NOPASSWD:ALL sudoers drop-in into the stopped guest. Deliberately undoes
+# the STIG requirement that sudo authenticates, so it needs a typed acceptance first.
 cmd_nopasswd() {
   need_root; need_guestfs
   local vm="${1:?usage: sudo $0 nopasswd <vm>}"
@@ -140,6 +151,7 @@ cmd_nopasswd() {
   [ "$c" = "i accept the finding" ] || die "not confirmed - nothing changed"
 
   ensure_off "$vm"
+  # 0440 is the mode sudo expects of a sudoers.d file; the 99- prefix makes it read last.
   virt-customize -a "$disk" \
     --write "/etc/sudoers.d/99-rescue-nopasswd:$ADMIN_USER ALL=(ALL) NOPASSWD:ALL" \
     --run-command "chmod 0440 /etc/sudoers.d/99-rescue-nopasswd" \
@@ -152,6 +164,8 @@ cmd_nopasswd() {
   say  "     sudo rm /etc/sudoers.d/99-rescue-nopasswd"
 }
 
+# console: attach to the guest's serial console, which works even when its network or sshd
+# does not. Only possible on a pty serial; a file-backed one gets the alternatives instead.
 cmd_console() {
   local vm="${1:?usage: sudo $0 console <vm>}"
 

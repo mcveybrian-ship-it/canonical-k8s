@@ -25,6 +25,9 @@
 #   runbook 6.3d - and closing it honestly needs audisp-remote actually delivering, which
 #   is the next piece of work. Do not let this script be mistaken for that one.
 #
+#   Tracked as backlog N-2 (runbook 6.3d.1). The gap it narrows is poam AO-04 (AU-4, AU-11):
+#   a 40 MB rolling trail on the machine that produced it.
+#
 # WHY A BUNDLE AND NOT JUST AN rsync OF /var/log/audit
 #
 #   The AO's answer (2026-09-23) was that the design must serve BOTH a self-contained
@@ -116,10 +119,14 @@ rotated_files() {
   find "$AUDIT_DIR" -maxdepth 1 -type f -name 'audit.log.*' 2>/dev/null | sort || true
 }
 
+# BatchMode: never prompt - the timer has no tty. accept-new: the first contact records the
+# collector's host key, and a CHANGED key later fails rather than being accepted.
 SSH_OPTS=(-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10
           -o LogLevel=ERROR -o IdentitiesOnly=yes)
 
 # -----------------------------------------------------------------------------------------
+# plan: read-only. Collector, drop dir, retention, auditd allocation, what `run` would bundle,
+# the key, and a live probe that the collector accepts and confines it (backlog 3.24).
 cmd_plan() {
   printf '\n  audit offload - plan for %s\n\n' "$ME"
   if is_collector; then
@@ -184,6 +191,8 @@ cmd_plan() {
 }
 
 # -----------------------------------------------------------------------------------------
+# collector-init: on svc-obs-01 only. Creates the drop directory 0750 root:root, checks rrsync
+# exists, and prints the authorized_keys template for each sender.
 cmd_collector_init() {
   need_root
   is_collector || die "collector-init runs on the COLLECTOR ($COLLECTOR); this is $ME"
@@ -232,6 +241,8 @@ cmd_agent_init() {
 }
 
 # -----------------------------------------------------------------------------------------
+# run: what the weekly timer executes - rotate, bundle (gzip each rotated file, MANIFEST,
+# SHA256SUMS, tar, a sidecar .sha256), deliver to the collector, append a line to $STATE.
 cmd_run() {
   need_root
   [ -d "$AUDIT_DIR" ] || die "$AUDIT_DIR does not exist"
@@ -288,6 +299,8 @@ cmd_run() {
   } > "$tmp/$bundle/MANIFEST"
 
   ( cd "$tmp/$bundle" && sha256sum ./*.gz MANIFEST > SHA256SUMS )
+  # Members in name order with numeric root ownership: the archive does not depend on this
+  # machine's user database, so any system can unpack and read it the same way.
   ( cd "$tmp" && tar -czf "$bundle.tar.gz" --sort=name --owner=0 --group=0 --numeric-owner "$bundle" )
   sha256sum "$tmp/$bundle.tar.gz" | awk '{print $1}' > "$tmp/$bundle.tar.gz.sha256"
   ok "bundle built: $bundle.tar.gz ($(stat -c %s "$tmp/$bundle.tar.gz") bytes)"
@@ -299,6 +312,8 @@ cmd_run() {
     ok "delivered locally to $DROP/$ME/"
   else
     [ -r "$KEY" ] || die "no key at $KEY - run collector-init on $COLLECTOR first"
+    # The remote path is RELATIVE: the forced `rrsync -wo $DROP` on the collector roots it,
+    # so "$ME/" lands in $DROP/$ME/ and nothing outside $DROP is addressable.
     rsync -q -e "ssh ${SSH_OPTS[*]} -i $KEY" \
       "$tmp/$bundle.tar.gz" "$tmp/$bundle.tar.gz.sha256" "root@$COLLECTOR:$ME/"
     ok "delivered to $COLLECTOR:$DROP/$ME/"
@@ -313,6 +328,8 @@ cmd_run() {
 }
 
 # -----------------------------------------------------------------------------------------
+# install: write and enable the weekly oneshot service + timer (Sunday 03:00 UTC) that runs
+# `run`. The "weekly" in UBTU-24-900950's check text is this timer.
 cmd_install() {
   need_root
   cat > "/etc/systemd/system/${UNIT}.service" <<UNIT_EOF
@@ -345,6 +362,8 @@ TIMER_EOF
 }
 
 # -----------------------------------------------------------------------------------------
+# prune: on the collector. Deletes bundles and their sidecars whose file mtime (arrival time)
+# is older than RETENTION_DAYS - 365, the AO's Q25 answer (AU-11).
 cmd_prune() {
   need_root
   is_collector || die "prune runs on the COLLECTOR ($COLLECTOR); this is $ME"
@@ -357,6 +376,8 @@ cmd_prune() {
 }
 
 # -----------------------------------------------------------------------------------------
+# verify: on the collector, as root. Re-hashes every bundle against its sidecar .sha256. That
+# detects corruption, not tampering - both files sit side by side (see SIGNING above).
 cmd_verify() {
   is_collector || die "verify runs on the COLLECTOR ($COLLECTOR); this is $ME"
   [ -d "$DROP" ] || die "$DROP does not exist"
@@ -396,6 +417,8 @@ cmd_verify() {
 }
 
 # -----------------------------------------------------------------------------------------
+# status: read-only. Runs recorded on this machine, the timer, and - on the collector - the
+# store's size and bundle count per sending machine.
 cmd_status() {
   printf '\n  audit offload - %s\n\n' "$ME"
   if [ -r "$STATE" ]; then

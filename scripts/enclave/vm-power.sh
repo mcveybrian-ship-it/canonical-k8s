@@ -98,6 +98,8 @@ targets() {
 reverse() { local d out=""; for d in $1; do out="$d $out"; done; printf '%s' "${out% }"; }
 
 # ---- status -------------------------------------------------------------------------------
+# status: read-only. Every domain with state and autostart, the configured order, whether the
+# image pool is mounted, and what libvirt-guests is actually configured to do.
 cmd_status() {
   assert_hypervisor
   hdr "domains"
@@ -162,6 +164,9 @@ stop_one() {
   return 1
 }
 
+# guests-down: one guest at a time in VM_POWER_ORDER - obs first so a planned stop is not an
+# alert storm, the mirror last because everything installs from it (contingency-plan.md 5.2).
+# Dies on any guest that will not stop, unless --force-destroy was given.
 cmd_guests_down() {
   need_root; assert_hypervisor
   local list; list="$(targets)"
@@ -221,6 +226,8 @@ cmd_guests_down() {
 }
 
 # ---- up -----------------------------------------------------------------------------------
+# guests-up: refuse if the image pool is not mounted, then start in the REVERSE of the
+# shutdown order and wait for each guest to answer ping by its domain name.
 cmd_guests_up() {
   need_root; assert_hypervisor
 
@@ -271,6 +278,9 @@ cmd_guests_up() {
 }
 
 # ---- the host ----------------------------------------------------------------------------
+# host-reboot / host-down: say what the boot will need (TPM or passphrase), confirm by typed
+# hostname, guests-down, re-check nothing runs, unmount the backup volume, then systemctl.
+# This is the replacement for trusting libvirt-guests - the 2026-09-17 incident in the header.
 host_power() {  # <reboot|poweroff>
   local action="$1"
   need_root; assert_hypervisor
@@ -339,6 +349,8 @@ host_power() {  # <reboot|poweroff>
 }
 
 # ---- after a boot ------------------------------------------------------------------------
+# after-boot: read-only. Four checks: image pool mounted, every domain running,
+# backup volume mounted, and whether the previous shutdown carried vm-power's clean marker.
 cmd_after_boot() {
   assert_hypervisor
   local bad=0

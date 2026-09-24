@@ -45,6 +45,15 @@ param(
     [switch] $DryRun
 )
 
+# MACHINE: a Windows workstation (PowerShell 5.1) with the CIDATA stick attached.
+#
+# STALE - READ BEFORE USING. This port has not kept up with 02-build-seed.sh. It does not
+# substitute CONSOLE_CMDLINE, KEYFILE_LATECMD, LUKS_UNLOCK, OS_DISK_MATCH, DATA_DISK_MATCH,
+# DATA_VG_SIZE, ROUTES, NAMESERVERS or GATEWAY_RECORD, and it insists on GATEWAY and DNS,
+# where the bash version treats them empty as 'air-gapped, no default route'. Against the
+# current user-data.template the placeholder check below therefore REFUSES - it fails safe,
+# it does not write a wrong seed. Until it is brought level, build the seed with
+# 02-build-seed.sh -o on stage-01 and copy the two files to the stick.
 $ErrorActionPreference = "Stop"
 function Die { param($m) Write-Host "[x] $m" -ForegroundColor Red; exit 1 }
 
@@ -100,6 +109,8 @@ if ($Encrypt -eq "true") {
     if (-not $pass)              { Die "ENCRYPT_DISKS=true but LUKS_PASSPHRASE is unset in $ParamsFile" }
     if ($pass -like "*REPLACE-ME*") { Die "LUKS_PASSPHRASE still holds a placeholder" }
     if ($pass.Length -lt 12)     { Die "LUKS_PASSPHRASE is under 12 characters" }
+    # curtin dm_crypt actions, one per volume group. key: is the LUKS passphrase IN PLAINTEXT
+    # inside user-data - the stick is a credential (backlog 2.6).
     $CryptOs   = "      - id: crypt-os`n        type: dm_crypt`n        dm_name: crypt-os`n        volume: p-pv`n        key: '$pass'`n"
     $CryptData = "      - id: crypt-data`n        type: dm_crypt`n        dm_name: crypt-data`n        volume: p-data`n        key: '$pass'`n"
     $Vg0Dev = "crypt-os"; $VgDataDev = "crypt-data"
@@ -215,6 +226,8 @@ if ($vol.FileSystemLabel -inotmatch '^cidata$') {
 }
 
 # --- write, with UNIX line endings ----------------------------------------------------------------
+# LF only (CRLF breaks cloud-init parsing - see the header) and UTF-8 with NO BOM, so the
+# file's first bytes are exactly '#cloud-config' and nothing precedes it.
 $raw = $raw -replace "`r`n", "`n"
 $enc = New-Object System.Text.UTF8Encoding($false)   # no BOM
 [System.IO.File]::WriteAllText("${DriveLetter}:\user-data", $raw, $enc)

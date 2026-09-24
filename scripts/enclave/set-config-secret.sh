@@ -7,6 +7,9 @@
 #   sudo ./set-config-secret.sh /opt/harbor-src/harbor/harbor.yml \
 #        harbor_admin_password password
 #
+#   MACHINE: whichever machine owns the file - svc-harbor-01 for harbor.yml, before Harbor
+#   first starts (runbook 4.5b). Interactive by design: it needs a tty.
+#
 # WHY THIS EXISTS RATHER THAN AN EDITOR OR A sed:
 #
 #   Config files that ship with a publicly-known default password - harbor.yml has TWO,
@@ -44,6 +47,9 @@ cp -a "$FILE" "$BACKUP"
 chmod 0600 "$BACKUP"
 say "backup: $BACKUP (0600 - it still holds the OLD secret)"
 
+# One python run per key. File and key go in through the environment; the VALUE comes only
+# from getpass, asked twice. It refuses a key with no existing value line, an empty or
+# mismatched entry, and anything other than exactly one replacement.
 for key in "$@"; do
   FILE="$FILE" KEY="$key" python3 - <<'PYEOF'
 import getpass, os, re, sys, pathlib

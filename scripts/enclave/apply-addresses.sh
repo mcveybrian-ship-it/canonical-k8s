@@ -15,6 +15,15 @@
 #   ./apply-addresses.sh zone            print the BIND zone files, change nothing
 #   ./apply-addresses.sh zone-install    write them and reload named   (sudo, DNS host only)
 #
+#   Not in the printed usage above, but dispatched:
+#   ./apply-addresses.sh resolver        print the systemd-resolved drop-in, change nothing
+#   ./apply-addresses.sh resolver-install  point THIS machine's resolver at the enclave DNS (sudo)
+#
+# MACHINE: render, zone and resolver print only - any machine with the repo. `apply` and
+# `resolver-install` ON each enclave machine. `zone-install` ON $ZONE_NS (svc-mgmt-01).
+# `push` and `verify` from a machine holding ENCLAVE_KEY (default ~/.ssh/build01), reaching
+# the enclave over ssh. Runbook 3.0 (addressing) and 9a.4 (enclave DNS); backlog 6b.1e.
+#
 # WHY DNS AT ALL, WHEN /etc/hosts ALREADY WORKS.
 #
 #   Two tiers, deliberately, and the order is in runbook 564: hosts FIRST, DNS second.
@@ -200,6 +209,7 @@ zone_named_conf() {
   printf 'zone "." {\n    type master;\n    file "%s/db.root";\n};\n' "$ZONE_DIR"
 }
 
+# zone: read-only. The three zone files and named.conf.local, exactly as zone-install writes them.
 cmd_zone() {
   printf '\n===== %s/db.%s =====\n' "$ZONE_DIR" "$ENCLAVE_DOMAIN"; zone_forward
   printf '\n===== %s/db.reverse =====\n' "$ZONE_DIR"; zone_reverse
@@ -208,6 +218,8 @@ cmd_zone() {
   printf '\n'
 }
 
+# render: the /etc/hosts managed block, marker to marker, from MAP. Read-only on its own;
+# apply and push both append its output.
 render() {
   echo "$BEGIN"
   echo "# Generated $(date -Is) from enclave-addresses.env. Edit that file, not this block."
@@ -273,6 +285,7 @@ apply_local() {
   ok "$(hostname): /etc/hosts updated, $(sed -n "/^$BEGIN\$/,/^$END\$/p" /etc/hosts | grep -c "$ENCLAVE_DOMAIN") name(s) in the managed block"
 }
 
+# Every address MAP resolves to - what push and verify try, including machines not built yet.
 targets() {
   local line var ip
   while IFS= read -r line; do
@@ -282,6 +295,8 @@ targets() {
   done <<< "$MAP"
 }
 
+# push: the same replace-the-managed-region edit as apply, done remotely on each reachable
+# node. Needs passwordless sudo, which hardened machines no longer have - use apply there.
 push() {
   local block; block=$(render)
   local ip rc=0
@@ -308,6 +323,8 @@ push() {
   return $rc
 }
 
+# verify: read-only, over ssh. Per node: every MAP name resolves to its own address, and a
+# *.apps name resolves - the proof that the enclave DNS is consulted at all. Non-zero on a miss.
 verify() {
   local ip line name var rc=0
   # ONE SSH CONNECTION PER MACHINE, NOT ONE PER NAME.
@@ -387,6 +404,7 @@ cmd_zone_install() {
        serving it, or two hosts answer for the same names and only one is right."
   command -v named-checkzone >/dev/null 2>&1 || die "bind9 tools absent - apt install bind9-utils"
 
+  # root owns the zone directory and files; group bind so named can read them.
   install -d -m 0755 -o root -g bind "$ZONE_DIR"
   local fwd="$ZONE_DIR/db.$ENCLAVE_DOMAIN" rev="$ZONE_DIR/db.reverse"
   local root="$ZONE_DIR/db.root"
@@ -435,6 +453,8 @@ cmd_zone_install() {
   named-checkconf || die "named.conf is invalid - FIX IT, named is still serving the old config"
   ok "named.conf.local written and valid"
 
+  # Reload keeps named answering through the change; restart only if reload is refused. Then two
+  # probes: a known enclave name must answer, and an outside name must be NXDOMAIN.
   systemctl reload named 2>/dev/null || systemctl restart named
   sleep 1
   local probe; probe="$(dig +short +time=2 @127.0.0.1 "svc-repo-01.$ENCLAVE_DOMAIN" 2>/dev/null)"
@@ -470,6 +490,7 @@ cmd_zone_install() {
 # enclave can reach. Turning it on would make every lookup fail closed.
 RESOLVED_DROPIN=/etc/systemd/resolved.conf.d/10-enclave-dns.conf
 
+# resolver: read-only. The drop-in resolver-install writes, printed.
 resolver_render() {
   local dns; dns="$(zone_ns_addr)"
   printf '# Enclave DNS. Written by apply-addresses.sh - do not edit.\n'
@@ -502,6 +523,8 @@ cmd_resolver_check() {
   printf '%s\n' "$dns"
 }
 
+# resolver-install: ON each enclave machine. Probe the DNS server, write the drop-in (keeping a
+# backup), restart systemd-resolved, then prove the hosts tier, the wildcard and an outside name.
 cmd_resolver_install() {
   [ "$(id -u)" -eq 0 ] || die "run with sudo"
   # DO NOT POINT AT A SERVER THAT IS NOT ANSWERING. A resolver configured at a dead address

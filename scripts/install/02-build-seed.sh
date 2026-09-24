@@ -27,6 +27,9 @@
 #   -n         dry run - print the resolved values and exit without writing
 #
 set -euo pipefail
+# MACHINE: stage-01 with -o (it has no USB - copy the two files to the stick afterwards), or
+# any Linux machine with the CIDATA stick mounted, with -d. It needs host-params.env, which is
+# gitignored and holds secrets, so it runs where that file lives - not on an enclave host.
 
 HOST=""; ADDR=""; DEST=""; DRYRUN=0; OUTDIR=""
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -195,11 +198,15 @@ esac
        resolve to the same disk. On an all-NVMe host, disambiguate by PCI address:
          ls -l /dev/disk/by-path/ | grep -v part"
   (( ${#LUKS_PASSPHRASE} >= 12 )) || die "LUKS_PASSPHRASE is under 12 characters"
+  # curtin storage-config dm_crypt actions, one per volume group. key: is the LUKS passphrase
+  # IN PLAINTEXT inside user-data - why every seed is a credential (backlog 2.6).
   CRYPT_OS=$'      - id: crypt-os\n        type: dm_crypt\n        dm_name: crypt-os\n        volume: p-pv\n        key: \''"$LUKS_PASSPHRASE"$'\'\n'
   CRYPT_DATA=$'      - id: crypt-data\n        type: dm_crypt\n        dm_name: crypt-data\n        volume: p-data\n        key: \''"$LUKS_PASSPHRASE"$'\'\n'
   VG0_DEV="crypt-os"
   VGDATA_DEV="crypt-data"
   ENC_SUMMARY="LUKS on both volume groups"
+  # An installer late-command: add a random keyfile as a SECOND keyslot on crypt-data and list
+  # it in crypttab, so only the OS volume asks for a passphrase at boot (START-HERE step 02).
   KEYFILE_LATECMD=$(cat <<'KFEOF'
     - |
       set -e
@@ -352,6 +359,7 @@ fi
 # directory you name yourself. The files still have to reach a FAT32 volume labelled CIDATA.
 if [[ -n "$OUTDIR" ]]; then
   [[ -d "$OUTDIR" ]] || mkdir -p "$OUTDIR" || die "cannot create $OUTDIR"
+  # 0700 dir, 0600 user-data: it holds the LUKS passphrase and the admin password hash.
   chmod 700 "$OUTDIR" 2>/dev/null || true
   printf '%s\n' "$content" > "$OUTDIR/user-data"
   : > "$OUTDIR/meta-data"

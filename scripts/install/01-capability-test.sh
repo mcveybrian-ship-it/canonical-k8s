@@ -20,6 +20,8 @@
 #   sudo ./01-capability-test.sh [-t PRO_TOKEN] [-o REPORT]
 #
 set -uo pipefail   # deliberately not -e: we want every probe to run and be recorded
+# MACHINE: a disposable 24.04 box at a NEW facility, release or Pro entitlement. Not part of an
+# enclave rebuild: for this enclave Q11/Q12 are answered and the script is history (runbook 2.3).
 
 TOKEN=""
 REPORT="capability-test-$(date -u +%Y%m%dT%H%M%SZ).txt"
@@ -103,6 +105,8 @@ echo "current FIPS mode: $(cat /proc/sys/crypto/fips_enabled 2>/dev/null || echo
 
 # ---------------------------------------------------------------------------- Q12: USG -----
 rule "Q12 — USG DISA-STIG profile for 24.04"
+# NOTE: despite "enables nothing" in the header, this DOES enable the usg service and install
+# the usg package when entitled - 'usg list' cannot run without them. FIPS is never enabled.
 if pro status --all 2>/dev/null | awk '$1=="usg" {print $2}' | grep -q "yes"; then
   echo "usg entitlement: available"
   pro enable usg --assume-yes 2>&1 | tail -2

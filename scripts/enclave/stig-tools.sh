@@ -8,6 +8,26 @@
 #     sudo ./stig-tools.sh detect       MACHINE: any in-gap machine. What applies - seconds, no scan.
 #     sudo ./stig-tools.sh scan         MACHINE: the machine being assessed. Scan + clean up.
 #     ./stig-tools.sh status            MACHINE: any. What is here and what is served.
+#     ./stig-tools.sh collect [machine...]
+#                                       MACHINE: stage-01. Pulls every machine's USG and
+#                                       Evaluate-STIG evidence into /srv/stig-evidence
+#                                       (STIG_COLLECT_DIR overrides). No sudo.
+#     ./stig-tools.sh coverage          MACHINE: any. Which archive patches each installed
+#                                       package - the Q28 list. Read-only.
+#
+#   `answers` takes NO sudo on stage-01, whatever the line above says - see cmd_answers. It
+#   asks for the sudo password on the TARGET, where the install happens.
+#
+# WHERE EACH RUNS IN A REBUILD - runbook section 6.0 steps 13a-14 (and 10.1 for the detail).
+# scripts/install/05-harden-host.sh step_evalstig runs `fetch` and `scan` itself.
+#
+#   when the scanner changes   publish            stage-01 -> the mirror's /tools/
+#   13a                        fetch              on the target
+#                              answers <machine>  from stage-01; answerfile.sh builds the file
+#   13b                        scan               on the target, 7-15 minutes
+#   13c / 13d                  triage, re-generate the Answer File, answers again, re-scan
+#   14                         collect            from stage-01, AFTER every scan has finished
+#   any time                   detect, status, coverage - read-only
 #
 # WHY THIS EXISTS:
 #
@@ -174,6 +194,10 @@ need_root() { [ "$(id -u)" -eq 0 ] || die "run with sudo"; }
 curl_v() { curl --cacert "$CA" "$@"; }
 
 # --------------------------------------------------------------------------------- publish
+# stage-01 only, whenever the scanner or PowerShell in the staging tree changes. Packs
+# Evaluate-STIG into one reproducible tarball, sends it and the PowerShell tarball plus a
+# SHA256SUMS written HERE to the mirror unprivileged, installs them under $REPO_ROOT/tools
+# with a single interactive sudo, then proves each one is served. runbook 10.1.
 cmd_publish() {
   local me; me="$(hostname -s)"
   [ "$me" = stage-01 ] || die "publish runs on stage-01, not $me.
@@ -229,6 +253,9 @@ cmd_publish() {
 
   say ""
   say "installing into $REPO_ROOT/tools - this asks for the sudo password on $MIRROR:"
+  # On the mirror, one sudo session: install the three files 0644, remove the pre-6a.25
+  # unpacked Evaluate-STIG tree, make the whole directory root-owned and world-readable
+  # (nginx serves it), then delete the staging copy from the operator's home.
   rsh_t "$MIRROR_USER@$MIRROR" \
     "sudo install -d -m 0755 '$REPO_ROOT/tools' \
      && sudo install -m 0644 '$STAGE_REMOTE/$ES_TARBALL' '$REPO_ROOT/tools/' \
@@ -285,6 +312,9 @@ cmd_publish() {
 }
 
 # --------------------------------------------------------------------------------- answers
+# RUNBOOK 6.0 STEP 13a, and again after every Answer File change (13c). stage-01 -> ONE named
+# machine over ssh: resolve the name, prove ssh works, scp to /tmp, then one sudo on the
+# target installs it as $DEST/Ubuntu24_AnswerFile.xml, where `scan` looks for it.
 cmd_answers() {
   local target="${1:-}"
   # NO sudo ON THIS SIDE. The usage said "sudo $0 answers" and that is wrong: this reads the
@@ -360,6 +390,9 @@ cmd_collect() {
     # side already knows. Levels of escaping are where these scripts break.
     local up; up="$(printf '%s' "$host" | tr 'a-z' 'A-Z')"
     say "  staging USG results (asks for the sudo password on $host):"
+    # On the target, as root: create $EVIDENCE/<HOST>/USG owned by the operator, copy USG's
+    # results and reports into it, and hand the copies over - so step 2 needs no privilege.
+    # <HOST> is upper case to sit beside the directory Evaluate-STIG itself names that way.
     rsh_t "$MIRROR_USER@$addr" \
       "sudo install -d -m 0755 -o $MIRROR_USER $EVIDENCE/$up/USG && \
        sudo cp -p /var/lib/usg/usg-results-*.xml /var/lib/usg/usg-report-*.html $EVIDENCE/$up/USG/ ; \
@@ -489,6 +522,10 @@ COVPY
 }
 
 # ----------------------------------------------------------------------------------- fetch
+# RUNBOOK 6.0 STEP 13a (05-harden-host.sh step_evalstig). On the machine to be scanned, as
+# root: pull Evaluate-STIG and PowerShell from the mirror over TLS verified against the
+# enclave root CA, check each against SHA256SUMS, install under $DEST, and RUN pwsh to prove
+# it starts. Also creates $EVIDENCE owned by the operator so the scan output can leave.
 cmd_fetch() {
   # THE MACHINE CHECK COMES BEFORE THE PRIVILEGE CHECK, DELIBERATELY.
   # With need_root first, pasting this on stage-01 answers "run with sudo" - which invites the
@@ -631,6 +668,10 @@ $(find "$TMPD" -maxdepth 2 | head -12 | sed 's/^/       /')
 # ------------------------------------------------------------------------------------ scan
 #
 # RUN THE SCAN, AND LEAVE THE EVIDENCE IN A STATE SOMEONE CAN ACTUALLY COLLECT.
+#
+# RUNBOOK 6.0 STEP 13b, and 13d for the re-scan (05-harden-host.sh step_evalstig). On the
+# machine being assessed, as root. Refuses on stage-01/build-01, which are outside the
+# boundary. Output - Summary, CKLB checklists, CombinedCSV - goes under $EVIDENCE.
 #
 # The bare invocation is six flags long, and two things must happen afterwards or the run is
 # worth less than it looks:
@@ -919,6 +960,8 @@ cmd_detect() {
 }
 
 # ---------------------------------------------------------------------------------- status
+# READ-ONLY, and the default with no argument: scanner, pwsh and Answer File on this machine,
+# and the HTTP code the mirror returns for /tools/.
 cmd_status() {
   local me; me="$(hostname -s)"
   printf '\n  stig tooling on %s\n\n' "$me"

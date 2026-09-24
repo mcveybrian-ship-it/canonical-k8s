@@ -8,6 +8,10 @@
 #     ./04-enclave-services.sh pro         point the pro client at it, and attach
 #     ./04-enclave-services.sh verify      prove what is running, change nothing
 #
+#     MACHINE per subcommand: `contracts` and `verify` on svc-mgmt-01 (10.2.20.161), which
+#     runs the contracts server behind nginx. `pro` on EVERY machine being hardened, hosts and
+#     guests alike - runbook 6.0 step 4 (05-harden-host.sh calls it for the hosts).
+#
 # Everything here assumes svc-repo-01 is already serving - it is where the packages and the
 # carried .debs come from. See docs/airgap-media.md.
 # =========================================================================================
@@ -25,6 +29,9 @@ die()  { printf '\n  [x] %s\n\n' "$*" >&2; exit 1; }
 need_root() { [ "$(id -u)" -eq 0 ] || die "run with sudo: sudo $0 $*"; }
 
 # =========================================================================================
+# contracts - run Canonical's air-gapped contracts server as a locked-down systemd service on
+# :8484, reachable only from loopback, with nginx terminating TLS in front of it. Without it
+# nothing in the gap can `pro attach`, so ESM, FIPS and USG stay unusable (runbook 2.8).
 cmd_contracts() {
   need_root contracts
 
@@ -146,6 +153,9 @@ UNIT
 }
 
 # =========================================================================================
+# pro - point this machine's pro client at the enclave contracts server and attach, with NO
+# service enabled (runbook 6.1). Enabling fips-updates and usg is step 05, where the
+# before/after evidence is captured.
 cmd_pro() {
   need_root pro
   # HTTPS through nginx, NOT http://...:8484. The contracts server's own port was bound to
@@ -217,6 +227,8 @@ cmd_pro() {
 }
 
 # =========================================================================================
+# verify - on svc-mgmt-01, read-only: the contracts daemon, its nginx TLS front as clients
+# reach it, and the enclave DNS (named) that the same machine serves.
 cmd_verify() {
   local fail=0
   echo; echo "  ---- step 04 verification on $(hostname) ----"
@@ -316,5 +328,5 @@ case "${1:-}" in
   contracts) cmd_contracts ;;
   pro)       cmd_pro ;;
   verify)    cmd_verify ;;
-  *)         sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  *)         sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

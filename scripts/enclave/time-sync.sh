@@ -10,6 +10,11 @@
 #        ./time-sync.sh verify    read-only: are we synchronised, and to what
 #        ./time-sync.sh drift     read-only: how far is this machine from a reference
 #
+#   MACHINE: `master` on TIME_MASTER only (host-4 - physical); `client` on every other enclave
+#   machine, guests included; `verify` anywhere; `drift` on an enclave machine at gap-open,
+#   against a reference it can then reach. Runbook 2.10 and 6.3b. Addresses AU-8 (poam AO-13)
+#   and the STIG rule chronyd_or_ntpd_set_maxpoll.
+#
 # WHY THIS IS NOT OPTIONAL, AND WHY IT COMES BEFORE THE CLUSTER:
 #
 #   Every machine in the enclave currently reports "System clock synchronized: no".
@@ -66,6 +71,9 @@ die()  { printf '\n  [x] %s\n\n' "$*" >&2; exit 1; }
 
 need_root() { [ "$(id -u)" -eq 0 ] || die "run with sudo"; }
 
+# Shared by master and client: chrony from the mirror, timesyncd off, a conf.d include in
+# chrony.conf so the enclave directives live in their own drop-in, and the dead public pools
+# commented out.
 install_chrony() {
   if ! dpkg -s chrony >/dev/null 2>&1; then
     say "installing chrony from the enclave mirror"
@@ -96,6 +104,7 @@ install_chrony() {
   local n
   n="$(grep -cE '^[[:space:]]*(server|pool)[[:space:]]' "$CONF" 2>/dev/null || echo 0)"
   if [ "${n:-0}" -gt 0 ]; then
+    # Timestamped copy first, so the original file can always be put back by hand.
     cp -a "$CONF" "/var/backups/chrony.conf.$(date +%Y%m%dT%H%M%S)"
     # awk, NOT sed. The pattern contains '|' and every sed delimiter worth using appears
     # either in the pattern or in the replacement text - the same trap that broke the
@@ -118,6 +127,8 @@ install_chrony() {
 }
 
 # ---------------------------------------------------------------------------- master
+# master: refuse on a guest, install chrony, write the drop-in (optional upstream, local
+# stratum, allow the enclave subnet, makestep/rtcsync), restart chrony and verify.
 cmd_master() {
   need_root
   # --upstream is how a real reference gets adopted WITHOUT touching a single client.
@@ -199,6 +210,8 @@ cmd_master() {
 }
 
 # ---------------------------------------------------------------------------- client
+# client: refuse on the master's own address, install chrony, write one `server <master>`
+# line with maxpoll, restart, wait up to ~20 s for NTPSynchronized, then verify.
 cmd_client() {
   need_root
   local myip; myip=$(ip -4 -br addr | awk '$1!="lo"{split($3,a,"/"); print a[1]; exit}')
@@ -240,6 +253,8 @@ cmd_client() {
 }
 
 # ---------------------------------------------------------------------------- verify
+# verify: read-only. Prints chrony tracking and sources, then judges by role - the master by
+# its leap status, a client by the kernel's NTPSynchronized flag. Non-zero on failure.
 cmd_verify() {
   local fail=0
   if ! command -v chronyc >/dev/null 2>&1; then

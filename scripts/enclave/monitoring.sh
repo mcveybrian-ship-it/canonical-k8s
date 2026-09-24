@@ -10,6 +10,15 @@
 #     sudo ./monitoring.sh alerting          alertmanager config only (B-09a) - collector runs it too
 #     sudo ./monitoring.sh alert-test on|off  PROVE an alert reaches the dashboard, and clears
 #     ./monitoring.sh status                 what is running here and where it is bound
+#     sudo ./monitoring.sh rules             Prometheus alert rules, validated, counted live
+#     sudo ./monitoring.sh facts             publish the compliance facts as metrics, once
+#     sudo ./monitoring.sh facts-timer       the 15-minute timer that runs `facts`
+#     sudo ./monitoring.sh dashboards        provision the repo's Grafana dashboards
+#
+#     WHICH MACHINE: exporter and facts-timer on EVERY in-gap machine; libvirt on each
+#     hypervisor (host-1..4); collector, alerting, alert-test, rules and dashboards on the
+#     collector, svc-obs-01. Build order: runbook 10a ("AS BUILT, 2026-09-14"). Controls:
+#     CA-7 and SI-4 (iscm-strategy.md). The alert path is backlog B-09a.
 #
 # WHY A SCRIPT FOR WHAT LOOKS LIKE ONE apt-get:
 #
@@ -87,6 +96,7 @@ ne_args() {  # <ip>
   printf '%s' " --collector.systemd --collector.systemd.unit-include=$SYSTEMD_UNITS"
 }
 
+# stage-01 and build-01 are outside the ATO boundary - refuse there by name.
 guard_in_gap() {
   local me; me="$(hostname -s)"
   case "$me" in
@@ -101,6 +111,10 @@ have_mellanox() { [ -d /sys/class/infiniband ] && [ -n "$(ls -A /sys/class/infin
 have_nvme()     { compgen -G '/dev/nvme[0-9]*n[0-9]*' >/dev/null 2>&1; }
 have_smart()    { compgen -G '/dev/sd[a-z]' >/dev/null 2>&1 || have_nvme; }
 
+# exporter: on every in-gap machine. Install node-exporter, bind it to this machine's enclave
+# address with the textfile directory and the systemd unit filter, keep only the collector
+# timers whose hardware exists, restart, PROVE the bind and both collectors, then purge
+# sysstat (V-270756). The firewall rule is stig-tailor.sh's job, not this one's.
 cmd_exporter() {
   guard_in_gap; need_root
   local me ip; me="$(hostname -s)"; ip="$(my_enclave_ip)"
@@ -279,6 +293,8 @@ cmd_exporter() {
   say "   port is open to the whole enclave - which is why the gap must be shut."
 }
 
+# libvirt: on each hypervisor only. prometheus-libvirt-exporter bound to the enclave address on
+# $LV_PORT, then a check that it serves libvirt_* series.
 cmd_libvirt() {
   guard_in_gap; need_root
   local me ip; me="$(hostname -s)"; ip="$(my_enclave_ip)"
@@ -293,6 +309,8 @@ cmd_libvirt() {
   DEBIAN_FRONTEND=noninteractive apt-get install -y prometheus-libvirt-exporter 2>&1 | tail -3
   if [ -f "$LV_DEFAULTS" ]; then
     cp -a "$LV_DEFAULTS" "/var/backups/$(basename "$LV_DEFAULTS").$(date +%Y%m%dT%H%M%S)"
+    # sed is safe HERE, unlike node-exporter's ARGS: this value is an address and a port, with
+    # no '|' in it to end the expression (see set_args for the case where it did).
     if grep -q '^ARGS=' "$LV_DEFAULTS"; then
       sed -i "s|^ARGS=.*|ARGS=\"--web.listen-address=${ip}:${LV_PORT}\"|" "$LV_DEFAULTS"
     else
@@ -444,6 +462,9 @@ DS
   ok "datasource provisioned with uid '$DS_UID'"
 }
 
+# collector: on svc-obs-01. Prometheus and Alertmanager on loopback, the scrape config generated
+# from scrape_targets() and the address file (promtool-checked), alertmanager.yml, Grafana
+# from the mirror (sha256-checked) on loopback behind nginx TLS - then prove every bind.
 cmd_collector() {
   guard_in_gap; need_root
   local me ip; me="$(hostname -s)"; ip="$(my_enclave_ip)"
@@ -461,6 +482,7 @@ cmd_collector() {
   # anywhere - Grafana proxies to them over loopback.
   set_args /etc/default/prometheus \
     "--web.listen-address=127.0.0.1:9090 --storage.tsdb.retention.time=$PROM_RETENTION_TIME --storage.tsdb.retention.size=$PROM_RETENTION_SIZE"
+  # An EMPTY --cluster.listen-address switches the 9094 HA gossip listener off - one node.
   set_args /etc/default/prometheus-alertmanager \
     "--web.listen-address=127.0.0.1:9093 --cluster.listen-address="
   # THE SAME FLAGS `exporter` WOULD SET - not just the listen address. Setting only the
@@ -563,6 +585,7 @@ cmd_collector() {
     for kv in "GF_SERVER_HTTP_ADDR=127.0.0.1" "GF_SERVER_HTTP_PORT=3000" \
               "GF_SERVER_ROOT_URL=https://${fqdn}/"; do
       k="${kv%%=*}"
+      # Replace the key's line if present, else append. These values hold no '|'.
       grep -q "^$k=" "$gd" 2>/dev/null && sed -i "s|^$k=.*|$kv|" "$gd" || printf '%s\n' "$kv" >> "$gd"
     done
     ensure_datasource
@@ -662,6 +685,8 @@ cmd_collector() {
 AM_CFG=/etc/prometheus/alertmanager.yml
 ALERT_TEST_METRIC=enclave_alert_path_test
 
+# Write the one-receiver config to a temp file, amtool-check it, install it 0644 (a backup of
+# the old one kept), reload, and confirm from the RUNNING process's /api/v2/status.
 write_alertmanager_config() {
   local tmp; tmp="$(mktemp)"
   cat > "$tmp" <<'AMCFG'
@@ -702,6 +727,7 @@ AMCFG
   esac
 }
 
+# alerting: on svc-obs-01. The Alertmanager config on its own; `collector` also runs it.
 cmd_alerting() {
   need_root
   command -v amtool >/dev/null 2>&1 || die "amtool not found - is prometheus-alertmanager installed?"
@@ -720,6 +746,10 @@ print(a[0]["state"] if a else "none")' 2>/dev/null || echo "?")"
   printf '%s %s\n' "$ps" "$am"
 }
 
+# alert-test on|off|status: on svc-obs-01. `on` publishes enclave_alert_path_test=1 through the
+# textfile directory, which the AlertPathTest rule fires on; `off` removes it and waits for the
+# alert to clear. The script proves scrape -> rule -> Alertmanager; the dashboard half needs a
+# person looking (runbook 10a, the daily alert check).
 cmd_alert_test() {
   local action="${1:-status}" f="$TEXTFILE_DIR/${ALERT_TEST_METRIC}.prom" st i
   case "$action" in
@@ -765,6 +795,11 @@ cmd_alert_test() {
   esac
 }
 
+# rules: on svc-obs-01. The WHY is the "ALERT RULES LIVE IN PROMETHEUS" note above the alerting
+# section. Writes /etc/prometheus/rules/enclave.yml from the AL_* thresholds (an UNQUOTED
+# heredoc: $VARS expand into the YAML, and every line inside it, '#' lines included, lands in
+# the generated file), checks it with promtool, makes sure prometheus.yml loads it, reloads,
+# and counts the rules in the RUNNING process.
 cmd_rules() {
   need_root
   local me; me="$(hostname -s)"
@@ -1326,6 +1361,7 @@ EOF
     # Insert after the alerting block, before scrape_configs - order does not matter to
     # Prometheus, but keeping it above scrape_configs keeps the file readable.
     if grep -qE '^scrape_configs:' "$cfg"; then
+      # GNU sed `0,/re/`: only the FIRST scrape_configs line is rewritten; s||| reuses /re/.
       sed -i '0,/^scrape_configs:/s||rule_files:\n  - /etc/prometheus/rules/*.yml\n\nscrape_configs:|' "$cfg"
     else
       printf '\nrule_files:\n  - /etc/prometheus/rules/*.yml\n' >> "$cfg"
@@ -1385,6 +1421,8 @@ for g in json.load(sys.stdin)["data"]["groups"]:
 # deliberately left out rather than putting a Harbor password in a metrics producer.
 harbor_facts() {
   local body
+  # -k: addressed by loopback IP rather than the certificate's name, so validation is skipped
+  # on purpose. TLS is not the check here - the JSON shape below is.
   body="$(curl -sk --max-time 8 "https://127.0.0.1/api/v2.0/health" 2>/dev/null)" || return 1
 
   # THE GUARD IS THE JSON, NOT THE HTTP STATUS. svc-repo-01 and svc-obs-01 also answer
@@ -1480,6 +1518,10 @@ TPY
 # dashboard that reads "0 Open" because the machine is clean. So every family publishes a
 # companion enclave_facts_source_ok{source="..."}, and a family with no source emits NO
 # SAMPLES AT ALL - "No data" on a panel is honest, a zero is a lie.
+#
+# Runs as root on every in-gap machine, from enclave-facts.timer: auditctl, ufw and the owning
+# process in `ss -p` are root-only. Writes enclave-compliance.prom in the textfile directory
+# (the PPSM generator, ppsm.py, reads its listener and ufw series - backlog 6a.22).
 cmd_facts() {
   need_root; guard_in_gap
   install -d -m 0755 "$TEXTFILE_DIR" 2>/dev/null || true
@@ -1909,6 +1951,7 @@ FACTSPY
   # would turn "the script broke" into "this machine has no findings", which is the exact
   # failure this whole file is written to avoid.
   if [ ! -s "$tmp" ]; then rm -f "$tmp"; die "facts produced NO output - $out left as it was"; fi
+  # Same directory, then rename: node-exporter only ever sees the old file or the whole new one.
   chmod 0644 "$tmp"; mv -f "$tmp" "$out"
   ok "wrote $out"
   say "   $(grep -vc '^#' "$out") samples, $(grep -c '^# HELP' "$out") metric families"
@@ -1928,6 +1971,8 @@ FACTSPY
 
 # Install the timer that keeps the facts fresh. 15 minutes: these are daily-to-weekly facts,
 # and a scrape interval is not a measurement interval.
+# facts-timer: on every in-gap machine. Refresh the root-owned runtime copy, write
+# enclave-facts.service + .timer, enable, and run it once now.
 cmd_facts_timer() {
   need_root; guard_in_gap
   # THE UNIT RUNS AS ROOT, SO IT RUNS A ROOT-OWNED COPY - backlog 3.11. It used to execute
@@ -1978,6 +2023,10 @@ UNIT
   systemctl list-timers enclave-facts.timer --no-pager 2>/dev/null | sed -n '2p' | sed 's/^/     /'
 }
 
+# dashboards: on svc-obs-01. The WHY is the "DASHBOARDS ARE FILES IN THIS REPOSITORY" note above
+# harbor_facts. Validate every JSON, check the datasource uid matches, install to
+# /var/lib/grafana/dashboards, write the file provider, set the home dashboard (B-09a), restart
+# Grafana, and confirm from Grafana's own database what it actually loaded.
 cmd_dashboards() {
   need_root
   local me; me="$(hostname -s)"
@@ -2143,6 +2192,8 @@ SQL
   say  "  Change scripts/enclave/dashboards/*.json and re-run this instead."
 }
 
+# status: read-only, any machine. Which monitoring services exist and are active, what is
+# listening on a monitoring port, any wildcard bind, and the collector timers.
 cmd_status() {
   local me ip; me="$(hostname -s)"; ip="$(my_enclave_ip)"
   printf '\n  monitoring on %s (%s)\n\n' "$me" "${ip:-no enclave address}"

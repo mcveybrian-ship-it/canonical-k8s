@@ -104,6 +104,8 @@ say "token  : loaded from $TOKEN_FILE (${#TOKEN} chars, not shown)"
 BASE="${REPO_SCHEME:-https}://${REPO_ADDRESS}"
 say "target : $BASE"
 
+# pro-airgapped's input: the contract token mapped to one aptURL override per mirrored
+# entitlement. It contains the token, so it only ever goes to stdin below, and -n masks it.
 INPUT=$(cat <<EOF
 {
   "$TOKEN": {
@@ -126,6 +128,8 @@ if [ "$DRY" -eq 1 ]; then
 fi
 
 install -d -m 0755 "$(dirname "$OUT")"
+# Output goes to a 0600 temp file first and is only installed once the aptURL and override
+# checks below pass - a file that fails them never reaches the path the bundle copies from.
 TMP=$(mktemp); chmod 600 "$TMP"; trap 'rm -f "$TMP"' EXIT
 # STDIN with NO --input flag. Its own help says `--input -` means stdin; it does not - it
 # tries to open a file named "" and fails with `open : no such file or directory`. Verified

@@ -44,6 +44,8 @@ import zipfile
 HERE = os.path.dirname(os.path.realpath(__file__))
 
 # ------------------------------------------------------------------------------ inputs
+# One instant query against the Prometheus HTTP API. A non-success status ends the run - a
+# report built on a refused query would read as "no ports", which is a false clean result.
 def prom(base, query):
     url = base.rstrip("/") + "/api/v1/query?" + urllib.parse.urlencode({"query": query})
     with urllib.request.urlopen(url, timeout=20) as r:
@@ -53,6 +55,7 @@ def prom(base, query):
     return d["data"]["result"]
 
 
+# KEY='value' lines from enclave-addresses.env, parsed as text - the shell file is never executed.
 def read_env(path):
     out = {}
     for line in open(path):
@@ -62,6 +65,8 @@ def read_env(path):
     return out
 
 
+# ppsm-services.tsv: proto, port, process, CAL service name, purpose - then optional CLSA name
+# and risk text. A CAL name of "-" means "not on the CAL", which routes it to AO approval.
 def read_services(path):
     rows = []
     for line in open(path):
@@ -76,6 +81,8 @@ def read_services(path):
     return rows
 
 
+# Identity is protocol + owning process + port; a port of "*" in the TSV matches any port for
+# that process. First match wins, so order in the TSV matters.
 def lookup_service(services, proto, port, process):
     for s in services:
         if s["proto"] == proto and s["process"] == process and s["port"] in (port, "*"):
@@ -326,7 +333,11 @@ def main():
     fresh = {r["metric"]["machine"]: float(r["value"][1])
              for r in prom(a.prometheus, "time() - enclave_facts_generated_seconds")}
 
+    # The machines assessed are the HOST_n and SVC_* entries of the address file - one list,
+    # the same one every other script uses.
     machines = sorted(addr_of)
+    # --scan: every TCP port, plus UDP_ALWAYS and every UDP port any machine reports listening
+    # on. The XML is written beside --out so the report and its evidence travel together.
     if a.scan:
         if not a.out:
             sys.exit("--scan needs --out, so the scan XML has somewhere to live beside the report")
@@ -355,6 +366,9 @@ def main():
         elif fresh.get(m, 1e9) > 3600:
             finding("STALE", m, "listener facts are %.0f minutes old" % (fresh[m] / 60))
 
+    # One pass per listening socket: identify it (TSV), find its design reason (stig-tailor.sh),
+    # its live ufw rule, its scan result and its CAL row - then derive the findings from those.
+    # External listeners first, loopback last, so the report leads with what the network sees.
     rows = []
     ao = collections.defaultdict(lambda: {"svc": None, "where": []})
     for m in machines:
@@ -568,6 +582,8 @@ def main():
     if a.out:
         with open(a.out, "w") as fh:
             fh.write(text)
+        # 0640 and handed back to the sudo caller: the file is a port inventory (sensitive), and a
+        # root-owned copy would block the next unprivileged regeneration.
         os.chmod(a.out, 0o640)
         uid, gid = os.environ.get("SUDO_UID"), os.environ.get("SUDO_GID")
         if uid and gid and os.geteuid() == 0:

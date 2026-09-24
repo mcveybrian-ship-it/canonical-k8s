@@ -109,6 +109,8 @@ note "have   : ${have_gb} GB on $_df_target"
 # anyone sensibly runs a 318 GB copy - every frame lands on its own line and buries any real
 # error in tens of MB of noise. Ask for it only when stdout is a terminal.
 if [ -t 1 ]; then RS_INFO="--info=progress2,stats1"; else RS_INFO="--info=stats1"; fi
+# --delete: the served tree becomes exactly the carried one, so anything removed from the
+# mirror on stage-01 is removed here too rather than lingering from an earlier trip.
 run rsync -a --delete "$RS_INFO" "$SRC/mirror/" "$REPO_ROOT/mirror/"
 note "tree   : $REPO_ROOT/mirror"
 
@@ -188,6 +190,7 @@ fi
 head2 "contracts server"
 if [ -f "$SRC/bundle/config/airgapped-contracts.yaml" ]; then
   run install -d -m 0755 /etc/ubuntu-advantage
+  # 0600: it maps contract tokens to entitlements - a credential.
   run install -m 0600 "$SRC/bundle/config/airgapped-contracts.yaml" /etc/ubuntu-advantage/
   note "config placed. Start it with:"
   note "  contracts-airgapped --config /etc/ubuntu-advantage/airgapped-contracts.yaml"

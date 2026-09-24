@@ -3,10 +3,13 @@
 # 03-compose-vm.sh - compose one enclave VM from the Minimal cloud image.
 #
 #     MACHINE: runs ON the virtualisation host (host-4 for the service VMs).
+#     It REFUSES a guest whose PLACE_<GUEST> in vm-specs.env names another host (backlog 2.7).
 #
 #     sudo ./03-compose-vm.sh svc-mgmt-01
 #     sudo ./03-compose-vm.sh svc-mgmt-01 -n        show what it would do, touch nothing
 #     sudo ./03-compose-vm.sh svc-mgmt-01 --destroy remove it and its disk
+#     ./03-compose-vm.sh plan                       does THIS host fit the guests mapped to it
+#     ./03-compose-vm.sh plan --spec                what each host must have - no hardware
 #
 # There are ten of these to build, so it is a composer rather than a one-off. Everything
 # comes from two files and nothing is typed twice:
@@ -187,12 +190,12 @@ while [ $# -gt 0 ]; do
     -n|--dry-run) DRY=1; shift ;;
     --destroy)    DESTROY=1; shift ;;
     --spec)       PLAN_ARG=--spec; shift ;;
-    -h|--help)    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)    sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     -*)           die "unknown option $1" ;;
     *)            VM="$1"; shift ;;
   esac
 done
-[ -n "$VM" ] || { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+[ -n "$VM" ] || { sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
 
 
 [ -r "$ENCLAVE_DIR/enclave-addresses.env" ] || die "no enclave-addresses.env in $ENCLAVE_DIR"
@@ -235,6 +238,8 @@ if [ "$DESTROY" -eq 1 ]; then
   [ "$(id -u)" -eq 0 ] || die "run with sudo"
   say "this DESTROYS $VM and $DISK"
   run virsh destroy "$VM" 2>/dev/null || true
+  # --nvram also deletes the guest's UEFI variable store; undefine refuses a UEFI guest
+  # without it (or --keep-nvram).
   run virsh undefine "$VM" --nvram 2>/dev/null || true
   run rm -f "$DISK" "$SEED" ${DATA_DISK:+"$DATA_DISK"}
   ok "$VM removed"; exit 0
@@ -293,6 +298,8 @@ say "spec    : ${VCPUS} vCPU, ${RAM_MB} MB, ${DISK_GB} GB sparse"
 say "bridge  : $BRIDGE"
 
 # ---- disk --------------------------------------------------------------------------------
+# 0711: qemu can open a seed by its path, other users cannot list the directory - every
+# seed carries the admin password hash and the authorized keys.
 run install -d -m 0711 "$POOL/seed"
 # Log the serial console to a file AND keep an interactive pty. A VM with no default route
 # that fails to bring up networking is invisible: no ssh, and the log is the only evidence of
@@ -322,6 +329,8 @@ run install -d -m 0755 "$LOGDIR"
 # can never be retired. A converted copy costs ~600 MB each - 6 GB across the fleet, against
 # 1.9 TB - and each VM is then independent. Cheap insurance.
 run qemu-img convert -f qcow2 -O qcow2 "$VM_BASE_IMAGE" "$DISK"
+# Grows the VIRTUAL size only (still sparse); cloud-init's growpart extends the root
+# filesystem into it on first boot.
 run qemu-img resize "$DISK" "${DISK_GB}G"
 ok "disk    : $DISK (independent copy, sparse, grown to ${DISK_GB}G)"
 
@@ -465,6 +474,8 @@ $(for k in $SSH_KEY_SEARCH; do printf '         %s%s\n' "$k" "$([ -r "$k" ] && e
        route AND no way in - it would boot and be unreachable."
 
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+# A fresh instance-id on every compose, so cloud-init treats a recomposed guest as a first
+# boot and runs the whole user-data again.
 cat > "$TMP/meta-data" <<EOF
 instance-id: $VM-$(date +%s)
 local-hostname: $VM
@@ -575,6 +586,7 @@ case "${VM_FIRMWARE:-uefi}" in
   *)    die "VM_FIRMWARE must be 'uefi' or 'bios', not '${VM_FIRMWARE}'" ;;
 esac
 
+# The NoCloud seed image (volume label cidata): user-data, meta-data and network-config.
 cloud-localds -N "$TMP/network-config" "$SEED" "$TMP/user-data" "$TMP/meta-data"
 ok "seed    : $SEED"
 
@@ -591,11 +603,14 @@ ok "seed    : $SEED"
 # produces no error and no output - the VM boots to a stock 'ubuntu' login with no address,
 # looking alive and being useless. NoCloud matches on the filesystem label, not on the device
 # being a cdrom, so a read-only virtio disk works and is visible to the trimmed initramfs.
+# Data disk: cache=none so a database fsync reaches the device rather than the host page
+# cache; discard=unmap so TRIM inside the guest returns space to the sparse qcow2.
 DATA_DISK_ARGS=()
 if [ -n "$DATA_DISK" ]; then
   DATA_DISK_ARGS=(--disk "path=$DATA_DISK,format=qcow2,bus=virtio,cache=none,io=native,discard=unmap")
 fi
 
+# host-passthrough: the guest sees the host CPU's real model and flags, not a generic one.
 virt-install \
   --name "$VM" \
   --memory "$RAM_MB" --vcpus "$VCPUS" \
@@ -612,6 +627,8 @@ virt-install \
   --import --noautoconsole
 ok "defined and started"
 
+# The guest starts with its host. After host-4's reboot on 2026-09-22 all four guests came
+# back with nobody at a console (backlog 1.1).
 virsh autostart "$VM" >/dev/null
 ok "autostart enabled"
 

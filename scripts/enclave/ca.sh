@@ -282,6 +282,7 @@ cmd_revoke() {
   cmd_gen_crl
 }
 
+# Only the operations that RUN a CA need ca-params.env - see the note above cmd_inventory.
 case "${1:-}" in
   trust|show|request|inventory|install-wildcard) CA_NEED_PARAMS=0 ;;
   *)                  CA_NEED_PARAMS=1 ;;
@@ -347,6 +348,10 @@ require_issuing_host() {
 }
 
 # =========================================================================================
+# init-root - ON stage-01, or wherever CA_ROOT_DIR points; never an enclave machine. Creates the
+# root: an AES-256-encrypted RSA key (0400) and a self-signed certificate. Run ONCE - every
+# certificate in the enclave chains to it. Its custody is backlog 3.7 / ssp-inputs.md 2.5
+# (suggested control SC-12); backup-root is the mechanism, not the policy.
 cmd_init_root() {
   require_root_host
   local d="$CA_ROOT_DIR"
@@ -444,6 +449,9 @@ CNF
 }
 
 # =========================================================================================
+# sign-issuing - ON the root host. Signs svc-mgmt-01's issuing-CA CSR with pathlen and, when
+# CA_NAME_CONSTRAINTS is set, nameConstraints. Both are fixed at signing time; without the
+# latter the issuing CA can sign for any name (poam.md ENG-31).
 cmd_sign_issuing() {
   require_root_host
   local csr="${1:-}"; [ -r "$csr" ] || die "usage: $0 sign-issuing <issuing.csr>"
@@ -502,6 +510,8 @@ cmd_sign_issuing() {
 }
 
 # =========================================================================================
+# init-issuing - ON svc-mgmt-01. The issuing CA's key is generated here and never leaves;
+# only the CSR travels to the root host for sign-issuing.
 cmd_init_issuing() {
   [ "$(id -u)" -eq 0 ] || die "run with sudo"
   require_issuing_host
@@ -567,6 +577,8 @@ CNF
 }
 
 # =========================================================================================
+# install-issuing - ON svc-mgmt-01. Installs the signed issuing certificate and the root,
+# after proving the certificate matches the local key and chains to that root.
 cmd_install_issuing() {
   [ "$(id -u)" -eq 0 ] || die "run with sudo"
   require_issuing_host
@@ -599,6 +611,9 @@ cmd_install_issuing() {
 }
 
 # =========================================================================================
+# issue - ON svc-mgmt-01, for services running ON svc-mgmt-01: the leaf key is generated
+# here. Every other machine runs `request` itself and sends the CSR to `sign-server`. SANs
+# come from enclave-addresses.env. --peer: proven only on a scratch CA (poam.md ENG-33).
 cmd_issue() {
   [ "$(id -u)" -eq 0 ] || die "run with sudo"
   require_issuing_host
@@ -733,6 +748,9 @@ cmd_issue() {
 }
 
 # =========================================================================================
+# request - ON the machine that needs a certificate: key and CSR are made here and the key
+# never moves. --profile picks the CSR shape for the PKI that will sign it (csr-profiles/);
+# the external dod-pki round trip has never been run end to end (poam.md ENG-34).
 cmd_request() {
   [ "$(id -u)" -eq 0 ] || die "run with sudo"
 
@@ -947,6 +965,8 @@ cmd_request() {
 }
 
 # =========================================================================================
+# sign-server - ON svc-mgmt-01. Signs a CSR made elsewhere (by `request`, or by an appliance)
+# and writes <name>.fullchain.crt - leaf + issuing - which is what goes back.
 cmd_sign_server() {
   [ "$(id -u)" -eq 0 ] || die "run with sudo"
   require_issuing_host
@@ -1062,6 +1082,8 @@ cmd_sign_server() {
 }
 
 # =========================================================================================
+# show - subject, issuer, dates, key usage, SANs and the SHA-256 fingerprint. Reads a
+# certificate only, never a key.
 cmd_show() {
   local f="${1:-}"; [ -r "$f" ] || die "usage: $0 show <certificate>"
   # Every pipeline here is guarded. cmd_show is called at the END of init-root, sign-issuing,

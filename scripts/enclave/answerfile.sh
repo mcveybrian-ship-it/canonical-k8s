@@ -8,6 +8,14 @@
 #     ./answerfile.sh generate              write the entries into the answer file
 #     ./answerfile.sh generate -n           dry run - print, change nothing
 #     ./answerfile.sh verify                validate the file against the vendor XSD
+#     ./answerfile.sh -f <path> <action>    work on another file (STIG_ANSWERFILE also sets it)
+#
+#   No action means `show`. None of these needs root.
+#
+# WHERE IT RUNS IN A REBUILD: runbook section 6.0 step 13c, on stage-01, after triaging a
+# scan and before the re-scan (13d). `stig-tools.sh answers <machine>` then carries the file
+# to each machine over ssh - it is never published on the mirror. On a from-scratch rebuild
+# with no answer file yet, `generate` seeds one from Evaluate-STIG's own template.
 #
 # WHY THIS EXISTS: THE HAND-BUILT ANSWERS ONLY WORKED ON ONE MACHINE.
 #
@@ -115,6 +123,14 @@ EOF
 #
 # Deliberately avoids `<` and `&` so the XML needs no CDATA and stays readable to an
 # assessor. `>` is legal unescaped in XML text content, so `2>/dev/null` is fine as-is.
+#
+# EVERY LINE BETWEEN `cat <<'EOF'` AND `EOF` BELOW IS SHIPPED. It becomes the ValidationCode
+# element of the answer file on every machine and in the assessor's copy - including any `#`
+# comment written there, which is PowerShell's comment syntax too. Explain an entry in
+# af_entries() or up here, never by adding a line inside a block. Each block sets
+# $V.Valid ($true -> ValidTrueStatus NF, $false -> ValidFalseStatus O) and $V.Results, the
+# evidence text the checklist records. The audit-family clause is the one UNQUOTED heredoc,
+# so $term and $paths expand and every PowerShell `$` in it is written `\$`.
 af_code() {
   local term paths
   case "$1" in
@@ -545,6 +561,8 @@ EOF
   esac
 }
 
+# The default action. READ-ONLY: every managed entry with its STIG id, the ExpectedStatus it
+# answers ([O], [NR], [NA]) and its one-line reason, then how many entries the file holds.
 cmd_show() {
   printf '\n  portable answer-file entries managed by this script\n\n'
   local id stig why exp
@@ -564,6 +582,11 @@ cmd_show() {
   echo
 }
 
+# RUNBOOK 6.0 STEP 13c. Rewrites every entry af_entries() manages and leaves every other
+# Vuln ID exactly as it was. Keeps a timestamped .bak- copy beside the file first; -n prints
+# the same report and writes nothing. The XML is built by the python below: one Answer per
+# Vuln, ExpectedStatus from af_entries' 4th column (O when absent), ValidTrueStatus NF,
+# ValidFalseStatus O, and no ResultHash.
 cmd_generate() {
   # BOOTSTRAP FROM THE VENDOR TEMPLATE. On a from-scratch rebuild there is no answer file to
   # modify, and "no answer file at ..." would stop the rebuild at exactly the point where
@@ -591,6 +614,7 @@ cmd_generate() {
     [ -n "${id:-}" ] || continue
     # AF_ADMINS is substituted here, not inside the PowerShell, so the generated answer
     # file is self-contained and an assessor can read the list in the artefact.
+    # Each comma list becomes the body of a PowerShell array: a,b -> "a","b".
     af_code "$id" \
       | sed "s/__AF_ADMINS__/$(printf '%s' "$AF_ADMINS" | tr ',' ' ' | xargs -n1 printf '\"%s\",' | sed 's/,$//')/" \
       | sed "s/__AF_EMERGENCY__/$(printf '%s' "$AF_EMERGENCY" | tr ',' ' ' | xargs -n1 printf '\"%s\",' | sed 's/,$//')/" \
@@ -664,6 +688,9 @@ print("  written: %s  (%d entries)" % (af, len(root.findall('Vuln'))))
 PY
 }
 
+# READ-ONLY. Schema-validate against the vendor XSD when xmllint and the XSD are both here
+# (well-formedness only otherwise), count entries, and list any non-empty ResultHash - the
+# per-machine pin this script exists to remove.
 cmd_verify() {
   [ -f "$AF" ] || die "no answer file at $AF"
   if command -v xmllint >/dev/null 2>&1; then
@@ -691,6 +718,7 @@ cmd_verify() {
   fi
 }
 
+# Flags and the action may come in any order. -n only affects `generate`.
 while [ $# -gt 0 ]; do
   case "$1" in
     -n|--dry-run) DRY=1; shift ;;

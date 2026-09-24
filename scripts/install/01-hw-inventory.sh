@@ -13,6 +13,8 @@
 #   sudo ./01-hw-inventory.sh [-o REPORT]
 #
 set -uo pipefail
+# MACHINE: the pathfinder, and then EACH real host before its step-02 seed is written - the
+# disk and NIC facts are per machine (docs/02-host-install.md, host-params.env).
 
 REPORT="hw-inventory-$(hostname)-$(date -u +%Y%m%dT%H%M%SZ).txt"
 while getopts ":o:h" opt; do
@@ -24,6 +26,7 @@ while getopts ":o:h" opt; do
 done
 
 [[ $EUID -eq 0 ]] || { echo "run with sudo — some probes need root" >&2; exit 1; }
+# Everything below goes to the terminal AND to the report file - the hardware baseline.
 exec > >(tee "$REPORT") 2>&1
 
 rule() { printf '\n%s\n%s\n' "$1" "$(printf '=%.0s' $(seq ${#1}))"; }
@@ -49,6 +52,8 @@ if [[ -d /sys/firmware/efi ]]; then
 else
   echo "boot mode: BIOS/legacy  <-- the autoinstall template assumes UEFI (ESP + grub_device)"
 fi
+# Secure Boot state is recorded because TPM unlock depends on it: PCR 7 binds the boot chain
+# only when Secure Boot is on (runbook 6.3i.1, ssp-inputs.md 2.1).
 if command -v mokutil >/dev/null; then
   mokutil --sb-state 2>/dev/null || echo "secure boot: could not read"
 else
@@ -140,6 +145,8 @@ echo "-- default route --"
 ip route show default || echo "no default route"
 
 # ---------------------------------------------------------------------------- summary ------
+# NOTE: these REPLACE-ME names are the pathfinder-era template's. Step 02 now takes the same
+# facts from host-params.env (NIC_MATCH, OS_DISK_MATCH, DATA_DISK_MATCH) via 02-build-seed.sh.
 rule "Values to paste into 02-host-autoinstall/user-data"
 PRIMARY_IF="$(ip route show default 2>/dev/null | awk '{print $5}' | head -1)"
 echo "REPLACE-ME-interface   ->  ${PRIMARY_IF:-<no default route; pick from the list above>}"

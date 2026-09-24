@@ -2,6 +2,11 @@
 #
 # build-transfer-bundle.sh - step 1 of 3. RUNS ON STAGE-01.
 #
+#     MACHINE: stage-01. The three steps and where each runs:
+#       1 build-transfer-bundle.sh   stage-01     gather + hash the extras (this script)
+#       2 write-transfer-media.sh    build-01     pull mirror + extras onto the transfer SSD
+#       3 restore-mirror.sh          svc-repo-01  inside the gap: install, serve, prove
+#
 # Assembles everything that has to cross the air gap ALONGSIDE the apt mirror, and
 # verifies the mirror itself is complete enough to be worth carrying.
 #
@@ -172,6 +177,8 @@ copy_in() {  # copy_in <label> <src dir> <dest subdir> <glob>
   note "$label: $got file(s)"
 }
 
+# The keyrings that sign the Pro archives (ESM, FIPS, USG), and the PPA .debs - among them
+# contracts-airgapped and pro-airgapped - that the mirror itself can never serve.
 copy_in "signing keys" "$MIRROR_BASE/keys" keys '*.gpg'
 copy_in "airgap debs"  "$MIRROR_BASE/debs" debs '*.deb'
 # Snaps side-load as a .snap + .assert PAIR. A .snap without its assertion cannot be
@@ -254,6 +261,7 @@ if [ -f "$CONTRACTS" ] && [ ! -r "$CONTRACTS" ]; then
        sudo chown root:$(id -un) $CONTRACTS && sudo chmod 640 $CONTRACTS"
 fi
 if [ -f "$CONTRACTS" ]; then
+  # 0600 inside the bundle: it is a credential, not a config file.
   [ "$DRY" -eq 0 ] && install -m 0600 "$CONTRACTS" "$STAGING_DIR/config/"
   note "contracts config: present"
   # Rewritten aptURLs are the whole point of the file. If an entitlement we mirror still
@@ -283,6 +291,8 @@ if [ -f "$_VHOST" ] && [ "$DRY" -eq 0 ]; then
 fi
 if [ "$DRY" -eq 0 ]; then
   cp -a "$SCRIPT_DIR/restore-mirror.sh" "$STAGING_DIR/scripts/" 2>/dev/null || true
+  # The params travel too: restore-mirror.sh reads REPO_ROOT, REPO_ADDRESS and
+  # EXPECTED_SUITES from them on the far side. They hold paths and names, no secrets.
   cp -a "$PARAMS" "$STAGING_DIR/scripts/transfer-params.env" 2>/dev/null || true
   note "restore script + params: copied"
 
@@ -330,6 +340,8 @@ head2 "manifest"
 if [ "$DRY" -eq 1 ]; then
   note "DRY RUN - no manifest written"
 else
+  # Relative paths, so `sha256sum -c` works wherever the disk is mounted - write-transfer-
+  # media.sh checks it on build-01 and restore-mirror.sh again inside the gap.
   ( cd "$STAGING_DIR" && find . -type f ! -name MANIFEST.sha256 -print0 \
       | sort -z | xargs -0 sha256sum > MANIFEST.sha256 )
   note "$(wc -l < "$STAGING_DIR/MANIFEST.sha256") item(s) hashed -> $STAGING_DIR/MANIFEST.sha256"

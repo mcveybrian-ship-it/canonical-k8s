@@ -7,6 +7,9 @@
 #   sudo ./add-mirrored-ppa.sh --list                 what the mirror actually carries
 #   sudo ./add-mirrored-ppa.sh maas/3.7 --remove
 #
+# MACHINE: any in-gap machine that must install from a PPA the mirror (svc-repo-01) carries.
+# Runbook 4.4a. The fetches are https, so the enclave root CA must already be trusted.
+#
 # WHY THIS EXISTS:
 #
 #   Mirroring a PPA and being able to install from it are two different things, and the gap
@@ -41,6 +44,8 @@ ok()   { printf '  [ok] %s\n' "$*"; }
 warn() { printf '  [!]  %s\n' "$*"; }
 die()  { printf '\n  [x] %s\n\n' "$*" >&2; exit 1; }
 
+# --list: read-only. Walks the mirror's nginx autoindex two levels deep (owner/, then name/)
+# and prints each owner/name pair - the exact argument the install form takes.
 cmd_list() {
   say "PPAs carried by the mirror at $REPO_HOST:"
   # autoindex gives us plain hrefs; no pipeline into grep -q anywhere in this script.
@@ -80,6 +85,7 @@ main() {
   local list="/etc/apt/sources.list.d/${name}.sources"
   local keyring="/usr/share/keyrings/${owner}-ppa.gpg"
 
+  # --remove: delete the source file, then refresh apt so its lists stop naming the PPA.
   if [ "$remove" -eq 1 ]; then
     rm -f "$list"; ok "removed $list"
     say "the keyring at $keyring was left in place - other sources may use it"
@@ -110,11 +116,15 @@ main() {
       The key has to be mirrored alongside the archive. On stage-01 it lives in
       /srv/apt-mirror/keys/ and reaches the enclave in the transfer bundle."
     fi
+    # Download to .tmp and rename only on HTTP 200, so a failed fetch never leaves an error
+    # page at the keyring path for the -s test above to take as a real key next run. 0644: apt
+    # verifies as its unprivileged _apt user, which must be able to read it.
     mv "$keyring.tmp" "$keyring"; chmod 0644 "$keyring"
     ok "installed $keyring"
   else
     say "keyring already present: $keyring"
   fi
+  # Show the fingerprint: the one thing that tells a reader by eye which key apt now trusts.
   say "key: $(gpg --show-keys --with-colons "$keyring" 2>/dev/null | awk -F: '/^fpr:/{print $10; exit}')"
 
   # 3. Write the source, deb822 style to match everything else on these machines.

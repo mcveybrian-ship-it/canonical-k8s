@@ -2,6 +2,8 @@
 #
 # 00 — Fetch and verify the Ubuntu 24.04 base images.
 #
+#     MACHINE: stage-01 - "stage-ext" below is the runbook's generic name for that machine.
+#
 # Runs on the CONNECTED staging host (stage-ext). Downloads the Ubuntu Server ISO and the
 # Ubuntu Minimal cloud image, verifies both against their signed checksums, and writes a
 # manifest for the air-gap evidence trail.
@@ -79,10 +81,13 @@ import_cd_keys() {
 # --- download + verify ---------------------------------------------------------------------
 fetch() {
   local base="$1" file="$2"
+  # A file already present is NOT re-downloaded, but it is still checksummed by verify_set
+  # below - so a truncated earlier download fails there rather than being trusted.
   if [[ -f "$file" ]]; then
     echo "    already present, skipping: $file"
   else
     echo "    downloading $file"
+    # -f: an HTTP error fails here instead of saving the error page under the file's name.
     curl -fL --progress-bar -O "$base/$file" || die "download failed: $base/$file"
   fi
 }
@@ -129,12 +134,17 @@ if (( WANT_MINIMAL )); then
   fetch "$MINIMAL_BASE" "$MINIMAL_MANIFEST"
   fetch "$MINIMAL_BASE" "SHA256SUMS"
   fetch "$MINIMAL_BASE" "SHA256SUMS.gpg"
+  # "report", not "trusted": this list is signed by a key the script does not pin, so its
+  # signature is shown but NOT verified. Until that key is confirmed the image has a checksum
+  # and no proven origin - backlog B-00 (GPG check on the Ubuntu media) is still open.
   verify_set "SHA256SUMS" "$MINIMAL_IMG" report
   echo "    package count in image: $(wc -l < "$MINIMAL_MANIFEST")"
   popd >/dev/null
 fi
 
 # --- evidence manifest -----------------------------------------------------------------------
+# Hashes of the files as verified above, with the date and host that produced them. It travels
+# with the media: the first supply-chain artefact an assessor asks for (docs/00-downloads.md).
 say "Writing manifest"
 {
   echo "# Ubuntu 24.04 media manifest"

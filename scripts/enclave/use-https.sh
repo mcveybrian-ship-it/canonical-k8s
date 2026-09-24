@@ -16,6 +16,10 @@
 #   SAN, nginx not listening - then apt stops working on a machine that has no other route
 #   to a package. Inside an air gap that is not a small problem. So this verifies https
 #   works BEFORE editing anything, and restores the backup if apt fails afterwards.
+#
+# MACHINE: each enclave machine whose apt or pro still points at the repo over http - once per
+# box (runbook 2.9a, step 4). svc-repo-01 reads its own mirror via file:// and has nothing to
+# migrate. Needs the enclave root trusted first (`ca.sh trust` on that machine).
 set -euo pipefail
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -90,6 +94,8 @@ case "$code" in
   *)        die "https://$REPO_HOST/ returned '$code'" ;;
 esac
 
+# pro's contract_url moves only if it is set here AND the contracts server already answers
+# https with a 200 - the same prove-before-edit rule as apt.
 MIGRATE_PRO=0
 if [ -r "$UACONF" ] && grep -qE '^\s*contract_url:' "$UACONF"; then
   if code=$(curl -sS --max-time 8 -o /dev/null -w '%{http_code}' "https://$MGMT_HOST/v1/resources" 2>&1) \
@@ -118,6 +124,8 @@ fi
 [ "${#FILES[@]}" -eq 0 ] && [ "$MIGRATE_PRO" -eq 0 ] && { ok "already fully on https"; exit 0; }
 
 # ---------------------------------------------------------------- back up, then edit
+# One timestamped backup per run, 0700 under /root, each file at its full original path -
+# the layout that --rollback and the automatic undo below both copy back onto /.
 STAMP=$(date +%Y-%m-%dT%H%M%S)
 BDIR="$BACKUP_ROOT/$STAMP"
 install -d -m 0700 "$BDIR/files"
@@ -125,11 +133,14 @@ for f in "${FILES[@]}"; do cp -a --parents "$f" "$BDIR/files/"; done
 [ "$MIGRATE_PRO" -eq 1 ] && cp -a --parents "$UACONF" "$BDIR/files/"
 ok "backed up to $BDIR"
 
+# All three spellings (FQDN, short name, IP) become the single https://$REPO_HOST, so every
+# machine ends on the same URL.
 for f in "${FILES[@]}"; do
   sed -i -E "s#http://($PAT)#https://$REPO_HOST#g" "$f"
 done
 [ "${#FILES[@]}" -gt 0 ] && ok "rewrote ${#FILES[@]} apt file(s) to https://$REPO_HOST"
 
+# Only the contract_url line changes; the rest of uaclient.conf is left as it was.
 if [ "$MIGRATE_PRO" -eq 1 ]; then
   sed -i -E "s#^(\s*contract_url:).*#\1 https://$MGMT_HOST#" "$UACONF"
   ok "contract_url -> https://$MGMT_HOST"

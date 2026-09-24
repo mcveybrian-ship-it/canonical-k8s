@@ -40,6 +40,8 @@ die()  { printf '\n  [x] %s\n\n' "$*" >&2; exit 1; }
 # shellcheck disable=SC1090
 . "$ADDRS"
 : "${STAGE_01:?}" "${HOST_4:?}"
+# The foot is .160 on host-4's /24 - 10.2.20.160 today, the same host number stage-01 has on
+# staging. The subnet comes from the address file; the .160 is fixed in this line.
 STAGING_ADDR="$STAGE_01/24"
 ENCLAVE_FOOT="$(printf '%s' "$HOST_4" | cut -d. -f1-3).160/24"
 
@@ -52,6 +54,8 @@ check_forwarding() {
   else warn "ip_forward = $f - stage-01 IS ROUTING. Turn it off:  sudo sysctl -w net.ipv4.ip_forward=0"; return 1; fi
 }
 
+# Rewrite stage-01's second-NIC netplan file whole: staging address always, enclave foot only
+# for State A. No routes, so eth0 keeps the only default route.
 write_netplan() {
   local want_foot="$1" tmp; tmp=$(mktemp)
   {
@@ -69,11 +73,15 @@ write_netplan() {
     echo "        - $STAGING_ADDR"
     [ "$want_foot" = "yes" ] && echo "        - $ENCLAVE_FOOT"
   } > "$tmp"
+  # 0600: netplan warns when its config is readable by others. `generate` parses the file
+  # first, so a file that does not parse is never applied to the NIC.
   install -m 0600 "$tmp" "$NETPLAN"; rm -f "$tmp"
   netplan generate || die "netplan generate failed - $NETPLAN not applied"
   netplan apply
 }
 
+# status: read-only. State is inferred from whether the foot address is on the NIC; the
+# reachability line tells you whether the dmz cable is in. Runbook: "Moving between the states".
 cmd_status() {
   local has_foot="no"
   ip -br addr show "$NIC" 2>/dev/null | grep -q "${ENCLAVE_FOOT%/*}" && has_foot="yes"
@@ -93,6 +101,8 @@ cmd_status() {
   fi
 }
 
+# open: State A. Refuses while stage-01 forwards (it would become a router into the enclave),
+# then adds the foot. The cable is the operator's move, not the script's.
 cmd_open() {
   [ "$(id -u)" -eq 0 ] || die "run with sudo"
   check_forwarding || die "refusing to open State A while stage-01 is forwarding"
@@ -105,6 +115,8 @@ cmd_open() {
   say "  While in State A the enclave is NOT air-gapped. Nothing built now is accredited."
 }
 
+# close: State B. Removes the foot. The air gap itself is the unplugged dmz cable - this only
+# stops stage-01 from holding an enclave address; the ping that FAILS is the proof.
 cmd_close() {
   [ "$(id -u)" -eq 0 ] || die "run with sudo"
   say "Before closing, confirm everything the enclave needs is INSIDE it."

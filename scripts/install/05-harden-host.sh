@@ -38,6 +38,14 @@
 #     deliberate: the scan then describes the machine that exists, and a `grub-common`
 #     upgrade cannot drop the `--unrestricted` that `grubpw prep` adds later. Every
 #     FUTURE patch cycle still needs `grubpw status` and `fixups --verify` afterwards.
+#   - It does NOT cover every row of runbook 6.0. Still by hand once `run` completes:
+#     12f `stig-tailor.sh accounts create` (backlog 3.15 - two custodians type and seal the
+#     emergency password; reboot afterwards so its audit rule loads), 14 `stig-tools.sh
+#     collect` FROM stage-01, 15 a test that the machine still does its job, and 16
+#     `audit-volume.sh install`.
+#
+# STEP NUMBERS. The numbers this script prints (0, 1, 2, 3, 3b ...) are its own. Each step
+# function below names the runbook 6.0 row it implements.
 #
 # Runbook §6.0 is the reference. This is the execution.
 # =========================================================================================
@@ -136,6 +144,8 @@ need_reboot() {
 # the steps
 # =========================================================================================
 
+# runbook 6.0 steps 1-2: an admin who can sudo, and a second session left open - the only way
+# back in if usg fix breaks authentication (6.3a).
 step_preflight() {
   done_step preflight && return 0
   hdr "0. preconditions"
@@ -167,6 +177,8 @@ step_preflight() {
   mark_step preflight
 }
 
+# Not a 6.0 row - the host-prep prerequisites: /etc/hosts, the enclave trust anchors, apt at
+# the mirror (03-host-services.sh), plus the tools later steps would otherwise find missing.
 step_hostprep() {
   done_step hostprep && return 0
   hdr "1. host prep - hosts, trust anchor, apt"
@@ -207,6 +219,7 @@ step_hostprep() {
   mark_step hostprep
 }
 
+# runbook 6.0 step 4 (6.1): attach to the enclave contracts server, nothing enabled.
 step_pro() {
   done_step pro && return 0
   hdr "2. Ubuntu Pro attach"
@@ -231,6 +244,8 @@ step_pro() {
   mark_step pro
 }
 
+# runbook 6.0 step 5 (6.2): fips-updates, then a reboot onto the FIPS kernel. The SSP wording
+# for what this delivers is ssp-inputs.md 1.1-1.2 (suggested control SC-13).
 step_fips() {
   done_step fips && return 0
   hdr "3. FIPS"
@@ -251,6 +266,8 @@ step_fips() {
   need_reboot "FIPS is enabled but the FIPS kernel is not running yet."
 }
 
+# Not a 6.0 row (this script's step 3b): patch to the mirror's level after FIPS and before
+# hardening. Why, at length, inside.
 step_patch() {
   done_step patch && return 0
   hdr "3b. PATCH - before hardening, deliberately"
@@ -311,6 +328,7 @@ step_patch() {
   ok "no reboot required by the upgrade"
 }
 
+# runbook 6.0 step 6: enable usg and pin the versioned STIG profile it offers.
 step_usg() {
   done_step usg && return 0
   hdr "4. USG"
@@ -335,6 +353,7 @@ usg_tally() {  # prints "pass=N fail=N" from the newest report
     "$(grep -c '<result>fail</result>' "$r")" "$(basename "$r")"
 }
 
+# runbook 6.0 step 7: the unhardened audit - the BEFORE number of the evidence pair.
 step_baseline() {
   done_step baseline && return 0
   hdr "5. baseline audit - the BEFORE half of the evidence pair"
@@ -346,6 +365,8 @@ step_baseline() {
   mark_step baseline
 }
 
+# runbook 6.0 steps 8b + 8c: what usg fix would remove here (6.3f), and AIDE kept off the
+# bulk data BEFORE fix builds its database (6.3h). Stops for a human decision.
 step_prechecks() {
   done_step prechecks && return 0
   hdr "6. what 'usg fix' will remove, and keeping AIDE off the bulk data"
@@ -361,6 +382,7 @@ step_prechecks() {
   mark_step prechecks
 }
 
+# runbook 6.0 step 9: usg fix, then the mandatory reboot. Never re-run fix; audit instead.
 step_usgfix() {
   done_step usgfix && return 0
   hdr "7. usg fix - THIS CHANGES THE MACHINE"
@@ -369,6 +391,8 @@ step_usgfix() {
   need_reboot "usg fix has been applied and needs a reboot before anything is re-checked."
 }
 
+# runbook 6.0 steps 10, 11 and 12b: tailoring (6.3b), fixups (6.3c), ufw (6.3e), and chrony
+# pointed at the time master. The post-reboot proof of the fixups is in step_verify.
 step_tailor() {
   done_step tailor && return 0
   hdr "8. tailoring, fixups, ufw, time"
@@ -400,6 +424,7 @@ step_tailor() {
   mark_step tailor
 }
 
+# runbook 6.0 step 12b2 (6.3g.1).
 step_radio() {
   done_step radio && return 0
   hdr "8a. radios - WiFi and Bluetooth"
@@ -420,6 +445,8 @@ step_radio() {
   mark_step radio
 }
 
+# runbook 6.0 step 12c (6.3i): GRUB password, V-270675. prep FIRST, or GRUB demands the
+# password to boot (ssp-inputs.md 4.4).
 step_grub() {
   done_step grub && return 0
   hdr "9. GRUB password"
@@ -436,6 +463,7 @@ step_grub() {
   mark_step grub
 }
 
+# runbook 6.0 step 12d (10.1): the DISA V1R6 fixes usg fix does not make, then a reboot.
 step_v1r6() {
   done_step v1r6 && return 0
   hdr "10. DISA V1R6 mechanical fixes"
@@ -445,6 +473,8 @@ step_v1r6() {
        Both need a boot - a reload will not do it."
 }
 
+# After the last reboot: the --verify halves of steps 12 and 12d, the GRUB state, and no
+# failed units.
 step_verify() {
   done_step verify && return 0
   hdr "11. verify everything, after the last reboot"
@@ -460,6 +490,7 @@ step_verify() {
   mark_step verify
 }
 
+# runbook 6.0 step 13: the AFTER number, audited against the tailoring file.
 step_final_audit() {
   done_step final_audit && return 0
   hdr "12. final USG audit, against the tailoring file"
@@ -477,6 +508,7 @@ step_final_audit() {
   mark_step final_audit
 }
 
+# runbook 6.0 steps 13a-13b (10.1): Evaluate-STIG, the second scanner, against DISA V1R6.
 step_evalstig() {
   done_step evalstig && return 0
   hdr "13. Evaluate-STIG - the second scanner, DISA V1R6 content"

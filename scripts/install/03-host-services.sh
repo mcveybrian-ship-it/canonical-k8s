@@ -219,6 +219,9 @@ load_params() {
 }
 
 # =========================================================================================
+# apt - replace ubuntu.sources with ONE deb822 stanza naming the enclave mirror (MIRROR_URL,
+# svc-repo-01). The original is kept once as ubuntu.sources.pre-mirror. This host has no
+# default route, so the mirror is its only package source.
 cmd_apt() {
   need_root apt; load_params
   local f=/etc/apt/sources.list.d/ubuntu.sources
@@ -254,6 +257,9 @@ cmd_apt() {
 }
 
 # =========================================================================================
+# libvirt - qemu/KVM + libvirt from debs, NOT LXD (snap-only on core24, no FIPS channel -
+# START-HERE 'Decisions locked', runbook 2.6); the operator into libvirt+kvm; and libvirt's
+# own NAT network switched off, because guests belong on the bridge.
 cmd_libvirt() {
   need_root libvirt; load_params
   local pkgs="qemu-system-x86 libvirt-daemon-system libvirt-clients virtinst ovmf"
@@ -269,6 +275,8 @@ cmd_libvirt() {
     ok "installed"
   fi
 
+  # Best effort: libvirt is socket-activated on 24.04, so unit state proves little - verify
+  # asks virsh instead. /dev/kvm on the next line is the real gate.
   systemctl enable --now libvirtd >/dev/null 2>&1 || true
   [ -c /dev/kvm ] || die "/dev/kvm missing - check virtualisation is enabled in firmware"
 
@@ -296,6 +304,9 @@ cmd_libvirt() {
 }
 
 # =========================================================================================
+# datavg - carve DATA_LVS out of vg-data (the LUKS data disk the step-02 install created),
+# mkfs, and mount by UUID via fstab. Get DATA_LVS right the FIRST time: growing out of
+# 100%FREE later means shrinking a mounted ext4 (runbook 6.5).
 cmd_datavg() {
   need_root datavg; load_params
   vgs "$DATA_VG" >/dev/null 2>&1 || die "volume group '$DATA_VG' does not exist.
@@ -358,6 +369,9 @@ cmd_datavg() {
 }
 
 # =========================================================================================
+# bridge - move this host's address from its NIC onto BRIDGE_NAME (br0) so guests sit on the
+# enclave subnet. The one step that can strand the host (no BMC, LUKS console): interactive
+# only, run it inside tmux, applied with an auto-reverting netplan try (runbook 6.5).
 cmd_bridge() {
   need_root bridge; load_params
   local np=/etc/netplan/70-bridge.yaml
@@ -442,6 +456,7 @@ network:
       dhcp6: false
       addresses: [$BRIDGE_ADDRESS]$routes$dns
 YAML
+  # netplan warns about a config file readable by other users; keep it owner-only.
   chmod 600 "$np"
   ok "wrote $np"
 
@@ -469,6 +484,8 @@ YAML
 }
 
 # =========================================================================================
+# pool - a libvirt 'dir' storage pool at POOL_PATH (the datavg volume), started and set to
+# autostart. 03-compose-vm.sh writes every guest disk into it.
 cmd_pool() {
   need_root pool; load_params
   mkdir -p "$POOL_PATH"
@@ -509,6 +526,8 @@ cmd_hosts() {
   fi
 }
 
+# trustca - install every anchor in scripts/enclave/trust-anchors/ into the system store.
+# Runs BEFORE apt: an https mirror cannot be reached until its root is trusted.
 cmd_trustca() {
   need_root trustca
   # Delegates to ca.sh so there is ONE implementation of "what does this machine trust".
@@ -522,6 +541,8 @@ cmd_trustca() {
 
 
 # =========================================================================================
+# keyonly - SSH password authentication off, after proving a key is present. Do it LAST: a
+# mistake here on a host with no default route is a trip to the physical console.
 cmd_keyonly() {
   # No load_params: this step needs nothing from the params file, and requiring one would
   # stop it running on stage-01 and build-01, which have no services-params.env and are
@@ -590,6 +611,9 @@ CONF
 }
 
 # =========================================================================================
+# tmux - tmux, ncurses-term and the shared /etc/tmux.conf (the file composed VMs also get).
+# The bridge step and other long runs go inside tmux so a dropped SSH session cannot kill
+# them (runbook 6.5).
 cmd_tmux() {
   need_root tmux; load_params
   local pkgs="tmux ncurses-term"
@@ -620,6 +644,7 @@ cmd_tmux() {
 }
 
 # =========================================================================================
+# verify - read-only proof of the steps above; returns non-zero if anything is missing.
 cmd_verify() {
   load_params
   local fail=0
@@ -686,6 +711,8 @@ cmd_verify() {
 }
 
 # =========================================================================================
+# _assert_enclave_host refuses unless this machine holds one of HOST_1..4's addresses. Every
+# subcommand except tmux and verify runs it first.
 case "${1:-}" in
   apt)     _assert_enclave_host; cmd_apt ;;
   libvirt) _assert_enclave_host; cmd_libvirt ;;

@@ -15,6 +15,47 @@
 #     sudo ./stig-tailor.sh radio status      # what radios this machine has
 #     sudo ./stig-tailor.sh radio disable     # ... and block them
 #
+# EVERY SUBCOMMAND, IN THE ORDER A REBUILD RUNS THEM. The numbers are runbook section 6.0's
+# hardening table. scripts/install/05-harden-host.sh runs 8b-12d in this same order under its
+# own step names (step_prechecks, step_tailor, step_radio, step_grub, step_v1r6, step_verify,
+# step_final_audit), except that it runs the tailored `audit` once, at the end. 12f is run
+# by hand because it prompts for passwords.
+#
+#   8b   preflight                   READ-ONLY. What `usg fix` will remove, disable or strip
+#                                    (packages, services, NOPASSWD grants) - decide each
+#                                    collision BEFORE fix. runbook 6.3f
+#   8c   aide status                 READ-ONLY. What AIDE would hash here, measured on disk.
+#        aide exclude --apply        Seed the exclusion BEFORE `usg fix` builds the database,
+#                                    or it hashes the bulk data inside the fix run. 6.3h
+#   10   generate, then audit        Build the tailoring file from the INSTALLED benchmark plus
+#                                    the deviations() table, and audit against it. 6.3b
+#   11   fixups | --apply | --verify What `usg fix` leaves failing but could have fixed, each
+#                                    fixed at the layer that owns the value. 6.3c
+#   12   fixups --verify             Again after a reboot: the tmpfiles fix must survive one.
+#   12b  ufw | --apply               Per-machine firewall table; REFUSES where there is
+#                                    none. 6.3e
+#   12b2 radio status | disable      V-270755 / UBTU-24-600230, plus Bluetooth. 6.3g.1
+#   12c  grubpw prep, then set       V-270675 / UBTU-24-102000. `set` refuses until
+#                                    `prep` has run. 6.3i
+#   12d  v1r6 | --apply | --verify   DISA V1R6 residual `usg fix` does not touch. 10.1d
+#   12f  accounts create             Second named admin + console-only emergency account.
+#                                    backlog 3.15. `accounts status` proves it after the reboot
+#   12e  one reboot for 12-12f, then grubpw status, v1r6 --verify, fixups --verify, audit
+#
+#   NOT IN THE 6.0 TABLE - run when the situation calls for it:
+#   luksenroll [--method=clevis|systemd] [--force]
+#                                    TPM unlock of the LUKS root, physical hosts only, after
+#                                    first boot. runbook 6.3i.1, backlog 2.4
+#   usb status | enable [--minutes N] | disable
+#                                    host-4's logged, time-boxed USB storage window. 6.3g
+#   aide init                        Rebuild the AIDE database after an exclusion change.
+#                                    Hours on a large filesystem.
+#   show                             Print the deviation table and its justifications.
+#   accounts rotate [user]           New password; for the emergency account, after EVERY use.
+#
+#   AFTER EVERY PATCH CYCLE (05-harden-host.sh step_done): grubpw status before the reboot,
+#   fixups --apply, v1r6 --apply, reboot, then the --verify pair. Packages revert controls.
+#
 # TWO JOBS, DELIBERATELY IN ONE PLACE:
 #
 #   generate/audit - DEVIATIONS. Rules that cannot pass here, answered by tailoring.
@@ -114,6 +155,10 @@ EOF
 #     revisit date, do not deselect permanently.
 
 # ---------------------------------------------------------------------------- generate
+# RUNBOOK 6.0 STEP 10 (05-harden-host.sh step_tailor). Writes $OUT (/etc/usg/enclave-
+# tailoring.xml by default): usg's own generated tailoring for $PROFILE with each deviation
+# from deviations() applied in place and its WHY carried as an XML comment. Root, because it
+# writes under /etc/usg. Safe to re-run - it regenerates from whatever benchmark is installed.
 cmd_generate() {
   need_root
   command -v usg >/dev/null 2>&1 || die "usg is not installed - 'sudo pro enable usg' first"
@@ -250,6 +295,10 @@ cmd_generate() {
 }
 
 # ---------------------------------------------------------------------------- audit
+# RUNBOOK 6.0 STEP 10, and the FINAL audit after the last reboot (05-harden-host.sh
+# step_final_audit). `usg audit` against the tailoring file, so deviations are scored as
+# tailored rather than as failures. That result is the AFTER half of the evidence pair; the
+# BEFORE half is the untailored baseline audit taken at step 7.
 cmd_audit() {
   need_root
   [ -f "$OUT" ] || die "$OUT does not exist - run '$0 generate' first"
@@ -266,6 +315,8 @@ cmd_audit() {
 }
 
 # ---------------------------------------------------------------------------- show
+# READ-ONLY, no root. Prints deviations() with its machine scope, value and justification -
+# the answer to an assessor's "what did you tailor, where, and why" without opening the XML.
 cmd_show() {
   printf '\n  Enclave STIG deviations - profile %s\n\n' "$PROFILE"
   local me_show; me_show="$(hostname -s)"
@@ -300,6 +351,28 @@ cmd_show() {
 #                        carries no `create` line, so the mode comes back on rotation.
 #
 # So each fix goes in at the layer that owns the value, not on the file.
+#
+# WHERE IT RUNS: runbook 6.0 step 11 (plan, --apply, --verify) and step 12 (--verify again
+# after a reboot); 05-harden-host.sh step_tailor runs --apply then --verify. Every item is
+# idempotent, which is what makes it the post-patch re-assert as well as a build step.
+#
+# THE ITEMS, IN THE ORDER --apply RUNS THEM (the plan prints 0-8 first, then 0b-0d):
+#   0c  /usr/bin/journalctl to 740 - UBTU-24-700030; a systemd upgrade restores 755
+#   0d  journal machine-id directories back to 0640 - UBTU-24-700020
+#   0b  disable sssd / openipmi / fwupd-refresh where each provably has nothing to serve
+#   0a  /etc/ssh/ssh_config.d/*.conf back to 0644 - usg leaves them 0600 and ssh-out breaks
+#   0   evict backups and stray files from /etc/logrotate.d, which parses them as config
+#   1   wtmp/btmp/lastlog modes via a tmpfiles override - file_permissions_var_log_stig
+#   2   apt logs: logrotate `create` line + a dpkg Post-Invoke hook - same rule
+#   2b  sysstat UMASK, then DISA's find/chmod over /var/log - V-270756 / UBTU-24-700010
+#   2c  `create 0640 root adm` for the root-written logrotate stanzas - V-270756
+#   3   /var/log group syslog - file_groupowner_var_log (needs rsyslog: --with-rsyslog)
+#   4   rsyslog daemon.* selector, plus rotation for every rsyslog destination -
+#       rsyslog_remote_access_monitoring; `su` and `maxsize` so rotation actually runs
+#   5   postfix inet_interfaces = loopback-only (usg installs it listening on 0.0.0.0:25)
+#   6   sudo passwd_tries=1 - one faillock strike per sudo invocation, not three (6.3m)
+#   7   audit allocation sized from THIS machine's measured rate - V-270816
+#   8   comment out the pam_lastlog line that breaks every console login - backlog 3.28
 
 VARCONF_SRC=/usr/lib/tmpfiles.d/var.conf
 VARCONF_DST=/etc/tmpfiles.d/var.conf
@@ -419,6 +492,9 @@ pam_module_present() {
 PAM_LOGIN=/etc/pam.d/login
 pam_lastlog_line() { grep -nE '^[[:space:]]*session[[:space:]].*pam_lastlog\.so' "$PAM_LOGIN" 2>/dev/null || true; }
 
+# `fixups` with no flag. PLAN ONLY: measures each item's state on THIS machine and prints the
+# fix it would make. Changes nothing and needs no root, though root-only files (auditd.conf)
+# then read as unreadable rather than as a state.
 fixups_plan() {
   printf '\n  STIG fixups - what `usg fix` does not fix\n'
   local stray_list
@@ -599,6 +675,9 @@ fixups_plan() {
   printf '\n  nothing above has been changed. re-run with --apply\n\n'
 }
 
+# `fixups --apply` (root) makes the changes, item by item, each reporting for itself;
+# `fixups --verify` hands off to fixups_verify(); no flag prints the plan.
+# --with-rsyslog allows item 3 to install rsyslog from the enclave mirror.
 cmd_fixups() {
   local apply=0 with_rsyslog=0 verify=0
   while [ $# -gt 0 ]; do
@@ -892,6 +971,8 @@ cmd_fixups() {
   [ "$n_stray" -eq 0 ] || say "   -> $STIG_BACKUP_DIR"
 
   # ---- 1. tmpfiles: wtmp, btmp, lastlog -------------------------------------------------
+  # file_permissions_var_log_stig. An existing /etc copy is left alone, never overwritten;
+  # `fixups --verify` reports how far it has drifted from the vendor file instead.
   if [ ! -f "$VARCONF_SRC" ]; then
     warn "1. $VARCONF_SRC does not exist - has the layout changed? SKIPPED"
     failed=1
@@ -899,6 +980,7 @@ cmd_fixups() {
     say "1. $VARCONF_DST exists - leaving it alone. Edit it by hand or remove it first."
   else
     install -d -m 0755 /etc/tmpfiles.d
+    # The WHOLE vendor file, with only the mode column of the three `f` lines rewritten.
     sed -E 's#^(f /var/log/(wtmp|btmp|lastlog)[[:space:]]+)[0-7]{4}#\1'"$LOGMODE"'#' \
       "$VARCONF_SRC" > "$VARCONF_DST"
     chmod 0644 "$VARCONF_DST"
@@ -913,6 +995,7 @@ cmd_fixups() {
       warn "   contents. Inspect $VARCONF_SRC by hand."
       failed=1
     fi
+    # Apply the new modes now instead of waiting for the next boot to do it.
     systemd-tmpfiles --create 2>/dev/null || warn "   systemd-tmpfiles --create reported an issue"
   fi
 
@@ -923,6 +1006,8 @@ cmd_fixups() {
     say "2. $APT_LOGROTATE already has a 'create' line - adding the missing apt hook below"
   elif [ -f "$APT_LOGROTATE" ]; then
     backup_file "$APT_LOGROTATE"; local aptbak="$LAST_BACKUP"
+    # Add `create $LOGMODE root adm` after each stanza's `rotate 12` - the anchor is Ubuntu's
+    # stock apt stanza, which has one per log (history.log, term.log).
     sed -i -E "s/^([[:space:]]*)rotate 12$/\1rotate 12\n\1create $LOGMODE root adm/" "$APT_LOGROTATE"
     # Validated through $LOGROTATE_MAIN - see logrotate_config_ok() for why testing a
     # fragment on its own is the wrong thing to test.
@@ -1116,6 +1201,8 @@ EOF
   done
 
   # ---- 3. /var/log group ownership -------------------------------------------------------
+  # file_groupowner_var_log. The group only exists with rsyslog, so the choice is install it
+  # (--with-rsyslog) or leave the rule failing - never `groupadd syslog` (see the plan).
   if getent group syslog >/dev/null 2>&1; then
     # Usually a no-op: rsyslog's postinst already runs `chgrp syslog /var/log; chmod g+w`.
     # Kept because the rule is about the END STATE - a machine can arrive here with the group
@@ -1139,6 +1226,8 @@ EOF
   fi
 
   # ---- 4. rsyslog selectors (only relevant once rsyslog is installed) -------------------
+  # rsyslog_remote_access_monitoring - the three selector regexes are RE_AUTH/RE_AUTHPRIV/
+  # RE_DAEMON above, copied from the benchmark's OVAL.
   if ! command -v rsyslogd >/dev/null 2>&1; then
     say "4. rsyslog not installed - rule is notapplicable, nothing to do"
   elif rsyslog_selector_present "$RE_DAEMON"; then
@@ -1163,6 +1252,8 @@ EOF
 daemon.*                        -$DAEMON_LOG
 EOF
     chmod 0644 "$RSYSLOG_STIG"
+    # `rsyslogd -N1` checks the whole configuration without starting a daemon; the restart
+    # that loads the drop-in only happens once it passes.
     if rsyslogd -N1 >/dev/null 2>&1; then
       systemctl restart rsyslog && ok "4. wrote $RSYSLOG_STIG (daemon.* -> $DAEMON_LOG)"
     else
@@ -1204,6 +1295,8 @@ EOF
       if grep -rqF "$d" /etc/logrotate.conf /etc/logrotate.d/ 2>/dev/null; then continue; fi
       missing=$((missing + 1))
       backup_file "$RSYSLOG_LOGROTATE"; local rsbak="$LAST_BACKUP"
+      # Append the path on the line after /var/log/syslog - i.e. into the file list of
+      # Ubuntu's rsyslog stanza, so it inherits that stanza's rotation settings.
       sed -i "\#^/var/log/syslog\$#a $d" "$RSYSLOG_LOGROTATE"
       if ! logrotate_config_ok; then
         cp -a "$rsbak" "$RSYSLOG_LOGROTATE"
@@ -1248,6 +1341,8 @@ EOF
     local vlgroup; vlgroup="$(stat -c %G /var/log 2>/dev/null || echo root)"
     if [ "$vlgroup" != root ] && ! grep -qE '^[[:space:]]*su[[:space:]]' "$RSYSLOG_LOGROTATE"; then
       backup_file "$RSYSLOG_LOGROTATE"; local sbak="$LAST_BACKUP"
+      # Insert `su root <group>` above the FIRST `rotate` line only (0,/re/ is GNU sed's
+      # first-match range), i.e. inside the stanza's braces.
       sed -i "0,/^[[:space:]]*rotate[[:space:]]/s//\tsu root $vlgroup\n&/" "$RSYSLOG_LOGROTATE"
       if ! logrotate_config_ok; then
         cp -a "$sbak" "$RSYSLOG_LOGROTATE"
@@ -1270,6 +1365,7 @@ EOF
     # quiet machines keep weekly rotation and noisy ones stop before the disk does.
     if ! grep -qE '^[[:space:]]*maxsize' "$RSYSLOG_LOGROTATE"; then
       backup_file "$RSYSLOG_LOGROTATE"; local mbak="$LAST_BACKUP"
+      # Same first-match insertion as the `su` line above.
       sed -i '0,/^[[:space:]]*rotate[[:space:]]/s//\tmaxsize 100M\n&/' "$RSYSLOG_LOGROTATE"
       if ! logrotate_config_ok; then
         cp -a "$mbak" "$RSYSLOG_LOGROTATE"
@@ -1290,6 +1386,8 @@ EOF
     if [ "$cur" = "loopback-only" ]; then
       say "5. postfix already loopback-only"
     else
+      # `postconf -e` edits main.cf in place; inet_interfaces only changes on a RESTART - a
+      # reload does not re-bind listeners. Then re-measured with ss, not trusted.
       postconf -e 'inet_interfaces = loopback-only' \
         && systemctl restart postfix 2>/dev/null
       local new; new="$(postconf -h inet_interfaces 2>/dev/null || echo '?')"
@@ -1409,6 +1507,8 @@ SUDOERS
         local new_max=$(( need_mb / 8 ))
         [ "$new_max" -lt 8 ] && new_max=8
         cp -a "$ACONF" "/var/backups/auditd.conf.$(date +%Y%m%dT%H%M%S)"
+        # num_logs is pinned at 8 and max_log_file (MB per file) carries the size, so the
+        # allocation is max_log_file x 8. Only existing lines are rewritten - none are added.
         sed -i -e "s/^max_log_file[[:space:]]*=.*/max_log_file = ${new_max}/" \
                -e "s/^num_logs[[:space:]]*=.*/num_logs = 8/" "$ACONF"
         # auditd re-reads its configuration on SIGHUP. `systemctl restart auditd` is REFUSED
@@ -1465,6 +1565,10 @@ SUDOERS
   say "verify with:  sudo $0 fixups --verify   then re-audit"
 }
 
+# `fixups --verify` - runbook 6.0 steps 11 and 12, and 05-harden-host.sh step_verify.
+# READ-ONLY re-check of END STATE, not of what the last --apply did: modes, groups, hooks,
+# selectors, logrotate, sudo, console PAM, postfix. Run it with sudo - the logrotate check
+# is skipped unprivileged. It prints its verdict and RETURNS 0 EITHER WAY.
 fixups_verify() {
   local fail=0
   printf '\n  verifying\n'
@@ -1615,6 +1719,10 @@ fixups_verify() {
 # NOT `usb_storage`. Blocking only usb_storage would leave a UAS enclosure working - the
 # control would look applied and not be - and enabling only usb_storage would leave the SSD
 # undetected while apparently permitted. Handle both, always.
+#
+# WHERE IT RUNS: not a runbook 6.0 step - `usg fix` already blocks USB storage everywhere.
+# This is the operating procedure for host-4's transfer and backup windows (runbook 6.3g;
+# vm-backup.sh points at it). Rule: kernel_module_usb-storage_disabled. ssp-inputs 4.1.
 # Module names for load/unload (modprobe accepts either spelling; these are the canonical
 # in-kernel names as they appear in lsmod).
 USB_MODULES="usb_storage uas"
@@ -1923,6 +2031,9 @@ initramfs_has() {
   return 1
 }
 
+# rebuild_initramfs [path-inside-initrd] - this function's header is the "ONE IMPLEMENTATION
+# OF REBUILD THE INITRAMFS, AND PROVE IT" block above initramfs_has(); the two headers sit
+# together there. Used by `radio` and `luksenroll` (clevis).
 rebuild_initramfs() {
   local want="${1:-}"                       # path INSIDE the initramfs, no leading slash
   local kver; kver="$(uname -r)"
@@ -2077,6 +2188,7 @@ radio_block_files() {
     /etc/modprobe.d /run/modprobe.d /usr/lib/modprobe.d 2>/dev/null | sort -u
 }
 
+# Append-only evidence of every block and unblock, like usb_log: when, what, and who (sudo).
 radio_log() {
   printf '%s  %-8s by=%s  %s\n' "$(date -Is)" "$1" "${SUDO_USER:-$(id -un)}" "${2:-}" \
     >> "$RADIO_LOG" 2>/dev/null \
@@ -2084,6 +2196,15 @@ radio_log() {
   chmod 0640 "$RADIO_LOG" 2>/dev/null || true
 }
 
+# RUNBOOK 6.0 STEP 12b2 (05-harden-host.sh step_radio runs status, disable, status).
+#   status   read-only: hardware, DISA's check beside the phy80211 check, block, initramfs
+#   disable  root: write the block to /etc AND /usr/lib/modprobe.d, rebuild the initramfs,
+#            unload the module chain. Nothing to do on a machine with no radio (every VM)
+#   enable   root: removes the /etc block file and logs V-270755 as open. It does NOT remove
+#            the /usr/lib/modprobe.d copy; its closing "other files may still block" line
+#            lists what is still blocking
+# The answer-file entry for V-270755 (answerfile.sh) re-checks this block at every scan.
+# ssp-inputs 4.1a.
 cmd_radio() {
   local action="${1:-status}"
   local mods prot clash m i disa left
@@ -2358,6 +2479,9 @@ _count_lines() {
 grubpw_pw_count()        { _count_lines '^password_pbkdf2' "$GRUB_CUSTOM"; }
 grubpw_su_count()        { _count_lines '^set superusers' "$GRUB_CUSTOM"; }
 
+# RUNBOOK 6.0 STEP 12c (05-harden-host.sh step_grub: prep, then set). Needs a reboot, batched
+# at 12e. `status` is read-only and belongs in every post-patch check too, because a
+# grub-common upgrade replaces 10_linux and drops --unrestricted (ssp-inputs 4.4).
 cmd_grubpw() {
   local action="${1:-status}"
   local me; me="$(hostname -s)"
@@ -2396,6 +2520,7 @@ cmd_grubpw() {
       # --unrestricted there covers every generated entry rather than one of them.
       grep -n '^CLASS=' "$GRUB_10_LINUX" | sed 's/^/       before: /'
       backup_file "$GRUB_10_LINUX"
+      # Insert " --unrestricted" just before the closing quote of the CLASS="..." line.
       sed -i -E 's|^(CLASS=".*)(")$|\1 --unrestricted\2|' "$GRUB_10_LINUX"
       grep -n '^CLASS=' "$GRUB_10_LINUX" | sed 's/^/       after:  /'
       if ! grubpw_unrestricted_ok; then
@@ -2467,6 +2592,8 @@ cmd_grubpw() {
         die "the password line has NO HASH - restored. This would accept any password."
       fi
 
+      # update-grub regenerates /boot/grub/grub.cfg from /etc/grub.d - the file GRUB reads.
+      # Nothing edited above has any effect at boot until this succeeds.
       local ug_out ug_rc=0
       ug_out="$(update-grub 2>&1)" || ug_rc=$?
       printf '%s\n' "$ug_out" | sed 's/^/       /'
@@ -2646,6 +2773,14 @@ v1r6_journal_reallywrong() {
        \( ! -group root -o -perm /0027 \) 2>/dev/null || true
 }
 
+# RUNBOOK 6.0 STEP 12d (05-harden-host.sh step_v1r6 runs --apply, step_verify runs --verify).
+# Runs BEFORE the first Evaluate-STIG scan so the scan measures the residual, not these.
+#   (none)    plan: DISA's check for each control, and the fix it would make
+#   --apply   root: make the fixes; audit=1 and new audit rules need a REBOOT (batched at 12e)
+#   --verify  the plan, scored: returns 1 while anything is outstanding, so it can gate
+# Controls handled: V-270645, V-270750, V-270699, V-270714, V-270676, V-274870, V-270757 /
+# V-270762. Re-run --apply after every patch cycle (05-harden-host.sh step_done): a PAM
+# package upgrade reinstates nullok.
 cmd_v1r6() {
   local apply=0 verify=0
   while [ $# -gt 0 ]; do
@@ -2754,6 +2889,8 @@ cmd_v1r6() {
         for f in /etc/pam.d/common-auth /usr/share/pam-configs/unix; do
           [ -f "$f" ] || continue
           backup_file "$f"
+          # Delete every " nullok" token (with its leading whitespace), leaving the rest of
+          # each pam_unix line exactly as it was.
           sed -i 's/[[:space:]]\{1,\}nullok//g' "$f"
         done
         # DEBIAN_FRONTEND=noninteractive, AND DO NOT SWALLOW THE OUTPUT.
@@ -2810,6 +2947,8 @@ cmd_v1r6() {
       backup_file /etc/default/grub
       local gl
       for gl in GRUB_CMDLINE_LINUX_DEFAULT GRUB_CMDLINE_LINUX; do
+        # Append audit=1 inside the closing quote of the line if it lacks it; add the whole
+        # line if the variable is not set at all.
         if grep -qE "^$gl=" /etc/default/grub; then
           grep -qE "^$gl=.*audit=1" /etc/default/grub \
             || sed -i -E "s|^($gl=\")(.*)(\")|\\1\\2 audit=1\\3|" /etc/default/grub
@@ -2937,6 +3076,8 @@ RULES
           failed=1
         fi
       fi
+      # augenrules merges /etc/audit/rules.d/*.rules into audit.rules and loads the result.
+      # Its exit status is ignored on purpose: the live `auditctl -l` check below is the test.
       augenrules --load >/dev/null 2>&1 || true
       if v1r6_cron_audit_ok; then
         ok "   loaded live"
@@ -3019,6 +3160,8 @@ z /var/log/journal 0640 root systemd-journal - -
 Z /var/log/journal/%m ~0640 root systemd-journal - -
 TMPF
       chmod 0644 "$V1R6_JOURNAL_TMPFILES"
+      # Apply it now. The global form is used here; `fixups` item 0d names the file instead,
+      # because on host-1 the global form left the machine-id directory at 2755.
       systemd-tmpfiles --create >/dev/null 2>&1 || true
       v1r6_journal_dirs | sed 's/^/       now: /'
       local badf really; badf="$(v1r6_journal_badfiles)"; really="$(v1r6_journal_reallywrong)"
@@ -3210,6 +3353,14 @@ aide_du_bytes() {
 
 aide_human() { numfmt --to=iec --suffix=B "${1:-0}" 2>/dev/null || echo "${1:-0}"; }
 
+# RUNBOOK 6.0 STEP 8c (05-harden-host.sh step_prechecks runs `aide exclude --apply`).
+#   status             read-only: the fragment, the table, and anything >AIDE_BIG_GB in scope
+#   exclude            plan: print the fragment it would write
+#   exclude --apply    root: write $AIDE_FRAGMENT, then say whether the database is now stale
+#   init               root: rebuild the database with aideinit - hours; refuses without the
+#                      fragment
+# Why it matters beyond the fix-run time: V-270650 (UBTU-24-100110) runs a full aide --check,
+# and on host-4 hashing /mnt/vmbackup blew the scanner's 15-minute per-rule timeout.
 cmd_aide() {
   local action="${1:-status}" apply=0
   shift || true
@@ -3423,6 +3574,8 @@ cmd_aide() {
       say "excluded: $(grep -c '^!' "$AIDE_FRAGMENT") path(s)"
       local t0 t1
       t0=$(date +%s)
+      # Debian's wrapper around `aide --init`. -y overwrites aide.db.new and -f replaces an
+      # existing $AIDE_DB, both without asking (aide-common's own usage text).
       aideinit -y -f
       t1=$(date +%s)
       ok "aideinit finished in $(( (t1 - t0) / 60 ))m $(( (t1 - t0) % 60 ))s"
@@ -3453,6 +3606,9 @@ cmd_aide() {
 #
 # This does not decide anything. It tells you what to decide.
 
+# RUNBOOK 6.0 STEP 8b (05-harden-host.sh step_prechecks: a failure here stops the build
+# before `usg fix`, and the operator must confirm the collisions were read). READ-ONLY. Run
+# it with sudo: unprivileged, the NOPASSWD check cannot read /etc/sudoers.d and says so.
 cmd_preflight() {
   local me; me="$(hostname -s)"
   command -v usg >/dev/null 2>&1 \
@@ -3686,6 +3842,10 @@ svc-mgmt-01	9100/tcp	limit	__SVC_OBS_01__	node-exporter, source-restricted to th
 EOF
 }
 
+# RUNBOOK 6.0 STEP 12b (05-harden-host.sh step_tailor runs it LAST, then stops for an off-box
+# reachability check). usg rules check_ufw_active, set_ufw_default_rule, ufw_rate_limit;
+# the DISA side is V-270754. No flag = plan (read-only); --apply = root, rebuilds the whole
+# rule set from ufw_rules() and enables ufw. Refuses on a machine with no table.
 cmd_ufw() {
   local apply=0 me; me="$(hostname -s)"
   while [ $# -gt 0 ]; do
@@ -3813,8 +3973,11 @@ cmd_ufw() {
   printf '%s\n' "$mine" | awk -F'\t' '$2 ~ /^22\// {found=1} END {exit !found}' \
     || die "the table for $me has no rule for 22 - refusing to enable ufw"
 
+  # Start from an EMPTY rule set, so what is live afterwards is exactly the table - no rule
+  # left over from a hand edit. --force skips ufw's interactive confirmation.
   ufw --force reset >/dev/null 2>&1 || true
   ufw default deny incoming >/dev/null   # set_ufw_default_rule
+  # Outbound stays open: the table, and the ufw rules above, govern INBOUND listeners only.
   ufw default allow outgoing >/dev/null
   local port action src why
   while IFS=$'\t' read -r _ port action src why; do
@@ -3833,6 +3996,8 @@ cmd_ufw() {
     fi
   done < <(printf '%s\n' "$mine")
 
+  # --force skips the "may disrupt existing ssh connections" prompt - safe only because the
+  # 22/tcp rule was proven present above. check_ufw_active.
   ufw --force enable >/dev/null && ok "ufw enabled"
   say ""
   ufw status verbose | sed 's/^/  /'
@@ -3942,6 +4107,7 @@ cmd_luksenroll_clevis() {
   # 2026-09-16. Remove it where it appears, and back the file up first - it is the boot path.
   if grep -q 'tpm2-device=' /etc/crypttab; then
     cp -a /etc/crypttab "/var/backups/crypttab.$(date +%Y%m%dT%H%M%S)"
+    # Three forms, so the option comes out cleanly wherever it sits in the comma list.
     sed -i -e 's/,tpm2-device=auto//g' -e 's/tpm2-device=auto,//g' -e 's/[[:space:]]tpm2-device=auto$//' /etc/crypttab
     ok "removed the inert tpm2-device= option from /etc/crypttab (clevis does not use it)"
   fi
@@ -3962,6 +4128,12 @@ cmd_luksenroll_clevis() {
   say  "   boot - seeing that still needs a BMC (backlog 1.1, 2.8)."
 }
 
+# NOT A RUNBOOK 6.0 STEP: runbook 6.3i.1, physical hosts only, once after first boot, for a
+# host built with LUKS_UNLOCK=tpm2. Proven on all four hosts with the clevis default
+# (backlog 2.4). Everything below the `case` is the --method=systemd path, kept for a stack
+# whose initramfs carries systemd-cryptsetup. NOTE: only that path reads the build's choice
+# from /etc/enclave-build-info (its step 2); the clevis default does not consult it.
+# ssp-inputs 2.1 states the trade: defeats a stolen disk, not a stolen chassis.
 cmd_luksenroll() {
   need_root
   local force=0 dev slot_count method=clevis
@@ -4243,6 +4415,13 @@ cmd_luksenroll() {
 # build, ADMIN2_PASSWORD_HASH / BREAKGLASS_PASSWORD_HASH may carry a pre-made SHA512 crypt
 # instead; nothing else is ever read from a file.
 #
+# WHERE IT RUNS: runbook 6.0 step 12f, by hand on every machine (05-harden-host.sh does not
+# call it - it prompts for passwords). Before the 12e reboot, because audit is immutable
+# after `usg fix` and the breakglass rule only loads at boot. ssp-inputs 2.1b.
+#   status   read-only (sudo for the real numbers): accounts, expiry, faillock, sshd, audit
+#   create   root: both accounts and every control around them; re-run to re-assert
+#   rotate   root: new password for one account, default the emergency one
+#
 # PARAMETERS (environment):
 #   ADMIN2_USER          required for create - the second admin's username. Read from
 #                        facility-profile.env (a site fact); environment overrides. No script
@@ -4356,14 +4535,19 @@ cmd_accounts() {
       local groups; groups="$(id -nG "$REFERENCE_ADMIN" | tr ' ' '\n' | grep -vx "$REFERENCE_ADMIN" | paste -sd, -)"
       if getent passwd "$ADMIN2_USER" >/dev/null; then
         ok "$ADMIN2_USER exists - groups and key re-applied, password left alone (use: accounts rotate)"
+        # -a APPENDS: adds any missing group, never removes one the account already has.
         usermod -aG "$groups" "$ADMIN2_USER"
       else
+        # -m home directory (it holds .ssh), bash (an interactive admin, not a nologin service
+        # account), -G the reference admin's supplementary groups computed above.
         useradd -m -s /bin/bash -G "$groups" "$ADMIN2_USER" || die "useradd $ADMIN2_USER failed"
         ok "created $ADMIN2_USER with groups $groups"
         acct_set_password "$ADMIN2_USER" "${ADMIN2_PASSWORD_HASH:-}"
       fi
       if [ -n "${ADMIN2_KEY:-}" ]; then
         local h; h="$(getent passwd "$ADMIN2_USER" | cut -d: -f6)"
+        # 700 / 600, owned by the user: sshd's StrictModes ignores authorized_keys when the
+        # file or its directory is writable by anyone else. The key is added only if absent.
         install -d -m 700 -o "$ADMIN2_USER" -g "$ADMIN2_USER" "$h/.ssh"
         grep -qxF "$(cat "$ADMIN2_KEY")" "$h/.ssh/authorized_keys" 2>/dev/null \
           || cat "$ADMIN2_KEY" >> "$h/.ssh/authorized_keys"
@@ -4375,6 +4559,8 @@ cmd_accounts() {
       if getent passwd "$BREAKGLASS_USER" >/dev/null; then
         ok "$BREAKGLASS_USER exists - controls re-applied, password left alone (use: accounts rotate)"
       else
+        # sudo and no other group: it exists to recover the machine - `faillock --reset` for a
+        # locked-out admin is the case it was made for.
         useradd -m -s /bin/bash -G sudo "$BREAKGLASS_USER" || die "useradd $BREAKGLASS_USER failed"
         ok "created $BREAKGLASS_USER (group: sudo)"
         say "   TWO CUSTODIANS: choose it, type it, seal it for THIS machine ($(hostname -s)) only."
@@ -4383,6 +4569,7 @@ cmd_accounts() {
       # NO EXPIRY, explicitly. useradd applied login.defs (max 60) and useradd's INACTIVE (35)
       # at creation; left alone, the sealed password dies at ~95 days. V-270682 exempts
       # emergency accounts from scheduled expiration - see the header.
+      # -M 99999 no maximum password age, -I -1 no inactivity lock, -E -1 no account expiry.
       chage -M 99999 -I -1 -E -1 "$BREAKGLASS_USER"
       local bh; bh="$(getent passwd "$BREAKGLASS_USER" | cut -d: -f6)"
       if [ -s "$bh/.ssh/authorized_keys" ]; then
@@ -4394,12 +4581,14 @@ cmd_accounts() {
       # reload is how a remote machine loses SSH for everyone.
       printf '# backlog 3.15 - the emergency account is console-only. Written by stig-tailor.sh accounts.\nDenyUsers %s\n' \
         "$BREAKGLASS_USER" > "$BG_SSHD_DROPIN.new"
+      # Written as .new and renamed, so sshd never reads a half-written file.
       chmod 600 "$BG_SSHD_DROPIN.new"; mv "$BG_SSHD_DROPIN.new" "$BG_SSHD_DROPIN"
       if ! sshd -t 2>/dev/null; then
         sshd -t 2>&1 | sed 's/^/       /'
         rm -f "$BG_SSHD_DROPIN"
         die "sshd -t failed with the drop-in - REMOVED it, sshd not reloaded"
       fi
+      # reload = re-read the config in place. The unit is `ssh` on Ubuntu, `sshd` elsewhere.
       systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || warn "sshd reload failed - reload it by hand"
       case ",$(sshd -T 2>/dev/null | awk '$1=="denyusers"{print $2}')," in
         *",$BREAKGLASS_USER,"*) ok "sshd now refuses $BREAKGLASS_USER" ;;
@@ -4407,6 +4596,8 @@ cmd_accounts() {
       esac
 
       # audit: every command it runs, keyed by its UID.
+      # auid is the LOGIN uid, which survives sudo - so commands run as root after logging in
+      # as breakglass are still attributed to it. b64 and b32 both, or 32-bit execs escape.
       local uid; uid="$(id -u "$BREAKGLASS_USER")"
       printf '%s\n' "## backlog 3.15 - every command run by the emergency account, by login UID" \
         "-a always,exit -F arch=b64 -S execve -F auid=$uid -k breakglass" \
@@ -4418,6 +4609,7 @@ cmd_accounts() {
         warn "audit rules are IMMUTABLE (enabled 2): the breakglass rule is written but goes live only"
         warn "  at the next reboot. Until then the account is NOT audited - reboot before relying on it."
       else
+        # Merge rules.d into audit.rules and load it now (only possible while not immutable).
         local ar; ar="$(augenrules --load 2>&1)" || { printf '%s\n' "$ar" | sed 's/^/       /'; warn "augenrules --load failed - output above"; }
       fi
       acct_status
@@ -4429,6 +4621,7 @@ cmd_accounts() {
       getent passwd "$u" >/dev/null || die "$u does not exist here"
       [ "$u" = "$BREAKGLASS_USER" ] && say "   TWO CUSTODIANS: new password, new envelope for $(hostname -s); destroy the old one."
       acct_set_password "$u"
+      # Re-assert "never expires" after the change - the same chage flags as `create`.
       [ "$u" = "$BREAKGLASS_USER" ] && chage -M 99999 -I -1 -E -1 "$u"
       ok "$u: password expires in $(acct_days_left "$u") day(s)"
       ;;
@@ -4460,6 +4653,8 @@ else
   printf '  [!]  stig-tailor.sh revision UNKNOWN - no .pushed-from, no git. Re-push before trusting a plan from this copy.  [%s]\n' "$HERE" >&2
 fi
 
+# Dispatch. The one-line usage below is the only built-in help; the long form, with the
+# runbook 6.0 step for each subcommand, is the header at the top of this file.
 case "${1:-}" in
   generate) shift; cmd_generate "$@" ;;
   fixups)   shift; cmd_fixups "$@" ;;

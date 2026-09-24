@@ -8,6 +8,7 @@
 #     ./push-repo-to-host.sh 10.0.20.155 -k ~/.ssh/build01 -d ~/canonical-k8s
 #     ./push-repo-to-host.sh 10.2.20.162 --allow-dirty   # send HEAD even with local edits
 #     ./push-repo-to-host.sh 10.2.20.162 --allow-untracked   # leave uncommitted new scripts behind
+#     -u USER sets the remote account (default encadmin); REPO_PUSH_KEY replaces the -k default
 #
 # WHY THIS EXISTS RATHER THAN 'rsync -a' OR 'git clone':
 #
@@ -28,7 +29,7 @@ set -euo pipefail
 TARGET=""; KEY="${REPO_PUSH_KEY:-$HOME/.ssh/build01}"; DEST="canonical-k8s"; USER_NAME="encadmin"
 ALLOW_DIRTY=0; ALLOW_UNTRACKED=0
 
-usage() { sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+usage() { sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
 die()   { printf '\n  [x] %s\n\n' "$*" >&2; exit 1; }
 
 while [ $# -gt 0 ]; do
@@ -162,11 +163,15 @@ if ! _ssh_err="$(ssh "${SSH_OPTS[@]}" "$USER_NAME@$TARGET" true 2>&1)"; then
   esac
 fi
 
+# Regular files only (tar entries not ending in /), so it compares with `find -type f` below.
 N=$(git archive --format=tar HEAD | tar -t | grep -cv '/$')
 HEAD_SHA=$(git rev-parse --short HEAD)
 HEAD_WHEN=$(git log -1 --format=%cd --date=format-local:'%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo unknown)
 echo "  sending $N tracked file(s) at $HEAD_SHA ($HEAD_WHEN UTC) to $USER_NAME@$TARGET:$DEST_SHOW"
 
+# Streamed: the tar goes straight into ssh and is never written to local disk. It extracts
+# OVER the existing copy - changed files are replaced, but a file deleted from git stays on
+# the target until someone removes it.
 git archive --format=tar HEAD \
   | ssh "${SSH_OPTS[@]}" "$USER_NAME@$TARGET" \
       "mkdir -p '$DEST' && tar -x -C '$DEST'" \

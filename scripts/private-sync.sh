@@ -10,6 +10,13 @@
 #
 #   ./scripts/private-sync.sh pack                      # on the machine that has them
 #   ./scripts/private-sync.sh unpack -i <tarball>       # on the machine that needs them
+#   ./scripts/private-sync.sh backup                    # pack, copy off-machine, verify, rotate
+#
+#     MACHINE: stage-01 owns the repo and these files, so pack and backup run there - backup
+#     after ANY edit to one of them, because git status never shows it (CLAUDE.md). unpack
+#     runs on the clone that needs them, including the Windows copy under Git Bash. backup's
+#     default target is build-01 (10.2.10.124): a SECOND copy, not an offsite one - same
+#     network, same room. Parameters and restore: docs/airgap-media.md section 8.
 #
 # After unpack it verifies every restored path is still ignored by git, so the material
 # cannot be committed to the public origin by accident. That check is the point of the
@@ -318,6 +325,8 @@ case "$MODE" in
     if [ "$BACKUP_KEEP" -gt 0 ]; then
       echo
       echo "rotating (keeping $BACKUP_KEEP):"
+      # Runs ON the far end: newest first (ls -t), everything after the first BACKUP_KEEP is
+      # deleted. Only canonical-k8s-private-*.tar.gz in BACKUP_DIR is ever touched.
       # shellcheck disable=SC2086
       ssh $SSH_OPTS "$BACKUP_TARGET" "
         cd '$BACKUP_DIR' 2>/dev/null || exit 0

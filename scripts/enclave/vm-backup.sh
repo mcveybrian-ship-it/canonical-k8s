@@ -59,6 +59,12 @@
 # key, MAAS database), svc-harbor-01 (pushed images) and svc-obs-01 (Grafana database,
 # Prometheus history). Everything else in this enclave is rebuildable from the repo, and a
 # rebuild is better evidence than a restore.
+#
+# WHAT IT ADDRESSES: CP-9 (contingency-plan.md 4), CP-4 through restore-test (backlog 2.1,
+# contingency-plan.md 9.2), and the backup half of red flag 1.2 through second-copy. Not in
+# the list above: `facts`, which monitoring.sh facts calls to publish the backup metrics.
+#
+# RETENTION IS NOT BOUNDED IN TIME TODAY (backlog 3.27) - read the note above cmd_prune.
 # =========================================================================================
 set -euo pipefail
 
@@ -71,6 +77,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 [ -f "$HERE/enclave-addresses.env" ] && . "$HERE/enclave-addresses.env"
 
 DEST="${VM_BACKUP_DEST:-${BACKUP_DEST:-}}"
+# KEEP counts CHAINS (a full plus its incrementals), not sets and not days - see cmd_prune.
 KEEP="${BACKUP_KEEP_CHAINS:-2}"
 LUKS_UUID="${BACKUP_LUKS_UUID:-}"
 LUKS_NAME="${BACKUP_LUKS_NAME:-vmbackup}"
@@ -277,6 +284,8 @@ check_dest() {
 }
 
 # ---------------------------------------------------------------- status
+# status: read-only. Destination and whether it is a real mount, allocated size per domain
+# against free space, and the libvirt checkpoints the next incremental would build on.
 cmd_status() {
   assert_hypervisor
   printf '\n  VM backup on %s\n\n' "$(hostname -s)"
@@ -328,6 +337,9 @@ cmd_status() {
 }
 
 # ---------------------------------------------------------------- backup
+# One domain, one SET: a push-mode libvirt backup of every qcow2 disk into
+# $DEST/<domain>/<stamp>/, plus a new checkpoint chk-<stamp> for the next incremental to build
+# on. After the copy: DOMAIN.xml, MANIFEST.sha256 (the completion marker) and INFO.
 backup_one() {  # <domain> <full|incr>
   local dom="$1" mode="$2"
   local out="$DEST/$dom/$STAMP"
@@ -359,6 +371,9 @@ backup_one() {  # <domain> <full|incr>
     say "   not backed up: $t format=$f  $p"
   done
 
+  # The two XML documents backup-begin takes. domainbackup: push mode (qemu writes the files),
+  # <incremental> naming the previous checkpoint when there is one, one <target>.<mode>.qcow2
+  # per disk. domaincheckpoint: the checkpoint this run creates.
   bxml="$(mktemp)"; cxml="$(mktemp)"
   {
     printf '<domainbackup mode="push">\n'
@@ -458,6 +473,8 @@ backup_one() {  # <domain> <full|incr>
   return $rc
 }
 
+# full | incr: the destination checks, then free space against the ALLOCATED size of every
+# domain in scope, then backup_one per domain. Non-zero if any domain failed.
 cmd_backup() {  # <full|incr> [domain|all]
   need_root; assert_hypervisor; check_dest
   local mode="$1" target="${2:-all}" rc=0 list
@@ -616,6 +633,9 @@ mark_set_verified() {  # <setdir>
   chmod 0600 "$1/VERIFIED" 2>/dev/null || true
 }
 
+# verify [--all]: every set on the volume - qemu-img info on each disk (and check on fulls),
+# then MANIFEST.sha256 against the bytes that are actually there. By default only sets that
+# changed since they last passed; --all re-reads everything (the weekly timer).
 cmd_verify() {
   need_root; check_dest
   local all=0
@@ -752,6 +772,13 @@ cmd_verify() {
 }
 
 # ---------------------------------------------------------------- prune
+# WHAT PRUNE DOES NOT DO: bound retention in time (backlog 3.27, measured 2026-09-24). It
+# retires a chain only once KEEP newer FULLS exist - but the nightly unit runs `incr`, and a
+# full is taken only when a domain has no checkpoint (first run, the broken-bitmap fallback in
+# backup_one) or by hand. So chains are rarely closed, KEEP=2 retires almost nothing, and a
+# set - with every record in it - stays on this volume and in the second copy indefinitely.
+# The designed fix (an age-based full, BACKUP_FULL_MAX_DAYS, plus a hold switch and a disposal
+# log; ssp-inputs.md 2.8) is owed and not in this code.
 cmd_prune() {
   need_root; check_dest
   local dry=0
@@ -885,6 +912,9 @@ cmd_prune() {
 
 luks_dev() { printf '/dev/disk/by-uuid/%s\n' "$LUKS_UUID"; }
 
+# keyfile: one-time. A random key file under /etc/enclave (on this host's own encrypted root)
+# added as an extra LUKS keyslot on the backup volume, so reattach and the timer can unlock it
+# with no human. The existing passphrase keeps working.
 cmd_keyfile() {
   need_root
   [ -n "$LUKS_UUID" ] || die "BACKUP_LUKS_UUID is not set in vm-specs.env"
@@ -910,6 +940,8 @@ cmd_keyfile() {
   fi
 }
 
+# reattach: after a reboot. Open the USB window if needed, unlock (keyfile if present, else
+# passphrase), mount at $DEST, and re-block USB on exit whatever happened.
 cmd_reattach() {
   need_root; assert_hypervisor
   [ -n "$DEST" ] || die "no destination set"
@@ -1315,6 +1347,7 @@ cmd_second_copy() {
   target="$(second_host)"
   [ -n "$target" ] || die "no second-copy target. Set PLACE_BACKUP_SECOND in vm-specs.env (or BACKUP_SECOND_HOST) -
        empty means every backup lives only on this machine, which IS red flag 1.2."
+  # The target's address from enclave-addresses.env: host-1 -> $HOST_1.
   local avar; avar="$(echo "$target" | tr 'a-z-' 'A-Z_')"; addr="${!avar:-}"
   [ -n "$addr" ] || die "$target has no address in enclave-addresses.env"
 
@@ -1378,6 +1411,8 @@ cmd_second_copy() {
   # THIS machine propagates to the copy, which is why the copy is not the only control - the
   # weekly deep verify and the restore test are what make it trustworthy. BACKUP_SECOND_DELETE=0
   # keeps everything and accepts the growth.
+  # -a keeps modes and mtimes, and rsync's size+mtime check is what lets last night's unchanged
+  # sets be skipped; --partial lets an interrupted multi-GB file resume instead of restarting.
   local -a RS=(rsync -a --partial --human-readable -e "${SSH[*]}")
   [ "${BACKUP_SECOND_DELETE:-1}" = 0 ] || RS+=(--delete)
   [ "$dry" -eq 1 ] && RS+=(--dry-run --itemize-changes)
@@ -1511,6 +1546,8 @@ cmd_restore_test() {
   local tgt i prev flat
   for tgt in "${targets[@]}"; do
     prev="$work/$tgt.base.qcow2"
+    # Copies, never the sets themselves: the rebase below rewrites each incremental's header,
+    # and the backup volume must stay exactly as verified. --sparse keeps holes as holes.
     cp --sparse=always "$DEST/$dom/${chain[0]}/$tgt.full.qcow2" "$prev"
     i=0
     for sset in "${chain[@]:1}"; do
@@ -1534,6 +1571,7 @@ cmd_restore_test() {
     qemu-img check "$flat" >/dev/null || die "qemu-img check FAILED on the restored $tgt"
     ok "$tgt rebuilt from ${#chain[@]} set(s) and passes qemu-img check"
   done
+  # QEMU opens these as $QUSER, not root - the same reason as the backup targets above.
   chown -R "${QUSER}:${QGROUP}" "$work" 2>/dev/null || true
   t1="$(date +%s)"
 
@@ -1828,6 +1866,7 @@ cmd_facts() {
   } > "$tmp"
 
   if [ ! -s "$tmp" ]; then rm -f "$tmp"; warn "backup facts produced NO output - $out left alone"; return 1; fi
+  # Written beside the target and renamed into place, so node-exporter never reads half a file.
   chmod 0644 "$tmp"; mv -f "$tmp" "$out"
   ok "wrote $out ($(grep -vc '^#' "$out") samples)"
 }

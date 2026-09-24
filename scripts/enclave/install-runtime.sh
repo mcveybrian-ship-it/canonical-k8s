@@ -70,12 +70,16 @@ for d in dashboards trust-anchors csr-profiles; do
 done
 shopt -u nullglob
 
+# .source line 1 answers "which code is root running": the push stamp by default, the
+# checkout's own commit where git is present, with '-dirty' for uncommitted edits here.
 src="unknown"
 [ -r "$HERE/../../.pushed-from" ] && src="$(head -1 "$HERE/../../.pushed-from")"
 command -v git >/dev/null 2>&1 && git -C "$HERE" rev-parse --short HEAD >/dev/null 2>&1 \
   && src="$(git -C "$HERE" rev-parse --short HEAD)$(git -C "$HERE" diff --quiet HEAD -- . || echo '-dirty')"
 printf '%s\ninstalled %s from %s\n' "$src" "$(date -u +%FT%TZ)" "$HERE" > "$stage/.source"
 
+# root owns all of it; group and other may read and traverse, never write. The find at the
+# end proves no write bit survived.
 chown -R root:root "$stage"
 chmod -R u=rwX,go=rX "$stage"
 chmod 0755 "$stage"

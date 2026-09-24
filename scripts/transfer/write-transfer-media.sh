@@ -61,6 +61,7 @@ RSYNC_BWLIMIT="${RSYNC_BWLIMIT:-0}"
 # ConnectTimeout so an unreachable host fails in seconds rather than sitting through the
 # default TCP timeout with no output. build-01 spent two minutes looking dead on
 # 2026-09-04 because its params still named a pre-migration address.
+# accept-new: the first contact records stage-01's host key; a CHANGED key still refuses.
 SSH_CMD="ssh -i $SSH_KEY -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10"
 REMOTE="$STAGE_USER@$STAGE_HOST"
 
@@ -129,6 +130,9 @@ fi
 # hour-long job - every frame lands on its own. The first run produced a 10 MB log that was
 # unreadable and buried the two rsync errors that actually mattered. Ask for progress only
 # when stdout is a terminal.
+#
+# --delete: the SSD ends up an exact copy of what stage-01 staged, so a file removed there
+# does not cross the gap as a leftover from an earlier trip.
 if [ -t 1 ]; then
   RSYNC_OPTS=(-a --delete --human-readable "--info=progress2,stats1")
 else

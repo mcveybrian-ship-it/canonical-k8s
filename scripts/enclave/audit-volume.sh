@@ -26,6 +26,9 @@
 #
 # IT MEASURES, IT DOES NOT DECIDE. The retention period is the AO's answer, not ours; this
 # supplies the bytes-per-day that the answer gets multiplied by.
+#
+# WHAT IT FEEDS: the audit-offload capacity on svc-obs-01 (backlog N-2) and the measured rates
+# in iscm-strategy.md 2.4. Runbook 6.3d.
 # =========================================================================================
 set -euo pipefail
 
@@ -40,6 +43,7 @@ warn() { printf '  [!]  %s\n' "$*"; }
 die()  { printf '\n  [x] %s\n\n' "$*" >&2; exit 1; }
 need_root() { [ "$(id -u)" -eq 0 ] || die "run with sudo"; }
 
+# sample: one line appended to $LOG - ISO time, bytes under $TARGET, top-level file count.
 cmd_sample() {
   need_root
   install -d -m 0755 "$DIR"
@@ -59,6 +63,8 @@ cmd_sample() {
   ok "$(date -Is)  $bytes bytes  $files file(s)  -> $LOG"
 }
 
+# report: read-only. Growth per interval, the overall rate, and 30/90/365-day projections
+# from the busiest interval under two hours.
 cmd_report() {
   [ -f "$LOG" ] || die "no samples yet at $LOG - run: sudo $0 sample"
   local n; n="$(grep -c . "$LOG" 2>/dev/null)" || true
@@ -112,6 +118,8 @@ cmd_report() {
   printf '  usg fix run or a failed-login sweep. runbook 6.3d\n\n'
 }
 
+# install: refresh the root-owned runtime copy, then write and enable an hourly oneshot timer
+# that runs `sample` from it.
 cmd_install() {
   need_root
   # THE UNIT RUNS AS ROOT, SO IT RUNS A ROOT-OWNED COPY - backlog 3.11. This used to point at
@@ -143,6 +151,8 @@ RandomizedDelaySec=120
 WantedBy=timers.target
 EOF
   chmod 0644 "/etc/systemd/system/$UNIT".{service,timer}
+  # daemon-reload so systemd reads the new files; enable --now starts the timer and keeps it
+  # across reboots.
   systemctl daemon-reload
   systemctl enable --now "$UNIT.timer"
   ok "timer installed and started"
@@ -151,6 +161,7 @@ EOF
   systemctl list-timers "$UNIT.timer" --no-pager | sed 's/^/       /'
 }
 
+# status: read-only. Sample count, the log's mode, the last three samples, and the timer.
 cmd_status() {
   printf '\n  audit volume sampling on %s\n\n' "$(hostname -s)"
   if [ -f "$LOG" ]; then

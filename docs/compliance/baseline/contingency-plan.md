@@ -208,6 +208,12 @@ boundary produces a recovery site: a standby is a second enclave and a second AT
 Either the AO accepts single-site with no disaster recovery as a stated risk, or the programme
 funds a second site. There is no third answer (`poam.md` AO-19).
 
+✅ **Decided 2026-09-24: the acting AO ACCEPTED single-site as a stated risk** (`poam.md` AO-19). Mission
+continuity through a site loss rests on the programme's continuity plan, not on this system. The
+compensating measure is an **offsite encrypted backup copy** — alternate *storage* (CP-6), which is
+not alternate *processing* (CP-7) and does not keep the system running; it turns a lost site into a
+slow rebuild rather than a total loss. Owed as backlog 3.29, under `poam.md` AO-14's media custody.
+
 Accordingly, `«NONE or the alternate processing site and its agreement reference»` and
 `«NONE or the alternate storage site for backup media»` are answered per engagement, and in the
 lab both are NONE. **CP-7 is not satisfied and this plan does not claim it is.**

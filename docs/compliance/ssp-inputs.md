@@ -325,6 +325,20 @@ exactly one label. Source: runbook §2.9b · suggested controls SC-12, SC-8.
 
 ---
 
+### 2.7 ✅ PostgreSQL at rest is protected by LUKS beneath the VM, not pgcrypto — AO DECISION 2026-09-23
+
+> **V-261901, V-261930 and V-261931 (two CAT I) name `pgcrypto` as the at-rest mechanism. This
+> enclave substitutes full-disk encryption beneath the database VMs, and says so.**
+
+| | |
+|---|---|
+| Why not pgcrypto | It is **not inside any FIPS validation boundary**, and its `crypt()` / `gen_salt()` offer MD5 and DES, which fail at runtime under the FIPS OpenSSL provider (§1.1). Installing it to turn a checkbox green would add an unvalidated crypto path to the one tier holding PII. |
+| What protects the data | Every VM disk lives in the libvirt pool `/var/lib/libvirt/images`, which is **LVM on `crypt-data` (LUKS2, aes-xts-plain64) on the host's NVMe** — measured 2026-09-24 on `host-1` and `host-4`. The cipher runs in the kernel crypto API, **FIPS 140-3 certificate #5215** (§1.2). Unlock is TPM2 via clevis (§2.1). |
+| Why not LUKS *inside* each guest | The threat the rules address is data read from storage outside the running system — a pulled disk, a discarded drive. The host layer already defeats that. A second layer inside each guest defends against nothing further and gives every database VM its own unattended-unlock problem. |
+| Decided | Acting AO, 2026-09-23 (backlog 6a.9): LUKS at the disk layer beneath the VM, **stated as the substitute** for pgcrypto against those three rules. |
+| Owed at build (B-06a) | Verify that the `pg-01..03` system **and data** disks are allocated from the encrypted pool: `lsblk -s` of the backing LV must show `crypt`. Record it as the evidence for the three rules. |
+| Source | runbook §9a (pgcrypto note) · backlog 6a.9 · suggested controls **SC-28**, SC-28(1), SC-13 |
+
 ## 3. Availability and recovery — what is and is not claimed
 
 ### 3.1 🔴 The design survives a single host failure. It does not survive a site event.
@@ -722,6 +736,45 @@ Only shipping records out of the boundary closes it. Until that external system 
 is a documented partial with a stated exception.
 
 Source: `docs/open-questions.md` Q25 · suggested controls **AU-11**, AU-4, AU-9(2), AU-12(1).
+
+### 4.1j ✅ Database SRG — scoped, not applied wholesale (2026-09-24, backlog 6a.17)
+
+> **For the enclave's own PostgreSQL (`pg-01..03`) the Database SRG is NOT assessed as a
+> separate guide. It is covered by the product STIG (§4.1g) plus the 34 SRG requirements that
+> STIG has no child for. For Harbor's embedded PostgreSQL 18.3 the Database SRG applies IN
+> FULL, because no STIG covers that version.**
+
+| | |
+|---|---|
+| The double count avoided | Of the Database SRG's **142** requirements, **108** have a child rule in the Crunchy Data PostgreSQL 16 STIG V1R3. Assessing both would score the same setting twice. |
+| The 34 carried forward | Requirements with **no** STIG child, assessed directly from the SRG — including **2 CAT I**: V-206555 (password complexity) and V-206561 (obscured authentication feedback), and **21 Rev-5 additions**, V-263602 through V-263622. |
+| Why this is the SRG's own rule | The SRG applies *"when a product-specific STIG is not available"*. For PostgreSQL 16 one is available (§4.1g); the delta is exactly what that product STIG does not reach. |
+| **Where the SRG still applies in full** | **`svc-harbor-01`: PostgreSQL 18.3 inside `goharbor/harbor-db`.** No STIG covers 18, so the Database SRG *is* the benchmark there (`poam.md` ENG-12). This scoping must never be read as excluding it. |
+| Source | backlog 6a.17 (analysis 2026-09-18) · §4.1g · `poam.md` ENG-12, AO-09 · suggested controls CM-6, SA-4 |
+
+### 4.1k ✅ Application Server SRG — excluded, and its three orphan controls kept (2026-09-24, backlog 6a.18 / 6a.19)
+
+> **Nothing in the enclave is an application server in the SRG's sense** — a runtime environment
+> hosting organisationally developed code — **so the Application Server SRG is excluded. Three
+> controls that appear in NO other guide we hold are assessed at system level instead, so the
+> exclusion does not silently drop them.**
+
+| Component | Why it is not an application server | Assessed against |
+|---|---|---|
+| Harbor | a registry product, not a host for our code | Container Platform SRG (backlog 6a.3) |
+| Grafana | a vendor web application | Web Server SRG (6a.12) |
+| nginx | a web server / TLS front end | Web Server SRG (6a.12) |
+
+**The orphans — found only in the Application Server SRG, and NOT dropped:**
+
+| CCI / control | What it asks | Assessed at system level as |
+|---|---|---|
+| **CCI-000174 — AU-12(1)** (V-204716) | a system-wide, **time-correlated** audit trail | the audit offload: every machine's records collected on `svc-obs-01` weekly, 1-year retention (backlog N-2 step 1, proven 2026-09-23); **continuous delivery (`audisp-remote`, N-2 step 2) is still owed**; time correlation rests on chrony against `host-4` (`poam.md` AO-13, time source not yet traceable). **Partially met — say so.** |
+| **CCI-002363 — AC-12(1)** | user-initiated logout, with an explicit logout message | the web interfaces (Grafana, Harbor): evidence owed |
+| **CCI-002169 — AC-3(7)** | role-based access control | Grafana roles, Harbor project roles, Kubernetes RBAC once built: evidence owed |
+
+Importing 137 rules to catch three would bury them; assessing the three directly keeps them
+visible. Source: backlog 6a.18, 6a.19 · suggested controls AU-12(1), AC-12(1), AC-3(7).
 
 ### 4.2 ⬜ Third-party packages no subscription tier covers
 

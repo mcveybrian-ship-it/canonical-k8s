@@ -2491,7 +2491,8 @@ cmd_radio() {
 #
 # So `set` REFUSES until `prep` has run. That is a guard, not a note.
 #
-# THE PASSWORD IS NOT THIS SCRIPT'S BUSINESS.
+# THE PASSWORD IS NOT THIS SCRIPT'S BUSINESS. (Since 2026-09-25 a pre-made pbkdf2 HASH may come
+# from GRUB_PASSWORD_HASH or the site credentials file - see cred_get. The password never does.)
 #
 #   It is one password for the whole enclave, held in the customer's controlled document, and
 #   deliberately nowhere in this repository - not host-params.env, not a parameter, not a
@@ -2606,6 +2607,19 @@ cmd_grubpw() {
         return 1
       fi
 
+      # A PRE-MADE HASH FIRST (2026-09-25) - environment, then the site credentials file - so an
+      # unattended rebuild never stops here. Made OFFLINE with grub-mkpasswd-pbkdf2 by the
+      # custodians; the password itself is never stored anywhere.
+      local H src=""
+      H="${GRUB_PASSWORD_HASH:-}"; [ -n "$H" ] && src="GRUB_PASSWORD_HASH (environment)"
+      if [ -z "$H" ]; then H="$(cred_get GRUB_PASSWORD_HASH)"; [ -n "$H" ] && src="$ENCLAVE_CREDENTIALS"; fi
+      if [ -n "$H" ]; then
+        # CHECK THE SHAPE: a truncated or mis-pasted hash would lock the editor with a password
+        # nobody knows - or, worse, one that matches nothing and is never noticed.
+        [[ "$H" =~ ^grub\.pbkdf2\.sha512\.[0-9]+\.[0-9A-F]+\.[0-9A-F]+$ ]] \
+          || die "the GRUB hash from $src is not a grub.pbkdf2.sha512 hash - nothing was changed"
+        ok "using the GRUB password hash from $src - no prompt (${#H} chars, not shown)"
+      else
       # READ IT TWICE, SILENTLY, AND NEVER ECHO IT.
       local P P2
       read -rsp '  GRUB password (enclave-wide, from the controlled document): ' P; echo
@@ -2614,7 +2628,6 @@ cmd_grubpw() {
       [ "$P" = "$P2" ] || die "the two entries do not match - nothing was changed"
 
       # PIPED, NOT PROMPTED - its prompts go to stdout and would be captured.
-      local H
       H="$(printf '%s\n%s\n' "$P" "$P" | grub-mkpasswd-pbkdf2 2>/dev/null \
             | awk '/PBKDF2 hash/{print $NF}')"
       P=""; P2=""
@@ -2622,6 +2635,7 @@ cmd_grubpw() {
         grub.pbkdf2.sha512.*) ok "hash generated (${#H} chars, not shown)" ;;
         *) die "grub-mkpasswd-pbkdf2 produced nothing usable - nothing was changed" ;;
       esac
+      fi
 
       backup_file "$GRUB_CUSTOM"
       # APPEND EXACTLY ONCE AND COUNT. An earlier hand-run of this appended twice and the
@@ -4497,6 +4511,24 @@ if [ -r "$_FP" ]; then
 fi
 BREAKGLASS_USER="${BREAKGLASS_USER:-breakglass}"
 REFERENCE_ADMIN="${REFERENCE_ADMIN:-encadmin}"
+
+# ---- the site credentials file (2026-09-25: every typed secret can also come from here) ----
+# So a rebuild can run with nobody at the keyboard. It holds HASHES wherever a hash works
+# (account passwords, the GRUB password) and a real value only where nothing else will do.
+# Precedence everywhere: environment variable > this file > prompt at the terminal. Never
+# in the repository; carried on custody-controlled media and deleted from the target once
+# hardening succeeds (docs/airgap-media.md, credential custody).
+ENCLAVE_CREDENTIALS="${ENCLAVE_CREDENTIALS:-/etc/enclave/credentials.env}"
+# cred_get KEY - print KEY's value from the credentials file, or nothing if the file or the key
+# is absent. REFUSES a file that is not root-owned mode 600: a readable hash is a hash an
+# offline cracker can work on. Parsed with sed, never sourced - a secrets file is not code.
+cred_get() {
+  local f="$ENCLAVE_CREDENTIALS"
+  [ -e "$f" ] || return 0
+  [ "$(stat -c '%U %a' "$f" 2>/dev/null)" = "root 600" ] \
+    || die "$f is not root-owned mode 600 ($(stat -c '%U %a' "$f" 2>/dev/null)) - refusing to read credentials from it"
+  sed -n "s/^$1='\\([^']*\\)'.*/\\1/p" "$f" | head -1
+}
 BG_SSHD_DROPIN=/etc/ssh/sshd_config.d/10-enclave-breakglass.conf
 BG_AUDIT_RULES=/etc/audit/rules.d/65-enclave-breakglass.rules
 

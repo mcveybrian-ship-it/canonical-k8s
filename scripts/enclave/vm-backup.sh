@@ -1409,7 +1409,23 @@ cmd_second_copy() {
         || die "ssh-keygen failed for type $kt - on a FIPS host try rsa or ecdsa"
       ok "created $SECOND_KEY"
     fi
-    local myaddr; myaddr="$(ip -4 -br addr | awk '{print $3}' | cut -d/ -f1 | grep -v '^127' | head -1)"
+    # THE ADDRESS THIS HOST WILL ACTUALLY CONNECT FROM - ask the kernel, do not guess (backlog
+    # 3.31 #12). This took "the first non-loopback IPv4 listed", which depends on interface
+    # order, not on routing. Measured 2026-09-25 on stage-01 (three addresses): that picked
+    # 10.0.20.160, an address that cannot reach host-1 at all, while the connection really
+    # leaves from 10.2.20.160. The from= restriction built from it would refuse the only real
+    # source. It mattered the day host-4 gains its 2.5 GbE storage NIC (3.16).
+    local myaddr mine mkey
+    myaddr="$(ip -4 route get "$addr" 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1)"
+    [ -n "$myaddr" ] || die "cannot tell which address $(hostname -s) uses to reach $target ($addr) - check 'ip -4 route get $addr'"
+    # Cross-check with the address table: a mismatch means the connection would leave from an
+    # address the enclave does not record for this host (e.g. traffic routed over the storage
+    # subnet). Not fatal - the route is the truth for from= - but say so before it is pasted.
+    mkey="$(hostname -s | tr '[:lower:]-' '[:upper:]_')"; mine="${!mkey:-}"
+    if [ -n "$mine" ] && [ "$mine" != "$myaddr" ]; then
+      warn "this host reaches $target from $myaddr, but enclave-addresses.env records $(hostname -s) as $mine."
+      warn "  from= will say $myaddr. If that is not the address you intend backups to use, fix the route first."
+    fi
     printf '\n  ON %s (%s), run this ONCE - it authorises a WRITE-ONLY rsync into one directory:\n\n' "$target" "$addr"
     # ONE PASTEABLE LINE PER STEP. An earlier version built the authorized_keys line with
     # `printf %s\n`, which the pasting shell collapses to the format "%sn" - it would have

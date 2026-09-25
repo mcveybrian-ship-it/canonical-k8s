@@ -664,14 +664,18 @@ fixups_plan() {
   local f0b="" svc
   for svc in sssd openipmi fwupd-refresh; do
     case "$(systemctl is-enabled "$svc" 2>/dev/null)" in
-      enabled|enabled-runtime|static) f0b="$f0b $svc($(systemctl is-active "$svc" 2>/dev/null))" ;;
+      # `|| true` IS LOAD-BEARING: is-active EXITS 3 for an inactive unit, and under set -e that
+      # ended the whole plan here, silently, before 0b-0d and the "nothing changed" line printed
+      # (found 2026-09-25 on stage-01; a fresh build, where these units are not yet disabled,
+      # would hit it at runbook 6.0 step 11).
+      enabled|enabled-runtime|static) f0b="$f0b $svc($(systemctl is-active "$svc" 2>/dev/null || true))" ;;
     esac
   done
   printf '     0b. disable units with nothing to serve, PROVEN case by case - no domain for sssd,\n'
   printf '         no /dev/ipmi* for openipmi, no route for fwupd-refresh. Packages stay installed.\n'
   printf '         state: enabled here:%s\n' "${f0b:- none}"
   printf '     0c. re-set the controls a package upgrade reverts and only `usg fix` ever set\n'
-  printf '     0d. /var/log/journal/<machine-id> back to 0640 - journald resets it on restart\n'
+  printf '     0d. /var/log/journal/<machine-id> to 0640, and %s so a REBOOT keeps it there\n' "$JOURNAL_MID_TMPFILES"
   printf '\n  nothing above has been changed. re-run with --apply\n\n'
 }
 
@@ -764,6 +768,17 @@ cmd_fixups() {
   # /run/log/journal and reported 0640 on both - correctly - while never looking at the %m
   # subdirectory that the rule evaluates. A verify that misses the object under test reads
   # exactly like a pass.
+  # FIRST, THE DECLARATION THAT HOLDS ACROSS A REBOOT - see JOURNAL_MID_TMPFILES. Without it
+  # this item repaired the directory until the next boot put it back (host-1/2, 2026-09-24).
+  if ! grep -qxF "$JOURNAL_MID_LINE" "$JOURNAL_MID_TMPFILES" 2>/dev/null; then
+    printf '%s\n' \
+      "# UBTU-24-700020 - the machine-id journal directory. Written by stig-tailor.sh fixups 0d." \
+      "# A same-type 'z' line, so it overrides /usr/lib/tmpfiles.d/systemd.conf's" \
+      "# 'z /var/log/journal/%m 2755' at boot. DISA's 'Z ... ~0640' alone loses (measured 2026-09-25)." \
+      "$JOURNAL_MID_LINE" > "$JOURNAL_MID_TMPFILES"
+    chmod 0644 "$JOURNAL_MID_TMPFILES"
+    ok "0d. wrote $JOURNAL_MID_TMPFILES - the machine-id journal dir now stays 0640 across reboots"
+  fi
   local jdir bad_jdir=0
   for jdir in /var/log/journal/* /run/log/journal/*; do
     [ -d "$jdir" ] || continue
@@ -799,7 +814,7 @@ cmd_fixups() {
       # The gap is not hidden either way - `fixups --verify` re-checks the directories.
       say "no stig tmpfiles config in /etc/tmpfiles.d yet - the journal machine-id directories"
       say "     stay at journald's default until 'v1r6 --apply' writes it (hardening step 12)."
-    elif systemd-tmpfiles --create "$jtf" >/dev/null 2>&1; then
+    elif systemd-tmpfiles --create "$jtf" "$JOURNAL_MID_TMPFILES" >/dev/null 2>&1; then
       local still=0
       for jdir in /var/log/journal/* /run/log/journal/*; do
         [ -d "$jdir" ] || continue
@@ -1691,6 +1706,19 @@ fixups_verify() {
     warn "sudo passwd_tries NOT set - one fumbled password locks this account permanently"
     fail=1
   fi
+  # THE MACHINE-ID JOURNAL DIRECTORY - what dir_permissions_system_journal evaluates, and what
+  # this verify never looked at until 2026-09-25 (so host-1/2 read clean here and failed usg).
+  if [ "$(id -u)" -eq 0 ]; then
+    local jd jbad=""
+    for jd in /var/log/journal/*/ /run/log/journal/*/; do
+      [ -d "$jd" ] || continue
+      case "$(stat -c %a "$jd")" in 640|600) : ;; *) jbad="$jbad $jd($(stat -c %a "$jd"))" ;; esac
+    done
+    if [ -n "$jbad" ]; then warn "journal machine-id dir(s) not 0640:$jbad (fixups 0d)"; fail=1
+    else say "journal machine-id directories: 0640"; fi
+  fi
+  grep -qxF "$JOURNAL_MID_LINE" "$JOURNAL_MID_TMPFILES" 2>/dev/null \
+    || { warn "$JOURNAL_MID_TMPFILES missing - the journal dir reverts to 2755 at the next reboot (fixups 0d)"; fail=1; }
   if [ -n "$(pam_lastlog_line)" ] && ! pam_module_present pam_lastlog.so; then
     warn "$PAM_LOGIN requires pam_lastlog.so, which is NOT installed - console login is BROKEN (fixups 8)"
     fail=1
@@ -2695,6 +2723,13 @@ cmd_grubpw() {
 V1R6_GRUB_DROPIN=/etc/default/grub.d/99-zz-enclave-stig.cfg
 V1R6_AUDIT_RULES=/etc/audit/rules.d/99-enclave-stig.rules
 V1R6_JOURNAL_TMPFILES=/etc/tmpfiles.d/zzz-systemd-stig.conf
+# THE LINE THAT MAKES IT SURVIVE A REBOOT (2026-09-25, measured on host-1). At boot the vendor
+# `z /var/log/journal/%m 2755` beat DISA's `Z /var/log/journal/%m ~0640`: where both rules for a
+# path are the SAME type (`z` vs `z`, the top-level dir) ours wins; where the types DIFFER
+# (`z` vs `Z`) the vendor's does. So the machine-id dir gets its own same-type `z` line, in a file
+# of its own so DISA's four-line FixText stays exactly four lines.
+JOURNAL_MID_TMPFILES=/etc/tmpfiles.d/zzzz-enclave-journal.conf
+JOURNAL_MID_LINE='z /var/log/journal/%m 0640 root systemd-journal - -'
 V1R6_REBOOT_NEEDED=0
 
 # ---- the checks, each one DISA's command ------------------------------------------------

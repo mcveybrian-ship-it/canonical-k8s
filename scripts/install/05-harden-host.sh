@@ -15,8 +15,10 @@
 # was done that way on five machines - which is five chances to do it in a different order.
 # host-1 on 2026-09-17 is the run this script encodes.
 #
-# IT ASKS FOR EXACTLY ONE THING IT CANNOT LOOK UP: the GRUB password, and only because
-# `grubpw set` is interactive by design. Everything else is discovered, derived, or read from
+# IT ASKS ONLY FOR SECRETS, AND ONLY WHEN NONE WAS SUPPLIED (2026-09-25, backlog 3.32): the
+# GRUB password, the second admin's password and this machine's emergency password. Each is
+# taken from a pre-made hash instead when one is in the environment or in the site credentials
+# file (/etc/enclave/credentials.env, root 600) - then the whole sequence runs unattended. Everything else is discovered, derived, or read from
 # a parameter file. If you find yourself being asked something the machine could have worked
 # out, that is a defect in this script.
 #
@@ -39,10 +41,9 @@
 #     upgrade cannot drop the `--unrestricted` that `grubpw prep` adds later. Every
 #     FUTURE patch cycle still needs `grubpw status` and `fixups --verify` afterwards.
 #   - It does NOT cover every row of runbook 6.0. Still by hand once `run` completes:
-#     12f `stig-tailor.sh accounts create` (backlog 3.15 - two custodians type and seal the
-#     emergency password; reboot afterwards so its audit rule loads), 14 `stig-tools.sh
-#     collect` FROM stage-01, 15 a test that the machine still does its job, and 16
-#     `audit-volume.sh install`.
+#     14 `stig-tools.sh collect` FROM stage-01, and 15 a test that the machine still does its
+#     job. (12f accounts and 16 audit-volume became steps `accounts` and `auditvolume` on
+#     2026-09-25 - backlog 3.31 #10.)
 #
 # STEP NUMBERS. The numbers this script prints (0, 1, 2, 3, 3b ...) are its own. Each step
 # function below names the runbook 6.0 row it implements.
@@ -463,6 +464,27 @@ step_grub() {
   mark_step grub
 }
 
+# runbook 6.0 step 12f (backlog 3.15 / 3.32): the second named admin and the console-only
+# emergency account. Placed BEFORE v1r6 on purpose: v1r6 ends in a reboot, and that reboot is
+# what loads the emergency account's audit rule - auditd is immutable after usg fix.
+# Unattended when hashes are supplied (environment, or /etc/enclave/credentials.env - the
+# emergency one PER MACHINE); otherwise two custodians type it here and seal it.
+step_accounts() {
+  done_step accounts && return 0
+  hdr "9b. second named admin and console-only emergency account"
+  "$ENC/stig-tailor.sh" accounts create
+  mark_step accounts
+}
+
+# runbook 6.0 step 16: the hourly audit-volume sample that sizes this machine's audit
+# allocation (V-270816). No prompts, safe to repeat; installs a root-owned runtime copy.
+step_auditvolume() {
+  done_step auditvolume && return 0
+  hdr "11b. audit-volume sampling timer"
+  "$ENC/audit-volume.sh" install
+  mark_step auditvolume
+}
+
 # runbook 6.0 step 12d (10.1): the DISA V1R6 fixes usg fix does not make, then a reboot.
 step_v1r6() {
   done_step v1r6 && return 0
@@ -568,11 +590,18 @@ step_done() {
 }
 
 # =========================================================================================
+# THE STEP LIST, ONCE. `status` and `run` each carried their own copy until 2026-09-25, and the
+# copies drifted: step_radio sat on the status board as "[ ] radio" and was never dispatched
+# (host-3 rebuild, 2026-09-21). One list means a step is either shown AND run, or neither.
+# Order matters: accounts before v1r6 (its reboot loads the emergency audit rule).
+STEPS=(preflight hostprep pro fips patch usg baseline prechecks usgfix tailor radio grub
+       accounts v1r6 verify auditvolume final_audit evalstig)
+
 cmd_status() {
   assert_enclave_host
   printf '\n  hardening state on %s\n\n' "$(hostname -s)"
   local s
-  for s in preflight hostprep pro fips patch usg baseline prechecks usgfix tailor radio grub v1r6 verify final_audit evalstig; do
+  for s in "${STEPS[@]}"; do
     printf '  %s %s\n' "$(done_step "$s" && echo '[x]' || echo '[ ]')" "$s"
   done
   printf '\n  state file: %s\n' "$STATE"
@@ -583,15 +612,15 @@ cmd_status() {
 cmd_run() {
   need_root; assert_enclave_host
   install -d -m 0755 "$STATE_DIR"; touch "$STATE" "$LOG"
-  step_preflight; step_hostprep; step_pro; step_fips; step_patch; step_usg; step_baseline
+  local s
   # step_radio WAS MISSING FROM THIS LIST while appearing in `status` as a step - so it read
   # "[ ] radio" forever and never ran. Found 2026-09-21 on the host-3 rebuild: the machine came
   # up with its RTL8821CE driver loaded, bluetooth loaded, wlp2s0 present and no blacklist, and
   # V-270755 landed Not Reviewed with "a wireless interface is configured". host-1/2/4 have no
   # radio only because someone disabled theirs BY HAND on 2026-09-17. A step that is displayed
   # but never dispatched is worse than a missing step: the status board says it is accounted for.
-  step_prechecks; step_usgfix; step_tailor; step_radio; step_grub; step_v1r6
-  step_verify; step_final_audit; step_evalstig; step_done
+  for s in "${STEPS[@]}"; do "step_$s"; done
+  step_done
 }
 
 case "${1:-status}" in

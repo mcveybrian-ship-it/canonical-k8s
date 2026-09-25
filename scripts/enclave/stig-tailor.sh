@@ -4502,12 +4502,22 @@ cmd_luksenroll() {
 #   BREAKGLASS_USER      default: breakglass
 #   REFERENCE_ADMIN      default: encadmin - ADMIN2 gets this account's supplementary groups
 #   ADMIN2_PASSWORD_HASH / BREAKGLASS_PASSWORD_HASH   unattended only, SHA512 crypt ($6$)
+#   ...or from the site credentials file (cred_get): ADMIN2_PASSWORD_HASH, and PER MACHINE
+#   BREAKGLASS_PASSWORD_HASH_<HOST> (e.g. _HOST_1) - never a shared emergency hash (3.32).
+#   ADMIN2_PUBKEY / ADMIN2_KEY_COMMENT (facility-profile.env) - the second admin's key when
+#   ADMIN2_KEY is not given: the key text, or the LAST WORD of the comment on the reference
+#   admin's key line (matched exactly; more than one match is refused, never guessed).
 # SITE VALUES FROM facility-profile.env, so a rebuild creates the same accounts the answer file
 # expects. Environment wins; only these two names are read from the file (grep, not source).
 _FP="$HERE/../../docs/compliance/baseline/facility-profile.env"
 if [ -r "$_FP" ]; then
   [ -n "${ADMIN2_USER:-}" ]     || ADMIN2_USER="$(sed -n "s/^ADMIN2_USER='\([^']*\)'.*/\1/p" "$_FP" | head -1)"
   [ -n "${BREAKGLASS_USER:-}" ] || BREAKGLASS_USER="$(sed -n "s/^BREAKGLASS_USER='\([^']*\)'.*/\1/p" "$_FP" | head -1)"
+  # The second admin's SSH key, without anyone passing a path (3.32 / decision A, 2026-09-25):
+  # ADMIN2_PUBKEY is the key text itself (a site whose second admin has their own key);
+  # otherwise ADMIN2_KEY_COMMENT picks that ONE line out of the reference admin's keys.
+  [ -n "${ADMIN2_PUBKEY:-}" ]      || ADMIN2_PUBKEY="$(sed -n "s/^ADMIN2_PUBKEY='\([^']*\)'.*/\1/p" "$_FP" | head -1)"
+  [ -n "${ADMIN2_KEY_COMMENT:-}" ] || ADMIN2_KEY_COMMENT="$(sed -n "s/^ADMIN2_KEY_COMMENT='\([^']*\)'.*/\1/p" "$_FP" | head -1)"
 fi
 BREAKGLASS_USER="${BREAKGLASS_USER:-breakglass}"
 REFERENCE_ADMIN="${REFERENCE_ADMIN:-encadmin}"
@@ -4620,6 +4630,27 @@ cmd_accounts() {
       getent passwd "$REFERENCE_ADMIN" >/dev/null || die "reference admin $REFERENCE_ADMIN does not exist here"
       [ "$ADMIN2_USER" != "$REFERENCE_ADMIN" ] && [ "$ADMIN2_USER" != "$BREAKGLASS_USER" ] \
         || die "ADMIN2_USER must differ from $REFERENCE_ADMIN and $BREAKGLASS_USER"
+      # THE SECOND ADMIN'S KEY, in order: ADMIN2_KEY (a path, for one run) > ADMIN2_PUBKEY (the
+      # key text, facility-profile.env) > the reference admin's key line whose COMMENT is
+      # ADMIN2_KEY_COMMENT. Matching on the comment is what keeps the automation key
+      # (stage-01 -> build-01) off a person's account: never "copy all of encadmin's keys".
+      local akey_tmp=""
+      if [ -z "${ADMIN2_KEY:-}" ]; then
+        akey_tmp="$(mktemp)"
+        if [ -n "${ADMIN2_PUBKEY:-}" ]; then
+          printf '%s\n' "$ADMIN2_PUBKEY" > "$akey_tmp"; ADMIN2_KEY="$akey_tmp"
+          say "   $ADMIN2_USER key: from ADMIN2_PUBKEY (facility-profile.env)"
+        elif [ -n "${ADMIN2_KEY_COMMENT:-}" ]; then
+          local rh rmatch; rh="$(getent passwd "$REFERENCE_ADMIN" | cut -d: -f6)"
+          rmatch="$(awk -v c="$ADMIN2_KEY_COMMENT" '$NF==c' "$rh/.ssh/authorized_keys" 2>/dev/null)"
+          case "$(printf '%s' "$rmatch" | grep -c .)" in
+            1) printf '%s\n' "$rmatch" > "$akey_tmp"; ADMIN2_KEY="$akey_tmp"
+               say "   $ADMIN2_USER key: copied from $REFERENCE_ADMIN's key with comment '$ADMIN2_KEY_COMMENT'" ;;
+            0) warn "no key with comment '$ADMIN2_KEY_COMMENT' in $REFERENCE_ADMIN's authorized_keys - $ADMIN2_USER gets NO key" ;;
+            *) warn "MORE than one key with comment '$ADMIN2_KEY_COMMENT' - refusing to guess; $ADMIN2_USER gets NO key" ;;
+          esac
+        fi
+      fi
       if [ -n "${ADMIN2_KEY:-}" ]; then
         [ -r "$ADMIN2_KEY" ] || die "ADMIN2_KEY=$ADMIN2_KEY is not readable"
         ssh-keygen -l -f "$ADMIN2_KEY" >/dev/null 2>&1 || die "$ADMIN2_KEY is not an SSH public key"
@@ -4636,7 +4667,8 @@ cmd_accounts() {
         # account), -G the reference admin's supplementary groups computed above.
         useradd -m -s /bin/bash -G "$groups" "$ADMIN2_USER" || die "useradd $ADMIN2_USER failed"
         ok "created $ADMIN2_USER with groups $groups"
-        acct_set_password "$ADMIN2_USER" "${ADMIN2_PASSWORD_HASH:-}"
+        # Hash: environment > site credentials file > prompt (3.32).
+        acct_set_password "$ADMIN2_USER" "${ADMIN2_PASSWORD_HASH:-$(cred_get ADMIN2_PASSWORD_HASH)}"
       fi
       if [ -n "${ADMIN2_KEY:-}" ]; then
         local h; h="$(getent passwd "$ADMIN2_USER" | cut -d: -f6)"
@@ -4648,6 +4680,7 @@ cmd_accounts() {
         chown "$ADMIN2_USER:$ADMIN2_USER" "$h/.ssh/authorized_keys"; chmod 600 "$h/.ssh/authorized_keys"
         ok "$ADMIN2_USER key: $(ssh-keygen -l -f "$ADMIN2_KEY" | awk '{print $2, $NF}')"
       fi
+      [ -n "$akey_tmp" ] && rm -f "$akey_tmp"
 
       # ---- BREAKGLASS: sudo only, no key, console only, audited -------------------------
       if getent passwd "$BREAKGLASS_USER" >/dev/null; then
@@ -4657,8 +4690,13 @@ cmd_accounts() {
         # locked-out admin is the case it was made for.
         useradd -m -s /bin/bash -G sudo "$BREAKGLASS_USER" || die "useradd $BREAKGLASS_USER failed"
         ok "created $BREAKGLASS_USER (group: sudo)"
-        say "   TWO CUSTODIANS: choose it, type it, seal it for THIS machine ($(hostname -s)) only."
-        acct_set_password "$BREAKGLASS_USER" "${BREAKGLASS_PASSWORD_HASH:-}"
+        # PER MACHINE, AND NO SHARED FALLBACK (AO decision 2026-09-23): the file key names this
+        # host - BREAKGLASS_PASSWORD_HASH_HOST_1 - so one envelope can never open two machines.
+        local bgk bgh; bgk="BREAKGLASS_PASSWORD_HASH_$(hostname -s | tr '[:lower:]-' '[:upper:]_')"
+        bgh="${BREAKGLASS_PASSWORD_HASH:-$(cred_get "$bgk")}"
+        [ -n "$bgh" ] || say "   TWO CUSTODIANS: choose it, type it, seal it for THIS machine ($(hostname -s)) only."
+        [ -n "$bgh" ] && say "   $BREAKGLASS_USER: hash from ${BREAKGLASS_PASSWORD_HASH:+the environment}${BREAKGLASS_PASSWORD_HASH:-$bgk in $ENCLAVE_CREDENTIALS}"
+        acct_set_password "$BREAKGLASS_USER" "$bgh"
       fi
       # NO EXPIRY, explicitly. useradd applied login.defs (max 60) and useradd's INACTIVE (35)
       # at creation; left alone, the sealed password dies at ~95 days. V-270682 exempts

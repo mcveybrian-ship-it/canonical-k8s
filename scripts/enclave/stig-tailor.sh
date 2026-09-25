@@ -1009,15 +1009,27 @@ cmd_fixups() {
     # Add `create $LOGMODE root adm` after each stanza's `rotate 12` - the anchor is Ubuntu's
     # stock apt stanza, which has one per log (history.log, term.log).
     sed -i -E "s/^([[:space:]]*)rotate 12$/\1rotate 12\n\1create $LOGMODE root adm/" "$APT_LOGROTATE"
+    # COUNT WHAT THE EDIT DID, do not assume it (backlog 3.31 #4). The anchor is the exact
+    # line `rotate 12`; a stanza with any other rotate count matches nothing, sed exits 0, and
+    # this used to report "added" regardless. Every stanza (one `rotate` line each) must now
+    # carry a `create` line - item 2c counts the same way.
+    local n_rot n_cre
+    n_rot="$(grep -cE '^[[:space:]]*rotate[[:space:]]' "$APT_LOGROTATE" || true)"
+    n_cre="$(grep -cE '^[[:space:]]*create[[:space:]]' "$APT_LOGROTATE" || true)"
+    if [ "${n_cre:-0}" -lt "${n_rot:-0}" ] || [ "${n_cre:-0}" -eq 0 ]; then
+      cp -a "$aptbak" "$APT_LOGROTATE"
+      warn "2. only ${n_cre:-0} of ${n_rot:-0} stanza(s) got a 'create' line - the 'rotate 12' anchor"
+      warn "   did not match them all. REVERTED. Add 'create $LOGMODE root adm' to each stanza by hand."
+      failed=1
     # Validated through $LOGROTATE_MAIN - see logrotate_config_ok() for why testing a
     # fragment on its own is the wrong thing to test.
-    if ! logrotate_config_ok; then
+    elif ! logrotate_config_ok; then
       cp -a "$aptbak" "$APT_LOGROTATE"
       warn "2. logrotate rejected the edit - REVERTED. Its output:"
       printf '%s\n' "$LOGROTATE_OUT" | sed 's/^/       /'
       failed=1
     else
-      ok "2. added 'create $LOGMODE root adm' to $APT_LOGROTATE (backup: $aptbak)"
+      ok "2. added 'create $LOGMODE root adm' to all $n_cre stanza(s) of $APT_LOGROTATE (backup: $aptbak)"
     fi
   else
     warn "2. $APT_LOGROTATE not present - skipped"

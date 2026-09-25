@@ -1067,6 +1067,11 @@ cmd_reattach() {
 # or move the destination to storage that survives a reboot. `status` says which you have.
 SVC_NAME="enclave-vm-backup"
 VERIFY_SVC="enclave-vm-verify"
+# Re-attaches the encrypted USB backup volume after every boot (backlog 1.2 / 3.27). Found
+# 2026-09-25: a host-4 reboot left /mnt/vmbackup unmounted, the 07:00 backup failed in the
+# same second, and nothing noticed until BackupMissed fired - backups had depended on a human
+# remembering `reattach`. Hands-off is the requirement: an unattended reboot must not stop them.
+ATTACH_SVC="enclave-vm-backup-attach"
 # WHEN THE DEEP VERIFY RUNS. Weekly, and deliberately not adjacent to the nightly backup:
 # both read the same USB volume and overlapping them halves the throughput of each. Sunday
 # 04:00 leaves the nightly run at 02:00 finished long before. A parameter, not a constant.
@@ -1145,6 +1150,10 @@ Type=oneshot
 Nice=10
 IOSchedulingClass=idle
 TimeoutStartSec=6h
+# REATTACH FIRST, EVERY RUN. Returns immediately when the volume is already mounted; after a
+# reboot or an unmount it unlocks with the keyfile and mounts. The boot unit below normally
+# does this already - this is the net under it (a slow USB bus at boot, a manual umount).
+ExecStartPre=${self} reattach
 ExecStart=${self} incr
 # NO --all HERE, DELIBERATELY. This step's question is "did the set written minutes ago
 # arrive intact", and the answer is in that set alone. Re-reading 400 GB of unchanged sets
@@ -1189,6 +1198,7 @@ Nice=10
 IOSchedulingClass=idle
 # Sized from measurement: 402 GB at ~82 MB/s is about 80 minutes, and the volume grows.
 TimeoutStartSec=6h
+ExecStartPre=${self} reattach
 ExecStart=${self} verify --all
 EOF
 
@@ -1211,6 +1221,35 @@ EOF
     || die "could not enable ${SVC_NAME}.timer"
   systemctl enable --now "${VERIFY_SVC}.timer" >/dev/null 2>&1 \
     || warn "could not enable ${VERIFY_SVC}.timer - the nightly backup still works, but"
+
+  # ---- attach at boot, hands-off (2026-09-25) -------------------------------------------
+  # Runs the same proven `reattach` a human used to type after every reboot. Keyfile only - a
+  # passphrase cannot be typed at boot, so without one this unit fails and says why.
+  # Restart=on-failure covers a USB bus that enumerates after this unit first runs.
+  [ -s "$KEYFILE" ] || warn "NO KEYFILE at $KEYFILE - the boot unit cannot unlock unattended. Run: sudo $0 keyfile"
+  cat > "/etc/systemd/system/${ATTACH_SVC}.service" <<EOF
+[Unit]
+Description=Attach the encrypted VM backup volume at ${DEST} after boot (keyfile, hands-off)
+After=local-fs.target
+StartLimitIntervalSec=900
+StartLimitBurst=6
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=${self} reattach
+Restart=on-failure
+RestartSec=60
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  if systemctl enable --now "${ATTACH_SVC}.service" >/dev/null 2>&1; then
+    ok "installed ${ATTACH_SVC}.service - the backup volume re-attaches itself at every boot"
+  else
+    warn "${ATTACH_SVC}.service did not start - see: systemctl status ${ATTACH_SVC}.service"
+  fi
   ok "scheduled: ${SVC_NAME}.timer at ${at} ${BACKUP_TZ} daily -> ${DEST}"
   ok "scheduled: ${VERIFY_SVC}.timer '${weekly_cal}' - deep verify, reads every byte"
   say ""
@@ -1247,8 +1286,12 @@ cmd_unschedule() {
     systemctl disable --now "${u}.timer" >/dev/null 2>&1 || true
     rm -f "/etc/systemd/system/${u}.timer" "/etc/systemd/system/${u}.service"
   done
+  # The boot attach unit goes too - disable only, NOT --now: stopping it would not unmount,
+  # and unmounting a volume a restore may be reading is not unschedule's business.
+  systemctl disable "${ATTACH_SVC}.service" >/dev/null 2>&1 || true
+  rm -f "/etc/systemd/system/${ATTACH_SVC}.service"
   systemctl daemon-reload
-  ok "removed ${SVC_NAME} and ${VERIFY_SVC} (.timer and .service)"
+  ok "removed ${SVC_NAME}, ${VERIFY_SVC} and ${ATTACH_SVC}"
 }
 
 # ---------------------------------------------------------------- restore

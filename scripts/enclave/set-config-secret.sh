@@ -138,6 +138,14 @@ PYEOF
   val=""
 done
 
+# NEVER WORLD-READABLE ONCE IT HOLDS A SECRET (backlog 3.34, 2026-09-26): harbor.yml sat at 644
+# with both real passwords in it, readable by every account on svc-harbor-01. Only "other" is
+# removed - a service group reading its own config is legitimate. Harbor's prepare reads the
+# file as root (image User is empty, dockerd has no userns-remap - checked on svc-harbor-01),
+# so this does not break the next prepare.
+chmod o-rwx "$FILE"
+ok "$(stat -c '%a %U:%G' "$FILE") $FILE - no access for other accounts"
+
 say ""
 say "Confirm no published default survived - this prints NO values:"
 say "    sudo grep -cE 'Harbor12345|root123|changeme|CHANGEME' $FILE"

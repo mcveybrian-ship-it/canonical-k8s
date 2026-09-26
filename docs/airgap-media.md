@@ -841,3 +841,204 @@ appear in `git status`, so nothing will remind you.
 > network in the same room. It removes the single-machine risk; it does not survive the room.
 > The Windows working copy is the third leg — see §7 decision 7 in
 > `airgapped-setup-machine/README.md`.
+
+## 9. Credential custody — the site credentials (backlog 3.32)
+
+**What they are.** The per-machine files that let the rebuild run with nobody typing a secret:
+the GRUB password hash, the second admin's hash, **each machine's own emergency-account hash**,
+the guest admin hash (hosts only), and three **real** service passwords — Harbor admin and
+database (svc-harbor-01 only) and Grafana admin (svc-obs-01 only). Keys and consumers:
+`scripts/enclave/credentials.env.example`.
+
+**Why they are custody material.** A hash is not a password, but it is what an offline cracker
+works on, and the three real values are live credentials. So they are made in one place, travel
+on one registered stick, sit on each target only while its hardening runs, and the stick is
+destroyed at the end. Every step leaves a line in the register.
+
+**Not covered here:** the LUKS passphrase and `encadmin` hash (they ride in `host-params.env` on
+each host's seed stick, under the same rules), the Ubuntu Pro token, and the root CA passphrase.
+
+### 9.1 The rules
+
+1. **Made only by `make-credentials.sh`, on build-01, with two custodians present**, written
+   straight onto the stick. It refuses to run on an enclave machine and refuses to write
+   anywhere that is not a filesystem labelled `enclave-cred` — a copy on build-01's own disk is
+   a copy nothing tracks and nothing can destroy.
+2. **One stick, registered, ext4, label `enclave-cred`,** with a medium ID written on it and in
+   the register. **Never the transfer SSD** (it goes back out every trip and is reused) and never
+   a seed stick. ext4 because a FAT stick cannot hold mode 600 — the generator refuses one.
+3. **One file per machine, holding only that machine's keys.** host-1 never holds host-2's
+   emergency hash; svc-repo-01 never holds Harbor's password. On the target it is installed as
+   `/etc/enclave/credentials.env`, **root 600** — every reader refuses any other owner or mode,
+   and refuses a malformed file by line number (`scripts/enclave/credentials.sh`).
+4. **Deleted from each target as soon as that target's hardening is done**, and the deletion is
+   written in the register.
+5. **The stick is destroyed, not wiped,** once the last deletion is recorded (§9.5).
+6. **The emergency passwords exist only in sealed envelopes** (§9.6). The generator never shows
+   a password and never writes one — only hashes, plus the three real values above.
+
+**What the split does and does not buy.** It limits what each machine *keeps*. It does not hide
+the other files from a machine *while the stick is attached*: root there can read the whole
+stick for those minutes. That root is the same administrator holding the stick, and on host-4
+it already owns every guest's disk — so the attach window is supervised, short, and adds no
+reader who could not already read the guests.
+
+### 9.2 Make — build-01, two custodians
+
+**Prepare the stick** (a new one each time — the last one was destroyed). The guard refuses
+anything that is not a small USB device, and anything mounted. **This erases the device.**
+
+```bash
+### MACHINE: build-01 (10.2.10.124) ###
+### DESTROYS ALL DATA ON $DEV - identify it first: lsblk -o NAME,SIZE,TRAN,MODEL,LABEL ###
+DEV=/dev/sdX; MAX_GB=128
+if [ "$(hostname -s)" != build-01 ]; then echo "WRONG MACHINE: $(hostname -s)"
+elif [ "$(lsblk -dno TRAN "$DEV" 2>&1)" != usb ]; then echo "REFUSING: $DEV is not a USB device"
+elif [ "$(lsblk -bdno SIZE "$DEV")" -gt $((MAX_GB*1024*1024*1024)) ]; then echo "REFUSING: $DEV is larger than ${MAX_GB} GB - the transfer SSD?"
+elif lsblk -no MOUNTPOINT "$DEV" | grep -q .; then echo "REFUSING: something on $DEV is mounted"
+else
+  sudo wipefs -a "$DEV" && sudo mkfs.ext4 -q -L enclave-cred "$DEV" && lsblk -o NAME,SIZE,FSTYPE,LABEL "$DEV"
+fi
+```
+
+The size cap is what keeps this off the transfer SSD — that one is also USB, and its serial
+cannot be trusted (§6.1e). Write the medium ID on the stick now.
+
+**Make the files.** Custodian A types; custodian B watches the screen and the envelopes. For
+each emergency prompt: A writes that machine's password on a card (chosen offline — dice, not a
+screen), types it twice, seals the card in an envelope marked with the machine and the date, and
+**both sign across the seal**. The GRUB password gets its own envelope the same way (the SSP
+requires it in the same custody as the emergency passwords — `ssp-inputs.md`, emergency
+account, item 3).
+
+```bash
+### MACHINE: build-01 (10.2.10.124) ###
+if [ "$(hostname -s)" != build-01 ]; then echo "WRONG MACHINE: $(hostname -s)"; else
+  sudo mkdir -p /mnt/cred && sudo mount LABEL=enclave-cred /mnt/cred \
+    && sudo install -d -o "$(id -un)" -g "$(id -gn)" -m 700 /mnt/cred/site \
+    && ~/canonical-k8s/scripts/transfer/make-credentials.sh -o /mnt/cred/site
+fi
+```
+
+Nothing else goes in that block: the generator reads from the terminal, and anything pasted
+after it would be read as a password. The site label in the register is `SYSTEM_ACRONYM` from
+`facility-profile.env` (this machine's name until that is filled in).
+
+**Then:** copy `REGISTER.txt` into the custody log (it holds no secret), fill its blanks by
+hand, unmount (`sudo umount /mnt/cred`), and confirm nothing was left on build-01 —
+`sudo find / -xdev -name 'credentials.*.env'` must print nothing (the stick is unmounted by
+then, so any hit is a copy outside custody).
+
+### 9.3 Place — each target, as its hardening starts
+
+**A host** (host-1..4): plug the stick in and run the block below. It installs **only the file
+named for the machine it runs on**, so it cannot place another machine's file, and it refuses
+outside the gap. The same block, unchanged, is used inside a guest.
+
+```bash
+### MACHINE: the machine being hardened (host-1..4, or a guest with the stick attached) ###
+f=/mnt/cred/site/credentials.$(hostname -s).env
+case "$(hostname -s)" in stage-01|build-01) echo "WRONG MACHINE: $(hostname -s) is outside the gap" ;; *)
+  sudo mkdir -p /mnt/cred && sudo mount -o ro LABEL=enclave-cred /mnt/cred
+  if [ ! -f "$f" ]; then echo "NO FILE for $(hostname -s) on the stick"; else
+    sudo sha256sum "$f" # must match this machine's line in REGISTER.txt
+    sudo install -D -o root -g root -m 600 "$f" /etc/enclave/credentials.env \
+      && sudo stat -c '%a %U %n' /etc/enclave/credentials.env
+  fi
+  sudo umount /mnt/cred ;;
+esac
+```
+
+**A guest** (the service VMs): guests have no USB and, inside the gap, no machine that can copy
+to them over the network. The stick goes in **read-only** from host-4, exactly as the transfer
+SSD does (§6.1e). The stick must not be mounted on host-4 while a guest has it. One guest at a
+time; `G` is the guest being hardened.
+
+```bash
+### MACHINE: host-4 (10.2.20.158) ###
+G=svc-obs-01
+if [ "$(hostname -s)" != host-4 ]; then echo "WRONG MACHINE: $(hostname -s)"
+elif findmnt -n --source LABEL=enclave-cred >/dev/null; then echo "REFUSING: the stick is mounted on host-4 - umount it first"
+else
+  sudo virsh attach-disk "$G" /dev/disk/by-label/enclave-cred vdc --targetbus virtio --sourcetype block --mode readonly \
+    && sudo virsh domblklist "$G"
+fi
+```
+
+Inside the guest, run the placement block above unchanged — the filesystem label travels with
+the disk, so `LABEL=enclave-cred` finds it as `vdc` (if it does not, `sudo blkid /dev/vdc` says
+why). Then take it back out — **unmount before detach**:
+
+```bash
+### MACHINE: host-4 (10.2.20.158) ###
+G=svc-obs-01
+if [ "$(hostname -s)" != host-4 ]; then echo "WRONG MACHINE: $(hostname -s)"; else
+  sudo virsh detach-disk "$G" vdc && sudo virsh domblklist "$G"    # expect vda and vdb only
+fi
+```
+
+**host-4 keeps its file until the guests are composed** — it holds the guest admin hash, which
+`03-compose-vm.sh` reads. Its deletion comes after its own `05-harden-host.sh` and the last
+compose, not before.
+
+Write "placed" in the register for each machine as it is done.
+
+### 9.4 Delete — each target, when its hardening is done
+
+"Done" means: a host's `05-harden-host.sh` finished (and, on host-4, the last guest composed);
+a guest's `stig-tailor.sh accounts create` and `grubpw set` ran; on svc-harbor-01,
+`set-config-secret.sh`; on svc-obs-01, `monitoring.sh collector`.
+
+```bash
+### MACHINE: the target just hardened ###
+if [ ! -e /etc/enclave/credentials.env ]; then echo "nothing to delete on $(hostname -s)"; else
+  sudo shred -u /etc/enclave/credentials.env \
+    && ! sudo test -e /etc/enclave/credentials.env \
+    && echo "deleted from $(hostname -s) at $(date -u +%FT%TZ)"
+fi
+```
+
+Write "deleted" in the register, with the time it printed. **`shred` is not a sanitisation
+claim** here — on an SSD, a journalled filesystem or a VM image it cannot promise to reach every
+copy, for the same reason as §9.5. What protects the remnants is that every host disk is LUKS,
+and every guest image sits on host-4's LUKS disk. The deletion's job is that the file is no
+longer readable on the running system.
+
+A file left behind is exactly what nobody notices. **Nothing detects it yet** — owed: publish
+its presence as an enclave fact and alert on it (backlog 3.32).
+
+### 9.5 Destroy the stick — once the last deletion is recorded
+
+**Destroy it; do not wipe and reuse it.** NIST SP 800-88 Rev. 2 (September 2025, superseding
+Rev. 1): for flash storage that has spare cells and does wear levelling, overwriting makes it
+*"infeasible for a user to sanitize all previous data using this approach because the device
+cannot support directly addressing all areas in which sensitive data has been stored using the
+native read and write interface."* A USB stick is exactly that device. Destroy (§3.1.3) *"render[s]
+target data recovery infeasible using state-of-the-art laboratory techniques"*.
+
+- Use the facility's approved destruction method (shred, disintegrate, incinerate); for a
+  destructive method, NIST's verification is to **inspect the remnants and record the equipment
+  used**.
+- Record method, date, who, and the witness in the register, then **close the register**. If the
+  facility uses one, complete a Certificate of Sanitization (800-88r2 Appendix C has a sample).
+
+> **Tailoring point.** A facility may instead keep one dedicated `enclave-cred` stick in the safe,
+> reused only for this and never leaving custody, and destroy it at end of life. That is a
+> legitimate choice, but it is a choice: the overwrite limitation above still applies between
+> uses, so record it as a tailoring decision in the SSP rather than as a sanitisation step.
+
+### 9.6 The envelopes
+
+- **One per machine** for the emergency password, **one** for the GRUB password. Kept in the
+  facility safe, inventoried with the register, and checked for an intact seal at each inventory.
+  Who holds them is `CP_BOOT_SECRET_CUSTODIAN` in `facility-profile.env` — the same person or
+  office that holds the LUKS passphrase; who may authorise the stick crossing the gap is
+  `CM_MEDIA_TRANSFER_AUTHORITY`.
+- The second admin's password is that person's own and is not sealed. The guest admin, Harbor and
+  Grafana passwords are working administrator credentials, held the way the site holds its other
+  administrator passwords. A facility that wants them sealed too adds envelopes; nothing else
+  changes.
+- **Using an envelope** — console recovery, rotation afterwards, recording the use as an
+  incident — is its own procedure, **still owed** (backlog 3.15 "still owed"; the design is in
+  `ssp-inputs.md`, emergency account, items 2–3). A rotated password means a new hash, and that
+  goes in through `stig-tailor.sh accounts rotate` at the console, not through this stick.

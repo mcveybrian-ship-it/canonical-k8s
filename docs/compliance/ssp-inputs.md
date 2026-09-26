@@ -225,6 +225,10 @@ machine that has to be rebuilt.
    a lockout is cleared over the network in minutes and this finding degrades from
    "architectural" to "operational".
 
+**Custody of the pre-made hashes and the envelopes** — how the per-machine credentials are made,
+carried, placed, deleted and the stick destroyed, with a register at every step:
+`docs/airgap-media.md` §9 (suggested controls **IA-5**, **MP-4**, **MP-5**, **MP-6**).
+
 **Explicitly NOT acceptable, and named here so nobody proposes them later:** relaxing
 `unlock_time`; a timer or cron job that resets `faillock` automatically (that is a brute-force
 window wearing a convenience label); `NOPASSWD` sudo; a shared administrator account; or

@@ -75,7 +75,7 @@ esac
 # gitignore is ever loosened, this stops the leak instead of discovering it on the target.
 echo "  checking the archive carries nothing private ..."
 LEAK=$(git archive --format=tar HEAD | tar -t 2>/dev/null | grep -E \
-  '^(HANDOFF\.md|docs/open-questions\.md|docs/runbook\.md|artifact/|archive/)|params\.env$' || true)
+  '^(HANDOFF\.md|docs/open-questions\.md|docs/runbook\.md|artifact/|archive/)|(params|credentials[^/]*)\.env$' || true)
 [ -z "$LEAK" ] && echo "  [ok] tracked files only - no private paths, no live params" \
   || die "the archive contains private paths. Nothing was sent:
 $LEAK"

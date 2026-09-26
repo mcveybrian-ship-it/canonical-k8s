@@ -62,7 +62,9 @@ trap 'rm -rf "$stage"' EXIT
 # than "everything but secrets": a new gitignored file must not start travelling by default.
 shopt -s nullglob
 for f in "$HERE"/*.sh "$HERE"/*.py "$HERE"/*.env "$HERE"/*.tsv; do
-  case "$(basename "$f")" in *-params.env) continue ;; esac
+  # NEVER the site credentials file (3.32): it is deleted from the target after hardening,
+  # and a root-only copy here would outlive that deletion.
+  case "$(basename "$f")" in *-params.env|credentials*.env) continue ;; esac
   cp -p "$f" "$stage/"
 done
 for d in dashboards trust-anchors csr-profiles; do

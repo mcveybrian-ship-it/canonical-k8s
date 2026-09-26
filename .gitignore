@@ -47,6 +47,10 @@ host-params.env
 # one that may ever be public.
 scripts/install/*/host-params*
 !scripts/install/*/host-params.env.example
+# The site credentials file (backlog 3.32) - password HASHES and the few real secrets an
+# unattended rebuild needs. ANY credentials*.env, at any depth. The .example ends in .example,
+# so it is not matched and stays public; it holds key names only, never a value.
+credentials*.env
 
 # Live step-03 params. No secret in the shipped example, but it names live addresses and is
 # the obvious place someone adds a token. Only the .example is tracked.

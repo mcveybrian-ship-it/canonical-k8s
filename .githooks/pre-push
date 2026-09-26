@@ -22,7 +22,7 @@ set -u
 # host-params[^/]*\.env$ widened 2026-09-17: it now catches PER-HOST copies such as
 # host-params-host4.env, which held a LUKS passphrase and matched neither the old hook
 # pattern nor .gitignore. Ending the match at \.env$ still excludes .env.example.
-PRIVATE_RE='^(HANDOFF\.md$|docs/open-questions\.md$|docs/runbook\.md$|artifact/|archive/|scripts/install/02-host-autoinstall/host-params[^/]*\.env$)'
+PRIVATE_RE='^(HANDOFF\.md$|docs/open-questions\.md$|docs/runbook\.md$|artifact/|archive/|scripts/install/02-host-autoinstall/host-params[^/]*\.env$|.*credentials[^/]*\.env$)'
 PROTECTED_BRANCH='refs/heads/prehistory'
 
 ZERO='0000000000000000000000000000000000000000'

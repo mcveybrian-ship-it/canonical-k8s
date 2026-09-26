@@ -603,6 +603,35 @@ sudo mount -o ro /dev/vdc /mnt/transfer
 cd ~/canonical-k8s/scripts/transfer && sudo ./restore-mirror.sh
 ```
 
+#### The contracts config — only when it changed, and to svc-mgmt-01, never svc-repo-01
+
+`airgapped-contracts.yaml` rides in the bundle (`bundle/config/`) but is **not** restored on
+svc-repo-01: the contracts server runs on svc-mgmt-01, and a copy anywhere else is a standing
+copy of a credential nothing reads (acting AO, 2026-09-26, backlog 3.36a). When it has changed —
+new token, address or domain — the same disk goes to svc-mgmt-01 after svc-repo-01 is done with it.
+**Unmount inside svc-repo-01 and detach it there first** (Taking it OUT, first two blocks).
+
+```bash
+### MACHINE: host-4 (10.2.20.158) ###
+if [ "$(hostname -s)" != host-4 ]; then echo "WRONG MACHINE: $(hostname -s)"; else
+  sudo virsh attach-disk svc-mgmt-01 /dev/disk/by-label/enclave-xfer vdc --targetbus virtio --sourcetype block --mode readonly \
+    && sudo virsh domblklist svc-mgmt-01
+fi
+```
+
+```bash
+### MACHINE: svc-mgmt-01 (10.2.20.161) ###
+if [ "$(hostname -s)" != svc-mgmt-01 ]; then echo "WRONG MACHINE: $(hostname -s)"; else
+  sudo mkdir -p /mnt/transfer && sudo mount -o ro /dev/vdc /mnt/transfer \
+    && sudo install -m 600 /mnt/transfer/bundle/config/airgapped-contracts.yaml /etc/ubuntu-advantage/ \
+    && sudo ~/canonical-k8s/scripts/install/04-enclave-services.sh contracts
+  sudo umount /mnt/transfer
+fi
+```
+
+`04-enclave-services.sh contracts` sets it `0640 root:contracts`, checks its four enclave aptURLs
+and restarts nothing that is running. Then detach on host-4 (`sudo virsh detach-disk svc-mgmt-01 vdc`).
+
 #### Taking it OUT — svc-repo-01 → build-01
 
 **Reverse order, and the first two steps are on different machines:**

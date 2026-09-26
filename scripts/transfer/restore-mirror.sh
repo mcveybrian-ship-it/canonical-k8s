@@ -187,18 +187,24 @@ else
 fi
 
 # --- 5. contracts server config ------------------------------------------------------------------
-head2 "contracts server"
+# NOT INSTALLED ON THIS MACHINE (acting AO, 2026-09-26, backlog 3.36a). The contracts server runs
+# on svc-mgmt-01, so a copy here is a standing copy of a credential that nothing reads - and this
+# script used to put one in /etc/ubuntu-advantage/ on every restore. It stays on the carried
+# medium and goes to svc-mgmt-01 the way every in-gap credential does: the disk attached
+# read-only from host-4 (docs/airgap-media.md 6.1e, "the contracts config").
+head2 "contracts server config"
 if [ -f "$SRC/bundle/config/airgapped-contracts.yaml" ]; then
-  run install -d -m 0755 /etc/ubuntu-advantage
-  # 0600: it maps contract tokens to entitlements - a credential.
-  run install -m 0600 "$SRC/bundle/config/airgapped-contracts.yaml" /etc/ubuntu-advantage/
-  note "config placed. NOTE: the contracts server does NOT run on this machine. It runs on"
-  note "  svc-mgmt-01 (04-enclave-services.sh contracts - contracts-airgapped --input <file>),"
-  note "  and clients reach it at https://svc-mgmt-01.<domain> (04-enclave-services.sh pro)."
-  note "  Nothing on this machine reads this copy - backlog 3.36."
+  note "carried: bundle/config/airgapped-contracts.yaml - NOT installed here (svc-mgmt-01 serves it)."
+  note "Only if it changed: attach this disk to svc-mgmt-01 read-only from host-4, then ON svc-mgmt-01"
+  note "  sudo install -m 600 <mount>/bundle/config/airgapped-contracts.yaml /etc/ubuntu-advantage/"
+  note "  sudo ~/canonical-k8s/scripts/install/04-enclave-services.sh contracts"
 else
   note "*** airgapped-contracts.yaml NOT PRESENT ***"
-  note "Packages will serve, but no client can 'pro attach' - ESM and FIPS stay inert."
+  note "Packages will serve, but a CHANGED contracts config cannot reach svc-mgmt-01 this trip."
+fi
+if [ -e /etc/ubuntu-advantage/airgapped-contracts.yaml ]; then
+  note "WARNING: an old copy of the contracts config is on THIS machine and nothing here reads it."
+  note "  Remove it: sudo shred -u /etc/ubuntu-advantage/airgapped-contracts.yaml   (backlog 3.36a)"
 fi
 
 # --- 6. local apt sources, the served keys/debs/snaps, then nginx -------------------------------

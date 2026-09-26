@@ -762,8 +762,9 @@ SA-22, RA-5.
 > programme provides an external air-gapped system, logs ship to it from `svc-obs-01` alone.
 
 *Corrected 2026-09-26: this entry said "audit and syslog 90 days" — the 2026-09-18 decision, which
-the 2026-09-23 Q25 answer superseded for audit records. Syslog is not named in either answer:
-whether it follows audit (1 year) or metrics (90 days) is open — backlog 3.36.*
+the 2026-09-23 Q25 answer superseded for audit records. **Syslog: 1 year, the same as audit**
+(acting AO, 2026-09-26, backlog 3.36c) — decided, NOT yet built: nothing collects syslog today
+(backlog 3.37).*
 
 The AO's first answer was 30 days; raised to 90 on the observation that **Prometheus already
 retains metrics for 90 days**, and mismatched windows mean that for days 31–90 you have a metric

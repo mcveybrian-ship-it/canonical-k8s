@@ -40,6 +40,24 @@ SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # bare-metal host addresses in enclave-addresses.env - the same file everything else in this
 # repo treats as the single source of truth. Renumber there and this keeps working; rename a
 # machine and it cannot be fooled.
+# keyonly is the ONE subcommand that also belongs on the two staging machines (backlog 3.36b).
+# Everything else here would do harm there - trustca adds the enclave CA to their trust
+# store, apt repoints them at the in-gap mirror - so every other subcommand still refuses.
+# Recognised the same way as the hosts: by an address this machine owns, from the address file.
+_assert_keyonly_host() {
+  local af="$SELF/../enclave/enclave-addresses.env" STAGE_01 BUILD_01 mine h
+  [ -r "$af" ] || die "cannot read $af - refusing to guess which machine this is"
+  # shellcheck disable=SC1090
+  eval "$(awk -F= '/^(STAGE_01|BUILD_01)=/{print $1"="$2}' "$af")"
+  mine="$(ip -4 -o addr show scope global 2>/dev/null \
+      | awk '{split($4,a,"/"); print a[1]}' | tr '\n' ' ')"
+  for h in "${STAGE_01:-}" "${BUILD_01:-}"; do
+    [ -n "$h" ] || continue
+    case " $mine " in *" $h "*) return 0 ;; esac
+  done
+  _assert_enclave_host
+}
+
 _assert_enclave_host() {
   local af="$SELF/../enclave/enclave-addresses.env"
   [ -r "$af" ] || die "cannot read $af - refusing to guess whether this is an enclave host"
@@ -547,9 +565,10 @@ cmd_keyonly() {
   # No load_params: this step needs nothing from the params file, and requiring one would
   # stop it running on stage-01 and build-01, which have no services-params.env and are
   # exactly the machines that turned out to need it. Its own guard below is the safety.
-  # BUT (found 2026-09-26): the dispatch runs _assert_enclave_host FIRST, which refuses
-  # stage-01 and build-01 - so as written it cannot run on them. Which is intended is an
-  # open decision, not settled here: backlog 3.36.
+  # DECIDED 2026-09-26 (acting AO, backlog 3.36b): keyonly runs on stage-01 and build-01 too -
+  # they hold keys into the enclave. The dispatch used to refuse them. Both were ALREADY
+  # key-only, set by hand (PasswordAuthentication no; 7 days of logins all publickey), so this
+  # is what lets a rebuild of either reproduce it. _assert_keyonly_host is the gate.
   need_root keyonly
   local u="${SUDO_USER:-$(id -un)}" home ak
   home=$(getent passwd "$u" | cut -d: -f6)
@@ -725,7 +744,7 @@ case "${1:-}" in
   tmux)    cmd_tmux ;;
   hosts)   _assert_enclave_host; cmd_hosts ;;
   trustca) _assert_enclave_host; cmd_trustca ;;
-  keyonly) _assert_enclave_host; cmd_keyonly ;;
+  keyonly) _assert_keyonly_host; cmd_keyonly ;;
   verify)  cmd_verify ;;
   all)     _assert_enclave_host; cmd_hosts; cmd_trustca; cmd_apt; cmd_libvirt; cmd_datavg; cmd_pool; cmd_tmux; cmd_verify ;;
   *)       sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;

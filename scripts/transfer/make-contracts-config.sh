@@ -257,5 +257,6 @@ else
 fi
 say ""
 say "It is a credential. Do not commit it, do not print it."
-say "It is served from svc-mgmt-01 (04-enclave-services.sh contracts). restore-mirror.sh also"
-say "drops a copy on svc-repo-01 that nothing reads - backlog 3.36."
+say "It is served from svc-mgmt-01 (04-enclave-services.sh contracts). It travels on the transfer"
+say "disk and reaches svc-mgmt-01 attached read-only from host-4 (airgap-media 6.1e); in the lab,"
+say "scp from stage-01 also works. It is never installed on svc-repo-01 (backlog 3.36a)."

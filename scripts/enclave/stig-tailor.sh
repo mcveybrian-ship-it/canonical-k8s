@@ -2735,6 +2735,9 @@ cmd_grubpw() {
 # DISA's own command said otherwise.
 
 V1R6_GRUB_DROPIN=/etc/default/grub.d/99-zz-enclave-stig.cfg
+# The kernel's audit queue BEFORE auditd loads its rules (backlog 3.33). 8192 matches the `-b 8192`
+# the rules file sets once auditd is running, so the limit is the same either side of that moment.
+AUDIT_BACKLOG_LIMIT="${AUDIT_BACKLOG_LIMIT:-8192}"
 V1R6_AUDIT_RULES=/etc/audit/rules.d/99-enclave-stig.rules
 V1R6_JOURNAL_TMPFILES=/etc/tmpfiles.d/zzz-systemd-stig.conf
 # THE LINE THAT MAKES IT SURVIVE A REBOOT (2026-09-25, measured on host-1). At boot the vendor
@@ -3113,6 +3116,85 @@ DROPIN
       say "      AND $V1R6_GRUB_DROPIN (what makes it true - cloudimg hard-assigns the"
       say "      default, so the /etc/default/grub value alone never reaches the kernel)"
       say "      then update-grub and REBOOT"
+    fi
+  fi
+
+  # ---- audit_backlog_limit at boot (backlog 3.33) ----------------------------------------
+  # NOT A STIG RULE, and said so rather than dressed up as one: DISA's Ubuntu 24.04 V1R6
+  # benchmark never mentions a backlog, and usg's stig profile does not select
+  # grub2_audit_backlog_limit_argument - only the CIS Level 2 profiles do (both checked
+  # 2026-09-26). It is here for what it PREVENTS (AU-5): until auditd loads its rules, the
+  # kernel queues at most 64 records, and every boot of seven machines dropped 450-570 of them
+  # (enclave_auditd_lost after the 2026-09-26 power cut). The kernel argument applies from the
+  # moment auditing starts. Measured on svc-mgmt-01, 2026-09-11: lost 460 -> 0.
+  #
+  # ONLY THE DROP-IN. No scanner reads /etc/default/grub for this, and the drop-in is what
+  # reaches the kernel on BOTH the cloud-image guests (50-cloudimg-settings.cfg hard-assigns
+  # the default) and the autoinstalled hosts (no cloudimg file at all).
+  printf '\n  audit_backlog_limit  AU-5 - no audit records dropped while the machine boots (not a STIG rule)\n'
+  local abl_now
+  abl_now="$(grep -oE 'audit_backlog_limit=[0-9]+' /proc/cmdline | tail -1 | cut -d= -f2 || true)"
+  say "   /proc/cmdline:      audit_backlog_limit=${abl_now:-ABSENT}   (want at least $AUDIT_BACKLOG_LIMIT)"
+  if [ -n "$abl_now" ] && [ "$abl_now" -ge "$AUDIT_BACKLOG_LIMIT" ]; then
+    ok "   live since this boot"
+  elif [ -n "$abl_now" ]; then
+    # Someone chose a smaller number. Do not overwrite a decision silently - say it.
+    n_todo=$((n_todo+1))
+    warn "   booted with $abl_now, below $AUDIT_BACKLOG_LIMIT - set by hand somewhere; change it"
+    warn "   deliberately (find it: sudo grep -rn audit_backlog_limit /etc/default/grub*)"
+  else
+    n_todo=$((n_todo+1))
+    if [ "$apply" -eq 1 ]; then
+      install -d -m 0755 /etc/default/grub.d
+      [ -f "$V1R6_GRUB_DROPIN" ] && backup_file "$V1R6_GRUB_DROPIN"
+      if grep -q 'audit_backlog_limit=' "$V1R6_GRUB_DROPIN" 2>/dev/null; then
+        ok "   $V1R6_GRUB_DROPIN already carries it - it needs a REBOOT, not another edit"
+      else
+        printf '# audit_backlog_limit for AU-5 (backlog 3.33). Written by stig-tailor.sh %s\n' "$(date -Is)" \
+          >> "$V1R6_GRUB_DROPIN"
+        # Idempotent append, like audit=1 above: a bare ="$X ..." would add it again each run.
+        cat >> "$V1R6_GRUB_DROPIN" <<DROPIN
+case " \$GRUB_CMDLINE_LINUX_DEFAULT " in
+  *" audit_backlog_limit="*) ;;
+  *) GRUB_CMDLINE_LINUX_DEFAULT="\$GRUB_CMDLINE_LINUX_DEFAULT audit_backlog_limit=$AUDIT_BACKLOG_LIMIT" ;;
+esac
+DROPIN
+        ok "   $V1R6_GRUB_DROPIN: audit_backlog_limit=$AUDIT_BACKLOG_LIMIT appended"
+      fi
+      # grub-mkconfig SOURCES this file. Syntax-check it and revert on failure, exactly as
+      # /etc/default/grub is treated above.
+      local dsh_out
+      if ! dsh_out="$(sh -n "$V1R6_GRUB_DROPIN" 2>&1)"; then
+        warn "   $V1R6_GRUB_DROPIN FAILED sh -n - REVERTING"; printf '%s\n' "$dsh_out" | sed 's/^/       /'
+        if [ -n "${LAST_BACKUP:-}" ] && [ -f "$LAST_BACKUP" ]; then cp -a "$LAST_BACKUP" "$V1R6_GRUB_DROPIN"; ok "   restored from $LAST_BACKUP"
+        else warn "   NO BACKUP TO RESTORE FROM - fix by hand before any update-grub"; fi
+        failed=1
+      else
+        ok "   $V1R6_GRUB_DROPIN passes sh -n"
+        # 0644 like every other grub.d file (svc-mgmt-01 and svc-repo-01 were left 0600 by
+        # hand edits) - but never loosen a file that holds a password line.
+        if grep -qiE 'password|pbkdf2' "$V1R6_GRUB_DROPIN"; then
+          warn "   $V1R6_GRUB_DROPIN holds a password line - leaving its mode alone ($(stat -c %a "$V1R6_GRUB_DROPIN"))"
+        else
+          chmod 0644 "$V1R6_GRUB_DROPIN"
+        fi
+        local ab_out ab_rc=0
+        ab_out="$(update-grub 2>&1)" || ab_rc=$?
+        printf '%s\n' "$ab_out" | sed 's/^/       /'
+        if [ "$ab_rc" -ne 0 ]; then
+          warn "   update-grub FAILED (exit $ab_rc) - output above. NOT rebooting on this."; failed=1
+        elif grep -q "audit_backlog_limit=$AUDIT_BACKLOG_LIMIT" /boot/grub/grub.cfg 2>/dev/null; then
+          ok "   audit_backlog_limit=$AUDIT_BACKLOG_LIMIT present in the generated /boot/grub/grub.cfg"
+          V1R6_REBOOT_NEEDED=1
+        else
+          warn "   update-grub ran but /boot/grub/grub.cfg has NO audit_backlog_limit=$AUDIT_BACKLOG_LIMIT -"
+          warn "   something later in /etc/default/grub.d/ is overriding it. Do not reboot on this."
+          failed=1
+        fi
+      fi
+    else
+      say "   -> append audit_backlog_limit=$AUDIT_BACKLOG_LIMIT to GRUB_CMDLINE_LINUX_DEFAULT in"
+      say "      $V1R6_GRUB_DROPIN, update-grub, REBOOT - then enclave_auditd_lost stays 0"
     fi
   fi
 

@@ -263,7 +263,7 @@ parameters at the top of the script; nothing is hardcoded — **21 of them**, co
 | availability | `InstanceDown` |
 | cpu / memory | `HighCPU`, `MemoryPressure` |
 | filesystems | `FilesystemFillingWarning`, `FilesystemFillingCritical`, `AuditFilesystemFilling`, `FilesystemWillFillSoon` (`predict_linear` over 6 h says full within 4 h), `FilesystemReadOnly` |
-| audit trail | `AuditRecordsLost`, `AuditdNotRunning`, `AuditBacklogNearLimit` |
+| audit trail | `AuditRecordsLost`, `AuditRecordsLostAtBoot`, `AuditdNotRunning`, `AuditBacklogNearLimit` |
 | compliance drift | `StigOpenControlsIncreased`, `StigScanStale`, `FipsModeDisabled`, `CertificateExpiringSoon`, `AideCheckStale`, `AideDetectedChanges`, `AccountLockoutRisk`, `ComplianceFactsStale` |
 | backups | `BackupMissed`, `BackupNeverCompleted`, `BackupInterrupted`, `BackupDestinationDetached`, `BackupTimerDisabled`, `BackupVolumeFilling`, `BackupFactsMissing` |
 | registry | `HarborUnhealthy`, `HarborComponentUnhealthy`, `TrivyDatabaseStale`, `TrivyDatabaseMissing` |
@@ -294,8 +294,10 @@ from here. It now fires on the first failure, which is the only warning that arr
 **`AuditRecordsLost` uses `delta`, not a bare threshold.** `auditd`'s lost counter is cumulative
 since boot, so `> 0` would fire forever on a machine that dropped records once weeks ago — and
 an alert that is always firing trains people to close it without reading. `delta` over an hour
-asks the actionable question: *is it losing records now*. On a reboot the counter resets, delta
-goes negative, and nothing fires, which is correct.
+asks the actionable question: *is it losing records now*. What it cannot see is loss **at boot**
+— the counter resets to what the boot dropped, not to zero, and stays flat — so
+**`AuditRecordsLostAtBoot`** alerts on any loss within `AL_BOOT_LOSS_WINDOW` of a boot and then
+clears by itself (backlog 3.33; the rationale is in `dashboards-and-metrics.md`).
 
 **Nothing alerts on the residual set being non-zero.** It is non-zero by design and every
 finding in it has a written rationale. `StigOpenControlsIncreased` alerts on it **changing**,

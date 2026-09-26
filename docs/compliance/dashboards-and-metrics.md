@@ -570,6 +570,7 @@ pager that trains people to ignore it.
 | `FilesystemReadOnly` | `node_filesystem_readonly == 1` | 1m | critical |
 | **audit trail** | | | |
 | `AuditRecordsLost` | `delta(enclave_auditd_lost[1h]) > 0` | 5m | critical |
+| `AuditRecordsLostAtBoot` | `enclave_auditd_lost > 0` and booted within `AL_BOOT_LOSS_WINDOW` (24 h) | 5m | critical |
 | `AuditdNotRunning` | the unit is not active | 5m | critical |
 | `AuditBacklogNearLimit` | backlog over half `backlog_limit` | 10m | warning |
 | **compliance drift** | | | |
@@ -619,8 +620,15 @@ here. It now fires on the first failure, which is the only warning that arrives 
 **`AuditRecordsLost` uses `delta`, not `> 0`.** auditd's `lost` counter is cumulative since
 boot, so a bare threshold would fire forever on a machine that dropped records once weeks ago —
 and an alert that is always firing trains people to close it without reading. `delta` over an
-hour asks the actionable question: *is it losing records now*. On a reboot the counter resets,
-delta goes negative, and nothing fires, which is correct.
+hour asks the actionable question: *is it losing records now*.
+
+**But `delta` cannot see loss at boot — found 2026-09-26 (backlog 3.33).** The counter does not
+reset to zero; it resets to whatever the boot itself dropped, then stays flat. A machine down
+longer than the hour has only post-boot samples, so `delta` is 0. Seven machines lost ~500
+records at every boot from 2026-09-14 and the rule fired once, on one machine, by accident of
+timing. **`AuditRecordsLostAtBoot`** covers it: any loss, but only for the first
+`AL_BOOT_LOSS_WINDOW` after a boot, so it clears by itself and never becomes the always-firing
+alert the `delta` rule was written to avoid.
 
 **Nothing alerts on the residual set being non-zero.** It is non-zero by design and every
 finding in it has a written rationale. `StigOpenControlsIncreased` alerts on it *changing*.

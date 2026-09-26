@@ -381,6 +381,7 @@ AL_DOWN_FOR="${AL_DOWN_FOR:-2m}"
 # expression cannot carry "26h" - and 26h rather than 24h so a nightly job that runs a little
 # late does not page every morning.
 AL_FACTS_STALE="${AL_FACTS_STALE:-3600}"          # facts older than this: every number is frozen
+AL_BOOT_LOSS_WINDOW="${AL_BOOT_LOSS_WINDOW:-86400}" # seconds after a boot that boot-time audit loss stays visible (3.33)
 AL_SCAN_STALE_DAYS="${AL_SCAN_STALE_DAYS:-30}"    # STIG checklist older than this
 AL_CERT_DAYS="${AL_CERT_DAYS:-30}"                # certificate inside this many days
 AL_AIDE_STALE="${AL_AIDE_STALE:-129600}"          # 36h - dailyaidecheck has missed a day
@@ -1045,8 +1046,14 @@ groups:
       # bare '> 0' would fire
       # forever on a machine that dropped records once six weeks ago - and an alert that is
       # always firing trains people to close it. delta() over an hour asks the question that
-      # is actually actionable: is it losing records NOW. On a reboot the counter resets to
-      # zero, delta goes negative, and nothing fires - which is correct.
+      # is actually actionable: is it losing records NOW.
+      #
+      # WHAT DELTA CANNOT SEE: LOSS AT BOOT (backlog 3.33, 2026-09-26). The counter does not
+      # reset to zero - it resets to whatever the boot itself dropped (450-570 on seven
+      # machines), then stays flat. A machine down longer than the window has only post-boot
+      # samples, so delta is 0 and nothing fires. Seven machines lost ~500 records at every
+      # boot from 2026-09-14 on; this rule fired once, on one machine, by accident of timing.
+      # AuditRecordsLostAtBoot below covers it.
       - alert: AuditRecordsLost
         expr: delta(enclave_auditd_lost[1h]) > 0
         for: 5m
@@ -1056,9 +1063,26 @@ groups:
           summary: "{{ \$labels.machine }} is DROPPING audit records"
           description: "The kernel discarded {{ \$value | printf \"%.0f\" }} audit events in the last hour. The trail has holes."
           action: >-
-            'sudo auditctl -s' on {{ \$labels.machine }}. If backlog is at backlog_limit,
-            raise it in /etc/audit/rules.d and 'sudo augenrules --load'. Persistent loss
-            means the rules are generating more than auditd can write - see runbook 6.3d.
+            'sudo auditctl -s' on {{ \$labels.machine }}. Persistent loss means the rules
+            generate more than auditd can write - see runbook 6.3d. The rules are IMMUTABLE
+            (-e 2): raising -b in /etc/audit/rules.d takes a REBOOT - 'augenrules --load' refuses.
+
+      # LOSS AT BOOT, visible for AL_BOOT_LOSS_WINDOW after each boot and then clearing by
+      # itself - so it is never the always-firing alert the rule above avoids. Any hit means
+      # the kernel's pre-auditd queue overflowed: audit_backlog_limit is missing from the boot.
+      - alert: AuditRecordsLostAtBoot
+        expr: enclave_auditd_lost > 0 and on(instance) (time() - node_boot_time_seconds) < ${AL_BOOT_LOSS_WINDOW}
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ \$labels.machine }} DROPPED audit records while it booted"
+          description: "{{ \$value | printf \"%.0f\" }} audit events were discarded since the last boot - before auditd started. That part of the trail does not exist."
+          action: >-
+            On {{ \$labels.machine }}: 'grep -o audit_backlog_limit=[0-9]* /proc/cmdline'. Absent
+            means the kernel queued 64 records before auditd loaded its rules and dropped the rest.
+            Fix: 'sudo stig-tailor.sh v1r6 --apply', then reboot (backlog 3.33). Clears by itself
+            once the boot is older than the window; the lost records do not come back.
 
       - alert: AuditdNotRunning
         expr: node_systemd_unit_state{name="auditd.service",state="active"} == 0
@@ -1415,7 +1439,7 @@ groups:
   # A TEST ALERT THE OPERATOR SWITCHES ON AND OFF (backlog B-09a). The notification this
   # enclave relies on is a firing alert on a dashboard someone watches - accepted by the AO
   # for V-270818/819 (Q26). A notification path that has never been seen to fire is an
-  # assumption, so `monitoring.sh alert-test on|off` drives this rule end to end: a
+  # assumption, so "monitoring.sh alert-test on|off" drives this rule end to end: a
   # textfile metric -> node-exporter -> Prometheus -> Alertmanager -> the dashboard.
   - name: enclave-alert-path
     rules:

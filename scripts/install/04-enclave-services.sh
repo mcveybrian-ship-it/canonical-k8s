@@ -120,7 +120,7 @@ RestrictAddressFamilies=AF_INET AF_INET6
 #
 # systemd enforces this with a BPF filter on the socket rather than a firewall rule, so it
 # travels with the unit and cannot be left behind when someone flushes nftables. Verify
-# with `ss -ltn` from another machine, not from localhost - localhost is allowed and will
+# with 'ss -ltn' from another machine, not from localhost - localhost is allowed and will
 # always answer.
 IPAddressDeny=any
 IPAddressAllow=localhost
@@ -138,6 +138,20 @@ AmbientCapabilities=
 WantedBy=multi-user.target
 UNIT
   ok "wrote /etc/systemd/system/contracts-airgapped.service"
+
+  # ASK SYSTEMD WHAT IT MADE OF THE FILE, before trusting it (2026-09-26). This unit was
+  # written from an unquoted heredoc whose comment held `ss -ltn` in backticks - so the shell
+  # RAN it and pasted the socket table into the unit. systemd ignored those lines with
+  # "Missing '='" and the service ran, so nothing looked wrong for three weeks. Only the
+  # complaints about THIS file count; ExecStart and friends are checked by starting it below.
+  local va
+  va="$(systemd-analyze verify /etc/systemd/system/contracts-airgapped.service 2>&1 \
+        | grep -F 'contracts-airgapped.service:' | grep -vE 'Command .* is not executable' || true)"
+  if [ -n "$va" ]; then
+    printf '%s\n' "$va" | sed 's/^/     /'
+    die "systemd rejects lines of the unit just written (above) - fix the text in $0, then re-run"
+  fi
+  ok "systemd-analyze verify: no complaints about the unit"
 
   systemctl daemon-reload
   systemctl enable --now contracts-airgapped >/dev/null 2>&1 || true

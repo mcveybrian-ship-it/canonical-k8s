@@ -397,8 +397,24 @@ TMUX_CONF=""
 #
 # A HASH goes in the user-data, never the password. cloud-init's user-data sits on the seed
 # ISO and in /var/lib/cloud on the guest, both readable.
-VM_ADMIN_HASH="${VM_ADMIN_PASSWORD_HASH:-}"
+#
+# WHERE THE HASH COMES FROM (3.32): VM_ADMIN_PASSWORD_HASH in the environment > the same key in
+# the site credentials file (/etc/enclave/credentials.env, root 600 - see credentials.sh) >
+# asked for here. One hash for every guest built from that file.
+VM_ADMIN_HASH="${VM_ADMIN_PASSWORD_HASH:-}"; VM_ADMIN_SRC="VM_ADMIN_PASSWORD_HASH (environment)"
 if [ -z "$VM_ADMIN_HASH" ] && [ "$DRY" -eq 0 ]; then
+  # shellcheck source=../enclave/credentials.sh
+  . "$ENCLAVE_DIR/credentials.sh"
+  cred_require_safe
+  VM_ADMIN_HASH="$(cred_get VM_ADMIN_PASSWORD_HASH)"; VM_ADMIN_SRC="$ENCLAVE_CREDENTIALS"
+fi
+if [ -n "$VM_ADMIN_HASH" ]; then
+  # CHECK THE SHAPE: a truncated paste would set a password that matches nothing, and the
+  # lock-out above would only show up after hardening.
+  [[ "$VM_ADMIN_HASH" =~ ^\$6\$[^\$]+\$[./A-Za-z0-9]+$ ]] \
+    || die "the VM admin hash from $VM_ADMIN_SRC is not SHA-512 crypt (\$6\$...) - nothing created"
+  ok "VM admin password: hash from $VM_ADMIN_SRC - no prompt"
+elif [ "$DRY" -eq 0 ]; then
   if [ -t 0 ]; then
     printf '  no VM_ADMIN_PASSWORD_HASH set - enter a password for %s on %s\n' "${VM_USER:-encadmin}" "$VM"
     read -rsp '  password: ' _p1; echo
@@ -410,8 +426,8 @@ if [ -z "$VM_ADMIN_HASH" ] && [ "$DRY" -eq 0 ]; then
     unset _p1 _p2
   else
     die "no VM_ADMIN_PASSWORD_HASH and no terminal to prompt on.
-      Generate one:   openssl passwd -6
-      Then:           VM_ADMIN_PASSWORD_HASH='<hash>' sudo -E ./03-compose-vm.sh $VM"
+      Unattended:     VM_ADMIN_PASSWORD_HASH in $ENCLAVE_CREDENTIALS (make-credentials.sh)
+      Or for one run: VM_ADMIN_PASSWORD_HASH='<hash>' sudo -E ./03-compose-vm.sh $VM"
   fi
 fi
 

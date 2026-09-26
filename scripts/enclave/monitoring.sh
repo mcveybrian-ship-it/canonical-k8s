@@ -7,6 +7,7 @@
 #     sudo ./monitoring.sh exporter          node-exporter: install, bind, prune collectors
 #     sudo ./monitoring.sh libvirt           per-guest metrics, HYPERVISORS ONLY
 #     sudo ./monitoring.sh collector         prometheus + alertmanager + grafana, configured
+#     sudo ./monitoring.sh grafana-admin     close admin/admin from the credentials file (3.32)
 #     sudo ./monitoring.sh alerting          alertmanager config only (B-09a) - collector runs it too
 #     sudo ./monitoring.sh alert-test on|off  PROVE an alert reaches the dashboard, and clears
 #     ./monitoring.sh status                 what is running here and where it is bound
@@ -67,6 +68,8 @@ ok()   { printf '  [ok] %s\n' "$*"; }
 warn() { printf '  [!]  %s\n' "$*"; }
 die()  { printf '\n  [x] %s\n\n' "$*" >&2; exit 1; }
 need_root() { [ "$(id -u)" -eq 0 ] || die "run with sudo"; }
+# shellcheck source=credentials.sh
+. "$HERE/credentials.sh"   # cred_require_safe / cred_get - Grafana's admin password (3.32)
 
 # THE MACHINE'S OWN ENCLAVE ADDRESS, from the one file that owns addressing.
 # Never `hostname -I` - stage-01 is multi-homed and that would pick whichever interface the
@@ -465,6 +468,91 @@ DS
 # collector: on svc-obs-01. Prometheus and Alertmanager on loopback, the scrape config generated
 # from scrape_targets() and the address file (promtool-checked), alertmanager.yml, Grafana
 # from the mirror (sha256-checked) on loopback behind nginx TLS - then prove every bind.
+# ---- Grafana's admin password (3.32, 2026-09-26) -------------------------------------------
+# A fresh Grafana accepts admin/admin - a PUBLISHED credential - until someone logs in and is
+# made to change it, and nothing makes that login happen soon. The collector closes it from
+# GRAFANA_ADMIN_PASSWORD in the environment > the site credentials file. With neither, it does
+# NOT prompt - the standing rule is that this password is typed at the browser, over TLS - it
+# says loudly that the default is live instead.
+#
+# IT ACTS ONLY WHILE admin/admin STILL WORKS, so a re-run never overwrites a password an
+# administrator has since changed. The check is a real form login (POST /login), not basic
+# auth: basic auth can be switched off, and then EVERY password gets a 401 - which would read
+# as "the default is already gone".
+#
+# THE CLI HAS TO BE TOLD WHERE THE DATABASE IS. The .deb gives the data path only on the
+# SERVICE's command line (cfg:default.paths.data=${DATA_DIR} in grafana-server.service). A bare
+# `grafana cli` falls back to <homepath>/data, resets the password in a database the server
+# never reads, and reports success. Proven on a scratch Grafana 13.2.1, 2026-09-26.
+GRAFANA_URL="${GRAFANA_URL:-http://127.0.0.1:3000}"
+GRAFANA_ADMIN_USER="${GRAFANA_ADMIN_USER:-admin}"
+GRAFANA_DEFAULTS="${GRAFANA_DEFAULTS:-/etc/default/grafana-server}"
+GF_ADMIN_STATE="not checked"
+
+gf_default() {   # KEY -> its value in the package's defaults file (parsed, never sourced)
+  sed -n "s/^$1=//p" "$GRAFANA_DEFAULTS" 2>/dev/null | tail -1 | tr -d '"'
+}
+gf_login() {     # USER PASSWORD -> the HTTP code of a form login. The body goes in on STDIN,
+  local u="$1" p="$2"   # never on curl's command line where ps would show it.
+  u="${u//\\/\\\\}"; u="${u//\"/\\\"}"; p="${p//\\/\\\\}"; p="${p//\"/\\\"}"
+  printf '{"user":"%s","password":"%s"}' "$u" "$p" \
+    | curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+        -H 'Content-Type: application/json' --data-binary @- "$GRAFANA_URL/login" || true
+}
+grafana_admin_password() {
+  local i code pw src out rc=0 home data conf runas c_old c_new
+  # Grafana migrates its database on first start - 70 s on stage-01's hardware (2026-09-26),
+  # longer on a small VM - so give it up to 180 s to answer at all.
+  for i in $(seq 1 90); do
+    [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "$GRAFANA_URL/api/health" || true)" = 200 ] && break
+    sleep 2
+  done
+  code="$(gf_login "$GRAFANA_ADMIN_USER" admin)"
+  case "$code" in
+    401) GF_ADMIN_STATE="changed"
+         ok "Grafana: the published default $GRAFANA_ADMIN_USER/admin is refused - password left alone"; return 0 ;;
+    200) warn "Grafana ACCEPTS the published default $GRAFANA_ADMIN_USER/admin" ;;
+    *)   GF_ADMIN_STATE="UNKNOWN"
+         warn "Grafana's login answered HTTP $code at $GRAFANA_URL - cannot tell whether admin/admin is live"; return 1 ;;
+  esac
+  GF_ADMIN_STATE="DEFAULT LIVE"
+  pw="${GRAFANA_ADMIN_PASSWORD:-}"; src="GRAFANA_ADMIN_PASSWORD (environment)"
+  if [ -z "$pw" ]; then cred_require_safe; pw="$(cred_get GRAFANA_ADMIN_PASSWORD)"; src="$ENCLAVE_CREDENTIALS"; fi
+  if [ -z "$pw" ]; then
+    warn "  no GRAFANA_ADMIN_PASSWORD in the environment or $ENCLAVE_CREDENTIALS -"
+    warn "  admin/admin STAYS LIVE until someone logs in at the browser and changes it"
+    return 1
+  fi
+  [ "$pw" != admin ] || { pw=""; warn "  the supplied password IS 'admin' - refusing"; return 1; }
+  home="$(gf_default GRAFANA_HOME)"; data="$(gf_default DATA_DIR)"; conf="$(gf_default CONF_FILE)"; runas="$(gf_default GRAFANA_USER)"
+  if [ -z "$home" ] || [ -z "$data" ] || [ -z "$conf" ]; then
+    pw=""; warn "  cannot read GRAFANA_HOME / DATA_DIR / CONF_FILE from $GRAFANA_DEFAULTS"; return 1
+  fi
+  # The server's database must already be there - otherwise the CLI would quietly make a new one.
+  [ -f "$data/grafana.db" ] || { pw=""; warn "  no $data/grafana.db - refusing to let the CLI create a second database"; return 1; }
+  local cmd=("$home/bin/grafana" cli --homepath "$home" --config "$conf"
+             --configOverrides "cfg:default.paths.data=$data"
+             admin reset-admin-password --password-from-stdin)
+  # As the service's own user, so nothing in its data directory ends up owned by root.
+  [ "$(id -un)" = "${runas:-grafana}" ] || cmd=(runuser -u "${runas:-grafana}" -- "${cmd[@]}")
+  out="$(printf '%s\n' "$pw" | "${cmd[@]}" 2>&1)" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    pw=""; warn "  grafana cli failed (exit $rc):"; printf '%s\n' "$out" | sed 's/^/         /'; return 1
+  fi
+  # PROVE IT, both ways - the CLI's own "success" is exactly what the wrong-database case says.
+  c_old="$(gf_login "$GRAFANA_ADMIN_USER" admin)"; c_new="$(gf_login "$GRAFANA_ADMIN_USER" "$pw")"; pw=""
+  if [ "$c_old" = 401 ] && [ "$c_new" = 200 ]; then
+    GF_ADMIN_STATE="set"
+    ok "Grafana $GRAFANA_ADMIN_USER password set from $src: admin/admin now refused (401), the new one accepted (200)"
+  else
+    warn "  Grafana password change NOT proven: admin/admin -> HTTP $c_old (want 401), new -> HTTP $c_new (want 200)"
+    printf '%s\n' "$out" | sed 's/^/         /'
+    return 1
+  fi
+}
+
+cmd_grafana_admin() { need_root; grafana_admin_password; }
+
 cmd_collector() {
   guard_in_gap; need_root
   local me ip; me="$(hostname -s)"; ip="$(my_enclave_ip)"
@@ -591,6 +679,7 @@ cmd_collector() {
     ensure_datasource
     systemctl daemon-reload
     systemctl enable --now grafana-server >/dev/null 2>&1 || true
+    grafana_admin_password || true   # it says what is wrong; the closing lines repeat it
   fi
 
   # ---- TLS in front of Grafana ----------------------------------------------------------
@@ -646,10 +735,14 @@ cmd_collector() {
   say ""
   ok "collector up. Targets take one scrape_interval to report:"
   say "   curl -s 'http://127.0.0.1:9090/api/v1/targets?state=any'"
-  if [ -f "/etc/ssl/enclave/${me}.fullchain.crt" ]; then
-    say "   grafana: https://${me}.${ENCLAVE_DOMAIN:-enclave.internal}/  - set the admin"
-    say "            password AT THE BROWSER PROMPT, over TLS. Never in a terminal."
-  fi
+  case "$GF_ADMIN_STATE" in
+    set|changed) ok "grafana admin password: $GF_ADMIN_STATE - the published default is refused" ;;
+    *) warn "GRAFANA ADMIN PASSWORD: $GF_ADMIN_STATE - admin/admin may be accepted on $me."
+       if [ -f "/etc/ssl/enclave/${me}.fullchain.crt" ]; then
+         say "   set it AT THE BROWSER PROMPT, over TLS: https://${me}.${ENCLAVE_DOMAIN:-enclave.internal}/"
+       fi
+       say "   or unattended: GRAFANA_ADMIN_PASSWORD in $ENCLAVE_CREDENTIALS, then: sudo $0 grafana-admin" ;;
+  esac
   warn "retention is ${PROM_RETENTION_TIME} / ${PROM_RETENTION_SIZE} - the TIME is a placeholder"
   warn "  until the AO answers. The SIZE cap is the real protection: it stops a noisy month"
   warn "  filling the disk and taking down the machine you use to find out why."
@@ -2222,6 +2315,7 @@ case "${1:-status}" in
   exporter) shift; cmd_exporter "$@" ;;
   libvirt)  shift; cmd_libvirt "$@" ;;
   collector) shift; cmd_collector "$@" ;;
+  grafana-admin) shift; cmd_grafana_admin "$@" ;;
   rules)      shift; cmd_rules "$@" ;;
   alerting)   shift; cmd_alerting "$@" ;;
   alert-test) shift; cmd_alert_test "$@" ;;

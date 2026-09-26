@@ -2612,7 +2612,7 @@ cmd_grubpw() {
       # custodians; the password itself is never stored anywhere.
       local H src=""
       H="${GRUB_PASSWORD_HASH:-}"; [ -n "$H" ] && src="GRUB_PASSWORD_HASH (environment)"
-      if [ -z "$H" ]; then H="$(cred_get GRUB_PASSWORD_HASH)"; [ -n "$H" ] && src="$ENCLAVE_CREDENTIALS"; fi
+      if [ -z "$H" ]; then cred_require_safe; H="$(cred_get GRUB_PASSWORD_HASH)"; [ -n "$H" ] && src="$ENCLAVE_CREDENTIALS"; fi
       if [ -n "$H" ]; then
         # CHECK THE SHAPE: a truncated or mis-pasted hash would lock the editor with a password
         # nobody knows - or, worse, one that matches nothing and is never noticed.
@@ -4528,17 +4528,10 @@ REFERENCE_ADMIN="${REFERENCE_ADMIN:-encadmin}"
 # Precedence everywhere: environment variable > this file > prompt at the terminal. Never
 # in the repository; carried on custody-controlled media and deleted from the target once
 # hardening succeeds (docs/airgap-media.md, credential custody).
-ENCLAVE_CREDENTIALS="${ENCLAVE_CREDENTIALS:-/etc/enclave/credentials.env}"
-# cred_get KEY - print KEY's value from the credentials file, or nothing if the file or the key
-# is absent. REFUSES a file that is not root-owned mode 600: a readable hash is a hash an
-# offline cracker can work on. Parsed with sed, never sourced - a secrets file is not code.
-cred_get() {
-  local f="$ENCLAVE_CREDENTIALS"
-  [ -e "$f" ] || return 0
-  [ "$(stat -c '%U %a' "$f" 2>/dev/null)" = "root 600" ] \
-    || die "$f is not root-owned mode 600 ($(stat -c '%U %a' "$f" 2>/dev/null)) - refusing to read credentials from it"
-  sed -n "s/^$1='\\([^']*\\)'.*/\\1/p" "$f" | head -1
-}
+# cred_get / cred_require_safe live in credentials.sh - ONE copy for every consumer. The
+# check runs up front in the main shell: from inside $(...) a refusal only ends a subshell.
+# shellcheck source=credentials.sh
+. "$HERE/credentials.sh"
 BG_SSHD_DROPIN=/etc/ssh/sshd_config.d/10-enclave-breakglass.conf
 BG_AUDIT_RULES=/etc/audit/rules.d/65-enclave-breakglass.rules
 
@@ -4624,6 +4617,7 @@ cmd_accounts() {
 
     create)
       need_root
+      cred_require_safe   # before any account is touched - an unsafe file stops the run HERE
       [ -n "${ADMIN2_USER:-}" ] || die "ADMIN2_USER is not set. It is a PERSON - name them in
        docs/compliance/baseline/facility-profile.env (ADMIN2_USER=...), or for one run:
        sudo ADMIN2_USER=<username> ADMIN2_KEY=<path/to/key.pub> $0 accounts create"

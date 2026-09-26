@@ -2762,8 +2762,13 @@ v1r6_timesyncd_installed() {
   # did not implement the comment. Run DISA's command, not a smarter one.
   dpkg -l 2>/dev/null | grep -q 'systemd-timesyncd'
 }
+# DISA's CheckText reads common-password AND common-auth (checked against the V1R6 XCCDF
+# 2026-09-26) - this used to read common-auth and the template only, so a nullok in
+# common-password would have passed here while the scanner marked a CAT I. The template
+# (/usr/share/pam-configs/unix) is NOT in DISA's check; it stays in ours for DURABILITY: it is
+# what pam-auth-update regenerates common-auth from, so a nullok left there comes back.
 v1r6_nullok_files() {
-  grep -l 'nullok' /etc/pam.d/common-auth /usr/share/pam-configs/unix 2>/dev/null || true
+  grep -l 'nullok' /etc/pam.d/common-password /etc/pam.d/common-auth /usr/share/pam-configs/unix 2>/dev/null || true
 }
 v1r6_bad_libs() {
   find /lib /lib64 /usr/lib /usr/lib64 -type f -name '*.so*' ! -group root \
@@ -2960,7 +2965,7 @@ cmd_v1r6() {
         # BOTH FILES OR NEITHER. common-auth alone is undone by the next pam-auth-update;
         # the pam-configs source alone does nothing until common-auth is regenerated.
         local f
-        for f in /etc/pam.d/common-auth /usr/share/pam-configs/unix; do
+        for f in /etc/pam.d/common-password /etc/pam.d/common-auth /usr/share/pam-configs/unix; do
           [ -f "$f" ] || continue
           backup_file "$f"
           # Delete every " nullok" token (with its leading whitespace), leaving the rest of
@@ -3372,11 +3377,12 @@ TMPF
 
   # ---- what is left, and who has to decide it -------------------------------------------
   printf '\n  NOT HANDLED HERE - each needs a decision, not a command:\n'
-  say "   V-270675           GRUB password - interactive. runbook 6.3i"
+  say "   V-270675           GRUB password - its own subcommand: grubpw set (05 step grub);"
+  say "                      unattended from GRUB_PASSWORD_HASH in the credentials file (3.32)"
   say "   V-270663/735/736   smart card / CAC family - one missing subsystem, AO question"
   say "   V-270722/745       DoD PKI + smart-card login - same family"
-  say "   V-270817 / 658     audit offload - svc-obs-01 can host the collector; the blocker"
-  say "                      is now the three AO answers alone, not the missing VM (6.3d)"
+  say "   V-270658           real-time audit offload (audisp) - DEFERRED by the AO, Q25 2026-09-18."
+  say "                      (V-270817, the weekly offload, is answered NF - answerfile.sh)"
   say "   V-270751           chrony - unpassable in an air gap by design. Answer File (10.1d)"
   say "   V-270681           rsyslog selectors - SCANNER FALSE POSITIVE. DISA's own grep"
   say "                      returns both required lines. Answer File with that output."

@@ -1070,8 +1070,17 @@ groups:
       # LOSS AT BOOT, visible for AL_BOOT_LOSS_WINDOW after each boot and then clearing by
       # itself - so it is never the always-firing alert the rule above avoids. Any hit means
       # the kernel's pre-auditd queue overflowed: audit_backlog_limit is missing from the boot.
+      #
+      # ONLY FACTS GENERATED SINCE THIS BOOT. The facts timer is OnCalendar every 15 min (not
+      # boot-relative, for the reason at its unit), so for up to 15 min after a reboot
+      # node-exporter still serves the PREVIOUS boot's count. Measured on host-1, 2026-09-26:
+      # booted 18:39:50 with the fix, still served 'lost 535', and went back to pending.
+      # Without the last clause a fixed machine alerts on its own history.
       - alert: AuditRecordsLostAtBoot
-        expr: enclave_auditd_lost > 0 and on(instance) (time() - node_boot_time_seconds) < ${AL_BOOT_LOSS_WINDOW}
+        expr: >-
+          enclave_auditd_lost > 0
+          and on(instance) (time() - node_boot_time_seconds) < ${AL_BOOT_LOSS_WINDOW}
+          and on(instance) (enclave_facts_generated_seconds > on(instance) node_boot_time_seconds)
         for: 5m
         labels:
           severity: critical

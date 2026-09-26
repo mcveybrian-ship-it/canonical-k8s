@@ -55,7 +55,11 @@ done
 # containing '2>&1' silently produced '2>@@PLACEHOLDER@@1'. Any free-text value can hit this:
 # a LUKS passphrase or an SSH key comment containing '&' would corrupt the seed with no error.
 # Escape every replacement that is not a fixed literal.
-esc() { printf '%s' "${1//&/\\&}"; }
+# BACKSLASHES FIRST, THEN &. With patsub_replacement (on by default since bash 5.2) the
+# replacement text treats BOTH as special. Escaping only & turned a double backslash into a
+# single one, and backslash-ampersand into a backslash followed by the placeholder name
+# (measured 2026-09-26). Every free-text value goes through here, the LUKS passphrase included.
+esc() { local s="${1//\\/\\\\}"; printf '%s' "${s//&/\\&}"; }
 
 die() { echo "[x] $*" >&2; exit 1; }
 
@@ -165,7 +169,12 @@ esac
 if [[ "$ENCRYPT_DISKS" == "true" ]]; then
   [[ -n "${LUKS_PASSPHRASE:-}" ]] || die "ENCRYPT_DISKS=true but LUKS_PASSPHRASE is unset in $PARAMS"
   [[ "$LUKS_PASSPHRASE" != *REPLACE-ME* ]] || die "LUKS_PASSPHRASE still holds a placeholder"
+  (( ${#LUKS_PASSPHRASE} >= 12 )) || die "LUKS_PASSPHRASE is under 12 characters"
+fi
 
+# THE DISK CHECKS RUN WHETHER OR NOT THE DISKS ARE ENCRYPTED (2026-09-26). The if above used
+# to stay open down to the crypt blocks, so everything between - no-USB, not-everything,
+# OS != data, DATA_VG_SIZE - was skipped for ENCRYPT_DISKS=false. The indentation hid it.
 # Disk matching decides which device gets wiped. Refuse the two ways it goes wrong.
 : "${OS_DISK_MATCH:?OS_DISK_MATCH not set in host-params.env}"
 : "${DATA_DISK_MATCH:?DATA_DISK_MATCH not set in host-params.env}"
@@ -197,11 +206,20 @@ esac
 [ "$OS_DISK_MATCH" != "$DATA_DISK_MATCH" ] ||   die "OS_DISK_MATCH and DATA_DISK_MATCH are identical ('$OS_DISK_MATCH') - they would both
        resolve to the same disk. On an all-NVMe host, disambiguate by PCI address:
          ls -l /dev/disk/by-path/ | grep -v part"
-  (( ${#LUKS_PASSPHRASE} >= 12 )) || die "LUKS_PASSPHRASE is under 12 characters"
+
+if [[ "$ENCRYPT_DISKS" == "true" ]]; then
+  # THE PASSPHRASE MEETS THREE PARSERS, and it now reaches each in a form that parser cannot
+  # misread (2026-09-26). Before, a ' broke the YAML below, and " $ \ ` were interpreted by the
+  # installer's shell in the late-command - the policy asks for symbols, so this was live.
+  #   YAML  key: '...'   - single-quoted, with ' written as '' (the only escape YAML has there)
+  #   shell late-command - base64, decoded at install time: [A-Za-z0-9+/=] means nothing to
+  #                        YAML, to sh, or to bash's ${//} replacement
+  LUKS_YAML="${LUKS_PASSPHRASE//\'/\'\'}"
+  LUKS_B64="$(printf '%s' "$LUKS_PASSPHRASE" | base64 -w0)"
   # curtin storage-config dm_crypt actions, one per volume group. key: is the LUKS passphrase
   # IN PLAINTEXT inside user-data - why every seed is a credential (backlog 2.6).
-  CRYPT_OS=$'      - id: crypt-os\n        type: dm_crypt\n        dm_name: crypt-os\n        volume: p-pv\n        key: \''"$LUKS_PASSPHRASE"$'\'\n'
-  CRYPT_DATA=$'      - id: crypt-data\n        type: dm_crypt\n        dm_name: crypt-data\n        volume: p-data\n        key: \''"$LUKS_PASSPHRASE"$'\'\n'
+  CRYPT_OS=$'      - id: crypt-os\n        type: dm_crypt\n        dm_name: crypt-os\n        volume: p-pv\n        key: \''"$LUKS_YAML"$'\'\n'
+  CRYPT_DATA=$'      - id: crypt-data\n        type: dm_crypt\n        dm_name: crypt-data\n        volume: p-data\n        key: \''"$LUKS_YAML"$'\'\n'
   VG0_DEV="crypt-os"
   VGDATA_DEV="crypt-data"
   ENC_SUMMARY="LUKS on both volume groups"
@@ -221,7 +239,7 @@ esac
 
         # Add the keyfile as an ADDITIONAL keyslot. The passphrase slot is never removed,
         # so a keyfile problem still leaves you able to unlock by hand.
-        printf '%s' "__LUKS_PASSPHRASE__" | \
+        printf '%s' '__LUKS_PASSPHRASE_B64__' | base64 -d | \
           cryptsetup luksAddKey "$DEV" /target/etc/luks/crypt-data.key --key-file=-
 
         # nofail: a keyfile problem then degrades to "data volume not mounted" instead of
@@ -233,7 +251,7 @@ esac
     - curtin in-target --target=/target -- update-initramfs -u -k all
 KFEOF
 )
-  KEYFILE_LATECMD="${KEYFILE_LATECMD//__LUKS_PASSPHRASE__/$LUKS_PASSPHRASE}"
+  KEYFILE_LATECMD="${KEYFILE_LATECMD//__LUKS_PASSPHRASE_B64__/$LUKS_B64}"
 else
   CRYPT_OS=""
   CRYPT_DATA=""

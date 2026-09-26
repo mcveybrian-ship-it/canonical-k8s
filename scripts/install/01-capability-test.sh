@@ -17,18 +17,25 @@
 # so that turning FIPS on stays a deliberate act.
 #
 # Usage:
-#   sudo ./01-capability-test.sh [-t PRO_TOKEN] [-o REPORT]
+#   sudo ./01-capability-test.sh [-T TOKEN_FILE] [-o REPORT]
+#
+#   -T FILE  the Pro token, in a file of mode 600 or 400. Without -T, on a terminal, it is asked
+#            for without echo (Enter skips: an unattached run). NEVER on the command line -
+#            -t TOKEN is refused: an argument is visible in ps and saved in shell history.
 #
 set -uo pipefail   # deliberately not -e: we want every probe to run and be recorded
 # MACHINE: a disposable 24.04 box at a NEW facility, release or Pro entitlement. Not part of an
 # enclave rebuild: for this enclave Q11/Q12 are answered and the script is history (runbook 2.3).
 
-TOKEN=""
+TOKEN=""; TOKEN_FILE=""
 REPORT="capability-test-$(date -u +%Y%m%dT%H%M%SZ).txt"
 
-while getopts ":t:o:h" opt; do
+while getopts ":t:T:o:h" opt; do
   case "$opt" in
-    t) TOKEN="$OPTARG" ;;
+    t) echo "REFUSING -t: a token on the command line is visible in ps and saved in shell history." >&2
+       echo "  Put it in a file (install -m 600 /dev/null tok; read -rs T; printf '%s' \"\$T\" > tok)" >&2
+       echo "  and pass -T tok - or run without it and type it when asked." >&2; exit 2 ;;
+    T) TOKEN_FILE="$OPTARG" ;;
     o) REPORT="$OPTARG" ;;
     h) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown option: -$OPTARG" >&2; exit 2 ;;
@@ -36,6 +43,19 @@ while getopts ":t:o:h" opt; do
 done
 
 [[ $EUID -eq 0 ]] || { echo "run with sudo" >&2; exit 1; }
+
+# THE TOKEN: from a file, or typed - never an argument (2026-09-26, found by the 2026-09-24
+# sweep). Read BEFORE the report tee starts, so not even the prompt lands in the report.
+if [[ -n "$TOKEN_FILE" ]]; then
+  [[ -r "$TOKEN_FILE" ]] || { echo "cannot read token file $TOKEN_FILE" >&2; exit 1; }
+  case "$(stat -c %a "$TOKEN_FILE")" in 600|400) ;; *)
+    echo "$TOKEN_FILE is mode $(stat -c %a "$TOKEN_FILE") - a token file must be 600 or 400" >&2; exit 1 ;; esac
+  TOKEN="$(head -1 "$TOKEN_FILE" | tr -d '[:space:]')"
+  [[ -n "$TOKEN" ]] || { echo "$TOKEN_FILE is empty" >&2; exit 1; }
+elif [[ -t 0 ]]; then
+  read -rsp "Ubuntu Pro token (Enter for an unattached run): " TOKEN; echo
+  TOKEN="$(printf '%s' "$TOKEN" | tr -d '[:space:]')"
+fi
 
 exec > >(tee "$REPORT") 2>&1
 
@@ -61,14 +81,19 @@ pro version
 if [[ -n "$TOKEN" ]]; then
   rule "Attaching Pro subscription"
   # --no-auto-enable keeps this a measurement, not a change to the machine.
-  pro attach "$TOKEN" --no-auto-enable || echo "ATTACH FAILED — everything below will be unattached"
+  # Through a mode-600 attach-config file - the same route as 04-enclave-services.sh - so the
+  # token is never an argument to pro either.
+  AC="$(mktemp)"; chmod 600 "$AC"; trap 'rm -f "$AC"' EXIT
+  printf 'token: %s\n' "$TOKEN" > "$AC"; TOKEN=""
+  pro attach --attach-config "$AC" --no-auto-enable || echo "ATTACH FAILED — everything below will be unattached"
+  rm -f "$AC"
 fi
 
 if ! pro status --format json 2>/dev/null | grep -q '"attached": true'; then
   echo
   echo "!! NOT ATTACHED to Ubuntu Pro."
   echo "!! Unattached output shows what EXISTS for this release, not what you are entitled to."
-  echo "!! Re-run with -t <token> for a conclusive answer."
+  echo "!! Re-run with -T <token file> (or type the token when asked) for a conclusive answer."
 fi
 
 # ---------------------------------------------------------------------------- Q11: FIPS ----

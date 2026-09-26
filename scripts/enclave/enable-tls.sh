@@ -34,6 +34,14 @@ ok()   { printf '  [ok] %s\n' "$*"; }
 warn() { printf '  [!]  %s\n' "$*"; }
 die()  { printf '\n  [x] %s\n\n' "$*" >&2; exit 1; }
 
+# THE SITE'S DOMAIN COMES FROM THE ADDRESS FILE, like every other enclave script. This one
+# used ENCLAVE_DOMAIN in server_name and in its own self-test URL but never read the file, so
+# it always used the built-in enclave.internal - correct only while the site happens to
+# match it. Found by the 2026-09-24 sweep, confirmed 2026-09-26.
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=/dev/null
+[ -f "$HERE/enclave-addresses.env" ] && . "$HERE/enclave-addresses.env"
+
 
 NAME=""; CHAIN=""; DOCROOT=""; PROXY=""
 REDIR_CONF=/etc/nginx/conf.d/00-http-redirect.conf

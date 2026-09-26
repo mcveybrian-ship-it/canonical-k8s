@@ -65,6 +65,10 @@ set +a
 : "${STAGING_DIR:?not set in $PARAMS}"
 : "${MEDIA_DIR:?not set in $PARAMS}"
 : "${REPO_ADDRESS:?not set in $PARAMS}"
+# THE DEFAULT THE COMMENTS ALWAYS CLAIMED (the clean step below says "TOOLS_DIR defaults to
+# $STAGING_DIR/tools"). It had none, and the .example did not set it, so a fresh params file
+# aborted under set -u at the tools step. Confirmed 2026-09-26.
+TOOLS_DIR="${TOOLS_DIR:-$STAGING_DIR/tools}"
 
 MIRROR_TREE="$MIRROR_BASE/mirror"
 
@@ -270,10 +274,15 @@ if [ -f "$CONTRACTS" ]; then
   # NOT `|| echo 0`: grep -c prints "0" AND exits 1 when nothing matches, so the fallback
   # appends a second zero and the result is the two-line string "0\n0" - which then fails
   # the integer test below with "integer expression expected".
-  local_urls=$(grep -c "aptURL: *http://$REPO_ADDRESS" "$CONTRACTS" 2>/dev/null || true)
+  # EITHER SCHEME. make-contracts-config.sh generates https:// since the enclave CA; counting
+  # http:// only would report 0 on every config made after that and warn about a good file.
+  local_urls=$(grep -cE "aptURL: *https?://$REPO_ADDRESS" "$CONTRACTS" 2>/dev/null || true)
   local_urls=${local_urls:-0}
+  local_http=$(grep -cE "aptURL: *http://$REPO_ADDRESS" "$CONTRACTS" 2>/dev/null || true)
   note "aptURLs pointing at $REPO_ADDRESS: $local_urls  (expect 4: esm-infra, esm-apps, fips-updates, cis)"
   [ "$local_urls" -ge 4 ] || note "  WARNING: fewer than 4 - check the overrides in the pro-airgapped input"
+  [ "${local_http:-0}" -eq 0 ] || note "  WARNING: $local_http of them are plain http:// - a pre-CA config. Regenerate with
+             make-contracts-config.sh (https is its default) before carrying it in."
 else
   note "contracts config: *** MISSING *** - see the warning at the end"
 fi

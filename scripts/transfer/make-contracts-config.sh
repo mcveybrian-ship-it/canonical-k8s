@@ -42,6 +42,10 @@ OUT=""; DRY=0
 say()  { printf '  %s\n' "$*"; }
 ok()   { printf '  [ok] %s\n' "$*"; }
 die()  { printf '\n  [x] %s\n\n' "$*" >&2; exit 1; }
+# warn was CALLED below (the aptURL reachability check) but never defined, so under set -e the
+# one case its own message calls "expected" - the repo not serving yet - killed the run with
+# exit 127 instead of warning. Found by the 2026-09-24 sweep, confirmed 2026-09-26.
+warn() { printf '  [!]  %s\n' "$*" >&2; }
 
 while [ $# -gt 0 ]; do
   case "$1" in

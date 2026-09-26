@@ -80,8 +80,10 @@ CANDIDATES=$(lsblk -b -d -n -o NAME,SIZE,RM,TYPE,TRAN   | awk '$4=="disk" && $3=
 if [[ -z "$CANDIDATES" ]]; then
   echo "  none found - check the disk table above by hand"
 else
-  echo "$CANDIDATES" | awk '{printf "  %-12s %s bytes
-", $2, $1}'
+  # "\n", NOT a real line break. The literal newline that stood here was an awk syntax error
+  # ("unterminated string"), so this list never printed - the one table this script exists to
+  # show. Found by the 2026-09-24 comment sweep; confirmed by running it 2026-09-26.
+  echo "$CANDIDATES" | awk '{printf "  %-12s %s bytes\n", $2, $1}'
 fi
 
 SMALLEST_SIZE=$(echo "$CANDIDATES" | head -1 | awk '{print $1}')

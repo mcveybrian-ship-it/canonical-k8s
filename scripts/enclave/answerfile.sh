@@ -704,16 +704,23 @@ PY
 # (well-formedness only otherwise), count entries, and list any non-empty ResultHash - the
 # per-machine pin this script exists to remove.
 cmd_verify() {
+  # IT CAN FAIL NOW (2026-09-26). It used to return 0 whatever it found: the schema check was
+  # `xmllint ... && ok`, so a failure ended the && list quietly (set -e does not fire inside
+  # one), and a pinned ResultHash only warned - while runbook 10.1 said "FAILS if any
+  # ResultHash reappears". A gate that cannot close is a 3.24 false pass.
   [ -f "$AF" ] || die "no answer file at $AF"
-  if command -v xmllint >/dev/null 2>&1; then
-    if [ -f "$XSD" ]; then
-      xmllint --noout --schema "$XSD" "$AF" && ok "validates against the vendor XSD"
-    else
-      xmllint --noout "$AF" && ok "well-formed (no XSD at $XSD to validate against)"
-    fi
+  local rc=0
+  if command -v xmllint >/dev/null 2>&1 && [ -f "$XSD" ]; then
+    if xmllint --noout --schema "$XSD" "$AF"; then ok "validates against the vendor XSD"
+    else warn "FAILS the vendor XSD - xmllint's reasons are above"; rc=1; fi
   else
-    warn "xmllint not installed - checking well-formedness with python only"
-    python3 -c "import xml.etree.ElementTree as ET,sys; ET.parse(sys.argv[1]); print('  [ok] well-formed')" "$AF"
+    # Say which half is missing, and that what follows is the WEAKER check - "[ok] well-formed"
+    # on its own reads like a validation that never ran.
+    command -v xmllint >/dev/null 2>&1 || warn "xmllint not installed (apt install libxml2-utils)"
+    [ -f "$XSD" ] || warn "no XSD at $XSD (STIG_AF_XSD)"
+    warn "the XSD check was NOT run - only well-formedness, which is not the same thing"
+    if python3 -c "import xml.etree.ElementTree as ET,sys; ET.parse(sys.argv[1])" "$AF"; then ok "well-formed"
+    else warn "NOT well-formed XML - python's reason is above"; rc=1; fi
   fi
   say "entries: $(grep -c '<Vuln ID=' "$AF")"
   # A ResultHash left anywhere in the file is the bug this script exists to remove - but
@@ -725,9 +732,12 @@ cmd_verify() {
     warn "$pinned entry(ies) still carry ResultHash - those answer only on the machine they"
     warn "  were built on. Portable entries must not have one."
     grep -n 'ResultHash="[^"]\+"' "$AF" | sed 's/^/       /'
+    rc=1
   else
     ok "no ResultHash anywhere - every answer is portable"
   fi
+  if [ "$rc" -eq 0 ]; then ok "VERIFY PASSED"; else warn "VERIFY FAILED"; fi
+  return "$rc"
 }
 
 # Flags and the action may come in any order. -n only affects `generate`.

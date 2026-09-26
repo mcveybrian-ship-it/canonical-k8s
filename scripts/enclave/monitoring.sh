@@ -382,6 +382,7 @@ AL_DOWN_FOR="${AL_DOWN_FOR:-2m}"
 # late does not page every morning.
 AL_FACTS_STALE="${AL_FACTS_STALE:-3600}"          # facts older than this: every number is frozen
 AL_BOOT_LOSS_WINDOW="${AL_BOOT_LOSS_WINDOW:-86400}" # seconds after a boot that boot-time audit loss stays visible (3.33)
+AL_CRED_MAX_AGE="${AL_CRED_MAX_AGE:-86400}"         # a credentials file older than this was forgotten (3.35)
 AL_SCAN_STALE_DAYS="${AL_SCAN_STALE_DAYS:-30}"    # STIG checklist older than this
 AL_CERT_DAYS="${AL_CERT_DAYS:-30}"                # certificate inside this many days
 AL_AIDE_STALE="${AL_AIDE_STALE:-129600}"          # 36h - dailyaidecheck has missed a day
@@ -1211,6 +1212,24 @@ groups:
             'sudo faillock' on {{ \$labels.machine }} to see who. Clear with
             'sudo faillock --user <name> --reset' before it reaches three.
 
+      # A CREDENTIALS FILE LEFT BEHIND (backlog 3.35). Placed for hardening (runbook 6.0 11a),
+      # deleted after it (16a) - by hand, so it can be forgotten. AL_CRED_MAX_AGE (24 h default)
+      # is a build window: host-4 legitimately keeps its file until the guests are composed.
+      - alert: CredentialsFileLeftBehind
+        expr: >-
+          enclave_credentials_file_present == 1
+          and on(instance) (time() - enclave_credentials_file_mtime_seconds) > ${AL_CRED_MAX_AGE}
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ \$labels.machine }} still holds the site credentials file"
+          description: "/etc/enclave/credentials.env has been on {{ \$labels.machine }} for more than ${AL_CRED_MAX_AGE} s. It holds password hashes (and on two machines real service passwords) and should have been deleted when hardening finished."
+          action: >-
+            If hardening on {{ \$labels.machine }} is finished: 'sudo shred -u /etc/enclave/credentials.env'
+            and record the deletion in the stick's REGISTER.txt (docs/airgap-media.md 9.4). If it is
+            host-4 and guests are still being composed, that is expected - finish them first.
+
       # THE META-ALERT. Without it, every rule in this group fails silently: a frozen fact
       # file keeps serving its last values forever, so nothing breaches a threshold and the
       # dashboards stay green on numbers that stopped being true.
@@ -1664,7 +1683,7 @@ cmd_facts() {
   hfile="$(mktemp)"
   if harbor_facts > "$hfile" 2>/dev/null; then harbor_ok=1; else : > "$hfile"; fi
 
-  LC_ALL=C HARBOR_OK="$harbor_ok" python3 - > "$tmp" <<'FACTSPY'
+  LC_ALL=C HARBOR_OK="$harbor_ok" CRED_FILE="$ENCLAVE_CREDENTIALS" python3 - > "$tmp" <<'FACTSPY'
 import os, sys, glob, csv, time, subprocess, collections, calendar, json, re
 
 OUT = []
@@ -1848,6 +1867,28 @@ try:
     SRC["accounts"] = 1
 except Exception:
     SRC["accounts"] = 0
+
+# ------------------------------------------------------------------ credentials left behind
+# The site credentials file (backlog 3.32) should exist only while this machine is being
+# hardened: placed at runbook 6.0 step 11a, deleted at 16a (docs/airgap-media.md 9.3-9.4).
+# Deleting it is a manual step, and a skipped one leaves live hashes - and on svc-harbor-01 /
+# svc-obs-01 real service passwords - on disk with nothing to say so (backlog 3.35).
+# PRESENCE AND AGE ONLY. The file is never opened here: a fact about a secret must not be a
+# path by which the secret travels.
+cf = os.environ.get("CRED_FILE") or "/etc/enclave/credentials.env"
+try:
+    st = os.stat(cf)
+    emit("enclave_credentials_file_present", 1,
+         help="1 while the site credentials file exists here - it should only during hardening")
+    emit("enclave_credentials_file_mtime_seconds", int(st.st_mtime),
+         help="unix time the credentials file was placed (install sets it), for its age")
+    SRC["credentials_file"] = 1
+except FileNotFoundError:
+    emit("enclave_credentials_file_present", 0,
+         help="1 while the site credentials file exists here - it should only during hardening")
+    SRC["credentials_file"] = 1
+except Exception:
+    SRC["credentials_file"] = 0      # could not tell - enclave_facts_source_ok says so
 
 rc, o, _ = run(["journalctl", "--since", "-24h", "-t", "sudo", "-o", "cat", "--no-pager"], timeout=60)
 if rc == 0:

@@ -264,7 +264,7 @@ parameters at the top of the script; nothing is hardcoded — **21 of them**, co
 | cpu / memory | `HighCPU`, `MemoryPressure` |
 | filesystems | `FilesystemFillingWarning`, `FilesystemFillingCritical`, `AuditFilesystemFilling`, `FilesystemWillFillSoon` (`predict_linear` over 6 h says full within 4 h), `FilesystemReadOnly` |
 | audit trail | `AuditRecordsLost`, `AuditRecordsLostAtBoot`, `AuditdNotRunning`, `AuditBacklogNearLimit` |
-| compliance drift | `StigOpenControlsIncreased`, `StigScanStale`, `FipsModeDisabled`, `CertificateExpiringSoon`, `AideCheckStale`, `AideDetectedChanges`, `AccountLockoutRisk`, `ComplianceFactsStale` |
+| compliance drift | `StigOpenControlsIncreased`, `StigScanStale`, `FipsModeDisabled`, `CertificateExpiringSoon`, `AideCheckStale`, `AideDetectedChanges`, `AccountLockoutRisk`, `CredentialsFileLeftBehind`, `ComplianceFactsStale` |
 | backups | `BackupMissed`, `BackupNeverCompleted`, `BackupInterrupted`, `BackupDestinationDetached`, `BackupTimerDisabled`, `BackupVolumeFilling`, `BackupFactsMissing` |
 | registry | `HarborUnhealthy`, `HarborComponentUnhealthy`, `TrivyDatabaseStale`, `TrivyDatabaseMissing` |
 | patch posture | `SecurityUpdatesPending`, `AptMetadataStale`, `ProContractExpiring`, `FipsUpdatesDisabled` |

@@ -431,6 +431,8 @@ older than the one that had just finished.
 | `enclave_aide_last_exit_code` | — | same | 0 = clean |
 | `enclave_aide_db_age_seconds` | `db` | mtime of `/var/lib/aide/aide.db*` | baseline age |
 | `enclave_faillock_users_with_failures` | — | non-empty files in `/run/faillock` | at 3 they are locked out |
+| `enclave_credentials_file_present` | — | `stat` of `/etc/enclave/credentials.env` — never opened | should be 1 only during hardening (3.35) |
+| `enclave_credentials_file_mtime_seconds` | — | the same file's mtime (`install` sets it at placement) | its age |
 | `enclave_failed_sudo_24h` | — | journal, `-t sudo` | authentication failures |
 | `enclave_sudo_invocations_24h` | — | journal, `-t sudo` | total `COMMAND=` lines |
 | `enclave_usb_storage_blocked` | — | `/etc/modprobe.d/*.conf` | where V-270718 looks |
@@ -581,6 +583,7 @@ pager that trains people to ignore it.
 | `AideCheckStale` | no AIDE run in 36h | 1h | warning |
 | `AideDetectedChanges` | last exit non-zero | 10m | warning |
 | `AccountLockoutRisk` | any faillock tally | **none** | warning |
+| `CredentialsFileLeftBehind` | credentials file present and older than `AL_CRED_MAX_AGE` (24 h) | 15m | warning |
 | `ComplianceFactsStale` | facts older than 1h | 15m | critical |
 | **backups** | | | |
 | `BackupMissed` | no complete set in 26h | 30m | critical |

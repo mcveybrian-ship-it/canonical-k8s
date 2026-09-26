@@ -1004,8 +1004,11 @@ copy, for the same reason as §9.5. What protects the remnants is that every hos
 and every guest image sits on host-4's LUKS disk. The deletion's job is that the file is no
 longer readable on the running system.
 
-A file left behind is exactly what nobody notices. **Nothing detects it yet** — owed: publish
-its presence as an enclave fact and alert on it (backlog 3.32).
+A file left behind is exactly what nobody notices, so it is watched: every machine's 15-minute
+facts publish `enclave_credentials_file_present` and the file's age (presence only — the file is
+never opened), and **`CredentialsFileLeftBehind`** fires when it has been there longer than
+`AL_CRED_MAX_AGE` (24 h by default — a build window; host-4 legitimately keeps its file until the
+guests are composed). Backlog 3.35.
 
 ### 9.5 Destroy the stick — once the last deletion is recorded
 

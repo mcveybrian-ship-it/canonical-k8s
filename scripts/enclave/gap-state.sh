@@ -40,10 +40,10 @@ die()  { printf '\n  [x] %s\n\n' "$*" >&2; exit 1; }
 # shellcheck disable=SC1090
 . "$ADDRS"
 : "${STAGE_01:?}" "${HOST_4:?}"
-# The foot is .160 on host-4's /24 - 10.2.20.160 today, the same host number stage-01 has on
-# staging. The subnet comes from the address file; the .160 is fixed in this line.
+# The foot is on host-4's /24 with the SAME host number stage-01 has on staging - 10.2.20.160
+# today. Both halves come from the address file (it used to fix .160 in this line).
 STAGING_ADDR="$STAGE_01/24"
-ENCLAVE_FOOT="$(printf '%s' "$HOST_4" | cut -d. -f1-3).160/24"
+ENCLAVE_FOOT="$(printf '%s' "$HOST_4" | cut -d. -f1-3).${STAGE_01##*.}/24"
 
 # --- the condition that must hold in BOTH states -----------------------------------------
 # Multi-homed is fine. ROUTING is not. With forwarding on, stage-01 silently becomes a router

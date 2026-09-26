@@ -11,7 +11,7 @@
 #     ./03-compose-vm.sh plan                       does THIS host fit the guests mapped to it
 #     ./03-compose-vm.sh plan --spec                what each host must have - no hardware
 #
-# There are ten of these to build, so it is a composer rather than a one-off. Everything
+# There are fourteen of these in vm-specs.env, so it is a composer rather than a one-off. Everything
 # comes from two files and nothing is typed twice:
 #     scripts/enclave/enclave-addresses.env   who is at which address
 #     scripts/enclave/vm-specs.env            cpu / ram / disk / image / mirror
@@ -23,7 +23,7 @@
 #   explicitly, which produces the same ability from an auditable list rather than from
 #   whatever an ISO happened to ship. Better evidence for the same outcome.
 #
-# The VM gets NO DEFAULT ROUTE, like its host. It reaches 10.0.20.0/24 and nothing else.
+# The VM gets NO DEFAULT ROUTE, like its host. It reaches the enclave /24 (10.2.20.0/24) and nothing else.
 # =========================================================================================
 set -euo pipefail
 
@@ -290,7 +290,7 @@ if [ -n "$MISSING" ] && [ "$DRY" -eq 0 ]; then
 fi
 [ -r "$VM_BASE_IMAGE" ] || [ "$DRY" -eq 1 ] || die "no base image at $VM_BASE_IMAGE
        Copy it from stage-01:
-         scp encadmin@10.0.20.160:/srv/bundle-staging/media/ubuntu-24.04-minimal-cloudimg-amd64.img \\
+         scp encadmin@${STAGE_01:-stage-01}:/srv/bundle-staging/media/ubuntu-24.04-minimal-cloudimg-amd64.img \\
              $VM_BASE_IMAGE"
 
 say "vm      : $VM  ($ADDRESS)"

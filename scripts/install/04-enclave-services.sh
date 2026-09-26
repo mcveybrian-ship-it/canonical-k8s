@@ -276,7 +276,7 @@ cmd_verify() {
   # by design, so it is reachable HERE and nowhere else.
   #
   # INSTALLING MAAS STOPPED AND DISABLED nginx on 2026-09-08 at 15:31, taking the contracts
-  # server offline for every client with no error anywhere. MAAS runs its own nginx for
+  # server offline for every client with no error anywhere. MAAS ran its own nginx for
   # :5248 and evidently does not want a second one enabled. Nothing surfaced it; it was found
   # by chance hours later. Hence this check.
   if systemctl is-active --quiet nginx 2>/dev/null; then

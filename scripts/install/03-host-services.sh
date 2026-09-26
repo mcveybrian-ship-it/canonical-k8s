@@ -547,6 +547,9 @@ cmd_keyonly() {
   # No load_params: this step needs nothing from the params file, and requiring one would
   # stop it running on stage-01 and build-01, which have no services-params.env and are
   # exactly the machines that turned out to need it. Its own guard below is the safety.
+  # BUT (found 2026-09-26): the dispatch runs _assert_enclave_host FIRST, which refuses
+  # stage-01 and build-01 - so as written it cannot run on them. Which is intended is an
+  # open decision, not settled here: backlog 3.36.
   need_root keyonly
   local u="${SUDO_USER:-$(id -un)}" home ak
   home=$(getent passwd "$u" | cut -d: -f6)
@@ -725,5 +728,5 @@ case "${1:-}" in
   keyonly) _assert_enclave_host; cmd_keyonly ;;
   verify)  cmd_verify ;;
   all)     _assert_enclave_host; cmd_hosts; cmd_trustca; cmd_apt; cmd_libvirt; cmd_datavg; cmd_pool; cmd_tmux; cmd_verify ;;
-  *)       sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  *)       sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

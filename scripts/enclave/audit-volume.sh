@@ -11,7 +11,7 @@
 #
 # WHY THIS EXISTS AS A SCRIPT AND NOT TWO du COMMANDS.
 #
-#   `svc-log-01`'s disk size is an AO question, and the answer depends on how much audit data
+#   `svc-obs-01`'s audit-offload disk size is an AO question, and the answer depends on how much audit data
 #   this enclave actually produces. The first attempt was a `du -sb` written to
 #   /tmp/audit-volume.txt on 2026-09-10, to be compared 24 hours later.
 #
@@ -131,7 +131,7 @@ cmd_install() {
   [ -x "$self" ] || { echo "$self missing after install-runtime.sh" >&2; exit 1; }
   cat > "/etc/systemd/system/$UNIT.service" <<EOF
 [Unit]
-Description=Sample audit log volume for svc-log-01 sizing
+Description=Sample audit log volume for svc-obs-01 audit-offload sizing
 Documentation=file://$self
 
 [Service]

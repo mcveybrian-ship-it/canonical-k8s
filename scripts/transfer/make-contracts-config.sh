@@ -8,11 +8,12 @@
 #     ./make-contracts-config.sh                     write to the bundle staging dir
 #     ./make-contracts-config.sh -o /path/out.yaml   write elsewhere
 #     ./make-contracts-config.sh -n                  show the INPUT, generate nothing
+#     ./make-contracts-config.sh -t <file>           the Pro token FILE (mode 600) to use
 #
 # WHY THIS EXISTS AS A SCRIPT
-#   The step was in the README's index as "§6.4a" and that section was never written, so the
+#   The step was in the README's index as "§6.4a" before that section was written, so the
 #   procedure that produces the credential the whole entitlement path depends on existed only
-#   in someone's shell history. It also has to be re-run whenever an address or domain
+#   in someone's shell history. README §6.4a now exists and calls this script. It also has to be re-run whenever an address or domain
 #   changes - which happened on 2026-09-03 when the enclave moved to .internal.
 #
 # WHAT IT PRODUCES
@@ -52,7 +53,7 @@ while [ $# -gt 0 ]; do
     -o) OUT="$2"; shift 2 ;;
     -n) DRY=1; shift ;;
     -t) TOKEN_FILE="$2"; shift 2 ;;
-    -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) die "unknown argument $1" ;;
   esac
 done
@@ -256,4 +257,5 @@ else
 fi
 say ""
 say "It is a credential. Do not commit it, do not print it."
-say "On svc-repo-01 it is installed by restore-mirror.sh to /etc/ubuntu-advantage/."
+say "It is served from svc-mgmt-01 (04-enclave-services.sh contracts). restore-mirror.sh also"
+say "drops a copy on svc-repo-01 that nothing reads - backlog 3.36."

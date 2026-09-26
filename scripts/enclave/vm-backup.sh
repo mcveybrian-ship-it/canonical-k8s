@@ -56,7 +56,7 @@
 # WHAT THIS IS AND IS NOT. Image-level backup answers "the VM is gone". It does not answer
 # "the database inside it is corrupt" - for that, back up the application from inside the
 # guest. The three machines holding state nothing can regenerate are svc-mgmt-01 (issuing CA
-# key, MAAS database), svc-harbor-01 (pushed images) and svc-obs-01 (Grafana database,
+# key and its issuance records - index.txt, serial, CRL), svc-harbor-01 (pushed images) and svc-obs-01 (Grafana database,
 # Prometheus history). Everything else in this enclave is rebuildable from the repo, and a
 # rebuild is better evidence than a restore.
 #

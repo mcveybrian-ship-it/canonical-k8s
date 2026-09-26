@@ -43,7 +43,7 @@ while [ $# -gt 0 ]; do
     --rollback) MODE=rollback; shift ;;
     --repo)     REPO_HOST="$2"; shift 2 ;;
     --contracts) MGMT_HOST="$2"; shift 2 ;;
-    -h|--help)  sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)  sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
 done

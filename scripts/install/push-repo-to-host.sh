@@ -4,8 +4,8 @@
 #
 #     MACHINE: runs on stage-01 (or wherever the repo lives). NOT on the target.
 #
-#     ./push-repo-to-host.sh 10.0.20.158
-#     ./push-repo-to-host.sh 10.0.20.155 -k ~/.ssh/build01 -d ~/canonical-k8s
+#     ./push-repo-to-host.sh 10.2.20.158
+#     ./push-repo-to-host.sh 10.2.20.155 -k ~/.ssh/build01 -d ~/canonical-k8s
 #     ./push-repo-to-host.sh 10.2.20.162 --allow-dirty   # send HEAD even with local edits
 #     ./push-repo-to-host.sh 10.2.20.162 --allow-untracked   # leave uncommitted new scripts behind
 #     -u USER sets the remote account (default encadmin); REPO_PUSH_KEY replaces the -k default

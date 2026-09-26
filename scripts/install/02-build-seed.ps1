@@ -21,7 +21,7 @@
   Hostname for this seed, e.g. h1
 
 .PARAMETER Address
-  IPv4 address without prefix, e.g. 10.0.20.115
+  IPv4 address without prefix, e.g. 10.2.20.155
 
 .PARAMETER DriveLetter
   Target USB drive letter, e.g. F. Omit with -DryRun.
@@ -30,10 +30,10 @@
   Print the resolved values and exit without writing.
 
 .EXAMPLE
-  .\02-build-seed.ps1 -HostName h1 -Address 10.0.20.115 -DriveLetter F
+  .\02-build-seed.ps1 -HostName host-1 -Address 10.2.20.155 -DriveLetter F
 
 .EXAMPLE
-  .\02-build-seed.ps1 -HostName h1 -Address 10.0.20.115 -DryRun
+  .\02-build-seed.ps1 -HostName host-1 -Address 10.2.20.155 -DryRun
 #>
 [CmdletBinding()]
 param(

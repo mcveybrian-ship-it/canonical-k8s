@@ -17,9 +17,10 @@
 #
 # WHY THIS IS NOT OPTIONAL, AND WHY IT COMES BEFORE THE CLUSTER:
 #
-#   Every machine in the enclave currently reports "System clock synchronized: no".
-#   systemd-timesyncd is running with NO server configured - active, and doing nothing. They
-#   agree with each other today only because they were built recently from a correct clock.
+#   Before this script (2026-09-04) every machine in the enclave reported "System clock
+#   synchronized: no": systemd-timesyncd ran with NO server configured - active, and doing
+#   nothing. They agreed with each other only because they had been built recently from a
+#   correct clock. `verify` is how you check that this is still not the case.
 #
 #   What breaks on skew, roughly in order of how confusing the failure is:
 #     etcd     - leader elections and lease expiry are wall-clock sensitive. The failure is
@@ -133,8 +134,8 @@ cmd_master() {
   need_root
   # --upstream is how a real reference gets adopted WITHOUT touching a single client.
   # host-4 stays the machine every client points at; it simply stops being the origin of
-  # the time and starts being a relay for one. `local stratum 10` below is deliberately
-  # poor, so chrony prefers any genuine source and falls back to the local clock only if
+  # the time and starts being a relay for one. `local stratum 5` below (TIME_MASTER_STRATUM)
+  # is worse than any real reference, so chrony prefers any genuine source and falls back to the local clock only if
   # the reference dies - which is exactly the behaviour you want from an appliance that
   # can lose GPS lock.
   local upstream=() u
@@ -287,7 +288,7 @@ cmd_verify() {
       ok "serving as the enclave reference (stratum ${stratum:-?}, leap $leap)"
       if grep -q '^server ' "$DROPIN"; then
         say "    upstream: $(grep '^server ' "$DROPIN" | awk '{print $2}' | tr '\n' ' ')"
-        say "    this machine relays a real reference - stratum should be above 1, not 10."
+        say "    this machine relays a real reference - stratum should be its upstream plus one, not the local fallback ${TIME_MASTER_STRATUM:-5}."
       else
         say "    timedatectl will report 'synchronized: no' on this machine, correctly:"
         say "    nothing synchronises the reference. Absolute accuracy is this machine's RTC"
@@ -333,5 +334,5 @@ case "${1:-}" in
   client) cmd_client ;;
   verify) cmd_verify ;;
   drift)  shift; cmd_drift "$@" ;;
-  *)      sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  *)      sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

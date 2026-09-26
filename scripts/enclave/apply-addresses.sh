@@ -15,7 +15,7 @@
 #   ./apply-addresses.sh zone            print the BIND zone files, change nothing
 #   ./apply-addresses.sh zone-install    write them and reload named   (sudo, DNS host only)
 #
-#   Not in the printed usage above, but dispatched:
+#   and for the resolver:
 #   ./apply-addresses.sh resolver        print the systemd-resolved drop-in, change nothing
 #   ./apply-addresses.sh resolver-install  point THIS machine's resolver at the enclave DNS (sudo)
 #
@@ -26,7 +26,8 @@
 #
 # WHY DNS AT ALL, WHEN /etc/hosts ALREADY WORKS.
 #
-#   Two tiers, deliberately, and the order is in runbook 564: hosts FIRST, DNS second.
+#   Two tiers, deliberately, and the order is in runbook 9a.4 ("/etc/hosts STAYS - both
+#   tiers"): hosts FIRST, DNS second.
 #   `nsswitch.conf` reads `hosts: files dns`, so a name pinned in /etc/hosts resolves even
 #   when the DNS host is rebooting - apt, containerd and `pro attach` must not depend on a
 #   single VM being up.
@@ -36,7 +37,7 @@
 #       wildcards, and enumerating every app name by hand is the thing this avoids;
 #     * CoreDNS. It forwards unknown names to the node's resolver, and with NO resolver at
 #       all every lookup TIMES OUT (~5s, with retries) instead of failing. That presents as
-#       a performance problem, not a DNS problem, which is the worst kind. runbook 1897.
+#       a performance problem, not a DNS problem, which is the worst kind. runbook 9a.4.
 #     * 17 machines at full build, each with its own /etc/hosts to keep in step.
 #
 #   THE ZONE COMES FROM THE SAME `MAP` BELOW AS /etc/hosts. One table, two renderers - so
@@ -102,7 +103,7 @@ k8s-wk-04:K8S_WK_04
 #
 # There is no upstream to recurse to - that is what an air gap means. An empty root zone
 # makes every name outside enclave.internal return NXDOMAIN *immediately* instead of being
-# refused or, worse, retried. Fast, honest failure is the entire point (runbook 1897).
+# refused or, worse, retried. Fast, honest failure is the entire point (runbook 9a.4).
 ZONE_DIR="${ZONE_DIR:-/etc/bind/enclave}"
 ZONE_NS="${ZONE_NS:-svc-mgmt-01}"          # which machine serves it
 # The reverse zone is derived, not typed: 10.2.20.x -> 20.2.10.in-addr.arpa
@@ -224,7 +225,7 @@ render() {
   echo "$BEGIN"
   echo "# Generated $(date -Is) from enclave-addresses.env. Edit that file, not this block."
   echo "# /etc/hosts is the PRIMARY resolver here - nsswitch reads 'files dns', so these"
-  echo "# entries win over MAAS DNS and keep working when svc-mgmt-01 is down."
+  echo "# entries win over DNS and keep working when svc-mgmt-01, the enclave DNS, is down."
   local line name var ip
   while IFS= read -r line; do
     [ -z "$line" ] && continue
@@ -577,5 +578,5 @@ case "${1:-}" in
   resolver)     resolver_render ;;
   resolver-check) cmd_resolver_check ;;
   resolver-install) cmd_resolver_install ;;
-  *)      sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  *)      sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

@@ -192,15 +192,16 @@ if [ -f "$SRC/bundle/config/airgapped-contracts.yaml" ]; then
   run install -d -m 0755 /etc/ubuntu-advantage
   # 0600: it maps contract tokens to entitlements - a credential.
   run install -m 0600 "$SRC/bundle/config/airgapped-contracts.yaml" /etc/ubuntu-advantage/
-  note "config placed. Start it with:"
-  note "  contracts-airgapped --config /etc/ubuntu-advantage/airgapped-contracts.yaml"
-  note "Clients then point uaclient.conf at http://$REPO_ADDRESS:$CONTRACTS_PORT"
+  note "config placed. NOTE: the contracts server does NOT run on this machine. It runs on"
+  note "  svc-mgmt-01 (04-enclave-services.sh contracts - contracts-airgapped --input <file>),"
+  note "  and clients reach it at https://svc-mgmt-01.<domain> (04-enclave-services.sh pro)."
+  note "  Nothing on this machine reads this copy - backlog 3.36."
 else
   note "*** airgapped-contracts.yaml NOT PRESENT ***"
   note "Packages will serve, but no client can 'pro attach' - ESM and FIPS stay inert."
 fi
 
-# --- 6. nginx ------------------------------------------------------------------------------------
+# --- 6. local apt sources, the served keys/debs/snaps, then nginx -------------------------------
 # The keyrings and .debs must live under $REPO_ROOT for the vhost aliases to reach them.
 # Installing the keys into /usr/share/keyrings (section 4) serves THIS machine; serving them
 # over HTTP is how host-1..3 and every other guest get them.
@@ -520,4 +521,4 @@ note "  2. a real pool file from each archive"
 note "  3. a GPG-verified apt resolution against the ESM suites, with dpkg-deb reading the result"
 note ""
 note "The repo is serving. Remaining before clients can 'pro attach':"
-note "  contracts-airgapped --config /etc/ubuntu-advantage/airgapped-contracts.yaml"
+note "  the contracts server on svc-mgmt-01: 04-enclave-services.sh contracts (runs contracts-airgapped --input)"

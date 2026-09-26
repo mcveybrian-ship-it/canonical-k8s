@@ -754,11 +754,16 @@ this decision, it is made permanent by it. TPM unlock (§2.1a) is the mitigation
 Source: `docs/runbook.md` §9b, §4840, §7607 · suggested controls **CM-7** (least functionality),
 SA-22, RA-5.
 
-### 4.1i ✅ Log retention is 90 days, aligned with metrics — AO DECISION 2026-09-18
+### 4.1i ✅ Retention — audit records 1 year online (2026-09-23), metrics 90 days (2026-09-18)
 
-> **Audit and syslog are retained 90 days on the collector — the same window as Prometheus —
-> unless the programme provides an external air-gapped system, in which case logs ship to it from
-> `svc-obs-01` alone.**
+> **Audit records are retained 1 year online on the collector** (AO answer to Q25, 2026-09-23 —
+> built as `audit-offload.sh`, `AUDIT_RETENTION_DAYS=365`, and the design must serve both a
+> self-contained enclave and a future external SIEM). **Prometheus metrics stay at 90 days.** If the
+> programme provides an external air-gapped system, logs ship to it from `svc-obs-01` alone.
+
+*Corrected 2026-09-26: this entry said "audit and syslog 90 days" — the 2026-09-18 decision, which
+the 2026-09-23 Q25 answer superseded for audit records. Syslog is not named in either answer:
+whether it follows audit (1 year) or metrics (90 days) is open — backlog 3.36.*
 
 The AO's first answer was 30 days; raised to 90 on the observation that **Prometheus already
 retains metrics for 90 days**, and mismatched windows mean that for days 31–90 you have a metric

@@ -13,8 +13,10 @@
 # Free-token entitlements are not guaranteed to match an enterprise contract, so treat a
 # positive result as reliable and confirm a negative one with Canonical.
 #
-# This script READS state and enables nothing. It ends by printing the exact enable command
-# so that turning FIPS on stays a deliberate act.
+# This script READS state, with the two exceptions Q12 needs: it installs
+# ubuntu-advantage-tools if absent, and ENABLES usg and installs the usg package when
+# entitled - `usg list` cannot run without them. It never enables FIPS: it ends by printing
+# the exact enable command so that turning FIPS on stays a deliberate act.
 #
 # Usage:
 #   sudo ./01-capability-test.sh [-T TOKEN_FILE] [-o REPORT]
@@ -130,8 +132,8 @@ echo "current FIPS mode: $(cat /proc/sys/crypto/fips_enabled 2>/dev/null || echo
 
 # ---------------------------------------------------------------------------- Q12: USG -----
 rule "Q12 — USG DISA-STIG profile for 24.04"
-# NOTE: despite "enables nothing" in the header, this DOES enable the usg service and install
-# the usg package when entitled - 'usg list' cannot run without them. FIPS is never enabled.
+# The exception the header names: this DOES enable the usg service and install the usg
+# package when entitled - 'usg list' cannot run without them. FIPS is never enabled.
 if pro status --all 2>/dev/null | awk '$1=="usg" {print $2}' | grep -q "yes"; then
   echo "usg entitlement: available"
   pro enable usg --assume-yes 2>&1 | tail -2

@@ -2397,5 +2397,5 @@ case "${1:-status}" in
   facts-timer) shift; cmd_facts_timer "$@" ;;
   dashboards) shift; cmd_dashboards "$@" ;;
   status)   shift; cmd_status "$@" ;;
-  *) printf 'usage: %s {exporter|libvirt|collector|rules|facts|facts-timer|dashboards|status}\n' "$0" >&2; exit 2 ;;
+  *) printf 'usage: %s {exporter|libvirt|collector|grafana-admin|rules|alerting|alert-test on|off|facts|facts-timer|dashboards|status}\n' "$0" >&2; exit 2 ;;
 esac

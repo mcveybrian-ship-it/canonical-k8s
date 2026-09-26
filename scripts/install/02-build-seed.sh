@@ -12,11 +12,11 @@
 #     sudo mount /dev/sdX1 /mnt
 #
 # Then, once per host:
-#     ./02-build-seed.sh -H h1 -a 10.0.20.115 -d /mnt
+#     ./02-build-seed.sh -H host-1 -a 10.2.20.155 -d /mnt
 #
 # Options:
-#   -H HOST    hostname, e.g. h1
-#   -a ADDR    IPv4 address without prefix, e.g. 10.0.20.115
+#   -H HOST    hostname, e.g. host-1
+#   -a ADDR    IPv4 address without prefix, e.g. 10.2.20.155
 #   -d DIR     mount point of the FAT32 stick
 #   -o DIR     write user-data/meta-data to a plain DIRECTORY instead, skipping the
 #              removable-media checks. For building the seed on a machine with no USB
@@ -45,7 +45,7 @@ while getopts ":H:a:d:o:p:t:nh" opt; do
     o) OUTDIR="$OPTARG" ;;
     t) TEMPLATE="$OPTARG" ;;
     n) DRYRUN=1 ;;
-    h) sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    h) sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown option: -$OPTARG" >&2; exit 2 ;;
   esac
 done
@@ -64,7 +64,7 @@ esc() { local s="${1//\\/\\\\}"; printf '%s' "${s//&/\\&}"; }
 die() { echo "[x] $*" >&2; exit 1; }
 
 [[ -n "$HOST" ]] || die "-H <hostname> is required"
-[[ -n "$ADDR" ]] || die "-a <address> is required, e.g. -a 10.0.20.115"
+[[ -n "$ADDR" ]] || die "-a <address> is required, e.g. -a 10.2.20.155"
 [[ "$ADDR" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "-a must be a bare IPv4 address, no prefix: $ADDR"
 [[ -f "$TEMPLATE" ]] || die "template not found: $TEMPLATE"
 # Sanity-check the params file BEFORE sourcing it. Sourcing a file with an unbalanced
@@ -359,8 +359,8 @@ cat <<PREFLIGHT
   encryption $ENC_SUMMARY
   ssh keys   $KEY_COUNT
 ${KEY_SUMMARY%$'\n'}
-  OS disk    id_path *-ata-*   (SATA; never USB)
-  data disk  id_path *-nvme-*  (NVMe)
+  OS disk    $OS_DISK_MATCH
+  data disk  $DATA_DISK_MATCH
   LV sizes   root=$LV_ROOT home=$LV_HOME var=$LV_VAR varlog=$LV_VARLOG audit=$LV_VARLOGAUDIT tmp=$LV_TMP
   data VG    $(if [ "$DATA_VG_SIZE" = -1 ]; then printf 'the WHOLE data disk (nothing left raw for a Ceph OSD)'; else printf '%s - the remainder of the data disk is left UNPARTITIONED' "$DATA_VG_SIZE"; fi)
   unlock     $LUKS_UNLOCK$([ "$LUKS_UNLOCK" = passphrase ] && printf ' (a human types it at the console on every boot)')

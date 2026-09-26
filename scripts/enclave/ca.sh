@@ -24,7 +24,7 @@
 #       sudo ./ca.sh revoke <cert>          revoke, then regenerate the CRL
 #
 #     ON any machine needing a certificate:
-#       sudo ./ca.sh request [--profile P] [--wildcard LABEL] [name] [san...]
+#       sudo ./ca.sh request [--profile P] [--wildcard LABEL] [--enclave-ips] [name] [san...]
 #                                         name and name.DOMAIN and this machine's own IP are
 #                                         added AUTOMATICALLY - extra SANs are usually not
 #                                         needed. Give them BARE (no DNS:/IP: prefix); a
@@ -32,6 +32,9 @@
 #                                         generate a key HERE and a CSR to send.
 #                                         Profiles live in csr-profiles/ - use one matching
 #                                         the PKI that will sign it (default: internal).
+#                                         --enclave-ips adds every HOST_* and SVC_* address
+#                                         from enclave-addresses.env (a shared cert that must
+#                                         verify by IP) - never STAGE_01, BUILD_01 or K8S_*.
 #
 #     ON any machine:
 #       sudo ./ca.sh trust [file|dir]     install trust anchors (default: trust-anchors/)
@@ -44,8 +47,8 @@
 #       sudo ./ca.sh backup-root <dir>    the root CA - THE single point of failure
 #
 # WHY AN INTERNAL CA AT ALL
-#   Everything the enclave serves is currently HTTP: the apt mirror, the contracts server,
-#   and shortly Harbor and MAAS. "Self-signed" is a finding in most DoD assessments while
+#   Before this CA (2026-09-04) everything the enclave served was plain HTTP: the apt mirror,
+#   the contracts server, Harbor. Each now sits behind a certificate this CA issued. "Self-signed" is a finding in most DoD assessments while
 #   "internal PKI with documented key management" is defensible - and they are not the same
 #   thing to an assessor even though the crypto is similar. Air-gapped does not exempt
 #   data-in-transit requirements.
@@ -841,7 +844,9 @@ cmd_request() {
       local v ipcount=0
       # HOST_* and SVC_* only. K8S_* belongs to the cluster's own PKI; STAGE_01 and BUILD_01
       # live outside the gap and must never appear in an enclave certificate.
-      for v in HOST_1 HOST_2 HOST_3 HOST_4 SVC_MGMT_01 SVC_REPO_01 SVC_HARBOR_01; do
+      # FROM THE ADDRESS FILE, as runbook 3.0 already claimed. It was a fixed list of seven and
+      # left out svc-obs-01 (found by the 2026-09-24 sweep, fixed 2026-09-26).
+      for v in $(grep -oE '^(HOST_[0-9]+|SVC_[A-Z0-9_]+)=' "$ADDRS" | tr -d '='); do
         [ -n "${!v:-}" ] || continue
         sans="$sans,IP:${!v}"
         ipcount=$((ipcount + 1))
@@ -925,7 +930,7 @@ cmd_request() {
     say "    - THE KEY MUST TRAVEL. Every other path in this script is built so that only a"
     say "      CSR ever leaves a host. A shared certificate breaks that deliberately, and"
     say "      the copy has to be handled as the secret it is - never through /tmp on an"
-    say "      intermediate host, never in a shell that logs, 0640 root:ssl-cert at rest."
+    say "      intermediate host, never in a shell that logs, 0640 root:root at rest (as install-wildcard sets it)."
     say "    - compromise of ANY machine holding it compromises every service it fronts,"
     say "      and revocation means reissuing and redeploying all of them at once."
     say "    - in the cluster it lives as a TLS secret, readable by anything that can read"
@@ -1154,5 +1159,5 @@ case "${1:-}" in
   gen-crl)        cmd_gen_crl ;;
   revoke)         shift; cmd_revoke "$@" ;;
   backup-root)    shift; cmd_backup_root "$@" ;;
-  *)              sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  *)              sed -n '2,47p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

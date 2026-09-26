@@ -9,7 +9,7 @@
 #     sudo ./vm-power.sh guests-up                  ordered start, reverse order
 #     sudo ./vm-power.sh host-reboot                guests down FIRST, then reboot the host
 #     sudo ./vm-power.sh host-down                  guests down FIRST, then power off
-#     sudo ./vm-power.sh after-boot                 the three checks that follow every boot
+#     sudo ./vm-power.sh after-boot                 the four checks that follow every boot
 #
 #     --only "a b c"     operate on these domains only, in the order given
 #     --timeout N        seconds to wait per guest      (VM_POWER_TIMEOUT, default 300)

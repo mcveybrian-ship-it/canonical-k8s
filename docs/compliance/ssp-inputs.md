@@ -860,11 +860,11 @@ status` belongs in post-patch verification, not only post-hardening.** Source:
 
 ## 5. Audit
 
-### 5.1 ⬜ Two controls require email notification and no email can leave an air gap
+### 5.1 ✅ Two controls require email notification — DECIDED, see §4.1d
 
-V-270818 (notify SA and ISSO at 75% of audit storage) and V-270819. Unresolved — needs an AO
-answer on an acceptable compensating mechanism. Source: `docs/open-questions.md` Q26 ·
-suggested controls AU-4, AU-5.
+V-270818 (notify SA and ISSO at 75% of audit storage) and V-270819. **Superseded 2026-09-18:**
+the AO accepted an in-boundary alert on the monitoring stack in place of email — §4.1d. This
+entry said "unresolved" until 2026-09-26 and contradicted that section. Suggested controls AU-4, AU-5.
 
 ### 5.2 ⬜ Five Not Reviewed controls need a signature, not more engineering
 
@@ -872,6 +872,18 @@ Triaged 2026-09-14; the set is identical on every machine. Nothing further can b
 technically. Source: `docs/open-questions.md` Q25.
 
 ---
+
+### 5.3 ✅ No audit records are dropped while a machine boots (2026-09-26, backlog 3.33)
+
+Until auditd loads its rules, the kernel queues audit records in a small default backlog and
+discards the overflow. Seven of eight machines lost **450–567 records at every boot** (the
+`enclave_auditd_lost` fact) from at least 2026-09-14. Every machine now boots with
+`audit_backlog_limit=8192` — the same size the audit rules set once auditd runs — written by
+`stig-tailor.sh v1r6`, and **lost 0** at its latest boot, proven machine by machine. It is **not a
+STIG rule** (DISA's Ubuntu 24.04 V1R6 benchmark never mentions a backlog; usg's `stig` profile
+does not select it — only CIS Level 2 does), so it is stated here as an AU-5 measure rather than
+claimed as a closed finding. Monitoring: `AuditRecordsLostAtBoot` alerts on any loss within 24 h
+of a boot (`dashboards-and-metrics.md`). Suggested controls **AU-5**, AU-9, AU-12.
 
 ## 6. 🔴 A stale instruction found while building this register
 

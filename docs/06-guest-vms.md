@@ -41,7 +41,7 @@ own FIPS kernel and its own STIG pass — runbook §7.4. That is ten more runs o
 | A new guest gets **no** repo, **no** Pro, **no** hardening | same |
 | The guest's serial console is logged on its host, to `<pool>/console/<vm>-console.log` (0644, a pty with a log, so `virsh console` still works) | `03-compose-vm.sh` `--serial pty,log.file=...` |
 | **The cloud-init seed stays attached for the guest's whole life** — and it carries the admin hash and the authorized keys | nothing detaches it; `03-compose-vm.sh` only warns that the data disk would move `vdc`→`vdb` if it ever were |
-| `05-harden-host.sh` has 18 steps, stops at 3 reboots for a human, and still needs a person in 3 places: the Pro token (`scp -3` from stage-01), passwords (now from the credentials file, 3.32), and **`step_tailor`'s `confirmed reachable from off-box? [y/N]`** | the script |
+| `05-harden-host.sh` has 18 steps, stops at 3 reboots for a human, and still needs a person in 4 places: the Pro token (`scp -3` from stage-01), passwords (now from the credentials file, 3.32), **`step_tailor`'s `confirmed reachable from off-box? [y/N]`**, and **`step_prechecks`'s `proceed to usg fix? [y/N]`** — the fourth was missed here and found by the slice-2 live run (2026-09-27), which halted on it | the script |
 | ufw rule tables exist for the eight current machines only; `stig-tailor.sh ufw` **refuses** on any other | `stig-tailor.sh` `ufw_rules()` |
 | **Neither STIG turns off what Kubernetes needs.** usg's `stig` profile (226 rules) and DISA's Ubuntu 24.04 V1R6 benchmark select **nothing** on `ip_forward`, forwarding, `br_netfilter`, BPF or `noexec` (usg's only "forwarding" rule is SSH X11) | queried both benchmark files, with known rules as the positive control |
 
@@ -148,7 +148,8 @@ never typed.
 | step | on a host (unchanged) | on a guest |
 |---|---|---|
 | preflight | count login sessions — a second session is the way back in | skip the session count; check the serial console is being logged — that is a guest's way back in |
-| hostprep, patch, usg, baseline, prechecks, usgfix, v1r6, verify, auditvolume, final_audit | as now | as now |
+| hostprep, patch, usg, baseline, usgfix, v1r6, verify, auditvolume, final_audit | as now | as now (hostprep verifies cloud-init's work instead of doing it — slice 1) |
+| prechecks | preflight, then `proceed to usg fix? [y/N]` | **with a terminal:** the same prompt. **Unattended:** proceed only if preflight flagged nothing beyond `GUEST_PRECHECK_EXPECTED` (`vm-specs.env`; measured on pg-01: `package_timesyncd_removed`, decided by V-270645 + chrony) and every account losing NOPASSWD has a password (6.3a). A service-account NOPASSWD, an incomplete preflight or anything new **halts** for a person. Decided on preflight's machine-readable report (`PREFLIGHT_REPORT`), not its printed text |
 | pro | token from `~/.pro-contract-token` | also accepts the root-600 token from 4.2 |
 | fips, usgfix, v1r6 reboots | stop and tell the human | **reboot itself** and resume |
 | tailor | ufw, time client, `[y/N]` off-box prompt | ufw **needs a rule table for this guest** (D5); time client as now; **no prompt** — `finish` checks from outside (4.5) |

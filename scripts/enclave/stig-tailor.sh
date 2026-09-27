@@ -3768,8 +3768,15 @@ cmd_aide() {
 # RUNBOOK 6.0 STEP 8b (05-harden-host.sh step_prechecks: a failure here stops the build
 # before `usg fix`, and the operator must confirm the collisions were read). READ-ONLY. Run
 # it with sudo: unprivileged, the NOPASSWD check cannot read /etc/sudoers.d and says so.
+# PREFLIGHT_REPORT=<file>: ALSO write each finding as one machine-readable line, so a caller
+# decides on data rather than scraping the text above (05 on an unattended guest - B-06 slice 2).
+#   package <rule> | service <rule> | nopasswd-service <user> | nopasswd-user <user>
+#   incomplete <check> | complete preflight   <- the last line; absent means it stopped early
+_pf_rec() { [ -n "${PREFLIGHT_REPORT:-}" ] || return 0; printf '%s %s\n' "$1" "$2" >> "$PREFLIGHT_REPORT"; }
+
 cmd_preflight() {
   local me; me="$(hostname -s)"
+  [ -z "${PREFLIGHT_REPORT:-}" ] || : > "$PREFLIGHT_REPORT"
   command -v usg >/dev/null 2>&1 \
     || die "usg is not installed on $me - runbook 6.0 step 6 first (pro enable usg)"
 
@@ -3818,7 +3825,7 @@ $(printf '%s\n' "$cand" | sed 's/^/        /')"
       *) continue ;;
     esac
     if dpkg -s "$name" 2>/dev/null | grep -q '^Status: install ok installed'; then
-      warn "  $name   (rule: $rule)"
+      warn "  $name   (rule: $rule)"; _pf_rec package "$rule"
       hits=$((hits + 1))
     else
       # THE RULE ID IS NOT ALWAYS THE PACKAGE NAME. package_timesyncd_removed refers to
@@ -3837,7 +3844,7 @@ $(printf '%s\n' "$cand" | sed 's/^/        /')"
       if [ -n "${matches// /}" ]; then
         warn "  $rule -> no package literally named '$name', but INSTALLED and similar:$matches"
         say  "     VERIFY BY HAND which one the rule means before running fix"
-        fuzzy=$((fuzzy + 1))
+        _pf_rec package "$rule"; fuzzy=$((fuzzy + 1))
       fi
     fi
   done < <(printf '%s\n' "$block")
@@ -3852,7 +3859,7 @@ $(printf '%s\n' "$cand" | sed 's/^/        /')"
       *) continue ;;
     esac
     if systemctl is-active "$name" >/dev/null 2>&1; then
-      warn "  $name is ACTIVE   (rule: $rule)"
+      warn "  $name is ACTIVE   (rule: $rule)"; _pf_rec service "$rule"
       shits=$((shits + 1))
     fi
   done < <(printf '%s\n' "$block")
@@ -3891,7 +3898,7 @@ $(printf '%s\n' "$cand" | sed 's/^/        /')"
     warn "  INCOMPLETE - /etc/sudoers.d is not readable as $(id -un)."
     say  "     This check found nothing because it could not look, NOT because there is"
     say  "     nothing. Re-run:  sudo $0 preflight"
-    nf=1
+    _pf_rec incomplete nopasswd; nf=1
   elif [ -z "$np_files" ]; then
     ok "  none found (checked as root, so this is a real answer)"
   else
@@ -3904,11 +3911,11 @@ $(printf '%s\n' "$cand" | sed 's/^/        /')"
           ""|*/nologin|*/false)
             warn "  $who in $(basename "$f") - SERVICE ACCOUNT (shell: ${shell:-none})"
             say  "     stripping this breaks whatever it automates, silently"
-            nf=$((nf + 1)) ;;
+            _pf_rec nopasswd-service "$who"; nf=$((nf + 1)) ;;
           *)
             say  "  $who in $(basename "$f") - interactive account (shell: $shell)"
             say  "     MUST have a working password before fix runs, or it is locked out (6.3a)"
-            nf=$((nf + 1)) ;;
+            _pf_rec nopasswd-user "$who"; nf=$((nf + 1)) ;;
         esac
       done < <(grep -hE '^[^#]*NOPASSWD' "$f" 2>/dev/null | awk '{print $1}' | grep -v '^%' | sort -u)
     done
@@ -3926,6 +3933,7 @@ $(printf '%s\n' "$cand" | sed 's/^/        /')"
   say ""
   ok "preflight complete - if you did not see this line, it exited early and the report is"
   ok "  INCOMPLETE. Do not run \`usg fix\` on a partial preflight."
+  _pf_rec complete preflight
 }
 
 # ---------------------------------------------------------------------------- ufw

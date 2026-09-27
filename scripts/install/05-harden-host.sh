@@ -8,6 +8,7 @@
 #
 #     sudo ./05-harden-host.sh status     where this machine is in the sequence
 #     sudo ./05-harden-host.sh run        do the next steps until it needs you
+#     sudo ./05-harden-host.sh resume     GUEST only: hand a halted run back to the unattended unit
 #     sudo ./05-harden-host.sh reset      forget the state and start over (does NOT undo)
 #
 # WHY THIS EXISTS
@@ -75,6 +76,9 @@ BUILD_COPY="${BUILD_COPY:-/opt/enclave-build}"
 HALTED="$STATE_DIR/hardening-halted"
 COMPLETE="$STATE_DIR/hardening-complete"
 CURRENT_STEP=""
+# What an UNATTENDED guest's preflight may flag and still proceed to `usg fix` (step_prechecks).
+# In vm-specs.env because the unit runs with no environment; the environment still wins by hand.
+GUEST_PRECHECK_EXPECTED="${GUEST_PRECHECK_EXPECTED-$(grep -oE "^GUEST_PRECHECK_EXPECTED='[^']*'" "$ENC/vm-specs.env" 2>/dev/null | cut -d"'" -f2)}"
 
 say()  { printf '  %s\n' "$*"; }
 ok()   { printf '  [ok] %s\n' "$*"; }
@@ -495,15 +499,43 @@ step_baseline() {
 step_prechecks() {
   done_step prechecks && return 0
   hdr "6. what 'usg fix' will remove, and keeping AIDE off the bulk data"
-  "$ENC/stig-tailor.sh" preflight || die "preflight failed or was incomplete - do NOT run usg fix"
+  local rep="$STATE_DIR/preflight-report"
+  PREFLIGHT_REPORT="$rep" "$ENC/stig-tailor.sh" preflight \
+    || die "preflight failed or was incomplete - do NOT run usg fix"
   "$ENC/stig-tailor.sh" aide exclude --apply || warn "aide exclude reported a problem"
   say ""
-  say "  Read the preflight output above. Anything it flagged as a COLLISION is a decision:"
-  say "  either the thing is needed here and becomes a tailoring deviation with a written"
-  say "  justification, or it is not and 'fix' may remove it."
-  printf '  preflight understood, proceed to usg fix? [y/N] '
-  local a=""; read -r a || true
-  case "$a" in y|Y) ;; *) die "stopped before usg fix. Nothing has been changed by it." ;; esac
+  if [ "$ROLE" = guest ] && [ ! -t 0 ]; then
+    # NOBODY IS HERE TO ANSWER, SO DECIDE - NARROWLY (B-06 slice 2, 2026-09-27: the [y/N] below
+    # read nothing and halted the first unattended run on pg-01, correctly). The gate exists so a
+    # person reads what `usg fix` will remove. Proceed ONLY if nothing was flagged beyond the
+    # already-decided set (a decided item already ABSENT is fine) and no account loses NOPASSWD
+    # into a lock-out (6.3a). Anything else halts for a person, who then runs 05 by hand and gets
+    # the question. Reads preflight's REPORT, not its prose.
+    local flagged extra u bad=0
+    grep -qx 'complete preflight' "$rep" 2>/dev/null \
+      || die "preflight left no complete report at $rep - do NOT run usg fix"
+    flagged="$(awk '$1=="package"||$1=="service"{print $2}' "$rep" | sort -u)"
+    extra="$(comm -23 <(printf '%s\n' "$flagged" | awk 'NF') \
+      <(printf '%s\n' "$GUEST_PRECHECK_EXPECTED" | tr -s ' \t' '\n\n' | awk 'NF' | sort -u) | paste -sd' ' -)"
+    if [ -z "$extra" ]; then ok "preflight flagged only decided items: [$(printf '%s' "$flagged" | paste -sd' ' -)]"
+    else warn "preflight flagged [$extra] - NOT in GUEST_PRECHECK_EXPECTED (vm-specs.env)"; bad=1; fi
+    for u in $(awk '$1=="nopasswd-service"||$1=="incomplete"{print $1":"$2}' "$rep"); do
+      warn "preflight: ${u} - a person must decide this one"; bad=1
+    done
+    for u in $(awk '$1=="nopasswd-user"{print $2}' "$rep" | sort -u); do
+      if [ "$(passwd -S "$u" 2>/dev/null | awk '{print $2}')" = P ]; then
+        ok "$u loses NOPASSWD and has a password - not locked out"
+      else warn "$u loses NOPASSWD and has NO usable password - the 6.3a lock-out"; bad=1; fi
+    done
+    [ "$bad" -eq 0 ] || die "stopped before usg fix - this preflight needs a person. Nothing has been changed by it."
+  else
+    say "  Read the preflight output above. Anything it flagged as a COLLISION is a decision:"
+    say "  either the thing is needed here and becomes a tailoring deviation with a written"
+    say "  justification, or it is not and 'fix' may remove it."
+    printf '  preflight understood, proceed to usg fix? [y/N] '
+    local a=""; read -r a || true
+    case "$a" in y|Y) ;; *) die "stopped before usg fix. Nothing has been changed by it." ;; esac
+  fi
   mark_step prechecks
 }
 
@@ -773,7 +805,16 @@ cmd_run() {
 case "${1:-status}" in
   status) cmd_status ;;
   run)    cmd_run ;;
+  resume) # A HALTED GUEST HANDED BACK TO THE UNATTENDED RUN (B-06 slice 2). Clears the halt,
+          # refreshes the root-owned copy from THIS repo - so a pushed fix reaches the unit - and
+          # starts the unit without waiting. Progress is on the host's console log, not here.
+          need_root; assert_enclave_host
+          [ "$ROLE" = guest ] || die "resume is for guests - a host is always run by hand: $0 run"
+          [ ! -e "$COMPLETE" ] || die "$COMPLETE exists - this guest already finished"
+          rm -f "$HALTED"; install_resume_unit
+          systemctl start --no-block "$RESUME_UNIT"
+          ok "handed to $RESUME_UNIT - watch the host's console log, lines start ENCLAVE-HARDEN" ;;
   reset)  need_root; assert_enclave_host
           rm -f "$STATE"; ok "state cleared - this does NOT undo anything already applied" ;;
-  *) printf 'usage: %s {status|run|reset}\n' "$(basename "$0")" >&2; exit 2 ;;
+  *) printf 'usage: %s {status|run|resume|reset}\n' "$(basename "$0")" >&2; exit 2 ;;
 esac

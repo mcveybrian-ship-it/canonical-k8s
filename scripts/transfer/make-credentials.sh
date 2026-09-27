@@ -317,4 +317,8 @@ reg="$OUT/REGISTER.txt"
 } > "$reg"
 chmod 644 "$reg"
 say ""; sed 's/^/  /' "$reg"; say ""
-ok "REGISTER.txt is on the stick; copy it into the custody log. It holds no secret."
+if [ "$ANY_DIR" -eq 1 ]; then
+  ok "REGISTER.txt is in $OUT - PRACTICE, not a stick; delete the directory when done. It holds no secret."
+else
+  ok "REGISTER.txt is on the stick; copy it into the custody log. It holds no secret."
+fi

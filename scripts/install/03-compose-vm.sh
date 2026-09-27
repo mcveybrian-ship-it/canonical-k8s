@@ -110,6 +110,10 @@ FINISH_WAIT="${FINISH_WAIT:-240}"
 # finish locked its own host out of the guest for as long as it kept knocking. 12 s apart stays
 # under the limit.
 FINISH_KNOCK=12
+# THE REGISTER LINE IS WRITTEN WHEN THE SHREDDING HAPPENS, and a re-run reprints THAT - found on
+# pg-01's second finish run, 2026-09-27: it found both disks already gone and still printed
+# "shredded <now>", a false entry in an audit record. No secret in it; root-owned, 0644.
+FINISH_RECORD_DIR="${FINISH_RECORD_DIR:-/var/lib/enclave/finish}"
 _ssh_answers() { [ -n "$(ssh-keyscan -T 5 "$ADDRESS" 2>/dev/null)" ]; }
 cmd_finish() {
   local logdir="$POOL/console" prov="$POOL/seed/$VM-prov.iso" logs prog last bad=0
@@ -139,7 +143,9 @@ cmd_finish() {
 
   # 2. from outside
   say ""; say "checks from outside $VM ($ADDRESS), made from $(hostname -s):"
-  if _ssh_answers; then
+  # One silent miss is not a verdict: this host may be inside a ufw-limit window left by an
+  # earlier run's knocking (pg-01's second finish, 2026-09-27). Wait the window out, ask once more.
+  if _ssh_answers || { say "  ssh did not answer - waiting 35 s in case this host is rate-limited, then once more"; sleep 35; _ssh_answers; }; then
     ok "ssh answers through its firewall (22/tcp)"
   else warn "ssh does NOT answer - the only way in besides the console"; bad=1; fi
   local rc=0
@@ -166,7 +172,7 @@ cmd_finish() {
 
   # 3. detach and shred - the persistent config first, so the next start cannot ask for a file
   #    that is gone; then the file. A re-run finds both already gone and says so.
-  local placed="" path tgt
+  local placed="" path tgt shredded=0 record="$FINISH_RECORD_DIR/$VM.register"
   [ -e "$prov" ] && placed="$(date -u -r "$prov" +%FT%TZ)"
   say ""
   for path in "$SEED" "$prov"; do
@@ -179,7 +185,7 @@ cmd_finish() {
     fi
     ! virsh dumpxml --inactive "$VM" | grep -qF "$path" \
       || die "$path is still in $VM's configuration - refusing to shred a disk the next start needs"
-    if [ -e "$path" ]; then shred -u "$path" && ok "detached${tgt:+ ($tgt)} and shredded: $path"
+    if [ -e "$path" ]; then shred -u "$path" && ok "detached${tgt:+ ($tgt)} and shredded: $path" && shredded=$((shredded + 1))
     else ok "already gone: $path"; fi
   done
 
@@ -227,12 +233,24 @@ cmd_finish() {
     fi
   fi
 
-  # 5. the register line
+  # 5. the register line - written by the run that shredded, reprinted (never re-invented) after
   say ""
   say "REGISTER - airgap-media §9, copy into the custody log:"
-  say "  credentials.$VM.env   placed ${placed:-(disk already shredded - see the first finish run)} by 03-compose-vm.sh --harden on $(hostname -s)"
-  say "                        deleted from $VM ${done_at:-(no time in the log - that run predates timestamps)} by the guest itself: ${deleted:-none reported}"
-  say "                        provisioning disk + seed shredded $(date -u +%FT%TZ) by ${SUDO_USER:-root} on $(hostname -s)"
+  if [ "$shredded" -gt 0 ]; then
+    install -d -m 0755 "$FINISH_RECORD_DIR"
+    {
+      printf '  credentials.%s.env   placed %s by 03-compose-vm.sh --harden on %s\n' "$VM" "${placed:-(unknown - no provisioning disk found)}" "$(hostname -s)"
+      printf '                        deleted from %s %s by the guest itself: %s\n' "$VM" "${done_at:-(no time in the log - that run predates timestamps)}" "${deleted:-none reported}"
+      printf '                        provisioning disk + seed shredded %s by %s on %s\n' "$(date -u +%FT%TZ)" "${SUDO_USER:-root}" "$(hostname -s)"
+    } > "$record"
+    chmod 0644 "$record"
+    cat "$record"
+  elif [ -r "$record" ]; then
+    cat "$record"; say "  (reprinted from $record - written by the finish run that shredded)"
+  else
+    say "  credentials.$VM.env   disks already gone, and no record of when - shredded by an earlier"
+    say "                        finish that predates $record (or by --destroy). Fill the times by hand."
+  fi
   say ""
   [ "$bad" -eq 0 ] && ok "finish: $VM is done" || warn "finish: done, but a check above FAILED - read it before calling $VM finished"
   return "$bad"

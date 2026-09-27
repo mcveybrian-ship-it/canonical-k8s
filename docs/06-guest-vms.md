@@ -175,7 +175,11 @@ anything is shredded) and shredded; failed checks do not stop this. By default a
 (shutdown + start, so qemu drops the disks) proves the guest boots: ssh must answer again, no unit
 may fail beyond `FINISH_EXPECTED_FAILED` (`vm-specs.env`: `sssd.service`, the CAC family), and
 cloud-init must not fall back to no datasource. `-n` does the read and the checks only. Exit 1 if
-any check failed. Progress lines now end ` @<UTC>` so the register can carry the deletion time.
+any check failed. Progress lines now end ` @<UTC>` so the register can carry the deletion time. **Found in its first live runs, fixed:** the ssh check must accept any host key type (FIPS
+OpenSSH offers no ed25519), must knock no faster than one per 12 s (a guest's ssh rule is `ufw
+limit`, 6 per 30 s, and every knock renews the ban), and a first miss waits one window before it
+counts; the register line is written by the run that shreds, kept in
+`/var/lib/enclave/finish/<vm>.register`, and reprinted — never re-timed — by any later run.
 
 ### 4.6 When something fails
 

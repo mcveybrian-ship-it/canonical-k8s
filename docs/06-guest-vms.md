@@ -1,6 +1,13 @@
 # Step 06 — compose and harden the guest VMs
 
-> **DESIGN, 2026-09-26 — D1, D2, D3 and the test guest DECIDED (§9); nothing built yet.** It answers backlog **B-06**:
+> **BUILT AND PROVEN 2026-09-27 — all four slices passed on pg-01 (host-1), one night.** A guest
+> composed with `sudo ./03-compose-vm.sh <vm> --harden` hardens itself from first boot and deletes
+> its own credentials; `sudo ./03-compose-vm.sh <vm> --finish` then checks it from outside, shreds
+> its seed and provisioning disk, proves it still boots and prints the custody register line.
+> Decided: D1–D3 (2026-09-26), D5 and D6 (2026-09-27, §9); D4 and D8 wait for B-07 and 2.6. The
+> "as built" notes in §4 record where the build differs from this design and why.
+>
+> **Originally: DESIGN, 2026-09-26.** It answers backlog **B-06**:
 > *nothing drives hardening on a guest* — `05-harden-host.sh` refuses anything but host-1..4, so
 > every guest so far was hardened by hand. The numbered decisions **D1–D8** at the end are what
 > the review settles; everything above them is the reasoning and the evidence behind each one.

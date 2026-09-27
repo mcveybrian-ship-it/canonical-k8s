@@ -267,6 +267,16 @@ stick path is exercised in 2.6).
   watching this run, which is why the first one is on a disposable guest.
 - **The serial log becomes load-bearing.** It is the progress channel and the evidence that a guest
   finished; its location and permissions on the host become part of the design, not a debugging aid.
+  **Found in slice 3's first live run (2026-09-27):** `virtlogd` rotates a console log at 2 MB
+  (`max_size`, 3 backups) and creates the new file **0600 root** — the 0644 compose sets survives
+  only until the first rotation. With `log.append=on` a guest's log grows across every recompose,
+  so pg-01's rotated 16 s after `provision START` and the run straddled two files. A reader
+  therefore needs root **and** `<vm>-console.log*`, oldest first (compose's hint now says so);
+  slice 4's `finish` runs as root and must read the rotated files too, never the live one alone.
+- **A hardening boot finishes late** (observed slice 3): the unit is ordered before
+  `multi-user.target`, so a boot that runs verify → evalstig reaches it ~7 minutes in, and
+  cloud-final waits with it (`ready after 413.79 seconds`). ssh and the serial getty are not
+  ordered behind it, so the way in is unaffected; anything that waits for "boot finished" is.
 - **Capacity.** The lab profile has to fit ten guests plus the service VMs within ~29–30 GB per
   host; that is 2.7's planner's job to confirm before anything is composed.
 - **The token on the hosts.** D3 uses the token each host already keeps from its own hardening. That

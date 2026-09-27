@@ -810,8 +810,11 @@ say "Then, from anywhere on the subnet:"
 say "    ssh ${VM_USER:-encadmin}@$ADDRESS 'cat /etc/enclave-build-info'"
 if [ -n "$PROV" ]; then
   say ""
+  # sudo AND the rotated files: virtlogd rotates a console log at 2 MB (max_size) and creates the
+  # new one 0600 root - found in slice 3's first live run, 2026-09-27, 16 s after provision START.
+  # A run can straddle the rotation, so read <vm>-console.log* (oldest first), not just the live one.
   say "--harden: it hardens ITSELF - do not log in. Progress, one line per step:"
-  say "    grep -a ENCLAVE-HARDEN $LOGDIR/$VM-console.log"
+  say "    sudo sh -c 'cat \$(ls -1r $LOGDIR/$VM-console.log*)' | grep -a ENCLAVE-HARDEN"
   say "  provision OK, one reboot, then every step to DONE (about 20 minutes). A HALTED line"
   say "  means read the log above it; the guest keeps its credentials for the re-run."
   say "  $PROV holds its credentials file and token until slice 4's finish shreds it."

@@ -145,7 +145,10 @@ install_resume_unit() {
   if [ "$src" != "$BUILD_COPY" ]; then
     rm -rf "$BUILD_COPY.new"; install -d -m 0755 "$BUILD_COPY.new"
     cp -a "$src/." "$BUILD_COPY.new/"
-    chown -R root:root "$BUILD_COPY.new"; chmod -R go-w "$BUILD_COPY.new"
+    # ROOT-WRITABLE ONLY, READABLE BY ALL - whatever modes the source had. A copy from a hardened
+    # host's repo (umask 077) arrived 0600/0700 in slice 3, so reading what ran needed sudo. The
+    # repo is public and tracked-files-only; only WRITE must stay root's (the 3.11 path).
+    chown -R root:root "$BUILD_COPY.new"; chmod -R u+rwX,go+rX,go-w "$BUILD_COPY.new"
     rm -rf "$BUILD_COPY"; mv "$BUILD_COPY.new" "$BUILD_COPY"
     ok "root-owned copy for the resume unit: $BUILD_COPY ($(cat "$BUILD_COPY/.pushed-from" 2>/dev/null | cut -c1-7 || echo '?'))"
   fi
@@ -215,7 +218,8 @@ need_reboot() {
     # already-unlocked storage - so it reboots itself and the resume unit carries on at boot.
     say "  A guest reboots ITSELF: no LUKS prompt, and $RESUME_UNIT resumes this run at boot."
     say "  An SSH session to it drops now. Watch from its host, no login needed:"
-    say "    sudo tail -f <pool>/console/$(hostname -s)-console.log     (lines start ENCLAVE-HARDEN)"
+    say "    sudo sh -c 'cat \$(ls -1r <pool>/console/$(hostname -s)-console.log*)' | grep -a ENCLAVE-HARDEN"
+    say "    (sudo, and the rotated files too: virtlogd rotates at 2 MB and the new file is 0600 root)"
     install_resume_unit
     progress "${CURRENT_STEP:-reboot}" REBOOT
     sync

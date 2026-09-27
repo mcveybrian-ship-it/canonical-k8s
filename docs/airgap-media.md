@@ -1006,11 +1006,20 @@ if [ "$(hostname -s)" != host-4 ]; then echo "WRONG MACHINE: $(hostname -s)"; el
 fi
 ```
 
+**A guest composed with `--harden`** (B-06, the cluster guests; built 2026-09-27): nothing is
+placed by hand. With the stick mounted **read-only** on the guest's host at `/mnt/cred` (the host
+block above, and the host must be the one the guest is mapped to), `03-compose-vm.sh <vm> --harden`
+reads that guest's own `credentials.<vm>.env` — refused unless root 600, in the reader's format,
+and carrying **that guest's** break-glass key — and puts it on a read-only provisioning disk with
+the host's Pro token and answer file. The guest installs it at first boot, root 600. Unmount the
+stick once compose has printed `prov :`. `--cred-dir DIR` points it elsewhere.
+
 **host-4 keeps its file until the guests are composed** — it holds the guest admin hash, which
 `03-compose-vm.sh` reads. Its deletion comes after its own `05-harden-host.sh` and the last
-compose, not before.
+compose, not before. The same now holds for any host that composes `--harden` guests.
 
-Write "placed" in the register for each machine as it is done.
+Write "placed" in the register for each machine as it is done — for a `--harden` guest, when
+compose prints `prov :`.
 
 ### 9.4 Delete — each target, when its hardening is done
 
@@ -1032,6 +1041,14 @@ claim** here — on an SSD, a journalled filesystem or a VM image it cannot prom
 copy, for the same reason as §9.5. What protects the remnants is that every host disk is LUKS,
 and every guest image sits on host-4's LUKS disk. The deletion's job is that the file is no
 longer readable on the running system.
+
+**A `--harden` guest deletes its own**: when its run reaches `DONE`, `05` shreds the credentials
+file and the Pro token and says so on the host's console log —
+`ENCLAVE-HARDEN <vm> DONE pass=.. fail=.. deleted: credentials.env pro-contract-token`. Write
+"deleted" in the register from that line. A run that **halted** keeps them for the re-run, and the
+alert below watches it. **Until slice 4's `finish` exists, the provisioning disk on the host
+(`<pool>/seed/<vm>-prov.iso`, root 0600) still holds a copy** — `03-compose-vm.sh <vm> --destroy`
+shreds it; record that deletion too.
 
 A file left behind is exactly what nobody notices, so it is watched: every machine's 15-minute
 facts publish `enclave_credentials_file_present` and the file's age (presence only — the file is

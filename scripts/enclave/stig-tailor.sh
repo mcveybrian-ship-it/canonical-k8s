@@ -4073,6 +4073,19 @@ cmd_ufw() {
     die "a rule for $me has an EMPTY source field - SVC_OBS_01 is probably unset in
        enclave-addresses.env. Refusing: an empty source silently becomes 'from anywhere'."
   fi
+  # D5 (B-06, decided 2026-09-27): EVERY PORT A TABLE OPENS IS IN THE PPSM REGISTER FIRST.
+  # ppsm-services.tsv says what a port IS (the CLSA's input); this table says why it is open. A
+  # row here with no entry there is a port the PPSM submission cannot account for. Checked for
+  # every machine, not just guests: all 36 rows in the table passed when this was written - and it
+  # is in place BEFORE B-06a adds the Postgres/Patroni/etcd ports, which is when it matters.
+  local ppsm="${PPSM_SERVICES:-$HERE/ppsm-services.tsv}" unreg
+  [ -r "$ppsm" ] || die "no PPSM register at $ppsm - a firewall table is checked against it (D5)"
+  unreg="$(printf '%s\n' "$mine" | awk -F'\t' '
+      NR==FNR { if ($0 !~ /^#/ && NF >= 2) reg[$2 "/" $1] = 1; next }
+      !($2 in reg) { printf "%s ", $2 }' "$ppsm" -)"
+  [ -z "$unreg" ] || die "the ufw table for $me opens port(s) not in the PPSM register: ${unreg% }
+       Register each in $ppsm first (proto, port, process, CAL name, purpose) -
+       decision D5: a port is described there before any firewall opens it."
   if [ -z "$mine" ]; then
     die "no ufw rule table for '$me'.
       This machine is deliberately not covered - see the comment above ufw_rules().

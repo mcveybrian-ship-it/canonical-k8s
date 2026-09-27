@@ -196,6 +196,14 @@ echo "  [ok] $GOT file(s) on $TARGET"
 ssh "${SSH_OPTS[@]}" "$USER_NAME@$TARGET" \
   "printf '%s  %s  from %s by %s\\n' '$HEAD_SHA' '$HEAD_WHEN' \"$(hostname -s)\" '$USER' > '$DEST/.pushed-from'" \
   && echo "  [ok] target stamped: $HEAD_SHA -> $DEST_SHOW/.pushed-from"
+# THE FILE LIST, for a guest's provisioning disk (B-06 slice 3). `03-compose-vm.sh --harden` copies
+# EXACTLY these files onto the disk it gives a guest - never the whole directory, which can hold
+# whatever has been put in it since (a params file, a token), and files deleted from git that the
+# extract-over-the-top above leaves behind.
+git archive --format=tar HEAD | tar -t | grep -v '/$' \
+  | ssh "${SSH_OPTS[@]}" "$USER_NAME@$TARGET" "cat > '$DEST/.pushed-files'" \
+  && echo "  [ok] file list: $N file(s) -> $DEST_SHOW/.pushed-files" \
+  || die "could not write $DEST_SHOW/.pushed-files on $TARGET - --harden composes from this host will refuse"
 ssh "${SSH_OPTS[@]}" "$USER_NAME@$TARGET" \
   "test -x '$DEST/scripts/install/03-host-services.sh'" \
   && echo "  [ok] scripts are executable on the target"

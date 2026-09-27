@@ -10,6 +10,10 @@
 #     sudo ./03-compose-vm.sh svc-mgmt-01 --destroy remove it and its disk
 #     ./03-compose-vm.sh plan                       does THIS host fit the guests mapped to it
 #     ./03-compose-vm.sh plan --spec                what each host must have - no hardware
+#     sudo ./03-compose-vm.sh pg-01 --harden [--cred-dir DIR]
+#         the guest hardens ITSELF from first boot (B-06): a read-only provisioning disk carries
+#         the repo, its credentials file (DIR/credentials.<vm>.env, default /mnt/cred = the
+#         enclave-cred stick), the host's Pro token and the answer file. Watch the console log.
 #
 # There are fourteen of these in vm-specs.env, so it is a composer rather than a one-off. Everything
 # comes from two files and nothing is typed twice:
@@ -29,7 +33,7 @@ set -euo pipefail
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENCLAVE_DIR="${ENCLAVE_DIR:-$SELF/../enclave}"
-DRY=0; DESTROY=0; VM=""; PLAN_ARG=""
+DRY=0; DESTROY=0; VM=""; PLAN_ARG=""; HARDEN=0; CRED_DIR="${CRED_DIR:-/mnt/cred}"
 
 say()  { printf '  %s\n' "$*"; }
 ok()   { printf '  [ok] %s\n' "$*"; }
@@ -190,12 +194,14 @@ while [ $# -gt 0 ]; do
     -n|--dry-run) DRY=1; shift ;;
     --destroy)    DESTROY=1; shift ;;
     --spec)       PLAN_ARG=--spec; shift ;;
-    -h|--help)    sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --harden)     HARDEN=1; shift ;;
+    --cred-dir)   [ $# -ge 2 ] || die "--cred-dir needs a directory"; CRED_DIR="$2"; shift 2 ;;
+    -h|--help)    sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     -*)           die "unknown option $1" ;;
     *)            VM="$1"; shift ;;
   esac
 done
-[ -n "$VM" ] || { sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+[ -n "$VM" ] || { sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
 
 
 [ -r "$ENCLAVE_DIR/enclave-addresses.env" ] || die "no enclave-addresses.env in $ENCLAVE_DIR"
@@ -242,6 +248,8 @@ if [ "$DESTROY" -eq 1 ]; then
   # without it (or --keep-nvram).
   run virsh undefine "$VM" --nvram 2>/dev/null || true
   run rm -f "$DISK" "$SEED" ${DATA_DISK:+"$DATA_DISK"}
+  # The provisioning disk (--harden) holds this guest's credentials file and the Pro token: shred.
+  if [ -e "$POOL/seed/$VM-prov.iso" ]; then run shred -u "$POOL/seed/$VM-prov.iso"; fi
   ok "$VM removed"; exit 0
 fi
 
@@ -369,6 +377,59 @@ elif [ "$DRY" -eq 0 ]; then
     die "no VM_ADMIN_PASSWORD_HASH and no terminal to prompt on.
       Unattended:     VM_ADMIN_PASSWORD_HASH in $ENCLAVE_CREDENTIALS (make-credentials.sh)
       Or for one run: VM_ADMIN_PASSWORD_HASH='<hash>' sudo -E ./03-compose-vm.sh $VM"
+  fi
+fi
+
+# ---- --harden: what the guest needs to harden ITSELF (B-06 slice 3) ------------------------
+# GATHERED AND CHECKED BEFORE ANYTHING IS CREATED, like the password above (3.38): a missing
+# token found after the disks exist is the same wasted round trip. Each input is the one a person
+# would otherwise carry to the guest by hand:
+#   the repo            - EXACTLY the files push-repo delivered (.pushed-files), never the whole
+#                         directory, which can hold anything put there since
+#   credentials.<vm>    - from CRED_DIR (the enclave-cred stick, mounted read-only - airgap-media
+#                         §9); checked by the SAME reader the guest will use, and it must carry
+#                         THIS guest's break-glass key, so another machine's file is refused
+#   the Pro token       - the host's own copy (D3)
+#   the answer file     - the host's own copy (the one its own scan used)
+PROV=""
+if [ "$HARDEN" -eq 1 ]; then
+  PROV="$POOL/seed/$VM-prov.iso"
+  REPO_ROOT="$(cd "$SELF/../.." && pwd)"
+  GUEST_CRED="$CRED_DIR/credentials.$VM.env"
+  PRO_TOKEN="${PRO_TOKEN_FILE:-$(getent passwd "${SUDO_USER:-root}" | cut -d: -f6)/.pro-contract-token}"
+  ANSWER_FILE="${STIG_ANSWER_FILE:-/srv/stig-tools/Ubuntu24_AnswerFile.xml}"
+  # A guest with no firewall table would harden for ten minutes and halt at tailor. Say so now.
+  if ! awk '/^ufw_rules\(\) \{/{f=1;next} f&&/^EOF$/{exit} f' "$ENCLAVE_DIR/stig-tailor.sh" \
+       | awk -F'\t' -v m="$VM" '$1==m {found=1} END {exit !found}'; then
+    die "$VM has no ufw rule table in stig-tailor.sh - its unattended run would halt at tailor.
+       Write its rows first (decision D5: each port registered in ppsm-services.tsv)."
+  fi
+  if [ "$DRY" -eq 1 ]; then
+    say "harden  : would build $PROV from:"
+    say "            repo        $REPO_ROOT ($([ -s "$REPO_ROOT/.pushed-files" ] && echo "$(wc -l < "$REPO_ROOT/.pushed-files") files per .pushed-files" || echo 'NO .pushed-files - a real run refuses'))"
+    say "            credentials $GUEST_CRED"
+    say "            Pro token   $PRO_TOKEN"
+    say "            answers     $ANSWER_FILE"
+  else
+    command -v genisoimage >/dev/null || die "no genisoimage - it comes with cloud-image-utils, which cloud-localds needs too"
+    [ -s "$REPO_ROOT/.pushed-files" ] && [ -s "$REPO_ROOT/.pushed-from" ] || die "no .pushed-files in $REPO_ROOT.
+       It lists exactly what push-repo delivered, so nothing else can reach a guest. Re-push:
+         (on stage-01)  ./scripts/install/push-repo-to-host.sh $(hostname -s)"
+    ! grep -qE '^/|(^|/)\.\.(/|$)' "$REPO_ROOT/.pushed-files" \
+      || die "$REPO_ROOT/.pushed-files has an absolute or .. path - refusing to build from it"
+    [ -e "$GUEST_CRED" ] || die "no credentials file for $VM at $GUEST_CRED.
+       Mount the enclave-cred stick read-only there (airgap-media §9), or pass --cred-dir."
+    # shellcheck source=../enclave/credentials.sh
+    . "$ENCLAVE_DIR/credentials.sh"
+    ENCLAVE_CREDENTIALS="$GUEST_CRED" cred_require_safe
+    for _k in GRUB_PASSWORD_HASH ADMIN2_PASSWORD_HASH "BREAKGLASS_PASSWORD_HASH_$KEY_NAME"; do
+      [ -n "$(ENCLAVE_CREDENTIALS="$GUEST_CRED" cred_get "$_k")" ] \
+        || die "$GUEST_CRED has no $_k - it is not $VM's file, or it was made without it"
+    done
+    [ -s "$PRO_TOKEN" ]   || die "no Pro token at $PRO_TOKEN (D3: the host's own copy) - or set PRO_TOKEN_FILE"
+    [ -s "$ANSWER_FILE" ] || die "no answer file at $ANSWER_FILE - push one to this host first:
+         (on stage-01)  ./scripts/enclave/stig-tools.sh answers $(hostname -s)"
+    ok "harden  : credentials ($GUEST_CRED), token, answer file, repo $(cut -c1-7 "$REPO_ROOT/.pushed-from") - all present"
   fi
 fi
 
@@ -517,7 +578,31 @@ $(for k in $SSH_KEY_SEARCH; do printf '         %s%s\n' "$k" "$([ -r "$k" ] && e
        Set VM_SSH_KEYS to a file containing them. Without a key the VM has no default
        route AND no way in - it would boot and be unreachable."
 
-TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+TMP="$(mktemp -d)"; PSTAGE=""
+# PSTAGE holds the guest's credentials file and the Pro token while the provisioning disk is
+# built - shredded on ANY exit, not only the happy path.
+cleanup() {
+  rm -rf "$TMP"
+  if [ -n "$PSTAGE" ] && [ -d "$PSTAGE" ]; then
+    shred -u "$PSTAGE/credentials.env" "$PSTAGE/pro-contract-token" 2>/dev/null || true
+    rm -rf "$PSTAGE"
+  fi
+}
+trap cleanup EXIT
+
+# --harden: mount the provisioning disk READ-ONLY, let 05 install what is on it, and reboot ONCE
+# after cloud-final so the hardening unit starts at a clean boot (05 first-boot says why).
+# The reboot is conditional: if first-boot failed, the guest stays up with the reason on its
+# console instead of rebooting into nothing.
+HARDEN_RUNCMD=""; HARDEN_POWER=""
+if [ -n "$PROV" ]; then
+  HARDEN_RUNCMD='  - [ sh, -c, "mkdir -p /mnt/enclave-prov && mount -o ro LABEL=ENCLAVE-PROV /mnt/enclave-prov && bash /mnt/enclave-prov/repo/scripts/install/05-harden-host.sh first-boot /mnt/enclave-prov; rc=$?; umount /mnt/enclave-prov 2>/dev/null; exit $rc" ]'
+  HARDEN_POWER='power_state:
+  mode: reboot
+  message: "enclave-harden: provisioned - rebooting once; it hardens itself from the next boot"
+  timeout: 120
+  condition: [ test, -e, /var/lib/enclave/provisioned ]'
+fi
 # A fresh instance-id on every compose, so cloud-init treats a recomposed guest as a first
 # boot and runs the whole user-data again.
 cat > "$TMP/meta-data" <<EOF
@@ -603,6 +688,8 @@ runcmd:
 $RESOLVER_RUN
   - [ sh, -c, "ip route | grep -q '^default' && echo 'WARNING: this VM has a default route' >> /etc/enclave-build-info || echo 'gateway=none-airgapped-no-default-route' >> /etc/enclave-build-info" ]
   - [ sh, -c, "echo \"composed=\$(date -Is) by 03-compose-vm.sh\" >> /etc/enclave-build-info" ]
+$HARDEN_RUNCMD
+$HARDEN_POWER
 
 final_message: "$VM ready after \$UPTIME seconds"
 EOF
@@ -634,6 +721,28 @@ esac
 cloud-localds -N "$TMP/network-config" "$SEED" "$TMP/user-data" "$TMP/meta-data"
 ok "seed    : $SEED"
 
+# THE PROVISIONING DISK (--harden). Staged on /run - tmpfs - so the credentials file and the token
+# never touch a disk on the way; Rock Ridge (-R, not -r) keeps their 0600 root inside the image.
+PROV_DISK_ARGS=()
+if [ -n "$PROV" ]; then
+  PSTAGE="$(mktemp -d -p /run enclave-prov.XXXXXX)"
+  mkdir -p "$PSTAGE/repo"
+  tar -C "$REPO_ROOT" --no-recursion -cf - -T "$REPO_ROOT/.pushed-files" .pushed-from .pushed-files \
+    | tar -C "$PSTAGE/repo" -xf - || die "could not copy the pushed files into the provisioning stage"
+  install -m 0600 "$GUEST_CRED"  "$PSTAGE/credentials.env"
+  install -m 0600 "$PRO_TOKEN"   "$PSTAGE/pro-contract-token"
+  install -m 0644 "$ANSWER_FILE" "$PSTAGE/Ubuntu24_AnswerFile.xml"
+  printf "ENCLAVE_OPERATOR='%s'\n" "${VM_USER:-encadmin}" > "$PSTAGE/provision.env"
+  ( umask 077; genisoimage -quiet -o "$PROV" -V ENCLAVE-PROV -R -input-charset utf-8 "$PSTAGE" ) \
+    || die "genisoimage failed building $PROV"
+  chmod 0600 "$PROV"
+  _nfiles="$(find "$PSTAGE/repo" -type f | wc -l)"
+  shred -u "$PSTAGE/credentials.env" "$PSTAGE/pro-contract-token"; rm -rf "$PSTAGE"; PSTAGE=""
+  ok "prov    : $PROV ($_nfiles repo files, credentials, token, answers) - read-only, 0600"
+  # AFTER the data disk, so a PG guest's data disk stays vdc (its fstab uses a LABEL anyway).
+  PROV_DISK_ARGS=(--disk "path=$PROV,device=disk,bus=virtio,format=raw,readonly=on")
+fi
+
 # ---- define and start --------------------------------------------------------------------
 # THE SEED GOES ON VIRTIO, NOT AS A SATA CDROM. Found on svc-mgmt-01 2026-09-03:
 # virt-install's default for device=cdrom is the SATA bus, and an Ubuntu cloud image ships a
@@ -664,6 +773,7 @@ virt-install \
   --disk "path=$DISK,format=qcow2,bus=virtio" \
   --disk "path=$SEED,device=disk,bus=virtio,format=raw,readonly=on" \
   "${DATA_DISK_ARGS[@]}" \
+  "${PROV_DISK_ARGS[@]}" \
   --network "bridge=$BRIDGE,model=virtio" \
   --graphics none \
   --console pty,target_type=serial \
@@ -698,3 +808,11 @@ say "Or read the console log, which needs no interactive session:"
 say "    sudo tail -f $LOGDIR/$VM-console.log"
 say "Then, from anywhere on the subnet:"
 say "    ssh ${VM_USER:-encadmin}@$ADDRESS 'cat /etc/enclave-build-info'"
+if [ -n "$PROV" ]; then
+  say ""
+  say "--harden: it hardens ITSELF - do not log in. Progress, one line per step:"
+  say "    grep -a ENCLAVE-HARDEN $LOGDIR/$VM-console.log"
+  say "  provision OK, one reboot, then every step to DONE (about 20 minutes). A HALTED line"
+  say "  means read the log above it; the guest keeps its credentials for the re-run."
+  say "  $PROV holds its credentials file and token until slice 4's finish shreds it."
+fi

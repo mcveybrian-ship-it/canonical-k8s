@@ -70,13 +70,24 @@ its serial console, which the host already logs.
 `03-compose-vm.sh` builds a small read-only disk, label `ENCLAVE-PROV`, next to the seed (same
 `0711` pool directory, file mode `0600`), holding exactly:
 
-- **the repo** — `git archive HEAD`, the same property `push-repo-to-host.sh` relies on: tracked
-  files only, so nothing gitignored can ride along;
+- **the repo** — exactly the files `push-repo-to-host.sh` delivered to the host, listed in the
+  `.pushed-files` it now writes beside `.pushed-from` (a host has no git). Never the whole
+  directory: it can hold anything put there since, and files deleted from git that an
+  extract-over-the-top leaves behind. Compose refuses without the list;
 - **this guest's credentials file** — `credentials.<vm>.env` read from the `enclave-cred` stick,
   mounted read-only on the host (`airgap-media.md` §9). The guest gets its own file and no other;
 - **the Pro token** — see D3;
 - **the Evaluate-STIG Answer File** — today pushed from stage-01, which will not be reachable;
-- **the profile** (`lab` / `production`) — so nothing on the guest is typed.
+- **the operator** (`provision.env`, `ENCLAVE_OPERATOR=` the VM admin user) — the account the
+  hardening unit acts for (4.3); parsed on the guest, never sourced.
+
+**As built (2026-09-27):** `sudo ./03-compose-vm.sh <vm> --harden [--cred-dir DIR]`. Every input
+is gathered and checked **before anything is created** (the 3.38 rule): the guest's file must be
+root 600, in the reader's format, and carry *that guest's* break-glass key; the token, the answer
+file and a ufw table for the guest must exist. Staged on `/run` (tmpfs), imaged with `genisoimage
+-R` (Rock Ridge keeps the 0600), the stage shredded on any exit. The disk goes after the data disk,
+so a PG guest's data disk stays `vdc`. The profile was dropped from the list: nothing on the guest
+reads it.
 
 Why not the seed: the seed has to exist for cloud-init and is small and public-shaped; putting the
 token and the credentials in it would make the thing that currently never gets detached into the
@@ -90,7 +101,16 @@ cloud-init's `runcmd` mounts `LABEL=ENCLAVE-PROV` read-only and:
    `install-runtime.sh`: root is going to execute it, so only root may be able to change it;
 2. installs the credentials file as `/etc/enclave/credentials.env`, root 600, and the token
    root 600;
-3. installs and starts `enclave-harden.service`.
+3. installs and **enables** `enclave-harden.service` — and does not start it. cloud-init's
+   `power_state` reboots the guest once after cloud-final (only if `first-boot` finished), and the
+   unit starts at that boot, exactly as it resumed three times in slice 2.
+
+**Why not start it straight away (found designing slice 3):** the unit is `WantedBy=
+multi-user.target`, so it is ordered *before* `multi-user.target`, and cloud-final runs *after* it.
+Starting the run from inside cloud-final races cloud-final's tail; ordering it `After=cloud-final`
+is a dependency cycle. One extra reboot (~20 s) buys the proven path. As built, the runcmd is
+`05-harden-host.sh first-boot /mnt/enclave-prov`, run from the read-only disk; a failure prints
+`provision FAIL` / `HALTED` on the console and suppresses the reboot.
 
 ### 4.3 `enclave-harden.service`
 
@@ -114,9 +134,9 @@ every hardening step and died at `evalstig` on `HOME: unbound variable`. `SUDO_U
 much: it is what hands the Evaluate-STIG evidence to the operator, so `collect` can pull it
 unprivileged. The unit therefore sets `HOME=/root USER=root LOGNAME=root` and the operator who
 handed the run over (`SUDO_USER/UID/GID`, captured from `sudo 05 run` or `resume`; every reboot
-rewrites the unit from the unit's own environment, so it stays put). **Slice 3 inherits a gap
-here:** at first boot no `sudo` run hands anything over, so the operator must come from the
-guest's admin-user parameter instead.
+rewrites the unit from the unit's own environment, so it stays put). At first boot no `sudo` run
+hands anything over, so the operator comes from `provision.env` on the provisioning disk — the VM
+admin user compose created (slice 3).
 
 ### 4.4 Completion, and step 16a done by the machine itself
 
@@ -222,6 +242,12 @@ mapped hosts (D8).
 **D2** — extend 05; **D3** — the host's own token copy; **slice-1 test guest: pg-01 on host-1**
 (in the address file and the map, lab-sized; destroyed and recomposed for real after the slices).
 D4–D8 are asked when their slice comes up.
+
+**Decided 2026-09-27 for slice 3:** hardening is triggered by **`--harden`** (a plain compose is
+unchanged; the 2.6 build passes the flag) · **D5 built now**, for every machine, not only guests
+(`stig-tailor.sh ufw` refuses a table port missing from `ppsm-services.tsv`; all 36 existing rows
+pass) · the slice-3 test uses a **throwaway credentials file copied to host-1**, not the stick (the
+stick path is exercised in 2.6).
 
 | # | Decision | Recommendation | Why |
 |---|---|---|---|

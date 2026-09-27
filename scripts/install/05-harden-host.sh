@@ -9,6 +9,7 @@
 #     sudo ./05-harden-host.sh status     where this machine is in the sequence
 #     sudo ./05-harden-host.sh run        do the next steps until it needs you
 #     sudo ./05-harden-host.sh resume     GUEST only: hand a halted run back to the unattended unit
+#     05-harden-host.sh first-boot <mnt>  GUEST only, run by cloud-init from the --harden disk
 #     sudo ./05-harden-host.sh reset      forget the state and start over (does NOT undo)
 #
 # WHY THIS EXISTS
@@ -75,6 +76,10 @@ RESUME_UNIT=enclave-harden.service
 BUILD_COPY="${BUILD_COPY:-/opt/enclave-build}"
 HALTED="$STATE_DIR/hardening-halted"
 COMPLETE="$STATE_DIR/hardening-complete"
+# B-06 slice 3: a guest composed with `03-compose-vm.sh --harden` gets its inputs on a read-only
+# provisioning disk; `first-boot` installs them here, root 600, and step_done deletes them.
+GUEST_TOKEN=/etc/enclave/pro-contract-token
+PROVISIONED="$STATE_DIR/provisioned"
 CURRENT_STEP=""
 # What an UNATTENDED guest's preflight may flag and still proceed to `usg fix` (step_prechecks).
 # In vm-specs.env because the unit runs with no environment; the environment still wins by hand.
@@ -378,16 +383,23 @@ step_pro() {
 
   # The token is a FILE, mode 0600, pushed from stage-01 with `scp -3` so it never lands on
   # an intermediate disk. It is the one thing this script cannot discover.
-  local tok="${SUDO_USER:+/home/$SUDO_USER}/.pro-contract-token"
-  [ -s "$tok" ] || tok="${HOME:-/root}/.pro-contract-token"
-  if [ ! -s "$tok" ]; then
+  # FOUND ONCE AND HANDED TO 04. 04 used to look the token up again on its own (the operator's
+  # home), so 05 could approve one file and 04 read another. Root-owned provisioning copy first
+  # (a guest composed with --harden, B-06 slice 3), then the operator's, then root's.
+  local tok="" _t
+  for _t in "$GUEST_TOKEN" \
+            ${SUDO_USER:+"$(getent passwd "$SUDO_USER" | cut -d: -f6)/.pro-contract-token"} \
+            "${HOME:-/root}/.pro-contract-token"; do
+    [ -s "$_t" ] && { tok="$_t"; break; }
+  done
+  if [ -z "$tok" ]; then
     die "no Pro contract token found.
        From stage-01, and it never touches an intermediate disk:
          scp -3 -p -i ~/.ssh/build01 \\
            encadmin@\$SVC_MGMT_01:~/.pro-contract-token encadmin@$(hostname -s):~/.pro-contract-token
        Then re-run:  sudo $0 run"
   fi
-  "$SELF/04-enclave-services.sh" pro
+  PRO_TOKEN_FILE="$tok" "$SELF/04-enclave-services.sh" pro
   mark_step pro
 }
 
@@ -756,8 +768,19 @@ step_evalstig() {
 step_done() {
   hdr "sequence complete on $(hostname -s)"
   if [ "$ROLE" = guest ]; then
+    # STEP 16a, DONE BY THE MACHINE (design 4.4). On a host deleting the credentials file is a
+    # manual, witnessed step - and so it can be skipped. On a guest nothing needs them after this
+    # line, so the machine deletes them itself and says so on the console. A run that HALTED never
+    # gets here and keeps them for the human re-run; CredentialsFileLeftBehind (3.35) watches that.
+    local f gone="" kept=""
+    for f in "${ENCLAVE_CREDENTIALS:-/etc/enclave/credentials.env}" "$GUEST_TOKEN" \
+             ${SUDO_USER:+"$(getent passwd "$SUDO_USER" | cut -d: -f6)/.pro-contract-token"}; do
+      [ -e "$f" ] || continue
+      shred -u "$f" 2>/dev/null || rm -f "$f"
+      if [ -e "$f" ]; then kept="$kept $f"; warn "could NOT delete $f"; else gone="$gone $(basename "$f")"; fi
+    done
     touch "$COMPLETE"; systemctl disable "$RESUME_UNIT" >/dev/null 2>&1 || true
-    progress DONE "$(grep -o 'final pass=[0-9]* fail=[0-9]*' "$LOG" 2>/dev/null | tail -1 | sed 's/final //')"
+    progress DONE "$(grep -o 'final pass=[0-9]* fail=[0-9]*' "$LOG" 2>/dev/null | tail -1 | sed 's/final //') deleted:${gone:- nothing}${kept:+ KEPT:$kept}"
   fi
   say "$(cat "$LOG" 2>/dev/null | tail -20)"
   say ""
@@ -820,9 +843,45 @@ cmd_run() {
   step_done
 }
 
+# B-06 slice 3 - run ONCE, by cloud-init's runcmd, from the READ-ONLY provisioning disk that
+# `03-compose-vm.sh --harden` attached. It installs what the guest needs and enables the unit; it
+# does NOT start the run. cloud-init's power_state reboots the guest after cloud-final, and the
+# unit starts at that boot - exactly as it resumed three times in slice 2. Starting it from here
+# instead would race the tail of cloud-final, and ordering the unit After=cloud-final is a cycle
+# (the unit is WantedBy multi-user.target; cloud-final runs after multi-user.target).
+cmd_first_boot() {
+  local prov="${1:-}" op f
+  [ -n "$prov" ] && [ -d "$prov" ] || die "first-boot needs the provisioning disk's mount point (got '${prov}')"
+  install -d -m 0755 "$STATE_DIR"
+  CURRENT_STEP=provision; progress provision START
+  trap 'harden_exit $?' EXIT
+  for f in provision.env credentials.env pro-contract-token Ubuntu24_AnswerFile.xml repo/.pushed-from; do
+    [ -s "$prov/$f" ] || die "the provisioning disk has no $f - recompose with --harden"
+  done
+  # The operator the unit acts for (tonight's slice-2 fix: the unit carries SUDO_USER). No sudo
+  # run hands the work over at first boot, so compose writes it down. Parsed, never sourced.
+  op="$(sed -n "s/^ENCLAVE_OPERATOR='\([a-z_][a-z0-9_-]*\)'[[:space:]]*$/\1/p" "$prov/provision.env" | head -1)"
+  [ -n "$op" ] && id "$op" >/dev/null 2>&1 || die "provision.env names no existing operator account ('${op:-none}')"
+  install -D -o root -g root -m 0600 "$prov/credentials.env" "${ENCLAVE_CREDENTIALS:-/etc/enclave/credentials.env}"
+  install -D -o root -g root -m 0600 "$prov/pro-contract-token" "$GUEST_TOKEN"
+  install -d -m 0755 "${STIG_TOOLS_DEST:-/srv/stig-tools}"
+  install -o root -g root -m 0640 "$prov/Ubuntu24_AnswerFile.xml" "${STIG_TOOLS_DEST:-/srv/stig-tools}/Ubuntu24_AnswerFile.xml"
+  ok "installed: credentials + token (root 600), answer file (0640) - operator $op"
+  SUDO_USER="$op"; SUDO_UID="$(id -u "$op")"; SUDO_GID="$(id -g "$op")"
+  export SUDO_USER SUDO_UID SUDO_GID
+  install_resume_unit
+  touch "$PROVISIONED"
+  CURRENT_STEP=""
+  progress provision "OK - rebooting once, then it hardens itself"
+}
+
 case "${1:-status}" in
   status) cmd_status ;;
   run)    cmd_run ;;
+  first-boot)
+          need_root; assert_enclave_host
+          [ "$ROLE" = guest ] || die "first-boot is for guests - it is run by cloud-init, not by hand"
+          cmd_first_boot "${2:-}" ;;
   resume) # A HALTED GUEST HANDED BACK TO THE UNATTENDED RUN (B-06 slice 2). Clears the halt,
           # refreshes the root-owned copy from THIS repo - so a pushed fix reaches the unit - and
           # starts the unit without waiting. Progress is on the host's console log, not here.
@@ -834,5 +893,5 @@ case "${1:-status}" in
           ok "handed to $RESUME_UNIT - watch the host's console log, lines start ENCLAVE-HARDEN" ;;
   reset)  need_root; assert_enclave_host
           rm -f "$STATE"; ok "state cleared - this does NOT undo anything already applied" ;;
-  *) printf 'usage: %s {status|run|resume|reset}\n' "$(basename "$0")" >&2; exit 2 ;;
+  *) printf 'usage: %s {status|run|resume|reset|first-boot <mnt>}\n' "$(basename "$0")" >&2; exit 2 ;;
 esac

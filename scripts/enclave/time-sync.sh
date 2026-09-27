@@ -9,6 +9,9 @@
 #   sudo ./time-sync.sh client    follow the enclave time source
 #        ./time-sync.sh verify    read-only: are we synchronised, and to what
 #        ./time-sync.sh drift     read-only: how far is this machine from a reference
+#        ./time-sync.sh drift-log     ON stage-01: one measurement of the enclave against UTC, logged
+#        ./time-sync.sh drift-report  ON stage-01: the log so far, and the drift RATE
+#   sudo ./time-sync.sh drift-timer   ON stage-01: measure every DRIFT_EVERY (3 h), as the operator
 #
 #   MACHINE: `master` on TIME_MASTER only (host-4 - physical); `client` on every other enclave
 #   machine, guests included; `verify` anywhere; `drift` on an enclave machine at gap-open,
@@ -60,6 +63,19 @@ SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 MASTER="${TIME_MASTER:?TIME_MASTER must be set in enclave-addresses.env}"
 MASTER_NAME="${TIME_MASTER_NAME:-time-master}"
+# ---- the enclave against UTC, measured from OUTSIDE (backlog 3.39, 2026-09-27) ----------------
+# Nothing inside the gap can see the enclave's error against UTC: every machine follows host-4
+# and host-4 follows its own crystal. stage-01 is outside, NTP-synced (ntp.ubuntu.com), and can
+# reach host-4 while the gap is open - so it measures. How: SSH midpoint. Read host-4's clock
+# inside one ssh call, bracket it with stage-01's clock before and after, offset = remote minus
+# the midpoint, uncertainty = half the round trip; the best of DRIFT_SAMPLES calls is kept.
+# First measured by hand 2026-09-27 14:15 UTC: +10.57 s, three samples within 5 ms.
+DRIFT_TARGET="${DRIFT_TARGET:-$MASTER}"            # what is measured: the time master, whose clock every machine follows
+DRIFT_LOG="${DRIFT_LOG:-/var/lib/enclave-time/drift.csv}"
+DRIFT_KEY="${DRIFT_KEY:-$HOME/.ssh/build01}"
+DRIFT_USER="${DRIFT_USER:-encadmin}"
+DRIFT_SAMPLES="${DRIFT_SAMPLES:-3}"
+DRIFT_EVERY="${DRIFT_EVERY:-*-*-* 00/3:17:00}"    # systemd OnCalendar - every 3 h, off the hour
 ALLOW="${TIME_ALLOW:-10.2.20.0/24}"
 MAXPOLL="${TIME_MAXPOLL:-16}"
 CONF=/etc/chrony/chrony.conf
@@ -315,10 +331,103 @@ cmd_verify() {
 # ---------------------------------------------------------------------------- drift
 # Measure against a reference WITHOUT changing anything. Used at gap-open to see how far the
 # enclave has walked from real time before deciding whether to re-anchor.
+# stage-01 only: the enclave's addresses are the other machines, and this measures FROM outside.
+assert_stage01() {
+  ip -4 -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | grep -qx "${STAGE_01:?STAGE_01 not set in enclave-addresses.env}" \
+    || die "this runs on stage-01 (${STAGE_01}) - outside the gap, on real time. This is $(hostname -s)."
+}
+
+# One measurement, one CSV row. Unreachable is a row too: a gap in the log must be explained.
+cmd_drift_log() {
+  assert_stage01
+  local synced refoff best="" a b r rtt off
+  synced="$(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo unknown)"
+  refoff="$(timedatectl timesync-status 2>/dev/null | awk '/Offset:/ {print $2}' | head -1)"
+  for _ in $(seq 1 "$DRIFT_SAMPLES"); do
+    a="$(date +%s.%N)"
+    r="$(ssh -i "$DRIFT_KEY" -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=yes \
+          "$DRIFT_USER@$DRIFT_TARGET" 'echo ENCLAVE-TIME; date +%s.%N' 2>/dev/null | sed -n '/^ENCLAVE-TIME$/{n;p}')" || r=""
+    b="$(date +%s.%N)"
+    [[ "$r" =~ ^[0-9]+\.[0-9]+$ ]] || continue
+    rtt="$(echo "$b - $a" | bc -l)"; off="$(echo "$r - ($a + $b) / 2" | bc -l)"
+    if [ -z "$best" ] || [ "$(echo "$rtt < ${best%% *}" | bc -l)" = 1 ]; then best="$rtt $off"; fi
+  done
+  install -d -m 0755 "$(dirname "$DRIFT_LOG")" 2>/dev/null || true
+  [ -w "$DRIFT_LOG" ] || [ ! -e "$DRIFT_LOG" ] || die "$DRIFT_LOG is not writable by $(id -un)"
+  [ -s "$DRIFT_LOG" ] || echo "utc,target,offset_s,uncertainty_s,reference_synced,reference_offset" > "$DRIFT_LOG"
+  if [ -n "$best" ]; then
+    printf '%s,%s,%.3f,%.3f,%s,%s\n' "$(date -u +%FT%TZ)" "$DRIFT_TARGET" "${best#* }" "$(echo "${best%% *} / 2" | bc -l)" "$synced" "${refoff:-?}" >> "$DRIFT_LOG"
+    ok "$DRIFT_TARGET is $(printf '%+.3f' "${best#* }") s from stage-01's clock (+/- $(printf '%.3f' "$(echo "${best%% *} / 2" | bc -l)") s; stage-01 NTPSynchronized=$synced, offset ${refoff:-?})"
+    [ "$synced" = yes ] || warn "stage-01 is NOT synchronised - this row measures against an unreliable reference"
+  else
+    printf '%s,%s,,,%s,%s\n' "$(date -u +%FT%TZ)" "$DRIFT_TARGET" "$synced" "${refoff:-?}" >> "$DRIFT_LOG"
+    warn "$DRIFT_TARGET did not answer - logged as unreachable (gap closed, or the key is not accepted)"
+  fi
+}
+
+# The rate: least squares over the rows measured against a synchronised reference.
+cmd_drift_report() {
+  [ -r "$DRIFT_LOG" ] || die "no drift log at $DRIFT_LOG - run drift-log (or drift-timer) on stage-01 first"
+  python3 - "$DRIFT_LOG" <<'PY'
+import csv, sys, datetime as dt
+rows = list(csv.DictReader(open(sys.argv[1])))
+good = [r for r in rows if r["offset_s"] and r["reference_synced"] == "yes"]
+print(f"  {len(rows)} row(s): {len(good)} usable, {len(rows) - len(good)} unreachable or against an unsynchronised reference")
+if not good:
+    sys.exit(0)
+t = [dt.datetime.fromisoformat(r["utc"].replace("Z", "+00:00")).timestamp() for r in good]
+y = [float(r["offset_s"]) for r in good]
+print(f"  first  {good[0]['utc']}  {y[0]:+.3f} s")
+print(f"  last   {good[-1]['utc']}  {y[-1]:+.3f} s")
+if len(good) < 2 or t[-1] - t[0] < 6 * 3600:
+    print("  RATE: not yet - needs at least two usable rows six hours apart"); sys.exit(0)
+n = len(t); mt = sum(t) / n; my = sum(y) / n
+slope = sum((a - mt) * (b - my) for a, b in zip(t, y)) / sum((a - mt) ** 2 for a in t)
+print(f"  RATE:  {slope * 86400:+.3f} s/day  ({slope * 1e6:+.1f} ppm) over {(t[-1] - t[0]) / 86400:.1f} day(s)")
+print(f"         at that rate the enclave moves 1 s from UTC every {abs(1 / (slope * 86400)):.1f} day(s)" if slope else "")
+PY
+}
+
+# Install the measurement as a timer - RUN AS THE OPERATOR, not root: it needs the operator's key
+# and nothing privileged, and a root unit running a repo copy the operator can edit is the 3.11 path.
+cmd_drift_timer() {
+  need_root; assert_stage01
+  local op="${SUDO_USER:-}" home
+  [ -n "$op" ] && [ "$op" != root ] || die "run with sudo as the operator whose key reaches host-4"
+  home="$(getent passwd "$op" | cut -d: -f6)"
+  install -d -m 0755 -o "$op" -g "$(id -gn "$op")" "$(dirname "$DRIFT_LOG")"
+  cat > /etc/systemd/system/enclave-time-drift.service <<UNIT
+[Unit]
+Description=Measure the enclave clock against UTC from stage-01 (backlog 3.39)
+[Service]
+Type=oneshot
+User=$op
+Environment=HOME=$home DRIFT_LOG=$DRIFT_LOG
+ExecStart=$SELF/time-sync.sh drift-log
+UNIT
+  cat > /etc/systemd/system/enclave-time-drift.timer <<UNIT
+[Unit]
+Description=Measure the enclave clock against UTC every few hours
+[Timer]
+OnCalendar=$DRIFT_EVERY
+Persistent=true
+[Install]
+WantedBy=timers.target
+UNIT
+  systemd-analyze verify /etc/systemd/system/enclave-time-drift.service /etc/systemd/system/enclave-time-drift.timer \
+    || die "the drift units do not verify - not enabling them"
+  systemctl daemon-reload
+  systemctl enable --now enclave-time-drift.timer
+  ok "enclave-time-drift.timer: $DRIFT_EVERY, as $op, logging to $DRIFT_LOG"
+  systemctl start enclave-time-drift.service && ok "first measurement taken: $(tail -1 "$DRIFT_LOG")"
+}
+
 cmd_drift() {
   local ref="${1:-}"
   [ -n "$ref" ] || die "usage: $0 drift <reference-host-or-ip>
-      At gap-open, stage-01 has a route to real time and is the obvious reference."
+      The reference must SERVE NTP to this machine. stage-01 does NOT today - it runs
+      systemd-timesyncd, a client only (found 2026-09-27, backlog 3.39). To measure the
+      enclave against UTC from stage-01's side instead:  ./time-sync.sh drift-log  (on stage-01)"
   command -v chronyd >/dev/null 2>&1 || die "chrony is not installed"
   say "measuring against $ref - this CHANGES NOTHING"
   # -Q queries and prints the offset without setting the clock or binding a port.
@@ -330,6 +439,9 @@ cmd_drift() {
 }
 
 case "${1:-}" in
+  drift-log)    cmd_drift_log ;;
+  drift-report) cmd_drift_report ;;
+  drift-timer)  cmd_drift_timer ;;
   master) shift; cmd_master "$@" ;;
   client) cmd_client ;;
   verify) cmd_verify ;;

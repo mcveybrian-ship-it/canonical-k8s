@@ -383,6 +383,8 @@ AL_DOWN_FOR="${AL_DOWN_FOR:-2m}"
 AL_FACTS_STALE="${AL_FACTS_STALE:-3600}"          # facts older than this: every number is frozen
 AL_BOOT_LOSS_WINDOW="${AL_BOOT_LOSS_WINDOW:-86400}" # seconds after a boot that boot-time audit loss stays visible (3.33)
 AL_CRED_MAX_AGE="${AL_CRED_MAX_AGE:-86400}"         # a credentials file older than this was forgotten (3.35)
+AL_CLOCK_MAX_OFFSET="${AL_CLOCK_MAX_OFFSET:-1}"      # seconds from its chrony source - DISA's own threshold (3.39)
+AL_CLOCK_SYNC_STALE="${AL_CLOCK_SYNC_STALE:-43200}"  # no measurement from the source in 12 h (VMs poll every 4.5 h)
 AL_SCAN_STALE_DAYS="${AL_SCAN_STALE_DAYS:-30}"    # STIG checklist older than this
 AL_CERT_DAYS="${AL_CERT_DAYS:-30}"                # certificate inside this many days
 AL_AIDE_STALE="${AL_AIDE_STALE:-129600}"          # 36h - dailyaidecheck has missed a day
@@ -1230,6 +1232,59 @@ groups:
             and record the deletion in the stick's REGISTER.txt (docs/airgap-media.md 9.4). If it is
             host-4 and guests are still being composed, that is expected - finish them first.
 
+      # CLOCKS (backlog 3.39). From chronyc via the facts - NOT node_timex_offset_seconds, which
+      # reads 0 under chrony whatever the error, nor node_timex_sync_status, which reads 0 on the
+      # master by design. INTERNAL ONLY: these catch a machine that has stopped following host-4.
+      # The enclave's error against UTC is invisible from inside; time-sync.sh drift-log measures
+      # it from stage-01.
+      - alert: ClockNotSynchronised
+        expr: enclave_clock_synced == 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ \$labels.machine }}'s clock is not synchronised"
+          description: "chrony on {{ \$labels.machine }} reports 'Not synchronised' - it has no usable source. Its audit timestamps now drift on their own."
+          action: >-
+            On {{ \$labels.machine }}: 'chronyc -n sources' and 'sudo ./time-sync.sh verify'. The
+            source should be host-4; if it is unreachable, check ufw and the network first.
+      - alert: ClockOffsetHigh
+        expr: abs(enclave_clock_offset_seconds) > ${AL_CLOCK_MAX_OFFSET}
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ \$labels.machine }}'s clock is {{ \$value | humanize }} s from its source"
+          description: "More than ${AL_CLOCK_MAX_OFFSET} s between {{ \$labels.machine }} and the enclave time master - DISA's threshold for correcting it. etcd, Ceph and TLS fail on skew before anything else notices."
+          action: >-
+            'chronyc -n tracking' on {{ \$labels.machine }}. chrony slews rather than steps once it
+            is running; a large offset that is not shrinking means it is not reaching host-4.
+      - alert: ClockSyncStale
+        expr: >-
+          enclave_clock_master == 0
+          and on(instance) (time() - enclave_clock_last_sync_seconds) > ${AL_CLOCK_SYNC_STALE}
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ \$labels.machine }} has not measured its time source in over ${AL_CLOCK_SYNC_STALE} s"
+          description: "chrony on {{ \$labels.machine }} keeps running on its last correction - 'synchronised' in name, free-running in fact."
+          action: >-
+            'chronyc -n sources' on {{ \$labels.machine }}: a source marked ? or x is unreachable or rejected.
+      - alert: ClockMasterNotSingle
+        expr: >-
+          ((count(enclave_clock_master == 1) or vector(0)) != 1)
+          and on() (count(enclave_clock_master) > 0)
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The enclave has {{ \$value }} time master(s) - it must have exactly one"
+          description: "Zero means no machine serves time and every clock free-runs alone; two means the enclave splits into two clock domains that drift apart - the failure etcd and Ceph see first."
+          action: >-
+            Exactly one machine, TIME_MASTER (host-4), runs 'time-sync.sh master'; every other
+            runs 'time-sync.sh client'. 'enclave_clock_reference' shows who follows what.
+
       # THE META-ALERT. Without it, every rule in this group fails silently: a frozen fact
       # file keeps serving its last values forever, so nothing breaches a threshold and the
       # dashboards stay green on numbers that stopped being true.
@@ -1896,6 +1951,49 @@ if rc == 0:
          help="failed sudo authentications in the last 24h, from the journal")
     emit("enclave_sudo_invocations_24h", sum(1 for l in o.splitlines() if "COMMAND=" in l),
          help="total sudo invocations in the last 24h - svc-mgmt-01 runs ~1.7 per SECOND and nobody knows why")
+
+# ------------------------------------------------------------------------------- CLOCK
+# THE CLOCK, FROM CHRONY ITSELF (backlog 3.39, 2026-09-27). node-exporter's node_timex_* looked
+# like the answer and is not: chrony steers by FREQUENCY and never fills the kernel's offset
+# field, so node_timex_offset_seconds read 0 on all eight machines - an alert on it could never
+# fire - and node_timex_maxerror_seconds tracks how RARELY chrony updates the kernel (4.8-8.3 s
+# on the VMs that poll every 4.5 h), not an error. `chronyc -n -c tracking` is the daemon's own
+# view as CSV: ref id, ref name, stratum, ref time, system time, last offset, rms offset, freq,
+# resid freq, skew, root delay, root dispersion, update interval, leap status.
+# WHAT THIS CANNOT SEE: the enclave's error against UTC. Every machine follows host-4 and
+# host-4 follows its own crystal (reference LOCAL, 7F7F0101) - +10.57 s on UTC when measured
+# from stage-01 on 2026-09-27. Nothing inside the gap can see that; time-sync.sh drift-log does.
+rc, o, _ = run(["chronyc", "-n", "-c", "tracking"])
+fields = next(csv.reader([o.strip()]), []) if (rc == 0 and o.strip()) else []
+if len(fields) >= 14:
+    try:
+        refid, refname, stratum = fields[0], fields[1], int(fields[2])
+        reftime, systime = float(fields[3]), float(fields[4])
+        lastoff, rootdelay, rootdisp = float(fields[5]), float(fields[10]), float(fields[11])
+        leap = fields[13].strip()
+        master = refid.upper() == "7F7F0101"
+        emit("enclave_clock_synced", 0 if leap.lower().startswith("not sync") else 1,
+             help="1 unless chrony reports 'Not synchronised' - from chronyc, NOT node_timex_sync_status")
+        emit("enclave_clock_master", 1 if master else 0,
+             help="1 on the machine whose chrony reference is LOCAL - the enclave time master. Exactly one should")
+        emit("enclave_clock_stratum", stratum, help="chrony stratum - the master's local stratum plus hops")
+        emit("enclave_clock_offset_seconds", systime,
+             help="this clock's offset from its chrony source (chronyc 'System time'). NOT an offset from UTC")
+        emit("enclave_clock_last_offset_seconds", lastoff, help="chrony's offset at its last measurement")
+        emit("enclave_clock_root_dispersion_seconds", rootdisp,
+             help="chrony's accumulated error bound back to the reference - root delay/2 plus this bounds the error")
+        emit("enclave_clock_root_delay_seconds", rootdelay, help="network delay back to the reference")
+        emit("enclave_clock_last_sync_seconds", reftime,
+             help="unix time chrony last took a measurement from its reference - its age is the staleness")
+        emit("enclave_clock_reference", 1, {"ref": "LOCAL" if master else (refname or refid)},
+             help="which source this clock follows")
+        SRC["clock"] = 1
+    except (ValueError, IndexError):
+        SRC["clock"] = 0          # chronyc answered and the answer did not parse - say so, emit no numbers
+elif rc == 127:
+    pass                          # no chronyc here: no clock facts at all, and no source_ok row claiming one
+else:
+    SRC["clock"] = 0
 
 # ------------------------------------------------------------------------- USB storage
 # V-270718 checks modprobe.d and NEVER lsmod, so this reads the same place the control does.

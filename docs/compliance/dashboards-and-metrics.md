@@ -433,6 +433,20 @@ older than the one that had just finished.
 | `enclave_faillock_users_with_failures` | — | non-empty files in `/run/faillock` | at 3 they are locked out |
 | `enclave_credentials_file_present` | — | `stat` of `/etc/enclave/credentials.env` — never opened | should be 1 only during hardening (3.35) |
 | `enclave_credentials_file_mtime_seconds` | — | the same file's mtime (`install` sets it at placement) | its age |
+| `enclave_clock_synced` | — | `chronyc -n -c tracking`, leap status | 0 = chrony has no usable source (3.39) |
+| `enclave_clock_master` | — | same, reference `LOCAL` (7F7F0101) | 1 on the time master; exactly one machine should |
+| `enclave_clock_offset_seconds` | — | same, "System time" | offset from its **chrony source** — not from UTC |
+| `enclave_clock_last_sync_seconds` | — | same, reference time | when it last measured its source; the age is the staleness |
+| `enclave_clock_stratum` · `_last_offset_seconds` · `_root_delay_seconds` · `_root_dispersion_seconds` | — | same | chrony's own error terms |
+| `enclave_clock_reference` | `ref` | same | who this clock follows (`LOCAL` on the master) |
+
+**Why not node-exporter's `node_timex_*` (measured 2026-09-27, 3.39):** chrony steers by frequency
+and never fills the kernel's offset field, so `node_timex_offset_seconds` read **0 on all eight
+machines** — an alert on it could never fire; `node_timex_maxerror_seconds` tracks how rarely chrony
+updates the kernel (4.8–8.3 s on VMs polling every 4.5 h), not an error; `node_timex_sync_status` is
+0 on the master by design. **Nothing here sees the enclave's error against UTC** — every machine
+follows host-4's free-running crystal. That is measured from outside by `time-sync.sh drift-log` on
+stage-01 (+10.57 s on 2026-09-27).
 | `enclave_failed_sudo_24h` | — | journal, `-t sudo` | authentication failures |
 | `enclave_sudo_invocations_24h` | — | journal, `-t sudo` | total `COMMAND=` lines |
 | `enclave_usb_storage_blocked` | — | `/etc/modprobe.d/*.conf` | where V-270718 looks |
@@ -584,6 +598,10 @@ pager that trains people to ignore it.
 | `AideDetectedChanges` | last exit non-zero | 10m | warning |
 | `AccountLockoutRisk` | any faillock tally | **none** | warning |
 | `CredentialsFileLeftBehind` | credentials file present and older than `AL_CRED_MAX_AGE` (24 h) | 15m | warning |
+| `ClockNotSynchronised` | chrony reports "Not synchronised" | 30m | warning |
+| `ClockOffsetHigh` | \|offset from its source\| > `AL_CLOCK_MAX_OFFSET` (1 s, DISA's threshold) | 15m | warning |
+| `ClockSyncStale` | a non-master has not measured its source in `AL_CLOCK_SYNC_STALE` (12 h) | 15m | warning |
+| `ClockMasterNotSingle` | not exactly one machine following `LOCAL` (only once any clock facts exist) | 30m | warning |
 | `ComplianceFactsStale` | facts older than 1h | 15m | critical |
 | **backups** | | | |
 | `BackupMissed` | no complete set in 26h | 30m | critical |

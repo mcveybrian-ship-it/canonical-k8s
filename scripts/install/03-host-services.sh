@@ -366,6 +366,13 @@ cmd_datavg() {
       *)                  opts="${DATA_MOUNTOPTS_DEFAULT:-defaults}" ;;
     esac
 
+    # /var/lib/libvirt MUST BE 0755 - the libvirt package's own mode - or qemu cannot reach its
+    # disks. Found 2026-09-27 composing the first guest on host-1: this step ran AFTER hardening,
+    # when root's umask is 077 (login.defs UMASK 077), so `mkdir -p` below created
+    # /var/lib/libvirt itself as 0700 before the package could. libvirt-qemu then could not
+    # traverse it and virt-install failed on the data disk. host-1 and host-2 had it; host-3 and
+    # host-4 (built in the other order) did not. Explicit modes, never the umask.
+    case "$mnt" in /var/lib/libvirt/*) install -d -m 0755 /var/lib/libvirt ;; esac
     mkdir -p "$mnt"
     local uuid; uuid=$(blkid -s UUID -o value "$dev")
     if grep -q "UUID=$uuid" /etc/fstab; then

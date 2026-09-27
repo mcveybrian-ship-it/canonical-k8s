@@ -293,6 +293,24 @@ fi
          scp encadmin@${STAGE_01:-stage-01}:/srv/bundle-staging/media/ubuntu-24.04-minimal-cloudimg-amd64.img \\
              $VM_BASE_IMAGE"
 
+# CAN QEMU REACH ITS DISKS? Checked BEFORE anything is created or any password asked for.
+# qemu runs as QEMU_USER (libvirt-qemu), and on a hardened host a directory created under
+# root's umask 077 is 0700 - found 2026-09-27 on host-1, where /var/lib/libvirt was 0700 and
+# virt-install failed on the data disk only after the admin password had been typed.
+QEMU_USER="${QEMU_USER:-libvirt-qemu}"
+if [ "$DRY" -eq 0 ] && id "$QEMU_USER" >/dev/null 2>&1; then
+  _blocked=""
+  for _d in "$POOL" ${DATA_POOL:+"$DATA_POOL"}; do
+    runuser -u "$QEMU_USER" -- test -x "$_d" 2>/dev/null || _blocked="$_blocked $_d"
+  done
+  [ -z "$_blocked" ] || die "$QEMU_USER cannot reach:$_blocked
+       qemu runs as $QEMU_USER and needs search (x) on every directory above its disks.
+       Look for a 0700 parent:   namei -m$_blocked
+       On host-1/host-2 it was /var/lib/libvirt (0700 from root's umask 077; the package ships 0755):
+         sudo chmod 0755 /var/lib/libvirt
+       03-host-services.sh datavg now sets it; this host was prepared before that fix."
+  ok "qemu ($QEMU_USER) can reach:$( printf ' %s' "$POOL" ${DATA_POOL:+"$DATA_POOL"})"
+fi
 say "vm      : $VM  ($ADDRESS)"
 say "spec    : ${VCPUS} vCPU, ${RAM_MB} MB, ${DISK_GB} GB sparse"
 say "bridge  : $BRIDGE"

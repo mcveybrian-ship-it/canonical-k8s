@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # =========================================================================================
-# 05-harden-host.sh - drive runbook §6.0 end to end on a bare-metal enclave host.
+# 05-harden-host.sh - drive runbook §6.0 end to end on an enclave machine: a bare-metal host,
+# or - since 2026-09-26 (B-06 slice 1, docs/06-guest-vms.md) - a guest VM.
 #
-#     MACHINE: runs ON the host being hardened. It refuses to run anywhere else.
+#     MACHINE: runs ON the host or guest being hardened. Which one it is comes from the address
+#     file, never from an argument; it refuses any machine that is neither.
 #
 #     sudo ./05-harden-host.sh status     where this machine is in the sequence
 #     sudo ./05-harden-host.sh run        do the next steps until it needs you
@@ -69,21 +71,31 @@ hdr()  { printf '\n=== %s ===\n' "$*"; }
 need_root() { [ "$(id -u)" -eq 0 ] || die "run with sudo"; }
 
 # ---- the guard. Not a hostname list: the address file is the source of truth -------------
+# HOST OR GUEST, DERIVED - never typed (backlog B-06, decision D2, 2026-09-26). Which
+# address-file key owns an address this machine holds decides it: HOST_* is a bare-metal host,
+# SVC_* / PG_* / K8S_CP_* / K8S_WK_* is a guest. Anything else - stage-01, build-01, the K8S API
+# VIP, a DHCP range - is refused. Hardening a guest is the same runbook 6.0 as a host: its own Pro
+# attach, FIPS kernel and STIG pass (runbook 7.4); the steps differ only where noted by ROLE.
+ROLE=""; ME_KEY=""
 assert_enclave_host() {
-  local af="$ENC/enclave-addresses.env"
+  local af="$ENC/enclave-addresses.env" mine key val
   [ -r "$af" ] || die "cannot read $af"
-  local HOST_1 HOST_2 HOST_3 HOST_4
-  eval "$(awk -F= '/^HOST_[0-9]=/{print $1"="$2}' "$af")"
-  local mine; mine="$(ip -4 -o addr show scope global 2>/dev/null \
+  mine="$(ip -4 -o addr show scope global 2>/dev/null \
       | awk '{split($4,a,"/"); print a[1]}' | tr '\n' ' ')"
-  local h
-  for h in "$HOST_1" "$HOST_2" "$HOST_3" "$HOST_4"; do
-    [ -n "${h:-}" ] || continue
-    case " $mine " in *" $h "*) return 0 ;; esac
-  done
+  while IFS='=' read -r key val; do
+    val="${val%%#*}"; val="$(printf '%s' "$val" | tr -d "'\" \t")"
+    [ -n "$val" ] || continue
+    case " $mine " in *" $val "*) ;; *) continue ;; esac
+    case "$key" in
+      HOST_[0-9]*)                                   ROLE=host ;;
+      SVC_*|PG_[0-9]*|K8S_CP_[0-9]*|K8S_WK_[0-9]*)   ROLE=guest ;;
+      *) continue ;;
+    esac
+    ME_KEY="$key"; return 0
+  done < <(grep -E '^[A-Z0-9_]+=' "$af")
   die "WRONG MACHINE: $(hostname -s) ($mine)
-       05-harden-host.sh runs ON a bare-metal enclave host. Expected one of:
-         $HOST_1  $HOST_2  $HOST_3  $HOST_4"
+       05-harden-host.sh runs ON an enclave machine - a host (HOST_*) or a guest (SVC_*, PG_*,
+       K8S_CP_*, K8S_WK_*) in $af. None of those addresses is on this machine."
 }
 
 # ---- state ------------------------------------------------------------------------------
@@ -100,11 +112,16 @@ need_reboot() {
   hdr "REBOOT REQUIRED"
   say "$why"
   say ""
-  say "  This host has no BMC and its LUKS root prompts at a physical console, so the"
-  say "  machine will NOT come back on its own - somebody has to be at it with the"
-  say "  passphrase. That is why this asks instead of just doing it: an automatic reboot"
-  say "  on a machine nobody is standing at is not automation, it is a host sitting at a"
-  say "  prompt until someone notices."
+  if [ "$ROLE" = guest ]; then
+    say "  A guest has no LUKS prompt - its disk is an image on its host's already-unlocked"
+    say "  storage - so it comes back on its own. (Slice 2 of B-06 will reboot it without"
+    say "  asking; for now it asks, like a host.)"
+  else
+    say "  On a host the TPM unlocks the disk at boot (clevis, all four hosts since"
+    say "  2026-09-22). If it cannot - firmware or boot-chain change - the LUKS passphrase is"
+    say "  needed at the console, and the host has no BMC. That is why this asks rather than"
+    say "  rebooting a machine nobody may be standing at."
+  fi
   say ""
 
   # OFFER rather than assume. At the console this is one keystroke; away from it, declining
@@ -114,7 +131,8 @@ need_reboot() {
   # LOCATION is the thing the machine cannot discover, and a default that guesses wrong
   # leaves the enclave down.
   if [ -t 0 ]; then
-    printf '  Are you at the console and ready to type the LUKS passphrase? reboot now? [y/N] '
+    if [ "$ROLE" = guest ]; then printf '  reboot now? [y/N] '
+    else printf '  reboot now? (if the TPM does not unlock it, the LUKS passphrase is needed at the console) [y/N] '; fi
     local a=""; read -r a || true
     case "$a" in
       y|Y)
@@ -157,8 +175,17 @@ step_preflight() {
 
   # A SECOND SESSION IS THE ONLY WAY BACK IN if usg fix breaks authentication, and on this
   # hardware there is no console short of driving to it. Count real login sessions.
+  #
+  # NOT ON A GUEST. A guest HAS a console: its serial port is a pty on its host, so
+  # `virsh console` from the host plus the break-glass account is the way back in - the path the
+  # composer built for exactly this (runbook 6.3j). Asking for a second SSH session there would
+  # be a prompt with no purpose, and unattended guest hardening (slices 2-3) cannot answer it.
   local sessions; sessions="$(who 2>/dev/null | wc -l)"
-  if [ "$sessions" -lt 2 ]; then
+  if [ "$ROLE" = guest ]; then
+    local place; place="$(grep -oE "PLACE_${ME_KEY}='[^']*'" "$ENC/vm-specs.env" 2>/dev/null | cut -d"'" -f2)"
+    ok "guest ($ME_KEY): the way back in is its serial console - on its host (the map says"
+    say "   ${place:-see vm-specs.env PLACE_$ME_KEY}; 'sudo virsh list' there confirms): sudo virsh console $(hostname -s)"
+  elif [ "$sessions" -lt 2 ]; then
     warn "only $sessions login session(s) open on this machine."
     say  "  OPEN A SECOND SSH SESSION NOW and leave it open until this finishes."
     say  "  usg fix has locked the admin account out of sudo before, and there is no BMC"
@@ -599,7 +626,7 @@ STEPS=(preflight hostprep pro fips patch usg baseline prechecks usgfix tailor ra
 
 cmd_status() {
   assert_enclave_host
-  printf '\n  hardening state on %s\n\n' "$(hostname -s)"
+  printf '\n  hardening state on %s (%s, %s)\n\n' "$(hostname -s)" "$ROLE" "$ME_KEY"
   local s
   for s in "${STEPS[@]}"; do
     printf '  %s %s\n' "$(done_step "$s" && echo '[x]' || echo '[ ]')" "$s"

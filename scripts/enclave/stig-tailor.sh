@@ -3998,6 +3998,12 @@ svc-mgmt-01	123/udp	allow	__ENCLAVE_CIDR__	chrony serving time on to the enclave
 svc-mgmt-01	80/tcp	allow	__ENCLAVE_CIDR__	nginx 301 to https only, so a plaintext client gets a redirect rather than a timeout
 svc-mgmt-01	443/tcp	allow	__ENCLAVE_CIDR__	nginx TLS in front of the Ubuntu Pro contracts server on 127.0.0.1:8484 - every machine's `pro` client talks to it. 8484 itself is NOT in this table: it is loopback-only by systemd IPAddressDeny, proven by the 2026-09-19 scan (filtered)
 svc-mgmt-01	9100/tcp	limit	__SVC_OBS_01__	node-exporter, source-restricted to the collector; limit for the same reason as host-1/2/3
+pg-01	22/tcp	limit	any	ssh - the rule the benchmark is aimed at. B-06 slice 1 (2026-09-26): the table every machine has, so ufw is active and default-deny from the first hardening pass
+pg-01	9100/tcp	limit	__SVC_OBS_01__	node-exporter, source-restricted to the collector; limit for the same reason as host-1/2/3. PostgreSQL, Patroni and its etcd ports are NOT here yet: they arrive with backlog B-06a, from its design (runbook 9a), registered in ppsm-services.tsv first (decision D5)
+pg-02	22/tcp	limit	any	ssh - the rule the benchmark is aimed at. B-06 slice 1 (2026-09-26): the table every machine has, so ufw is active and default-deny from the first hardening pass
+pg-02	9100/tcp	limit	__SVC_OBS_01__	node-exporter, source-restricted to the collector; limit for the same reason as host-1/2/3. PostgreSQL, Patroni and its etcd ports are NOT here yet: they arrive with backlog B-06a, from its design (runbook 9a), registered in ppsm-services.tsv first (decision D5)
+pg-03	22/tcp	limit	any	ssh - the rule the benchmark is aimed at. B-06 slice 1 (2026-09-26): the table every machine has, so ufw is active and default-deny from the first hardening pass
+pg-03	9100/tcp	limit	__SVC_OBS_01__	node-exporter, source-restricted to the collector; limit for the same reason as host-1/2/3. PostgreSQL, Patroni and its etcd ports are NOT here yet: they arrive with backlog B-06a, from its design (runbook 9a), registered in ppsm-services.tsv first (decision D5)
 EOF
 }
 

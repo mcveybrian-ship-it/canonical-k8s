@@ -20,8 +20,9 @@ four service VMs, with anti-affinity between the members of each set:
 | host-3 | pg-03, k8s-cp-03, k8s-wk-03, **svc-obs-01** |
 | host-4 | k8s-wk-04, **svc-mgmt-01** |
 
-The four service VMs run on host-4 today; the map spreads them, and the from-scratch build (2.6)
-builds to the map.
+That is the **production** map. The **lab** profile keeps all four service VMs on host-4, where
+they run today (`vm-specs.env`, `VM_PROFILE=lab`); `03-compose-vm.sh plan` shows the lab layout
+and confirms it fits — on 2026-09-26 host-1 needed 26 of its 30 GiB, anti-affinity held.
 
 **The lab cannot run the production spec, and the spec is not shrunk to fit it.** Production asks
 for ~200 GB of guest RAM against ~91 GB available, and a single production worker (32 GB) is larger

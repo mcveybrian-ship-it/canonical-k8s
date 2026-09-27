@@ -1,6 +1,6 @@
 # Step 06 — compose and harden the guest VMs
 
-> **DESIGN FOR REVIEW, 2026-09-26. Nothing here is built.** It answers backlog **B-06**:
+> **DESIGN, 2026-09-26 — D1, D2, D3 and the test guest DECIDED (§9); nothing built yet.** It answers backlog **B-06**:
 > *nothing drives hardening on a guest* — `05-harden-host.sh` refuses anything but host-1..4, so
 > every guest so far was hardened by hand. The numbered decisions **D1–D8** at the end are what
 > the review settles; everything above them is the reasoning and the evidence behind each one.
@@ -181,20 +181,35 @@ The data disk must be mounted by UUID or LABEL before `finish` removes the seed 
 already warns; `finish` enforces it. The WAL archive and the at-rest evidence (`lsblk -s` shows
 `crypt` under both disks) stay as backlog B-06a and 6a.9 describe.
 
-## 8. Order of work, once the decisions are made
+## 8. Built and tested in four slices — one new thing at a time
 
-1. **05 grows guest mode** — the derived host/guest role, self-reboot, the serial progress lines,
-   the token path, the guest `done` step. Tested on a scratch guest first.
-2. **03 grows the provisioning disk** and the cloud-init `runcmd` + `enclave-harden.service`.
-3. **`03-compose-vm.sh finish`** — shred seed and provisioning disk, the outside checks, the
-   register line.
-4. **ufw tables for pg-01..03** in `stig-tailor.sh`, and the ufw-vs-PPSM check (D5).
-5. **Prove it end to end on ONE disposable guest (lab profile)** — the first run of `usg fix` with
-   nobody watching, so it is on a machine that can be thrown away. Then pg-01..03 (06a), then the
-   K8S guests once B-07 has its port list.
-6. In 2.6 the four service VMs are rebuilt through the same path, onto their mapped hosts.
+Testing all of this at once would be miserable, and a failure would not say which part broke. So
+it is built in four slices, **each tested on the same throwaway guest (lab profile), each with a
+pass/fail you can see, each useful on its own** — stopping after any slice leaves the enclave
+better than before it.
+
+| slice | what gets built | what you test | pass looks like | needs |
+|---|---|---|---|---|
+| **1** | 05 learns **"I am on a guest"**: the guard accepts `SVC_*`/`PG_*`/`K8S_*` (role derived, never typed), preflight skips the session count, the token and passwords are read the guest way | Compose one throwaway guest; SSH in; run `sudo 05-harden-host.sh run` **by hand**, exactly as on host-3 | It reaches the end; USG lands where the other guests did (209–212 pass) | D2, D3 |
+| **2** | On a guest, 05 **reboots itself** at the three reboot points and **resumes** from its state file | Rebuild the guest; start 05 once | All three reboots pass with nobody touching it; the state file shows every step once | D7 |
+| **3** | The **provisioning disk** and **`enclave-harden.service`** — the guest hardens itself from first boot | Compose the guest and do not log in | The serial log shows every `ENCLAVE-HARDEN ... OK` and a `DONE` line; the credentials file is gone from the guest | D1, D5 (a table for the test guest) |
+| **4** | **`03-compose-vm.sh finish`** — shred seed + provisioning disk, the outside checks, the register line | Run `finish` on the host | Both disks gone; SSH still answers through ufw; time and DNS checked from outside | D6 |
+
+**Slice 1 alone closes B-06's actual gap** — *nothing can harden a guest* — and costs you the
+least, because it is the procedure you already use on the hosts. Slices 2–4 are what make it
+unattended for the from-scratch build (2.6); they wait until slice 1 has shown the steps behave on
+a guest.
+
+**After the four slices:** pg-01..03 (06a, with their ufw tables), then the K8S guests once B-07
+has its verified port list (D4), then in 2.6 the four service VMs through the same path onto their
+mapped hosts (D8).
 
 ## 9. Decisions for review
+
+**Decided 2026-09-26 by the acting AO:** **D1** — the guest hardens itself (all four slices are built);
+**D2** — extend 05; **D3** — the host's own token copy; **slice-1 test guest: pg-01 on host-1**
+(in the address file and the map, lab-sized; destroyed and recomposed for real after the slices).
+D4–D8 are asked when their slice comes up.
 
 | # | Decision | Recommendation | Why |
 |---|---|---|---|

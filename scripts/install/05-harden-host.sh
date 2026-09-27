@@ -144,7 +144,26 @@ install_resume_unit() {
     rm -rf "$BUILD_COPY"; mv "$BUILD_COPY.new" "$BUILD_COPY"
     ok "root-owned copy for the resume unit: $BUILD_COPY ($(cat "$BUILD_COPY/.pushed-from" 2>/dev/null | cut -c1-7 || echo '?'))"
   fi
-  cat > "/etc/systemd/system/$RESUME_UNIT" <<UNIT
+  resume_unit_text > "/etc/systemd/system/$RESUME_UNIT"
+  systemctl daemon-reload
+  systemctl enable "$RESUME_UNIT" >/dev/null 2>&1 || die "could not enable $RESUME_UNIT"
+  ok "$RESUME_UNIT enabled - it resumes this run at the next boot"
+}
+
+# THE UNIT CONTINUES A SUDO RUN, SO IT CARRIES A SUDO RUN'S ENVIRONMENT. Found 2026-09-27: the
+# first unattended pass on pg-01 got through every hardening step and died at evalstig on
+# `HOME: unbound variable` - systemd gives a root service no HOME, and no SUDO_USER either, which
+# is what hands the Evaluate-STIG evidence to the operator so `collect` can pull it unprivileged.
+# The operator is whoever handed the run over (`sudo 05 run` or `resume`). The unit sets it, so
+# every reboot rewrites the unit with the same value. No operator: root-only evidence, said so.
+resume_unit_text() {
+  local op=""
+  if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ] && id "$SUDO_USER" >/dev/null 2>&1; then
+    op="Environment=SUDO_USER=$SUDO_USER SUDO_UID=$(id -u "$SUDO_USER") SUDO_GID=$(id -g "$SUDO_USER")"
+  else
+    warn "no invoking operator (SUDO_USER) - evidence the unit writes will be readable by root only" >&2
+  fi
+  cat <<UNIT
 [Unit]
 Description=Enclave hardening - resumes 05-harden-host.sh after its own reboot (B-06 slice 2)
 Wants=network-online.target
@@ -158,13 +177,12 @@ ExecStart=$BUILD_COPY/scripts/install/05-harden-host.sh run
 StandardOutput=journal+console
 StandardError=journal+console
 TimeoutStartSec=infinity
+Environment=HOME=/root USER=root LOGNAME=root
+$op
 
 [Install]
 WantedBy=multi-user.target
 UNIT
-  systemctl daemon-reload
-  systemctl enable "$RESUME_UNIT" >/dev/null 2>&1 || die "could not enable $RESUME_UNIT"
-  ok "$RESUME_UNIT enabled - it resumes this run at the next boot"
 }
 
 # HOWEVER 05 ENDS. set -e ends a failing step without passing through die(), so the halt hangs
@@ -361,7 +379,7 @@ step_pro() {
   # The token is a FILE, mode 0600, pushed from stage-01 with `scp -3` so it never lands on
   # an intermediate disk. It is the one thing this script cannot discover.
   local tok="${SUDO_USER:+/home/$SUDO_USER}/.pro-contract-token"
-  [ -s "$tok" ] || tok="$HOME/.pro-contract-token"
+  [ -s "$tok" ] || tok="${HOME:-/root}/.pro-contract-token"
   if [ ! -s "$tok" ]; then
     die "no Pro contract token found.
        From stage-01, and it never touches an intermediate disk:

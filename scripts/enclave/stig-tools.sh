@@ -72,7 +72,7 @@ CA="${STIG_TOOLS_CA:-$HERE/trust-anchors/enclave-root.crt}"
 # of "$HOME/.ssh/build01" works or fails depending on a setting nobody looks at. Resolve
 # the INVOKING user's home explicitly instead. `answers` needs no root on this end anyway;
 # it scps, and the privileged half runs on the far machine.
-_invoker_home="$HOME"
+_invoker_home="${HOME:-}"   # unset under systemd - 05's unattended run died here 2026-09-27
 if [ -n "${SUDO_USER:-}" ]; then
   _h="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)"
   [ -n "$_h" ] && _invoker_home="$_h"

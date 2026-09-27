@@ -108,6 +108,16 @@ ENCLAVE-HARDEN pg-01 fips OK
 nobody has to log in to watch it. It is 0644 on the host, so the runner prints step names and
 results only — never a value from the credentials file or the token.
 
+**The unit carries a `sudo` run's environment, because it continues one** (found 2026-09-27, live
+run 2 on pg-01). systemd gives a root service no `HOME` and no `SUDO_USER`; the run got through
+every hardening step and died at `evalstig` on `HOME: unbound variable`. `SUDO_USER` matters as
+much: it is what hands the Evaluate-STIG evidence to the operator, so `collect` can pull it
+unprivileged. The unit therefore sets `HOME=/root USER=root LOGNAME=root` and the operator who
+handed the run over (`SUDO_USER/UID/GID`, captured from `sudo 05 run` or `resume`; every reboot
+rewrites the unit from the unit's own environment, so it stays put). **Slice 3 inherits a gap
+here:** at first boot no `sudo` run hands anything over, so the operator must come from the
+guest's admin-user parameter instead.
+
 ### 4.4 Completion, and step 16a done by the machine itself
 
 The last step deletes the credentials file and the token (runbook §6.0 step 16a — on a guest it

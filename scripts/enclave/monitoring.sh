@@ -2070,8 +2070,8 @@ if os.path.exists("/usr/sbin/ufw"):
     if rc == 0 and o.strip() and rc2 == 0:
         emit("enclave_ufw_active", 1 if re.search(r"^Status:\s*active", o, re.M) else 0,
              help="1 if ufw is enforcing on this machine")
-        # `ufw status` prints NO rules while inactive - host-4 and svc-mgmt-01 are exactly
-        # that case. `ufw show added` lists the table in both states, as the commands that
+        # `ufw status` prints NO rules while inactive - host-4 is exactly that case (ENABLED=no,
+        # while ufw.service still reads "active (exited)"; svc-mgmt-01 was too until 2026-09-19). `ufw show added` lists the table in both states, as the commands that
         # built it: "ufw limit from 10.2.20.164 to any port 9100 proto tcp".
         for line in o2.splitlines():
             line = line.strip()

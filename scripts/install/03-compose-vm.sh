@@ -103,6 +103,14 @@ plan_sum() {  # <host> -> "vcpu ram_mb disk_gb data_gb count", from the specs
 # -n does 1 and 2 only. Exit 1 if any check failed - after 3 and 4 have still been done.
 FINISH_PROBE_PORT="${FINISH_PROBE_PORT:-65531}"
 FINISH_WAIT="${FINISH_WAIT:-240}"
+# ANY host key type, and GENTLY. Found on pg-01 2026-09-27, the first live finish: `-t ed25519`
+# got nothing, because FIPS OpenSSH (guest and host) offers only ECDSA and RSA - a false "ssh does
+# NOT answer". And the wait loop knocked every few seconds, while a guest's ssh rule is `ufw limit`
+# (6 connections per 30 s from one source, DROP after that, the window renewed by every attempt):
+# finish locked its own host out of the guest for as long as it kept knocking. 12 s apart stays
+# under the limit.
+FINISH_KNOCK=12
+_ssh_answers() { [ -n "$(ssh-keyscan -T 5 "$ADDRESS" 2>/dev/null)" ]; }
 cmd_finish() {
   local logdir="$POOL/console" prov="$POOL/seed/$VM-prov.iso" logs prog last bad=0
   virsh dominfo "$VM" >/dev/null 2>&1 || die "$VM is not defined on $(hostname -s)"
@@ -131,7 +139,7 @@ cmd_finish() {
 
   # 2. from outside
   say ""; say "checks from outside $VM ($ADDRESS), made from $(hostname -s):"
-  if [ -n "$(ssh-keyscan -T 5 -t ed25519 "$ADDRESS" 2>/dev/null)" ]; then
+  if _ssh_answers; then
     ok "ssh answers through its firewall (22/tcp)"
   else warn "ssh does NOT answer - the only way in besides the console"; bad=1; fi
   local rc=0
@@ -193,10 +201,13 @@ cmd_finish() {
     else
       virsh start "$VM" >/dev/null || die "virsh start $VM failed after the disks were removed"
       chmod 0644 "$logdir/$VM-console.log" 2>/dev/null || true
-      for i in $(seq 1 "$FINISH_WAIT"); do
-        [ -n "$(ssh-keyscan -T 3 -t ed25519 "$ADDRESS" 2>/dev/null)" ] && break; sleep 2
+      local up=0 deadline=$((SECONDS + FINISH_WAIT))
+      sleep 20                                  # let it boot before the first knock
+      while [ "$SECONDS" -lt "$deadline" ]; do
+        if _ssh_answers; then up=1; break; fi
+        sleep "$FINISH_KNOCK"
       done
-      if [ -n "$(ssh-keyscan -T 3 -t ed25519 "$ADDRESS" 2>/dev/null)" ]; then
+      if [ "$up" -eq 1 ]; then
         ok "$VM is back and ssh answers"
       else warn "$VM did not answer ssh within the wait after the restart"; bad=1; fi
       if virsh domblklist "$VM" --details | grep -qF -e "$SEED" -e "$prov"; then

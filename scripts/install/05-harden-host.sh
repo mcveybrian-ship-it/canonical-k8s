@@ -131,7 +131,9 @@ mark_step()  { printf '%s\n' "$1" >> "$STATE"; printf '%s  %s\n' "$(date -Is)" "
 # results only: that log is 0644 on the host, so nothing from a credential ever goes here.
 progress() {
   [ "$ROLE" = guest ] || return 0
-  [ -w /dev/ttyS0 ] && printf 'ENCLAVE-HARDEN %s %s %s\n' "$(hostname -s)" "$1" "$2" > /dev/ttyS0 2>/dev/null || true
+  # The UTC time goes LAST, after " @", so every reader keyed on "ENCLAVE-HARDEN <vm> <step>" is
+  # unchanged. It is what the custody register records for "deleted from target" (slice 4).
+  [ -w /dev/ttyS0 ] && printf 'ENCLAVE-HARDEN %s %s %s @%s\n' "$(hostname -s)" "$1" "$2" "$(date -u +%FT%TZ)" > /dev/ttyS0 2>/dev/null || true
 }
 
 # The unit, and the root-owned copy it runs. Re-copied whenever 05 is started from anywhere

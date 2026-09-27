@@ -163,6 +163,20 @@ On the host, once `DONE` appears in the serial log:
 3. prints the register line for its credentials file (placed / deleted, with times) — §9's
    custody record, filled by the machine.
 
+**As built (2026-09-27): `sudo ./03-compose-vm.sh <vm> --finish [--no-reboot]`** (a flag like
+`--destroy`, not a subcommand). It refuses unless the guest's **last** `ENCLAVE-HARDEN` line — read
+from every rotated console log, oldest first — is `DONE`, and says whether that line reports the
+credentials deleted. Checks from outside: ssh answers (`ssh-keyscan`); a port nothing opens to the
+host is **dropped**, not refused (ufw default-deny, `FINISH_PROBE_PORT`); the enclave DNS answers
+forward and reverse when asked directly with `dig`. **Time is not checked from outside** — no
+guest is scraped and no clock-offset alert exists; every run says so (backlog 3.39). Then the seed
+and provisioning disk are detached from the persistent config (verified gone from it before
+anything is shredded) and shredded; failed checks do not stop this. By default a **cold** restart
+(shutdown + start, so qemu drops the disks) proves the guest boots: ssh must answer again, no unit
+may fail beyond `FINISH_EXPECTED_FAILED` (`vm-specs.env`: `sssd.service`, the CAC family), and
+cloud-init must not fall back to no datasource. `-n` does the read and the checks only. Exit 1 if
+any check failed. Progress lines now end ` @<UTC>` so the register can carry the deletion time.
+
 ### 4.6 When something fails
 
 The unit stops, prints `ENCLAVE-HARDEN <vm> <step> FAIL` on the serial console, and leaves its
@@ -248,6 +262,11 @@ unchanged; the 2.6 build passes the flag) · **D5 built now**, for every machine
 (`stig-tailor.sh ufw` refuses a table port missing from `ppsm-services.tsv`; all 36 existing rows
 pass) · the slice-3 test uses a **throwaway credentials file copied to host-1**, not the stick (the
 stick path is exercised in 2.6).
+
+**Decided 2026-09-27 for slice 4:** **D6** — `finish` shreds **both** the seed and the provisioning
+disk · it **cold-restarts the guest by default** to prove it boots without them (`--no-reboot`
+skips it) · time sync is **not** faked from inside: `finish` says it is unchecked, and backlog 3.39
+builds the real check (guests scraped + a clock-offset alert for every machine).
 
 | # | Decision | Recommendation | Why |
 |---|---|---|---|

@@ -14,6 +14,8 @@
 #         the guest hardens ITSELF from first boot (B-06): a read-only provisioning disk carries
 #         the repo, its credentials file (DIR/credentials.<vm>.env, default /mnt/cred = the
 #         enclave-cred stick), the host's Pro token and the answer file. Watch the console log.
+#     sudo ./03-compose-vm.sh pg-01 --finish [--no-reboot]    after DONE: checks from outside,
+#         shreds the seed + provisioning disk, proves it still boots, prints the register line
 #
 # There are fourteen of these in vm-specs.env, so it is a composer rather than a one-off. Everything
 # comes from two files and nothing is typed twice:
@@ -33,7 +35,7 @@ set -euo pipefail
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENCLAVE_DIR="${ENCLAVE_DIR:-$SELF/../enclave}"
-DRY=0; DESTROY=0; VM=""; PLAN_ARG=""; HARDEN=0; CRED_DIR="${CRED_DIR:-/mnt/cred}"
+DRY=0; DESTROY=0; VM=""; PLAN_ARG=""; HARDEN=0; CRED_DIR="${CRED_DIR:-/mnt/cred}"; FINISH=0; NO_REBOOT=0
 
 say()  { printf '  %s\n' "$*"; }
 ok()   { printf '  [ok] %s\n' "$*"; }
@@ -78,6 +80,151 @@ plan_sum() {  # <host> -> "vcpu ram_mb disk_gb data_gb count", from the specs
     tv=$((tv+vc)); tr=$((tr+rm)); td=$((td+dk)); tdd=$((tdd+${dt:-0})); n=$((n+1))
   done
   printf '%s %s %s %s %s' "$tv" "$tr" "$td" "$tdd" "$n"
+}
+
+# ---- finish (B-06 slice 4, decision D6, 2026-09-27) --------------------------------------
+# Run ON the guest's host once its console log says DONE. In order:
+#   1. READ that the guest's LAST run reached DONE, and what it reported deleting - from every
+#      console log, oldest first: virtlogd rotates at 2 MB into a 0600 file (found in slice 3), so
+#      a run can straddle two files and the live one alone can miss the start.
+#   2. CHECK FROM OUTSIDE what the guest cannot check on itself - this replaces 05's old off-box
+#      [y/N]: ssh answers through its firewall; a port nothing opens to this host is DROPPED (a
+#      timeout is ufw's default-deny; "refused" would be a closed port with no firewall in front);
+#      the enclave DNS resolves it both ways, asked directly so /etc/hosts cannot answer instead.
+#      TIME IS NOT CHECKABLE FROM OUTSIDE TODAY - no guest is scraped and no clock-offset alert
+#      exists anywhere. Said on every run, never skipped silently: backlog 3.39.
+#   3. DETACH AND SHRED the seed (admin hash, keys) and the provisioning disk (credentials file,
+#      Pro token) - D6. Neither is used after first boot. Failed checks do NOT stop this: the
+#      disks cannot help a recovery, and the secrets on them should not outlive a failed check.
+#   4. PROVE IT STILL BOOTS: a COLD restart (shutdown + start - a guest reboot keeps the same qemu
+#      and the disks it had), then ssh must answer again and the console must show no failed unit
+#      beyond FINISH_EXPECTED_FAILED (vm-specs.env). --no-reboot skips it and says so.
+#   5. PRINT THE REGISTER LINE for airgap-media §9.
+# -n does 1 and 2 only. Exit 1 if any check failed - after 3 and 4 have still been done.
+FINISH_PROBE_PORT="${FINISH_PROBE_PORT:-65531}"
+FINISH_WAIT="${FINISH_WAIT:-240}"
+cmd_finish() {
+  local logdir="$POOL/console" prov="$POOL/seed/$VM-prov.iso" logs prog last bad=0
+  virsh dominfo "$VM" >/dev/null 2>&1 || die "$VM is not defined on $(hostname -s)"
+  logs="$(ls -1r "$logdir/$VM-console.log"* 2>/dev/null || true)"
+  [ -n "$logs" ] || die "no console log for $VM in $logdir"
+
+  # 1. the last run
+  prog="$(while IFS= read -r _f; do cat "$_f"; done <<< "$logs" | tr -d '\r' \
+          | grep -ao "ENCLAVE-HARDEN $VM .*" || true)"
+  last="$(printf '%s\n' "$prog" | tail -1)"
+  case "$last" in
+    "ENCLAVE-HARDEN $VM DONE"*) ok "last run reached DONE: ${last#ENCLAVE-HARDEN "$VM" DONE }" ;;
+    "") die "no ENCLAVE-HARDEN line for $VM in its console log - composed with --harden, or run by hand?" ;;
+    *)  die "$VM's last run did not finish. Its last line:
+         $last
+       finish only follows DONE; a halted guest keeps its disks until it is fixed and re-run." ;;
+  esac
+  local deleted done_at
+  deleted="$(printf '%s' "$last" | sed -n 's/.* deleted:\([^@]*\).*/\1/p' | sed 's/^ *//; s/ *$//')"
+  done_at="$(printf '%s' "$last" | sed -n 's/.* @\([0-9T:Z-]*\)$/\1/p')"
+  case "$deleted" in
+    *KEPT*|""|nothing) warn "the guest did NOT report deleting its credentials ('${deleted:-no report}') - check it by hand"; bad=1 ;;
+    *credentials.env*) ok "the guest deleted its own: $deleted" ;;
+    *) warn "the guest's deletion report does not name credentials.env: $deleted"; bad=1 ;;
+  esac
+
+  # 2. from outside
+  say ""; say "checks from outside $VM ($ADDRESS), made from $(hostname -s):"
+  if [ -n "$(ssh-keyscan -T 5 -t ed25519 "$ADDRESS" 2>/dev/null)" ]; then
+    ok "ssh answers through its firewall (22/tcp)"
+  else warn "ssh does NOT answer - the only way in besides the console"; bad=1; fi
+  local rc=0
+  timeout 6 bash -c "exec 3<>/dev/tcp/$ADDRESS/$FINISH_PROBE_PORT" 2>/dev/null || rc=$?
+  case "$rc" in
+    124) ok "port $FINISH_PROBE_PORT is DROPPED (timed out) - the firewall is default-deny" ;;
+    0)   warn "port $FINISH_PROBE_PORT ANSWERED - something listens and the firewall lets this host in"; bad=1 ;;
+    *)   warn "port $FINISH_PROBE_PORT was REFUSED, not dropped - no firewall in front of it (is ufw active?)"; bad=1 ;;
+  esac
+  local dns fwd rev
+  dns="$("$ENCLAVE_DIR/apply-addresses.sh" resolver-check 2>/dev/null || true)"
+  if [ -z "$dns" ]; then warn "the enclave DNS is not answering - forward and reverse NOT checked"; bad=1
+  else
+    fwd="$(dig +short +time=3 +tries=1 @"$dns" "$VM.$DOMAIN" A 2>/dev/null | tail -1 || true)"
+    rev="$(dig +short +time=3 +tries=1 @"$dns" -x "$ADDRESS" 2>/dev/null | tail -1 || true)"
+    if [ "$fwd" = "$ADDRESS" ]; then ok "enclave DNS $dns: $VM.$DOMAIN -> $fwd"
+    else warn "enclave DNS $dns: $VM.$DOMAIN -> '${fwd:-nothing}', expected $ADDRESS"; bad=1; fi
+    if [ "$rev" = "$VM.$DOMAIN." ]; then ok "enclave DNS $dns: $ADDRESS -> $rev"
+    else warn "enclave DNS $dns: $ADDRESS -> '${rev:-nothing}', expected $VM.$DOMAIN."; bad=1; fi
+  fi
+  warn "time sync: NOT checked from outside - no guest is scraped and no clock-offset alert exists (backlog 3.39)"
+
+  if [ "$DRY" -eq 1 ]; then say ""; say "-n: stopping here - nothing detached, shredded or restarted"; return "$bad"; fi
+
+  # 3. detach and shred - the persistent config first, so the next start cannot ask for a file
+  #    that is gone; then the file. A re-run finds both already gone and says so.
+  local placed="" path tgt
+  [ -e "$prov" ] && placed="$(date -u -r "$prov" +%FT%TZ)"
+  say ""
+  for path in "$SEED" "$prov"; do
+    tgt="$(virsh domblklist "$VM" --details --inactive 2>/dev/null | awk -v p="$path" '$4==p {print $3}')"
+    [ -n "$tgt" ] || tgt="$(virsh domblklist "$VM" --details 2>/dev/null | awk -v p="$path" '$4==p {print $3}')"
+    if [ -n "$tgt" ]; then
+      virsh detach-disk "$VM" "$tgt" --persistent >/dev/null 2>&1 \
+        || virsh detach-disk "$VM" "$tgt" --config >/dev/null 2>&1 \
+        || die "could not detach $tgt ($path) from $VM - nothing shredded"
+    fi
+    ! virsh dumpxml --inactive "$VM" | grep -qF "$path" \
+      || die "$path is still in $VM's configuration - refusing to shred a disk the next start needs"
+    if [ -e "$path" ]; then shred -u "$path" && ok "detached${tgt:+ ($tgt)} and shredded: $path"
+    else ok "already gone: $path"; fi
+  done
+
+  # 4. prove it boots without them
+  if [ "$NO_REBOOT" -eq 1 ]; then
+    warn "--no-reboot: NOT proven that $VM boots without its seed. When convenient:"
+    warn "  sudo virsh shutdown $VM ; (wait for 'shut off') ; sudo virsh start $VM"
+  else
+    local before=0 i st new failed
+    before="$(wc -l < "$logdir/$VM-console.log" 2>/dev/null || echo 0)"
+    say "cold restart of $VM (shutdown + start) to prove it boots without them ..."
+    virsh shutdown "$VM" >/dev/null 2>&1 || true
+    for i in $(seq 1 "$FINISH_WAIT"); do
+      st="$(virsh domstate "$VM" 2>/dev/null || true)"; [ "$st" = "shut off" ] && break; sleep 1
+    done
+    if [ "$st" != "shut off" ]; then
+      warn "$VM did not shut down in ${FINISH_WAIT}s - nothing forced. The disks ARE shredded; start it by hand."
+      bad=1
+    else
+      virsh start "$VM" >/dev/null || die "virsh start $VM failed after the disks were removed"
+      chmod 0644 "$logdir/$VM-console.log" 2>/dev/null || true
+      for i in $(seq 1 "$FINISH_WAIT"); do
+        [ -n "$(ssh-keyscan -T 3 -t ed25519 "$ADDRESS" 2>/dev/null)" ] && break; sleep 2
+      done
+      if [ -n "$(ssh-keyscan -T 3 -t ed25519 "$ADDRESS" 2>/dev/null)" ]; then
+        ok "$VM is back and ssh answers"
+      else warn "$VM did not answer ssh within the wait after the restart"; bad=1; fi
+      if virsh domblklist "$VM" --details | grep -qF -e "$SEED" -e "$prov"; then
+        warn "a removed disk is still attached after the restart"; bad=1
+      else ok "running without seed or provisioning disk"; fi
+      [ -z "$DATA_DISK" ] || say "  its data disk is vdb from this boot on (it was vdc behind the seed) - mount it by LABEL or UUID, never /dev/vdX (B-06a)"
+      # The console since the start. If it rotated meanwhile, the whole new file is all "since".
+      if [ "$(wc -l < "$logdir/$VM-console.log")" -lt "$before" ]; then before=0; fi
+      new="$(tail -n +"$((before + 1))" "$logdir/$VM-console.log" | tr -d '\r' | sed 's/\x1b\[[0-9;]*m//g')"
+      failed="$(printf '%s\n' "$new" | grep -ao 'Failed to start [^ ]*' | awk '{print $4}' | sort -u \
+                | grep -vxF -f <(printf '%s\n' ${FINISH_EXPECTED_FAILED:-} | awk 'NF') || true)"
+      if [ -n "$failed" ]; then warn "failed at boot, beyond the expected (${FINISH_EXPECTED_FAILED:-none}): $(printf '%s' "$failed" | tr '\n' ' ')"; bad=1
+      else ok "no unit failed at boot beyond the expected (${FINISH_EXPECTED_FAILED:-none})"; fi
+      if printf '%s\n' "$new" | grep -qaiE 'fallback datasource|DataSourceNone'; then
+        warn "cloud-init fell back to no datasource - it may have rewritten the network config"; bad=1
+      fi
+    fi
+  fi
+
+  # 5. the register line
+  say ""
+  say "REGISTER - airgap-media §9, copy into the custody log:"
+  say "  credentials.$VM.env   placed ${placed:-(disk already shredded - see the first finish run)} by 03-compose-vm.sh --harden on $(hostname -s)"
+  say "                        deleted from $VM ${done_at:-(no time in the log - that run predates timestamps)} by the guest itself: ${deleted:-none reported}"
+  say "                        provisioning disk + seed shredded $(date -u +%FT%TZ) by ${SUDO_USER:-root} on $(hostname -s)"
+  say ""
+  [ "$bad" -eq 0 ] && ok "finish: $VM is done" || warn "finish: done, but a check above FAILED - read it before calling $VM finished"
+  return "$bad"
 }
 
 cmd_plan() {
@@ -195,13 +342,15 @@ while [ $# -gt 0 ]; do
     --destroy)    DESTROY=1; shift ;;
     --spec)       PLAN_ARG=--spec; shift ;;
     --harden)     HARDEN=1; shift ;;
+    --finish)     FINISH=1; shift ;;
+    --no-reboot)  NO_REBOOT=1; shift ;;
     --cred-dir)   [ $# -ge 2 ] || die "--cred-dir needs a directory"; CRED_DIR="$2"; shift 2 ;;
-    -h|--help)    sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)    sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     -*)           die "unknown option $1" ;;
     *)            VM="$1"; shift ;;
   esac
 done
-[ -n "$VM" ] || { sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+[ -n "$VM" ] || { sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
 
 
 [ -r "$ENCLAVE_DIR/enclave-addresses.env" ] || die "no enclave-addresses.env in $ENCLAVE_DIR"
@@ -276,6 +425,11 @@ fi
 [ "$DRY" -eq 1 ] || ok "placement: $VM -> $PLACE (this machine)"
 
 [ "$DRY" -eq 1 ] || [ "$(id -u)" -eq 0 ] || die "run with sudo"
+
+if [ "$FINISH" -eq 1 ]; then
+  [ "$(id -u)" -eq 0 ] || die "--finish reads the console logs (0600 after a rotation) - run with sudo, -n included"
+  cmd_finish && exit 0 || exit 1
+fi
 
 
 # These describe the target host, so they are checked for a real run only. A dry run must be

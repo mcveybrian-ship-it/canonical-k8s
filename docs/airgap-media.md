@@ -1046,9 +1046,12 @@ longer readable on the running system.
 file and the Pro token and says so on the host's console log —
 `ENCLAVE-HARDEN <vm> DONE pass=.. fail=.. deleted: credentials.env pro-contract-token`. Write
 "deleted" in the register from that line. A run that **halted** keeps them for the re-run, and the
-alert below watches it. **Until slice 4's `finish` exists, the provisioning disk on the host
-(`<pool>/seed/<vm>-prov.iso`, root 0600) still holds a copy** — `03-compose-vm.sh <vm> --destroy`
-shreds it; record that deletion too.
+alert below watches it. **The provisioning disk on the host (`<pool>/seed/<vm>-prov.iso`, root
+0600) still holds a copy until `finish`:** `sudo ./03-compose-vm.sh <vm> --finish`, on the guest's
+host after `DONE`, detaches and shreds it and the seed, proves the guest still boots, and prints
+the register line — placed (when compose built the disk), deleted from the guest (the time on its
+`DONE` line), disk shredded (now, by whom). Copy that line into the register. `--destroy` also
+shreds the disk, for a guest thrown away instead.
 
 A file left behind is exactly what nobody notices, so it is watched: every machine's 15-minute
 facts publish `enclave_credentials_file_present` and the file's age (presence only — the file is

@@ -211,16 +211,34 @@ step_hostprep() {
   done_step hostprep && return 0
   hdr "1. host prep - hosts, trust anchor, apt"
 
-  local pf="$SELF/03-host-services/services-params.env"
-  if [ ! -r "$pf" ]; then
-    # Nothing in it needs a human any more: the NIC and address discover themselves.
-    cp "$pf.example" "$pf"
-    ok "created services-params.env from the example (NIC and address self-discover)"
-  fi
+  if [ "$ROLE" = guest ]; then
+    # ON A GUEST, CLOUD-INIT ALREADY DID THIS (03-compose-vm.sh user-data: the /etc/hosts block,
+    # ca_certs, the mirror's ubuntu.sources) - and 03-host-services.sh refuses anything but a
+    # bare-metal host. Found 2026-09-27, the first 05 run on a guest (pg-01, B-06 slice 1).
+    # VERIFY instead of assuming: a guest composed before a change to the composer, or one whose
+    # first boot half-failed, must not be hardened on top of a missing piece.
+    local gbad=0
+    if grep -q '^# BEGIN enclave-addresses' /etc/hosts; then ok "/etc/hosts carries the enclave block (cloud-init)"
+    else warn "/etc/hosts has NO enclave block - cloud-init did not write it"; gbad=1; fi
+    if grep -qE '^URIs: https://[^ ]*svc-repo-01' /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null; then ok "apt points at the enclave mirror over https (cloud-init)"
+    else warn "apt is NOT pointed at the enclave mirror"; gbad=1; fi
+    # One real fetch proves both the CA trust and the reachability that everything after this needs.
+    local gcode; gcode="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 https://svc-repo-01.enclave.internal/ 2>&1 || true)"
+    case "$gcode" in 2??|3??) ok "the enclave CA is trusted - https to the mirror verifies (HTTP $gcode)" ;;
+      *) warn "https to the mirror FAILED (HTTP ${gcode:-none}) - the enclave CA is not trusted, or the mirror is unreachable"; gbad=1 ;; esac
+    [ "$gbad" -eq 0 ] || die "this guest is missing what cloud-init should have given it - fix that (or recompose) before hardening"
+  else
+    local pf="$SELF/03-host-services/services-params.env"
+    if [ ! -r "$pf" ]; then
+      # Nothing in it needs a human any more: the NIC and address discover themselves.
+      cp "$pf.example" "$pf"
+      ok "created services-params.env from the example (NIC and address self-discover)"
+    fi
 
-  "$SELF/03-host-services.sh" hosts
-  "$SELF/03-host-services.sh" trustca
-  "$SELF/03-host-services.sh" apt
+    "$SELF/03-host-services.sh" hosts
+    "$SELF/03-host-services.sh" trustca
+    "$SELF/03-host-services.sh" apt
+  fi
 
   # THE TOOLS LATER STEPS NEED, INSTALLED WHILE THE MIRROR IS KNOWN GOOD - not discovered
   # missing halfway through hardening.
@@ -238,8 +256,10 @@ step_hostprep() {
   for _p in $_need; do dpkg -s "$_p" >/dev/null 2>&1 || _miss="$_miss $_p"; done
   if [ -n "$_miss" ]; then
     say "installing tools later steps need:$_miss"
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $_miss >/dev/null 2>&1 \
-      || warn "could not install:$_miss - the mirror may be unreachable"
+    # Output captured, and SHOWN on failure - never thrown away (the swallowed-output habit).
+    local _out _rc=0
+    _out="$(DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $_miss 2>&1)" || _rc=$?
+    [ "$_rc" -eq 0 ] || { warn "could not install:$_miss (apt exit $_rc):"; printf '%s\n' "$_out" | tail -8 | sed 's/^/       /' >&2; }
   fi
   for _p in $_need; do
     dpkg -s "$_p" >/dev/null 2>&1 && ok "$_p present" || warn "$_p STILL MISSING - checks that need it will be skipped, not failed"

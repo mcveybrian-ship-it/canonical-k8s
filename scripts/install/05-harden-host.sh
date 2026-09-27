@@ -63,6 +63,19 @@ STATE_DIR=/var/lib/enclave
 STATE="$STATE_DIR/harden.state"
 LOG="$STATE_DIR/harden.log"
 
+# ---- B-06 slice 2: on a GUEST, 05 reboots itself and resumes (docs/06-guest-vms.md §8) -----
+# A guest has no LUKS prompt, so the one reason a host stops at every reboot does not apply.
+# At its first reboot 05 installs RESUME_UNIT, which runs 05 again at each boot until the
+# sequence is complete or halted. The unit runs a ROOT-OWNED copy of the repo (BUILD_COPY), never
+# ~/canonical-k8s: that is encadmin-writable, and a root unit executing it is the privilege path
+# closed in backlog 3.11. D7 (2026-09-26): a failure STOPS - it marks HALTED and disables the unit,
+# so nothing retries at every boot; a human reads the console log and re-runs by hand.
+RESUME_UNIT=enclave-harden.service
+BUILD_COPY="${BUILD_COPY:-/opt/enclave-build}"
+HALTED="$STATE_DIR/hardening-halted"
+COMPLETE="$STATE_DIR/hardening-complete"
+CURRENT_STEP=""
+
 say()  { printf '  %s\n' "$*"; }
 ok()   { printf '  [ok] %s\n' "$*"; }
 warn() { printf '  [!]  %s\n' "$*" >&2; }
@@ -102,7 +115,65 @@ assert_enclave_host() {
 # One step per line. Presence means done. Deliberately a flat file: an operator who has to
 # understand why the script thinks step 9 is finished can read it with cat.
 done_step()  { grep -qxF "$1" "$STATE" 2>/dev/null; }
-mark_step()  { printf '%s\n' "$1" >> "$STATE"; printf '%s  %s\n' "$(date -Is)" "$1" >> "$LOG"; }
+mark_step()  { printf '%s\n' "$1" >> "$STATE"; printf '%s  %s\n' "$(date -Is)" "$1" >> "$LOG"; progress "$1" OK; }
+
+# ONE LINE PER STEP ON THE GUEST'S SERIAL CONSOLE, which its host logs to
+# <pool>/console/<vm>-console.log - how a run nobody is logged into is watched. Step names and
+# results only: that log is 0644 on the host, so nothing from a credential ever goes here.
+progress() {
+  [ "$ROLE" = guest ] || return 0
+  [ -w /dev/ttyS0 ] && printf 'ENCLAVE-HARDEN %s %s %s\n' "$(hostname -s)" "$1" "$2" > /dev/ttyS0 2>/dev/null || true
+}
+
+# The unit, and the root-owned copy it runs. Re-copied whenever 05 is started from anywhere
+# else (so a fix pushed to ~/canonical-k8s reaches the next unattended boot); left alone while
+# the unit itself is running from the copy.
+install_resume_unit() {
+  # THE GUARD FIRST: the copy is replaced wholesale, so only the two known locations are allowed.
+  case "$BUILD_COPY" in /opt/enclave-build|/usr/local/lib/enclave-build) ;;
+    *) die "BUILD_COPY='$BUILD_COPY' - refusing: it is replaced wholesale, so it must be /opt/enclave-build or /usr/local/lib/enclave-build" ;; esac
+  local src; src="$(cd "$REPO" && pwd -P)"
+  if [ "$src" != "$BUILD_COPY" ]; then
+    rm -rf "$BUILD_COPY.new"; install -d -m 0755 "$BUILD_COPY.new"
+    cp -a "$src/." "$BUILD_COPY.new/"
+    chown -R root:root "$BUILD_COPY.new"; chmod -R go-w "$BUILD_COPY.new"
+    rm -rf "$BUILD_COPY"; mv "$BUILD_COPY.new" "$BUILD_COPY"
+    ok "root-owned copy for the resume unit: $BUILD_COPY ($(cat "$BUILD_COPY/.pushed-from" 2>/dev/null | cut -c1-7 || echo '?'))"
+  fi
+  cat > "/etc/systemd/system/$RESUME_UNIT" <<UNIT
+[Unit]
+Description=Enclave hardening - resumes 05-harden-host.sh after its own reboot (B-06 slice 2)
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=!$COMPLETE
+ConditionPathExists=!$HALTED
+
+[Service]
+Type=oneshot
+ExecStart=$BUILD_COPY/scripts/install/05-harden-host.sh run
+StandardOutput=journal+console
+StandardError=journal+console
+TimeoutStartSec=infinity
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  systemctl daemon-reload
+  systemctl enable "$RESUME_UNIT" >/dev/null 2>&1 || die "could not enable $RESUME_UNIT"
+  ok "$RESUME_UNIT enabled - it resumes this run at the next boot"
+}
+
+# HOWEVER 05 ENDS. set -e ends a failing step without passing through die(), so the halt hangs
+# off EXIT, not off die. rc 0 is a normal stop (a reboot, or the end).
+harden_exit() {
+  local rc="$1"
+  [ "$rc" -ne 0 ] && [ -n "$CURRENT_STEP" ] || return 0
+  progress "$CURRENT_STEP" "FAIL rc=$rc"
+  if [ "$ROLE" = guest ] && [ ! -t 0 ]; then
+    touch "$HALTED"; systemctl disable "$RESUME_UNIT" >/dev/null 2>&1 || true
+    progress "$CURRENT_STEP" "HALTED - read this log, fix, then run 05 by hand"
+  fi
+}
 
 # ---- the reboot gate --------------------------------------------------------------------
 # Records that a reboot is OWED, so a re-run before it happens says so rather than carrying
@@ -113,15 +184,21 @@ need_reboot() {
   say "$why"
   say ""
   if [ "$ROLE" = guest ]; then
-    say "  A guest has no LUKS prompt - its disk is an image on its host's already-unlocked"
-    say "  storage - so it comes back on its own. (Slice 2 of B-06 will reboot it without"
-    say "  asking; for now it asks, like a host.)"
-  else
-    say "  On a host the TPM unlocks the disk at boot (clevis, all four hosts since"
-    say "  2026-09-22). If it cannot - firmware or boot-chain change - the LUKS passphrase is"
-    say "  needed at the console, and the host has no BMC. That is why this asks rather than"
-    say "  rebooting a machine nobody may be standing at."
+    # B-06 slice 2: no question. A guest has no LUKS prompt - its disk is an image on its host's
+    # already-unlocked storage - so it reboots itself and the resume unit carries on at boot.
+    say "  A guest reboots ITSELF: no LUKS prompt, and $RESUME_UNIT resumes this run at boot."
+    say "  An SSH session to it drops now. Watch from its host, no login needed:"
+    say "    sudo tail -f <pool>/console/$(hostname -s)-console.log     (lines start ENCLAVE-HARDEN)"
+    install_resume_unit
+    progress "${CURRENT_STEP:-reboot}" REBOOT
+    sync
+    systemctl --no-block reboot
+    exit 0
   fi
+  say "  On a host the TPM unlocks the disk at boot (clevis, all four hosts since"
+  say "  2026-09-22). If it cannot - firmware or boot-chain change - the LUKS passphrase is"
+  say "  needed at the console, and the host has no BMC. That is why this asks rather than"
+  say "  rebooting a machine nobody may be standing at."
   say ""
 
   # OFFER rather than assume. At the console this is one keystroke; away from it, declining
@@ -464,11 +541,18 @@ step_tailor() {
   esac
 
   say ""
-  warn "VERIFY SSH FROM ANOTHER MACHINE NOW, before continuing."
-  say  "  ufw is live. A firewall you have not tested from off-box is a firewall you are guessing."
-  printf '  confirmed reachable from off-box? [y/N] '
-  local a=""; read -r a || true
-  case "$a" in y|Y) ;; *) die "stopped. Fix reachability, then re-run." ;; esac
+  if [ "$ROLE" = guest ]; then
+    # No question on a guest (B-06): an unattended run has nobody to answer it, and a machine
+    # cannot test its own firewall from outside. Its host does that after the run (slice 4);
+    # until then, check it by hand: ssh to it from another machine.
+    warn "ufw is live - check SSH to $(hostname -s) FROM ANOTHER MACHINE (slice 4 will do this from the host)"
+  else
+    warn "VERIFY SSH FROM ANOTHER MACHINE NOW, before continuing."
+    say  "  ufw is live. A firewall you have not tested from off-box is a firewall you are guessing."
+    printf '  confirmed reachable from off-box? [y/N] '
+    local a=""; read -r a || true
+    case "$a" in y|Y) ;; *) die "stopped. Fix reachability, then re-run." ;; esac
+  fi
   mark_step tailor
 }
 
@@ -607,6 +691,10 @@ step_evalstig() {
     say "  will triage 17 entries by hand and then scan again. Do it first."
     say ""
     say "  Then:  sudo $0 run"
+    if [ "$ROLE" = guest ] && [ ! -t 0 ]; then
+      touch "$HALTED"; systemctl disable "$RESUME_UNIT" >/dev/null 2>&1 || true
+      progress evalstig "WAITING - push the answer file, then run 05 by hand"
+    fi
     exit 0
   fi
   ok "Answer File present: $ANSWERS ($(grep -c '<Vuln ' "$ANSWERS" 2>/dev/null || echo '?') entries)"
@@ -617,6 +705,10 @@ step_evalstig() {
 
 step_done() {
   hdr "sequence complete on $(hostname -s)"
+  if [ "$ROLE" = guest ]; then
+    touch "$COMPLETE"; systemctl disable "$RESUME_UNIT" >/dev/null 2>&1 || true
+    progress DONE "$(grep -o 'final pass=[0-9]* fail=[0-9]*' "$LOG" 2>/dev/null | tail -1 | sed 's/final //')"
+  fi
   say "$(cat "$LOG" 2>/dev/null | tail -20)"
   say ""
   say "  STILL OWED, and neither is part of §6.0:"
@@ -659,6 +751,9 @@ cmd_status() {
 cmd_run() {
   need_root; assert_enclave_host
   install -d -m 0755 "$STATE_DIR"; touch "$STATE" "$LOG"
+  # A HUMAN starting it (a terminal) is the retry D7 asks for: clear the halt and go on.
+  if [ -t 0 ]; then rm -f "$HALTED"; elif [ -e "$HALTED" ]; then exit 0; fi
+  trap 'harden_exit $?' EXIT
   local s
   # step_radio WAS MISSING FROM THIS LIST while appearing in `status` as a step - so it read
   # "[ ] radio" forever and never ran. Found 2026-09-21 on the host-3 rebuild: the machine came
@@ -666,7 +761,12 @@ cmd_run() {
   # V-270755 landed Not Reviewed with "a wireless interface is configured". host-1/2/4 have no
   # radio only because someone disabled theirs BY HAND on 2026-09-17. A step that is displayed
   # but never dispatched is worse than a missing step: the status board says it is accounted for.
-  for s in "${STEPS[@]}"; do "step_$s"; done
+  for s in "${STEPS[@]}"; do
+    CURRENT_STEP="$s"
+    done_step "$s" || progress "$s" START
+    "step_$s"
+  done
+  CURRENT_STEP=""
   step_done
 }
 

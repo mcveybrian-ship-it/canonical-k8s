@@ -311,6 +311,67 @@ if [ "$DRY" -eq 0 ] && id "$QEMU_USER" >/dev/null 2>&1; then
        03-host-services.sh datavg now sets it; this host was prepared before that fix."
   ok "qemu ($QEMU_USER) can reach:$( printf ' %s' "$POOL" ${DATA_POOL:+"$DATA_POOL"})"
 fi
+# ---- the admin password -------------------------------------------------------------------
+# ASKED BEFORE ANYTHING IS CREATED (3.38). It used to be asked after the OS and data disks were
+# made; on 2026-09-27 a mistyped pair killed a pg-01 recompose and left disks with no domain.
+# Now a typo, a bad hash or a refused credentials file costs nothing - no file exists yet.
+#
+# EVERY VM GETS ONE, and it is not optional.
+#
+# The composer used to create the user with `sudo: ALL=(ALL) NOPASSWD:ALL` and NO password at
+# all. That works right up until the DISA STIG is applied: usg removes NOPASSWD (correctly -
+# STIG requires sudo to authenticate), and sudo then asks for a password that was never set.
+# There is no number of attempts that succeeds. On svc-harbor-01 on 2026-09-08 that locked
+# the only sudo-capable account out of root on a headless VM, recoverable only by editing the
+# disk offline from the hypervisor.
+#
+# Had it been found later it would have done that to all six Kubernetes nodes at once.
+#
+# NOPASSWD is KEPT as well, deliberately: it is convenient before hardening, and STIG removes
+# it afterwards - at which point the password below is what keeps the machine usable.
+#
+# A HASH goes in the user-data, never the password. cloud-init's user-data sits on the seed
+# ISO and in /var/lib/cloud on the guest, both readable.
+#
+# WHERE THE HASH COMES FROM (3.32): VM_ADMIN_PASSWORD_HASH in the environment > the same key in
+# the site credentials file (/etc/enclave/credentials.env, root 600 - see credentials.sh) >
+# asked for here. One hash for every guest built from that file.
+VM_ADMIN_HASH="${VM_ADMIN_PASSWORD_HASH:-}"; VM_ADMIN_SRC="VM_ADMIN_PASSWORD_HASH (environment)"
+if [ -z "$VM_ADMIN_HASH" ] && [ "$DRY" -eq 0 ]; then
+  # shellcheck source=../enclave/credentials.sh
+  . "$ENCLAVE_DIR/credentials.sh"
+  cred_require_safe
+  VM_ADMIN_HASH="$(cred_get VM_ADMIN_PASSWORD_HASH)"; VM_ADMIN_SRC="$ENCLAVE_CREDENTIALS"
+fi
+if [ -n "$VM_ADMIN_HASH" ]; then
+  # CHECK THE SHAPE: a truncated paste would set a password that matches nothing, and the
+  # lock-out above would only show up after hardening.
+  [[ "$VM_ADMIN_HASH" =~ ^\$6\$[^\$]+\$[./A-Za-z0-9]+$ ]] \
+    || die "the VM admin hash from $VM_ADMIN_SRC is not SHA-512 crypt (\$6\$...) - nothing created"
+  ok "VM admin password: hash from $VM_ADMIN_SRC - no prompt"
+elif [ "$DRY" -eq 0 ]; then
+  if [ -t 0 ]; then
+    printf '  no VM_ADMIN_PASSWORD_HASH set - enter a password for %s on %s\n' "${VM_USER:-encadmin}" "$VM"
+    # THREE TRIES, like passwd. A mismatch used to die - and it came AFTER the disks were made.
+    _try=1
+    while :; do
+      read -rsp '  password: ' _p1; echo
+      read -rsp '  again:    ' _p2; echo
+      [ -n "$_p1" ] || die "refusing to create a VM with an empty password - STIG will make it unusable"
+      [ "$_p1" = "$_p2" ] && break
+      [ "$_try" -lt 3 ] || die "the two entries did not match 3 times - nothing created"
+      warn "the two entries do not match - try again ($_try of 3)"; _try=$((_try + 1))
+    done
+    # -stdin keeps it off the command line and out of ps.
+    VM_ADMIN_HASH=$(printf '%s' "$_p1" | openssl passwd -6 -stdin) || die "hashing failed"
+    unset _p1 _p2
+  else
+    die "no VM_ADMIN_PASSWORD_HASH and no terminal to prompt on.
+      Unattended:     VM_ADMIN_PASSWORD_HASH in $ENCLAVE_CREDENTIALS (make-credentials.sh)
+      Or for one run: VM_ADMIN_PASSWORD_HASH='<hash>' sudo -E ./03-compose-vm.sh $VM"
+  fi
+fi
+
 say "vm      : $VM  ($ADDRESS)"
 say "spec    : ${VCPUS} vCPU, ${RAM_MB} MB, ${DISK_GB} GB sparse"
 say "bridge  : $BRIDGE"
@@ -398,57 +459,6 @@ TMUX_CONF=""
 # EVERY anchor in trust-anchors/, not just this CA's root. A site running DoD PKI drops its
 # roots in there and composed VMs pick them up with no change here - which is the whole point
 # of that directory being a directory.
-# ---- the admin password -------------------------------------------------------------------
-# EVERY VM GETS ONE, and it is not optional.
-#
-# The composer used to create the user with `sudo: ALL=(ALL) NOPASSWD:ALL` and NO password at
-# all. That works right up until the DISA STIG is applied: usg removes NOPASSWD (correctly -
-# STIG requires sudo to authenticate), and sudo then asks for a password that was never set.
-# There is no number of attempts that succeeds. On svc-harbor-01 on 2026-09-08 that locked
-# the only sudo-capable account out of root on a headless VM, recoverable only by editing the
-# disk offline from the hypervisor.
-#
-# Had it been found later it would have done that to all six Kubernetes nodes at once.
-#
-# NOPASSWD is KEPT as well, deliberately: it is convenient before hardening, and STIG removes
-# it afterwards - at which point the password below is what keeps the machine usable.
-#
-# A HASH goes in the user-data, never the password. cloud-init's user-data sits on the seed
-# ISO and in /var/lib/cloud on the guest, both readable.
-#
-# WHERE THE HASH COMES FROM (3.32): VM_ADMIN_PASSWORD_HASH in the environment > the same key in
-# the site credentials file (/etc/enclave/credentials.env, root 600 - see credentials.sh) >
-# asked for here. One hash for every guest built from that file.
-VM_ADMIN_HASH="${VM_ADMIN_PASSWORD_HASH:-}"; VM_ADMIN_SRC="VM_ADMIN_PASSWORD_HASH (environment)"
-if [ -z "$VM_ADMIN_HASH" ] && [ "$DRY" -eq 0 ]; then
-  # shellcheck source=../enclave/credentials.sh
-  . "$ENCLAVE_DIR/credentials.sh"
-  cred_require_safe
-  VM_ADMIN_HASH="$(cred_get VM_ADMIN_PASSWORD_HASH)"; VM_ADMIN_SRC="$ENCLAVE_CREDENTIALS"
-fi
-if [ -n "$VM_ADMIN_HASH" ]; then
-  # CHECK THE SHAPE: a truncated paste would set a password that matches nothing, and the
-  # lock-out above would only show up after hardening.
-  [[ "$VM_ADMIN_HASH" =~ ^\$6\$[^\$]+\$[./A-Za-z0-9]+$ ]] \
-    || die "the VM admin hash from $VM_ADMIN_SRC is not SHA-512 crypt (\$6\$...) - nothing created"
-  ok "VM admin password: hash from $VM_ADMIN_SRC - no prompt"
-elif [ "$DRY" -eq 0 ]; then
-  if [ -t 0 ]; then
-    printf '  no VM_ADMIN_PASSWORD_HASH set - enter a password for %s on %s\n' "${VM_USER:-encadmin}" "$VM"
-    read -rsp '  password: ' _p1; echo
-    read -rsp '  again:    ' _p2; echo
-    [ -n "$_p1" ] || die "refusing to create a VM with an empty password - STIG will make it unusable"
-    [ "$_p1" = "$_p2" ] || die "the two entries do not match"
-    # -stdin keeps it off the command line and out of ps.
-    VM_ADMIN_HASH=$(printf '%s' "$_p1" | openssl passwd -6 -stdin) || die "hashing failed"
-    unset _p1 _p2
-  else
-    die "no VM_ADMIN_PASSWORD_HASH and no terminal to prompt on.
-      Unattended:     VM_ADMIN_PASSWORD_HASH in $ENCLAVE_CREDENTIALS (make-credentials.sh)
-      Or for one run: VM_ADMIN_PASSWORD_HASH='<hash>' sudo -E ./03-compose-vm.sh $VM"
-  fi
-fi
-
 ANCHOR_DIR="$ENCLAVE_DIR/trust-anchors"
 ROOT_CA=""; ANCHOR_COUNT=0
 if [ -d "$ANCHOR_DIR" ]; then

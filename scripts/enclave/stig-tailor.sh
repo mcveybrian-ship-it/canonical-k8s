@@ -4007,11 +4007,26 @@ svc-mgmt-01	80/tcp	allow	__ENCLAVE_CIDR__	nginx 301 to https only, so a plaintex
 svc-mgmt-01	443/tcp	allow	__ENCLAVE_CIDR__	nginx TLS in front of the Ubuntu Pro contracts server on 127.0.0.1:8484 - every machine's `pro` client talks to it. 8484 itself is NOT in this table: it is loopback-only by systemd IPAddressDeny, proven by the 2026-09-19 scan (filtered)
 svc-mgmt-01	9100/tcp	limit	__SVC_OBS_01__	node-exporter, source-restricted to the collector; limit for the same reason as host-1/2/3
 pg-01	22/tcp	limit	any	ssh - the rule the benchmark is aimed at. B-06 slice 1 (2026-09-26): the table every machine has, so ufw is active and default-deny from the first hardening pass
-pg-01	9100/tcp	limit	__SVC_OBS_01__	node-exporter, source-restricted to the collector; limit for the same reason as host-1/2/3. PostgreSQL, Patroni and its etcd ports are NOT here yet: they arrive with backlog B-06a, from its design (runbook 9a), registered in ppsm-services.tsv first (decision D5)
+pg-01	9100/tcp	limit	__SVC_OBS_01__	node-exporter, source-restricted to the collector; limit for the same reason as host-1/2/3
+pg-01	5432/tcp	allow	__K8S_WK_01__,__K8S_WK_02__,__K8S_WK_03__,__K8S_WK_04__,__PG_01__,__PG_02__,__PG_03__	PostgreSQL - application pods on the four K8S workers, and replication between the pg nodes; nothing else in the enclave (decided 2026-09-27, B-06a). ALLOW, not limit: a connection pool reconnecting after a failover must not be dropped - ufw limit is 6 per 30 s per source and every attempt renews the ban (finish locked host-1 out of pg-01 that way, 2026-09-27)
+pg-01	2379/tcp	allow	__PG_01__,__PG_02__,__PG_03__	etcd client API - Patroni on the three pg nodes only. The database's OWN etcd, not the cluster's (runbook 9a). Allow: reconnects after a partition heals must not be dropped
+pg-01	2380/tcp	allow	__PG_01__,__PG_02__,__PG_03__	etcd peer - the three members of the database's etcd; mutual TLS from the enclave CA (ca.sh sign-server --peer)
+pg-01	8008/tcp	allow	__PG_01__,__PG_02__,__PG_03__,__SVC_OBS_01__	Patroni REST API - the other members query it during a leader race, svc-obs-01 scrapes /metrics for the sync-degradation alert. Not the application's port
+pg-01	9187/tcp	limit	__SVC_OBS_01__	postgres-exporter, source-restricted to the collector; limit like every exporter
 pg-02	22/tcp	limit	any	ssh - the rule the benchmark is aimed at. B-06 slice 1 (2026-09-26): the table every machine has, so ufw is active and default-deny from the first hardening pass
-pg-02	9100/tcp	limit	__SVC_OBS_01__	node-exporter, source-restricted to the collector; limit for the same reason as host-1/2/3. PostgreSQL, Patroni and its etcd ports are NOT here yet: they arrive with backlog B-06a, from its design (runbook 9a), registered in ppsm-services.tsv first (decision D5)
+pg-02	9100/tcp	limit	__SVC_OBS_01__	node-exporter, source-restricted to the collector; limit for the same reason as host-1/2/3
+pg-02	5432/tcp	allow	__K8S_WK_01__,__K8S_WK_02__,__K8S_WK_03__,__K8S_WK_04__,__PG_01__,__PG_02__,__PG_03__	PostgreSQL - application pods on the four K8S workers, and replication between the pg nodes; nothing else in the enclave (decided 2026-09-27, B-06a). ALLOW, not limit: a connection pool reconnecting after a failover must not be dropped - ufw limit is 6 per 30 s per source and every attempt renews the ban (finish locked host-1 out of pg-01 that way, 2026-09-27)
+pg-02	2379/tcp	allow	__PG_01__,__PG_02__,__PG_03__	etcd client API - Patroni on the three pg nodes only. The database's OWN etcd, not the cluster's (runbook 9a). Allow: reconnects after a partition heals must not be dropped
+pg-02	2380/tcp	allow	__PG_01__,__PG_02__,__PG_03__	etcd peer - the three members of the database's etcd; mutual TLS from the enclave CA (ca.sh sign-server --peer)
+pg-02	8008/tcp	allow	__PG_01__,__PG_02__,__PG_03__,__SVC_OBS_01__	Patroni REST API - the other members query it during a leader race, svc-obs-01 scrapes /metrics for the sync-degradation alert. Not the application's port
+pg-02	9187/tcp	limit	__SVC_OBS_01__	postgres-exporter, source-restricted to the collector; limit like every exporter
 pg-03	22/tcp	limit	any	ssh - the rule the benchmark is aimed at. B-06 slice 1 (2026-09-26): the table every machine has, so ufw is active and default-deny from the first hardening pass
-pg-03	9100/tcp	limit	__SVC_OBS_01__	node-exporter, source-restricted to the collector; limit for the same reason as host-1/2/3. PostgreSQL, Patroni and its etcd ports are NOT here yet: they arrive with backlog B-06a, from its design (runbook 9a), registered in ppsm-services.tsv first (decision D5)
+pg-03	9100/tcp	limit	__SVC_OBS_01__	node-exporter, source-restricted to the collector; limit for the same reason as host-1/2/3
+pg-03	5432/tcp	allow	__K8S_WK_01__,__K8S_WK_02__,__K8S_WK_03__,__K8S_WK_04__,__PG_01__,__PG_02__,__PG_03__	PostgreSQL - application pods on the four K8S workers, and replication between the pg nodes; nothing else in the enclave (decided 2026-09-27, B-06a). ALLOW, not limit: a connection pool reconnecting after a failover must not be dropped - ufw limit is 6 per 30 s per source and every attempt renews the ban (finish locked host-1 out of pg-01 that way, 2026-09-27)
+pg-03	2379/tcp	allow	__PG_01__,__PG_02__,__PG_03__	etcd client API - Patroni on the three pg nodes only. The database's OWN etcd, not the cluster's (runbook 9a). Allow: reconnects after a partition heals must not be dropped
+pg-03	2380/tcp	allow	__PG_01__,__PG_02__,__PG_03__	etcd peer - the three members of the database's etcd; mutual TLS from the enclave CA (ca.sh sign-server --peer)
+pg-03	8008/tcp	allow	__PG_01__,__PG_02__,__PG_03__,__SVC_OBS_01__	Patroni REST API - the other members query it during a leader race, svc-obs-01 scrapes /metrics for the sync-degradation alert. Not the application's port
+pg-03	9187/tcp	limit	__SVC_OBS_01__	postgres-exporter, source-restricted to the collector; limit like every exporter
 EOF
 }
 
@@ -4051,6 +4066,21 @@ cmd_ufw() {
   local mine; mine="$(ufw_rules \
       | sed -e "s|__SVC_OBS_01__|${obs}|g" -e "s|__ENCLAVE_CIDR__|${cidr}|g" \
       | awk -F'\t' -v m="$me" '$1==m')"
+  # ANY ADDRESS-FILE KEY AS A SOURCE, AND SEVERAL SOURCES IN ONE ROW (B-06a, 2026-09-27). pg-01..03
+  # need 5432 from seven fixed machines and etcd/Patroni from three; written out one per row that
+  # is ~18 rows per node. `__KEY__` is any key in enclave-addresses.env, and a comma-separated
+  # from field expands into one rule per source BEFORE the checks below see it - so the empty-
+  # source guard, D5 and the plan all judge the expanded rules. A key with no address REFUSES:
+  # an empty source becomes "from anywhere".
+  local ph key
+  for ph in $(printf '%s\n' "$mine" | grep -oE '__[A-Z0-9_]+__' | sort -u); do
+    key="${ph#__}"; key="${key%__}"
+    [ -n "${!key:-}" ] || die "the ufw table for $me names $ph, and $key has no address in enclave-addresses.env.
+       Refusing: an empty source becomes 'from anywhere'."
+    mine="$(printf '%s\n' "$mine" | sed "s|$ph|${!key}|g")"
+  done
+  mine="$(printf '%s\n' "$mine" | awk -F'\t' 'BEGIN { OFS = "\t" }
+      { n = split($4, s, ","); if (n == 0) { print; next } for (i = 1; i <= n; i++) { $4 = s[i]; print } }')"
 
   # NO TABLE AT ALL IS CHECKED FIRST, and the order is load-bearing. `printf '%s\n' ""`
   # emits ONE EMPTY LINE, so awk sees a record whose $4 is empty and the source check below

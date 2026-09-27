@@ -98,13 +98,21 @@ def read_design_table(tailor, env):
         sys.exit("cannot find the ufw_rules() table in %s" % tailor)
     obs = env.get("SVC_OBS_01", "")
     cidr = env.get("ENCLAVE_CIDR") or (obs.rsplit(".", 1)[0] + ".0/24" if obs else "")
+    # READ IT EXACTLY AS stig-tailor.sh cmd_ufw DOES (B-06a, 2026-09-27): any address-file key as
+    # __KEY__, and a comma-separated source field is one rule per source. Reading only the two old
+    # placeholders would have recorded pg-01's 5432 source as the literal "__K8S_WK_01__,..." - a
+    # design record that matches no live rule and says nothing.
+    def subst(s):
+        return re.sub(r"__([A-Z0-9_]+)__",
+                      lambda k: cidr if k.group(1) == "ENCLAVE_CIDR" else env.get(k.group(1), k.group(0)), s)
     rows = []
     for line in m.group(1).splitlines():
-        f = line.replace("__SVC_OBS_01__", obs).replace("__ENCLAVE_CIDR__", cidr).split("\t")
+        f = line.split("\t")
         if len(f) >= 5:
             port, proto = f[1].split("/")
-            rows.append({"machine": f[0], "port": port, "proto": proto, "action": f[2],
-                         "source": f[3], "why": f[4]})
+            for source in subst(f[3]).split(","):
+                rows.append({"machine": f[0], "port": port, "proto": proto, "action": f[2],
+                             "source": source, "why": f[4]})
     return rows
 
 

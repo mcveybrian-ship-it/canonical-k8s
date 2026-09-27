@@ -358,8 +358,34 @@ cmd_plan() {
     warn "cannot measure $POOL - is it mounted?"
   fi
   if [ "$dt" -gt 0 ]; then
-    local dpool="${VM_POOL_DATA:-}"
+    local dpool="${VM_POOL_DATA:-}" dsize
     [ -n "$dpool" ] || { warn "guests here want ${dt} GB of data disk and VM_POOL_DATA is unset"; fail=1; }
+    # Data disks are RESERVED (3.42), so the pool's SIZE must hold them all - a hard fit, not a
+    # ceiling. And the pool must be its own mount, or the data disk lands on the OS drive (3.43).
+    if [ -n "$dpool" ]; then
+      if ! mountpoint -q "$dpool" 2>/dev/null; then
+        warn "data pool $dpool is not a mounted volume on $me - a data disk would land on the OS drive"; fail=1
+      else
+        dsize="$(df -BG --output=size "$dpool" 2>/dev/null | tail -1 | tr -dc 0-9 || true)"
+        if [ -n "$dsize" ] && [ "$dt" -le "$dsize" ]; then
+          ok "data pool $dpool: ${dsize} GB volume holds the ${dt} GB of reserved data disks"
+        else
+          warn "data pool $dpool: ${dsize:-?} GB volume, ${dt} GB of RESERVED data disks - does not fit"; fail=1
+        fi
+      fi
+    fi
+  fi
+  # THE RING BACKUP COPY IS REAL BYTES ON THIS HOST'S IMAGES POOL (3.42). With PLACE_BACKUP_SECOND
+  # ring, every host running guests also receives the previous host's copy - host-1 held host-4's
+  # 173.7 GB on 2026-09-27, and this planner said "plan holds" without counting a byte of it.
+  if [ "${PLACE_BACKUP_SECOND:-}" = ring ] && [ -n "$pool_avail" ]; then
+    local psize reserve_copy="${BACKUP_COPY_RESERVE_GB:-200}"
+    psize="$(df -BG --output=size "$POOL" 2>/dev/null | tail -1 | tr -dc 0-9 || true)"
+    if [ -n "$psize" ] && [ $(( dk + reserve_copy )) -le "$psize" ]; then
+      ok "pool $POOL: ${psize} GB holds ${dk} GB of OS-disk ceilings plus a ${reserve_copy} GB backup-copy reserve (BACKUP_COPY_RESERVE_GB)"
+    else
+      warn "pool $POOL: ${psize:-?} GB vs ${dk} GB of OS-disk ceilings + ${reserve_copy} GB backup-copy reserve - over-committed; the copy is real bytes, the OS disks are sparse. Watch it"
+    fi
   fi
   printf '\n'
   [ "$fail" -eq 0 ] || die "the plan does not hold on $me - fix the map or the hardware before composing"
@@ -470,6 +496,14 @@ if [ "$DRY" -eq 0 ]; then
     die "$VM already exists. Remove it first:  sudo $0 $VM --destroy"
   fi
   mountpoint -q "$POOL" || warn "$POOL is not its own volume - VM disks will fill the root fs"
+  # A DATA DISK ON AN UNMOUNTED POOL IS A DATA DISK ON THE OS DRIVE. Found 2026-09-27 checking
+  # host-3 for pg-03: it has no images-data volume, and the `install -d` below would have created
+  # the directory on /var (30 GB, the OS disk) and put the database there. Refuse instead.
+  if [ -n "$DATA_DISK" ] && ! mountpoint -q "$DATA_POOL"; then
+    die "$VM wants a data disk in $DATA_POOL, and that is not a mounted volume on $(hostname -s).
+       It would land on the OS drive. Build the data pool first (03-host-services.sh datavg,
+       DATA_LVS with a libvirt-data volume), then compose."
+  fi
 fi
 
 # ---- tools -------------------------------------------------------------------------------
@@ -675,9 +709,14 @@ if [ -n "${DATA_GB:-}" ]; then
       is a different spindle. Set VM_POOL_DATA in vm-specs.env to a path on the data device."
   run install -d -m 0711 "$DATA_POOL"
   # CREATE, not convert - a data disk is blank, there is no base image for it.
-  [ -e "$DATA_DISK" ] || run qemu-img create -f qcow2 -o preallocation=metadata \
+  # RESERVED, NOT SPARSE (backlog 3.42, decided 2026-09-27). A sparse database disk promises space
+  # it does not hold: on host-1 the ring backup copy filled the same volume to 25.8 GB free while
+  # pg-01's 150 GiB disk had 24 MB allocated - the day the volume fills, PostgreSQL's writes fail.
+  # falloc reserves every block at create time (fallocate - seconds, not a zero-fill), so a full
+  # volume fails the copy or the compose, never a database write.
+  [ -e "$DATA_DISK" ] || run qemu-img create -f qcow2 -o preallocation=falloc \
       "$DATA_DISK" "${DATA_GB}G"
-  ok "data    : $DATA_DISK (${DATA_GB}G, sparse, metadata preallocated)"
+  ok "data    : $DATA_DISK (${DATA_GB}G, RESERVED - preallocated, not sparse)"
   # IT LANDS AT vdc, BEHIND THE READ-ONLY SEED - AND THAT IS NOT STABLE. The seed disk is
   # only needed for the first boot; detach it later and the data disk moves vdc -> vdb.
   # So MOUNT IT BY UUID OR LABEL, NEVER BY /dev/vdX. An fstab entry naming vdc is a machine

@@ -82,7 +82,12 @@ KEEP="${BACKUP_KEEP_CHAINS:-2}"
 LUKS_UUID="${BACKUP_LUKS_UUID:-}"
 LUKS_NAME="${BACKUP_LUKS_NAME:-vmbackup}"
 KEYFILE="${BACKUP_KEYFILE:-/etc/enclave/vmbackup.key}"
-SECOND_DIR="${BACKUP_SECOND_DIR:-/var/lib/libvirt/images-data/backup-copy}"
+# NOT images-data (backlog 3.42, decided 2026-09-27): that volume holds the database disks, and
+# host-1's copy of host-4's backups (173.7 GB) had filled it to 25.8 GB free beside pg-01's.
+# The images volume holds sparse OS disks and room for the copy; `03-compose-vm.sh plan` counts
+# the copy against it (BACKUP_COPY_RESERVE_GB). THE TARGET'S authorized_keys NAMES THIS PATH in
+# its forced rrsync command - moving it means changing that line too (runbook 10b).
+SECOND_DIR="${BACKUP_SECOND_DIR:-/var/lib/libvirt/images/backup-copy}"
 SECOND_KEY="${BACKUP_SECOND_KEY:-/etc/enclave/backup-copy.key}"
 SECOND_STATE="${BACKUP_SECOND_STATE:-/var/lib/enclave-backup-second.state}"
 # THE MIRROR IS EXCLUDED BY DEFAULT, AND IT IS A MEASUREMENT THAT SAYS SO. svc-repo-01 is

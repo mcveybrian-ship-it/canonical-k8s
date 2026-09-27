@@ -1009,10 +1009,48 @@ fi
 **A guest composed with `--harden`** (B-06, the cluster guests; built 2026-09-27): nothing is
 placed by hand. With the stick mounted **read-only** on the guest's host at `/mnt/cred` (the host
 block above, and the host must be the one the guest is mapped to), `03-compose-vm.sh <vm> --harden`
-reads that guest's own `credentials.<vm>.env` — refused unless root 600, in the reader's format,
-and carrying **that guest's** break-glass key — and puts it on a read-only provisioning disk with
-the host's Pro token and answer file. The guest installs it at first boot, root 600. Unmount the
-stick once compose has printed `prov :`. `--cred-dir DIR` points it elsewhere.
+reads that guest's own `site/credentials.<vm>.env` — refused unless root 600, in the reader's
+format, and carrying **that guest's** break-glass key — and its `site/audit-offload.<vm>.key`
+(root 600, must parse), and puts them on a read-only provisioning disk with the host's Pro token
+and answer file. The guest installs both at first boot, root 600. Unmount the stick once compose
+has printed `prov :`. `--cred-dir DIR` points it elsewhere (default `/mnt/cred/site`).
+
+**The audit-offload keys and the collector (2026-09-27).** `make-credentials.sh` also writes one
+`audit-offload.<machine>.key` per machine except the collector, and `audit-collector.authorized_keys`
+— every one of those keys, pinned to its machine's address, forced to write-only `rrsync` into the
+collector's drop directory. A host installs its key in the block above (the lines below);
+svc-obs-01 trusts them all, **once per stick, before any `--harden` guest is composed** — with the
+stick attached to it as for any service VM, then, inside it:
+
+```bash
+### MACHINE: svc-obs-01 (10.2.20.164) ###
+if [ "$(hostname -s)" != svc-obs-01 ]; then echo "WRONG MACHINE: $(hostname -s)"; else
+  sudo mkdir -p /mnt/cred && sudo mount -o ro LABEL=enclave-cred /mnt/cred \
+    && sudo ~/canonical-k8s/scripts/enclave/audit-offload.sh collector-trust /mnt/cred/site/audit-collector.authorized_keys
+  sudo umount /mnt/cred
+fi
+```
+
+It refuses the whole file if any line is wider than that exact form, names an address outside the
+enclave or the collector itself; it merges by address (a machine's old line is replaced, every
+other line is kept byte for byte) and keeps the previous file beside it. A host places its key with
+its credentials, in the place block above:
+
+```bash
+### MACHINE: the host being hardened (host-1..4) ###
+k=/mnt/cred/site/audit-offload.$(hostname -s).key
+case "$(hostname -s)" in host-[0-9]*)
+  sudo mkdir -p /mnt/cred && sudo mount -o ro LABEL=enclave-cred /mnt/cred
+  if sudo test -f "$k"; then sudo install -D -o root -g root -m 600 "$k" /etc/enclave/audit-offload.key && echo "audit key placed"; else echo "NO audit key for $(hostname -s) on the stick"; fi
+  sudo umount /mnt/cred ;;
+*) echo "WRONG MACHINE: $(hostname -s) is not a host" ;;
+esac
+```
+
+**These keys are operational, not one-time credentials: never deleted from the target** (§9.4 does
+not apply to them). All one can do is append to its own machine's directory on the collector, from
+that machine's address. `05-harden-host.sh`'s `auditoffload` step proves the first delivery; a key
+the collector does not trust halts the run there. The stick's copies go with the stick (§9.5).
 
 **host-4 keeps its file until the guests are composed** — it holds the guest admin hash, which
 `03-compose-vm.sh` reads. Its deletion comes after its own `05-harden-host.sh` and the last

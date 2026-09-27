@@ -684,6 +684,26 @@ step_auditvolume() {
   mark_step auditvolume
 }
 
+# THE WEEKLY AUDIT OFFLOAD (backlog N-2) - INSTALLED AND PROVEN, not just installed. V-270817
+# reads NotAFinding only while it works: timer enabled, running the root-owned copy, a successful
+# delivery within 8 days (answerfile.sh). Added 2026-09-27, B-06: the eight were enrolled by hand;
+# a machine built unattended gets its key from the stick (make-credentials.sh -> --harden for a
+# guest, airgap-media §9.3 for a host) and the collector trusts it through `audit-offload.sh
+# collector-trust`. A DELIVERY THAT FAILS HALTS THE RUN (D7): a DONE machine whose audit records
+# never leave it is exactly the gap this step closes. The collector delivers to itself, no key.
+step_auditoffload() {
+  done_step auditoffload && return 0
+  hdr "11c. audit offload to the collector - the weekly timer, and one delivery proven now"
+  "$ENC/audit-offload.sh" install || die "audit-offload install failed"
+  "$ENC/audit-offload.sh" run || die "the first audit offload did not reach the collector.
+       Either this machine has no key at ${AUDIT_KEY:-/etc/enclave/audit-offload.key} (it comes from
+       make-credentials.sh: a --harden guest from its provisioning disk, a host from the stick), or
+       the collector does not trust it yet - on svc-obs-01, from the same stick:
+         sudo ./audit-offload.sh collector-trust <stick>/audit-collector.authorized_keys
+       Then: sudo $0 resume   (a guest)   or   sudo $0 run   (a host)"
+  mark_step auditoffload
+}
+
 # runbook 6.0 step 12d (10.1): the DISA V1R6 fixes usg fix does not make, then a reboot.
 step_v1r6() {
   done_step v1r6 && return 0
@@ -813,7 +833,7 @@ step_done() {
 # (host-3 rebuild, 2026-09-21). One list means a step is either shown AND run, or neither.
 # Order matters: accounts before v1r6 (its reboot loads the emergency audit rule).
 STEPS=(preflight hostprep pro fips patch usg baseline prechecks usgfix tailor radio grub
-       accounts v1r6 verify auditvolume final_audit evalstig)
+       accounts v1r6 verify auditvolume auditoffload final_audit evalstig)
 
 cmd_status() {
   assert_enclave_host
@@ -870,9 +890,14 @@ cmd_first_boot() {
   [ -n "$op" ] && id "$op" >/dev/null 2>&1 || die "provision.env names no existing operator account ('${op:-none}')"
   install -D -o root -g root -m 0600 "$prov/credentials.env" "${ENCLAVE_CREDENTIALS:-/etc/enclave/credentials.env}"
   install -D -o root -g root -m 0600 "$prov/pro-contract-token" "$GUEST_TOKEN"
+  # The audit-offload key is OPERATIONAL, not a one-time credential: installed and KEPT (the
+  # collector has none - it delivers to itself). step_auditoffload proves it.
+  if [ -s "$prov/audit-offload.key" ]; then
+    install -D -o root -g root -m 0600 "$prov/audit-offload.key" "${AUDIT_KEY:-/etc/enclave/audit-offload.key}"
+  fi
   install -d -m 0755 "${STIG_TOOLS_DEST:-/srv/stig-tools}"
   install -o root -g root -m 0640 "$prov/Ubuntu24_AnswerFile.xml" "${STIG_TOOLS_DEST:-/srv/stig-tools}/Ubuntu24_AnswerFile.xml"
-  ok "installed: credentials + token (root 600), answer file (0640) - operator $op"
+  ok "installed: credentials + token (root 600)$([ -s "$prov/audit-offload.key" ] && echo ', audit-offload key (600, kept)'), answer file (0640) - operator $op"
   SUDO_USER="$op"; SUDO_UID="$(id -u "$op")"; SUDO_GID="$(id -g "$op")"
   export SUDO_USER SUDO_UID SUDO_GID
   install_resume_unit

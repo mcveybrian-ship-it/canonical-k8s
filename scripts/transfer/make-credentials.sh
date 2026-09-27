@@ -22,6 +22,17 @@
 #                               OWN BREAKGLASS_PASSWORD_HASH_<MACHINE>; the hosts also get
 #                               VM_ADMIN_PASSWORD_HASH (they compose the guests); HARBOR_* goes
 #                               to HARBOR_MACHINE only, GRAFANA_* to OBS_MACHINE only.
+#   audit-offload.<machine>.key the machine's key for the weekly audit offload (RSA 4096 - FIPS
+#                               refuses ed25519). Every machine but the collector (OBS_MACHINE),
+#                               which delivers to itself. An OPERATIONAL key, not a one-time
+#                               credential: installed as /etc/enclave/audit-offload.key and KEPT.
+#                               All it can do, once the collector trusts it: append to its own
+#                               directory on the collector, from its own address.
+#   audit-collector.authorized_keys
+#                               the collector's trust list for exactly those keys, each pinned to
+#                               its machine's address from the address file - merged on the
+#                               collector by `audit-offload.sh collector-trust` (B-06, 2026-09-27).
+#                               Public keys only; carried with the rest because it must match.
 #   REGISTER.txt                the custody record - no secret in it (see below)
 #
 #   Why split (2026-09-26): with one site file, every machine would briefly hold every other
@@ -56,6 +67,10 @@ ADDRS="$SELF/../enclave/enclave-addresses.env"
 CRED_LABEL="${CRED_LABEL:-enclave-cred}"
 HARBOR_MACHINE="${HARBOR_MACHINE:-SVC_HARBOR_01}"   # who gets HARBOR_*  (address-file key)
 OBS_MACHINE="${OBS_MACHINE:-SVC_OBS_01}"            # who gets GRAFANA_* (address-file key)
+# The collector's drop directory and forced command - must be EXACTLY what the collector runs
+# (audit-offload.sh DROP and rrsync), or `collector-trust` refuses the line.
+AUDIT_DROP_DIR="${AUDIT_DROP_DIR:-/srv/audit-offload}"
+RRSYNC="${RRSYNC:-/usr/bin/rrsync}"
 # The enclave's machines, by their address-file key. NOT every key: STAGE_01 and BUILD_01
 # live in the same file but sit outside the gap, and this script is meant to run on one.
 ENCLAVE_RE='^(HOST_[0-9]+|SVC_[A-Z0-9_]+|PG_[0-9]+|K8S_(CP|WK)_[0-9]+)$'
@@ -91,6 +106,7 @@ done
 [ -t 0 ] || die "needs a terminal - the secrets are typed, never piped or passed as arguments"
 command -v openssl >/dev/null || die "openssl not found"
 command -v grub-mkpasswd-pbkdf2 >/dev/null || die "grub-mkpasswd-pbkdf2 not found (package grub-common)"
+command -v ssh-keygen >/dev/null || die "ssh-keygen not found (package openssh-client) - it makes the audit-offload keys"
 
 ALL_KEYS=()
 while IFS= read -r k; do ALL_KEYS+=("$k"); done < <(grep -oE '^[A-Z0-9_]+=' "$ADDRS" | tr -d '=')
@@ -133,7 +149,8 @@ if [ "${fs_label:-}" != "$CRED_LABEL" ]; then
        Practice runs only: --any-dir"
   warn "--any-dir: $OUT is NOT the credentials stick - PRACTICE ONLY, delete it afterwards"
 fi
-existing="$(find "$OUT" -maxdepth 1 \( -name 'credentials.*.env' -o -name REGISTER.txt \) -printf '%f ')"
+existing="$(find "$OUT" -maxdepth 1 \( -name 'credentials.*.env' -o -name 'audit-offload.*.key' \
+            -o -name audit-collector.authorized_keys -o -name REGISTER.txt \) -printf '%f ')"
 if [ -n "$existing" ] && [ "$FORCE" -ne 1 ]; then
   die "$OUT already holds: $existing- refusing to overwrite. --force only to REPLACE them."
 fi
@@ -262,6 +279,26 @@ for m in "${KEYS[@]}"; do
 done
 for k in "${!V[@]}"; do V[$k]=""; done
 
+# ---- the audit-offload keys and the collector's trust list for them -----------------------
+# One key per SENDING machine (everyone but the collector), and one line per key for the
+# collector: pinned to the machine's address, `restrict`, forced to write-only rrsync into the
+# drop directory - the exact form `audit-offload.sh collector-trust` accepts and nothing else.
+addr_of() { sed -n "s/^$1=['\"]\{0,1\}\([0-9][0-9.]*\).*/\1/p" "$ADDRS" | head -1; }
+AK_SENDERS=()
+for m in "${KEYS[@]}"; do [ "$m" = "$OBS_MACHINE" ] || AK_SENDERS+=("$m"); done
+for m in "${AK_SENDERS[@]}"; do
+  a="$(addr_of "$m")"
+  [[ "$a" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || die "no IPv4 address for $m in $ADDRS - cannot pin its audit key"
+  kf="$tmpd/audit-offload.$(lower "$m").key"
+  ssh-keygen -q -t rsa -b 4096 -N "" -C "audit-offload $(lower "$m")" -f "$kf" \
+    || die "ssh-keygen failed for $(lower "$m")"
+  chmod 600 "$kf"
+  printf 'from="%s",restrict,command="%s -wo %s" %s\n' "$a" "$RRSYNC" "$AUDIT_DROP_DIR" "$(cat "$kf.pub")" \
+    >> "$tmpd/audit-collector.authorized_keys"
+  rm -f "$kf.pub"
+done
+[ ! -e "$tmpd/audit-collector.authorized_keys" ] || chmod 644 "$tmpd/audit-collector.authorized_keys"
+
 # Read back the way the targets will (credentials.sh's parser), and prove each machine holds
 # exactly its own keys - no other machine's emergency hash, no service password it does not run.
 bad=0
@@ -282,15 +319,30 @@ for m in "${KEYS[@]}"; do
   [ "$(stat -c %a "$f")" = 600 ] || { warn "$(basename "$f") is not mode 600"; bad=1; }
 done
 val=""
+# Each audit key parses, is 600, and its public half is on exactly one trust line, at its
+# machine's address - read back, not assumed.
+for m in "${AK_SENDERS[@]}"; do
+  kf="$tmpd/audit-offload.$(lower "$m").key"
+  pub="$(ssh-keygen -y -f "$kf" 2>/dev/null | cut -d' ' -f1-2)"
+  [ -n "$pub" ] || { warn "$(basename "$kf") does not parse as a private key"; bad=1; continue; }
+  [ "$(stat -c %a "$kf")" = 600 ] || { warn "$(basename "$kf") is not mode 600"; bad=1; }
+  [ "$(grep -cF " $pub " "$tmpd/audit-collector.authorized_keys")" = 1 ] \
+    && grep -F " $pub " "$tmpd/audit-collector.authorized_keys" | grep -q "^from=\"$(addr_of "$m")\"," \
+    || { warn "$(lower "$m")'s audit key is not on exactly one trust line pinned to $(addr_of "$m")"; bad=1; }
+done
 [ "$bad" -eq 0 ] || die "read-back failed - nothing was moved into place"
 
 # Replacing: the old files go only now, once the new set is proven.
 if [ -n "$existing" ]; then
-  find "$OUT" -maxdepth 1 \( -name 'credentials.*.env' -o -name REGISTER.txt \) -delete
+  find "$OUT" -maxdepth 1 \( -name 'credentials.*.env' -o -name 'audit-offload.*.key' \
+       -o -name audit-collector.authorized_keys -o -name REGISTER.txt \) -delete
   say "replaced: $existing"
 fi
-mv "$tmpd"/credentials.*.env "$OUT"/; rmdir "$tmpd"; tmpd=""
+mv "$tmpd"/credentials.*.env "$OUT"/
+[ "${#AK_SENDERS[@]}" -eq 0 ] || mv "$tmpd"/audit-offload.*.key "$tmpd"/audit-collector.authorized_keys "$OUT"/
+rmdir "$tmpd"; tmpd=""
 ok "wrote ${#KEYS[@]} files to $OUT (mode 600), each read back and holding only its own keys"
+[ "${#AK_SENDERS[@]}" -eq 0 ] || ok "wrote ${#AK_SENDERS[@]} audit-offload key(s) (600) and audit-collector.authorized_keys, each key on one trust line pinned to its address"
 
 # ---- the register: NO SECRET - what custody needs to track every file to its destruction ---
 reg="$OUT/REGISTER.txt"
@@ -309,6 +361,16 @@ reg="$OUT/REGISTER.txt"
   done
   printf '\n  full sha256 of each file:\n'
   for m in "${KEYS[@]}"; do f="$OUT/credentials.$(lower "$m").env"; printf '    %s  %s\n' "$(sha256sum "$f" | cut -d' ' -f1)" "$(basename "$f")"; done
+  if [ "${#AK_SENDERS[@]}" -gt 0 ]; then
+    printf '\n  audit-offload keys - OPERATIONAL, installed as /etc/enclave/audit-offload.key and KEPT;\n'
+    printf '  the stick copy goes with the stick. Fingerprints are public.\n'
+    printf '  %-34s %-51s  %s\n' "file" "fingerprint" "installed on target (date/by)"
+    for m in "${AK_SENDERS[@]}"; do
+      kf="$OUT/audit-offload.$(lower "$m").key"
+      printf '  %-34s %-51s  ____________________\n' "$(basename "$kf")" "$(ssh-keygen -l -f "$kf" | awk '{print $2}')"
+    done
+    printf '  %-34s %-51s  ____________________\n' audit-collector.authorized_keys "$(wc -l < "$OUT/audit-collector.authorized_keys") line(s), merged on $(lower "$OBS_MACHINE")"
+  fi
   printf '\n  envelopes    %s emergency passwords sealed, one per machine, signed across the seal\n' "${#KEYS[@]}"
   printf '               by both custodians: ______ / ______   location ____________________\n'
   printf '  stick        DESTROYED on ____________ by ______________ witness ______________\n'

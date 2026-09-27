@@ -211,6 +211,7 @@ never typed.
 | radio | disable what exists | run it — a VM should report none; that result is the evidence |
 | grub | prep + set (hash from the credentials file) | same — and it matters more: the serial console is exactly where a password without `--unrestricted` would stop the boot |
 | accounts | from the credentials file | same |
+| auditoffload *(added 2026-09-27)* | install the weekly offload timer, prove one delivery | same — the key comes from the provisioning disk (made on build-01 with the credentials), the collector already trusts it via `collector-trust`; a failed delivery halts (D7). Closes V-270817 on the first scan; V-270816 needs a week of the guest's own audit history and closes on a later scan |
 | evalstig | Answer File pushed from stage-01 | Answer File from the provisioning disk |
 | done | — | delete credentials + token; write `hardening-complete`; disable the unit |
 
@@ -278,6 +279,10 @@ stick path is exercised in 2.6).
 disk · it **cold-restarts the guest by default** to prove it boots without them (`--no-reboot`
 skips it) · time sync is **not** faked from inside: `finish` says it is unchecked, and backlog 3.39
 builds the real check (guests scraped + a clock-offset alert for every machine).
+
+**Decided 2026-09-27 for the audit offload:** keys are **made on build-01** with the site
+credentials — one per machine plus the collector's trust list, pinned by address — rather than the
+collector pulling (a new login on every sender) or a hand-pasted line per guest (not unattended).
 
 | # | Decision | Recommendation | Why |
 |---|---|---|---|

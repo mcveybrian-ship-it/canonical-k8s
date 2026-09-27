@@ -11,6 +11,8 @@
 #     ./audit-offload.sh status
 #     sudo ./audit-offload.sh agent-init       # ON A SENDER - key + its authorized_keys line
 #     sudo ./audit-offload.sh collector-init   # ON THE COLLECTOR - create the drop directory
+#     sudo ./audit-offload.sh collector-trust <file>   # ON THE COLLECTOR - trust the machines in
+#                                              the stick's audit-collector.authorized_keys
 #     sudo ./audit-offload.sh prune            # ON THE COLLECTOR - enforce retention
 #     ./audit-offload.sh verify                # ON THE COLLECTOR - re-check every checksum
 #
@@ -76,6 +78,8 @@ KEY="${AUDIT_KEY:-/etc/enclave/audit-offload.key}"
 RETENTION_DAYS="${AUDIT_RETENTION_DAYS:-365}"
 STATE="${AUDIT_STATE:-/var/local/enclave-metrics/audit-offload.state}"
 UNIT="enclave-audit-offload"
+AUTHKEYS="${AUDIT_AUTHKEYS:-/root/.ssh/authorized_keys}"
+RRSYNC="${AUDIT_RRSYNC:-/usr/bin/rrsync}"
 ROTATE_WAIT="${AUDIT_ROTATE_WAIT:-10}"
 RUN_TMP=""            # staging dir for `run`; global so the EXIT trap can still see it
 
@@ -193,6 +197,71 @@ cmd_plan() {
 # -----------------------------------------------------------------------------------------
 # collector-init: on svc-obs-01 only. Creates the drop directory 0750 root:root, checks rrsync
 # exists, and prints the authorized_keys template for each sender.
+# ---- collector-trust: trust machines built UNATTENDED (B-06, 2026-09-27) ----------------
+# A guest that hardens itself cannot paste its key here - nothing unattended reaches this
+# machine as root, by design. So the keys are made on build-01 with the site credentials
+# (make-credentials.sh) and this file travels with them: audit-collector.authorized_keys.
+#
+# EVERY LINE MUST BE EXACTLY THE FORM THIS COLLECTOR ENFORCES, or the WHOLE FILE is refused
+# before anything is written:
+#     from="<ONE enclave address>",restrict,command="<RRSYNC> -wo <DROP>" <rsa|ecdsa key> [comment]
+# No wider option set, no other command, no second address, nothing outside the address file,
+# never the collector's own address (it delivers locally).
+#
+# MERGED BY ADDRESS, not appended: an incoming line replaces whatever line that address had -
+# the eight machines enrolled by hand in N-2 carry no comment, so the address pin is the only
+# reliable key - and every other line is kept byte for byte. The old file is kept beside it.
+cmd_collector_trust() {
+  need_root
+  is_collector || die "collector-trust runs on the COLLECTOR ($COLLECTOR); this is $ME"
+  local src="${1:-}"
+  [ -n "$src" ] && [ -r "$src" ] || die "usage: collector-trust <audit-collector.authorized_keys from the stick>"
+  [ -x "$RRSYNC" ] || die "$RRSYNC not found - every key trusted here would fail closed. Install rsync first."
+  local k enc=""
+  for k in $(grep -oE '^(HOST_[0-9]+|SVC_[A-Z0-9_]+|PG_[0-9]+|K8S_(CP|WK)_[0-9]+)=' "$ADDRS" | tr -d '='); do
+    enc="$enc ${!k:-}"
+  done
+  local re="^from=\"([0-9]{1,3}(\\.[0-9]{1,3}){3})\",restrict,command=\"${RRSYNC} -wo ${DROP}\" (ssh-rsa|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521) ([A-Za-z0-9+/]+={0,2})( [^\"]*)?$"
+  local line n=0 bad=0 addr seen=" " i
+  local -a IN_ADDR=() IN_LINE=()
+  while IFS= read -r line || [ -n "$line" ]; do
+    n=$((n + 1))
+    case "$line" in ''|'#'*) continue ;; esac
+    if [[ ! "$line" =~ $re ]]; then warn "line $n is not the exact collector form (restrict, write-only $RRSYNC into $DROP, one address) - refused"; bad=1; continue; fi
+    addr="${BASH_REMATCH[1]}"
+    case " $enc " in *" $addr "*) ;; *) warn "line $n: $addr is not an enclave machine in $ADDRS - refused"; bad=1; continue ;; esac
+    if [ "$addr" = "$COLLECTOR" ]; then warn "line $n: $addr is the collector itself - it delivers locally and needs no key"; bad=1; continue; fi
+    case "$seen" in *" $addr "*) warn "line $n: $addr appears twice"; bad=1; continue ;; esac
+    seen="$seen$addr "
+    printf '%s %s\n' "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}" | ssh-keygen -l -f - >/dev/null 2>&1 \
+      || { warn "line $n: the key for $addr does not parse"; bad=1; continue; }
+    IN_ADDR+=("$addr"); IN_LINE+=("$line")
+  done < "$src"
+  [ "$bad" -eq 0 ] || die "$src refused - nothing was written to $AUTHKEYS"
+  [ "${#IN_ADDR[@]}" -gt 0 ] || die "no trust lines in $src"
+
+  install -d -m 0700 "$(dirname "$AUTHKEYS")"
+  [ -e "$AUTHKEYS" ] || install -m 0600 /dev/null "$AUTHKEYS"
+  local tmp; tmp="$(mktemp "$(dirname "$AUTHKEYS")/.authorized_keys.XXXXXX")"
+  # every line whose from= pin is NOT incoming, byte for byte
+  awk -v list="${IN_ADDR[*]}" 'BEGIN { n = split(list, a, " "); for (i = 1; i <= n; i++) m["from=\"" a[i] "\""] = 1 }
+       { p = $0; sub(/,.*/, "", p); if (!(p in m)) print }' "$AUTHKEYS" > "$tmp"
+  local added=0 replaced=0 same=0
+  for i in "${!IN_ADDR[@]}"; do
+    if grep -qxF "${IN_LINE[$i]}" "$AUTHKEYS"; then same=$((same + 1)); say "unchanged: ${IN_ADDR[$i]}"
+    elif awk -v p="from=\"${IN_ADDR[$i]}\"," 'index($0, p) == 1 { f = 1 } END { exit !f }' "$AUTHKEYS"; then
+      replaced=$((replaced + 1)); say "replaced:  ${IN_ADDR[$i]} - that machine must now use its NEW key from the same stick"
+    else added=$((added + 1)); say "added:     ${IN_ADDR[$i]}"; fi
+    printf '%s\n' "${IN_LINE[$i]}" >> "$tmp"
+  done
+  cp -p "$AUTHKEYS" "$AUTHKEYS.bak-$(date -u +%Y%m%dT%H%M%SZ)"
+  chmod 0600 "$tmp"; mv -f "$tmp" "$AUTHKEYS"
+  for i in "${!IN_LINE[@]}"; do
+    [ "$(grep -cxF "${IN_LINE[$i]}" "$AUTHKEYS")" = 1 ] || die "${IN_ADDR[$i]} is not in $AUTHKEYS exactly once after the merge - inspect it"
+  done
+  ok "collector trusts $((added + replaced + same)) machine(s) from $src: $added added, $replaced replaced, $same unchanged ($(grep -c . "$AUTHKEYS") line(s) in $AUTHKEYS, 600)"
+}
+
 cmd_collector_init() {
   need_root
   is_collector || die "collector-init runs on the COLLECTOR ($COLLECTOR); this is $ME"
@@ -457,9 +526,10 @@ case "${1:-plan}" in
   run)            shift; cmd_run "$@" ;;
   install)        shift; cmd_install "$@" ;;
   collector-init) shift; cmd_collector_init "$@" ;;
+  collector-trust) shift; cmd_collector_trust "$@" ;;
   agent-init)     shift; cmd_agent_init "$@" ;;
   prune)          shift; cmd_prune "$@" ;;
   verify)         shift; cmd_verify "$@" ;;
   status)         shift; cmd_status "$@" ;;
-  *) die "unknown subcommand: $1 (plan|run|install|agent-init|collector-init|prune|verify|status)" ;;
+  *) die "unknown subcommand: $1 (plan|run|install|agent-init|collector-init|collector-trust|prune|verify|status)" ;;
 esac

@@ -12,8 +12,9 @@
 #     ./03-compose-vm.sh plan --spec                what each host must have - no hardware
 #     sudo ./03-compose-vm.sh pg-01 --harden [--cred-dir DIR]
 #         the guest hardens ITSELF from first boot (B-06): a read-only provisioning disk carries
-#         the repo, its credentials file (DIR/credentials.<vm>.env, default /mnt/cred = the
-#         enclave-cred stick), the host's Pro token and the answer file. Watch the console log.
+#         the repo, its credentials file and audit-offload key (DIR/credentials.<vm>.env and
+#         DIR/audit-offload.<vm>.key, default /mnt/cred/site = the enclave-cred stick), the
+#         host's Pro token and the answer file. Watch the console log.
 #     sudo ./03-compose-vm.sh pg-01 --finish [--no-reboot]    after DONE: checks from outside,
 #         shreds the seed + provisioning disk, proves it still boots, prints the register line
 #
@@ -35,7 +36,7 @@ set -euo pipefail
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENCLAVE_DIR="${ENCLAVE_DIR:-$SELF/../enclave}"
-DRY=0; DESTROY=0; VM=""; PLAN_ARG=""; HARDEN=0; CRED_DIR="${CRED_DIR:-/mnt/cred}"; FINISH=0; NO_REBOOT=0
+DRY=0; DESTROY=0; VM=""; PLAN_ARG=""; HARDEN=0; CRED_DIR="${CRED_DIR:-/mnt/cred/site}"; FINISH=0; NO_REBOOT=0
 
 say()  { printf '  %s\n' "$*"; }
 ok()   { printf '  [ok] %s\n' "$*"; }
@@ -581,6 +582,10 @@ if [ "$HARDEN" -eq 1 ]; then
   GUEST_CRED="$CRED_DIR/credentials.$VM.env"
   PRO_TOKEN="${PRO_TOKEN_FILE:-$(getent passwd "${SUDO_USER:-root}" | cut -d: -f6)/.pro-contract-token}"
   ANSWER_FILE="${STIG_ANSWER_FILE:-/srv/stig-tools/Ubuntu24_AnswerFile.xml}"
+  # Its audit-offload key - every guest but the collector, which delivers to itself. 05's
+  # auditoffload step proves it reaches the collector, so a missing key would halt the run late.
+  AUDIT_KEY_SRC=""
+  [ "$ADDRESS" = "${SVC_OBS_01:-}" ] || AUDIT_KEY_SRC="$CRED_DIR/audit-offload.$VM.key"
   # A guest with no firewall table would harden for ten minutes and halt at tailor. Say so now.
   if ! awk '/^ufw_rules\(\) \{/{f=1;next} f&&/^EOF$/{exit} f' "$ENCLAVE_DIR/stig-tailor.sh" \
        | awk -F'\t' -v m="$VM" '$1==m {found=1} END {exit !found}'; then
@@ -593,6 +598,7 @@ if [ "$HARDEN" -eq 1 ]; then
     say "            credentials $GUEST_CRED"
     say "            Pro token   $PRO_TOKEN"
     say "            answers     $ANSWER_FILE"
+    say "            audit key   ${AUDIT_KEY_SRC:-(none - $VM is the collector)}"
   else
     command -v genisoimage >/dev/null || die "no genisoimage - it comes with cloud-image-utils, which cloud-localds needs too"
     [ -s "$REPO_ROOT/.pushed-files" ] && [ -s "$REPO_ROOT/.pushed-from" ] || die "no .pushed-files in $REPO_ROOT.
@@ -610,9 +616,15 @@ if [ "$HARDEN" -eq 1 ]; then
         || die "$GUEST_CRED has no $_k - it is not $VM's file, or it was made without it"
     done
     [ -s "$PRO_TOKEN" ]   || die "no Pro token at $PRO_TOKEN (D3: the host's own copy) - or set PRO_TOKEN_FILE"
+    if [ -n "$AUDIT_KEY_SRC" ]; then
+      [ -e "$AUDIT_KEY_SRC" ] || die "no audit-offload key for $VM at $AUDIT_KEY_SRC - make-credentials.sh makes one
+       per machine beside its credentials file; without it 05 halts at its auditoffload step."
+      [ "$(stat -c '%U %a' "$AUDIT_KEY_SRC")" = "root 600" ] || die "$AUDIT_KEY_SRC is not root 600 ($(stat -c '%U %a' "$AUDIT_KEY_SRC")) - refusing a readable private key"
+      ssh-keygen -y -f "$AUDIT_KEY_SRC" >/dev/null 2>&1 || die "$AUDIT_KEY_SRC does not parse as a private key"
+    fi
     [ -s "$ANSWER_FILE" ] || die "no answer file at $ANSWER_FILE - push one to this host first:
          (on stage-01)  ./scripts/enclave/stig-tools.sh answers $(hostname -s)"
-    ok "harden  : credentials ($GUEST_CRED), token, answer file, repo $(cut -c1-7 "$REPO_ROOT/.pushed-from") - all present"
+    ok "harden  : credentials ($GUEST_CRED), ${AUDIT_KEY_SRC:+audit key, }token, answer file, repo $(cut -c1-7 "$REPO_ROOT/.pushed-from") - all present"
   fi
 fi
 
@@ -767,7 +779,7 @@ TMP="$(mktemp -d)"; PSTAGE=""
 cleanup() {
   rm -rf "$TMP"
   if [ -n "$PSTAGE" ] && [ -d "$PSTAGE" ]; then
-    shred -u "$PSTAGE/credentials.env" "$PSTAGE/pro-contract-token" 2>/dev/null || true
+    shred -u "$PSTAGE/credentials.env" "$PSTAGE/pro-contract-token" "$PSTAGE/audit-offload.key" 2>/dev/null || true
     rm -rf "$PSTAGE"
   fi
 }
@@ -914,14 +926,17 @@ if [ -n "$PROV" ]; then
     | tar -C "$PSTAGE/repo" -xf - || die "could not copy the pushed files into the provisioning stage"
   install -m 0600 "$GUEST_CRED"  "$PSTAGE/credentials.env"
   install -m 0600 "$PRO_TOKEN"   "$PSTAGE/pro-contract-token"
+  [ -z "$AUDIT_KEY_SRC" ] || install -m 0600 "$AUDIT_KEY_SRC" "$PSTAGE/audit-offload.key"
   install -m 0644 "$ANSWER_FILE" "$PSTAGE/Ubuntu24_AnswerFile.xml"
   printf "ENCLAVE_OPERATOR='%s'\n" "${VM_USER:-encadmin}" > "$PSTAGE/provision.env"
   ( umask 077; genisoimage -quiet -o "$PROV" -V ENCLAVE-PROV -R -input-charset utf-8 "$PSTAGE" ) \
     || die "genisoimage failed building $PROV"
   chmod 0600 "$PROV"
   _nfiles="$(find "$PSTAGE/repo" -type f | wc -l)"
-  shred -u "$PSTAGE/credentials.env" "$PSTAGE/pro-contract-token"; rm -rf "$PSTAGE"; PSTAGE=""
-  ok "prov    : $PROV ($_nfiles repo files, credentials, token, answers) - read-only, 0600"
+  shred -u "$PSTAGE/credentials.env" "$PSTAGE/pro-contract-token"
+  [ ! -e "$PSTAGE/audit-offload.key" ] || shred -u "$PSTAGE/audit-offload.key"
+  rm -rf "$PSTAGE"; PSTAGE=""
+  ok "prov    : $PROV ($_nfiles repo files, credentials, ${AUDIT_KEY_SRC:+audit key, }token, answers) - read-only, 0600"
   # AFTER the data disk, so a PG guest's data disk stays vdc (its fstab uses a LABEL anyway).
   PROV_DISK_ARGS=(--disk "path=$PROV,device=disk,bus=virtio,format=raw,readonly=on")
 fi

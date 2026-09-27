@@ -149,11 +149,19 @@ SSH_OPTS=(-i "$KEY" -o BatchMode=yes -o ConnectTimeout=10
 # the fix instead of sending someone to go and find it.
 if ! _ssh_err="$(ssh "${SSH_OPTS[@]}" "$USER_NAME@$TARGET" true 2>&1)"; then
   case "$_ssh_err" in
-    *"REMOTE HOST IDENTIFICATION HAS CHANGED"*|*"Host key verification failed"*)
+    # CHANGED and UNKNOWN both end in "Host key verification failed" under BatchMode, and this
+    # used to call both "a DIFFERENT host key" - so on 2026-09-27, right after the operator had
+    # run the suggested `ssh-keygen -R` for a rebuilt pg-01, it told him to run it again.
+    *"REMOTE HOST IDENTIFICATION HAS CHANGED"*)
       die "$TARGET presents a DIFFERENT host key than known_hosts records.
        Expected after a rebuild of that machine. Drop the stale entries and retry:
          ssh-keygen -R $TARGET
        If that machine was NOT rebuilt, stop and find out why its identity changed." ;;
+    *"Host key verification failed"*)
+      die "$TARGET is not in known_hosts yet - a new machine, or a rebuilt one whose old entry is gone.
+       Trust it once, interactively, checking the fingerprint against its console:
+         ssh -i $KEY $USER_NAME@$TARGET true
+       then re-run this." ;;
     *"Permission denied"*)
       die "$TARGET refused $KEY (publickey). Is the key in its authorized_keys?
        A freshly installed host gets them from the seed - check the seed carried both keys." ;;

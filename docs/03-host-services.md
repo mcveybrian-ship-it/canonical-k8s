@@ -627,6 +627,11 @@ cd ~/canonical-k8s/scripts/install
 sudo ./03-host-services.sh keyonly
 ```
 
+**stage-01 and build-01 are accepted** — until 2026-09-26 the script's machine check refused them,
+so this block could not actually run on the jump host; `keyonly` now has its own check that
+admits the two staging machines and nothing else new (backlog 3.36b). Both were already
+key-only by then, set by hand.
+
 **State on 2026-09-03 before this step:**
 
 ```

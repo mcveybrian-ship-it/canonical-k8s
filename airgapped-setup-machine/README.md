@@ -952,6 +952,11 @@ read -rs -p "Paste Pro token: " T && printf '%s\n' "$T" > ~/.pro-contract-token 
 ./scripts/transfer/make-contracts-config.sh
 ```
 
+**Getting it to svc-mgmt-01**, where the contracts server runs: in the lab, `scp` it from
+stage-01; inside the gap, it travels on the transfer disk and is attached read-only to
+svc-mgmt-01 from host-4 (`docs/airgap-media.md` §6.1e, "the contracts config"). It is **never**
+installed on svc-repo-01 — nothing there reads it (backlog 3.36a, 2026-09-26).
+
 **The token goes in a file, never on a command line.** A token as an argument is visible in
 `ps` to every user on the box and lands in shell history — the same mechanism that exposed the
 LUKS passphrase on 2026-09-02. The script refuses a token file that is not mode `0600`, and

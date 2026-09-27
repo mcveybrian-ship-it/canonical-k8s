@@ -772,7 +772,7 @@ Expected output on a healthy run:
 |---|---|---|---|
 | 1 | STAGE-01 | `build-transfer-bundle.sh` — gather mirror + 4 keyrings + 3 `.deb`s + ISOs + `airgapped-contracts.yaml` + MIRROR-01 configs into one staging tree; manifest the non-repo items | minutes |
 | 2 | `build-01` | `write-transfer-media.sh` — rsync that tree onto the SSD, verify | **60–90 min first trip**, minutes after |
-| 3 | MIRROR-01 | `restore-mirror.sh` — rsync in, install the 3 `.deb`s, place the 4 keyrings, drop the nginx vhost, start the contracts server, run the three-level proof from `airgap-update-lab.md` §6.5 | ~20 min |
+| 3 | MIRROR-01 | `restore-mirror.sh` — rsync in, install the 3 `.deb`s, place the 4 keyrings, drop the nginx vhost, run the three-level proof (the contracts config is NOT installed here — it goes to svc-mgmt-01, §6.1e) from `airgap-update-lab.md` §6.5 | ~20 min |
 
 Step 3 is the one that matters: it turns files on a disk into a working enclave service, and it
 is the part nobody can improvise at the rack.

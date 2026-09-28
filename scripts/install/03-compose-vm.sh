@@ -372,6 +372,24 @@ cmd_plan() {
         else
           warn "data pool $dpool: ${dsize:-?} GB volume, ${dt} GB of RESERVED data disks - does not fit"; fail=1
         fi
+        # "Reserved" is a claim about the FILES, so check the files (3.42, 2026-09-28): the
+        # arithmetic above held on all three hosts while every data disk had been hole-punched
+        # down to what the guest had written. Allocated against apparent size, per disk.
+        local ddisk blocks bsize alloc appar
+        for ddisk in "$dpool"/*-data.qcow2; do
+          [ -e "$ddisk" ] || continue
+          # Bash arithmetic, not awk: mawk on the hosts is not trusted with 12-digit integers.
+          blocks="" bsize="" appar=""
+          read -r blocks bsize appar < <(stat -c '%b %B %s' "$ddisk" 2>/dev/null) || true
+          [[ "$blocks" =~ ^[0-9]+$ && "$bsize" =~ ^[0-9]+$ && "$appar" =~ ^[1-9][0-9]*$ ]] \
+            || { warn "cannot read $ddisk"; continue; }
+          alloc=$(( blocks * bsize ))
+          if [ "$(( alloc * 100 / appar ))" -ge 98 ]; then
+            ok "data disk $(basename "$ddisk"): reserved ($(( alloc / 1024 / 1024 / 1024 )) of $(( appar / 1024 / 1024 / 1024 )) GiB allocated)"
+          else
+            warn "data disk $(basename "$ddisk"): NOT reserved - $(( alloc / 1024 / 1024 / 1024 )) of $(( appar / 1024 / 1024 / 1024 )) GiB allocated. Guest TRIM through discard=unmap punched it (3.42); re-reserving means the guest down"; fail=1
+          fi
+        done
       fi
     fi
   fi
@@ -994,10 +1012,14 @@ fi
 # looking alive and being useless. NoCloud matches on the filesystem label, not on the device
 # being a cdrom, so a read-only virtio disk works and is visible to the trimmed initramfs.
 # Data disk: cache=none so a database fsync reaches the device rather than the host page
-# cache; discard=unmap so TRIM inside the guest returns space to the sparse qcow2.
+# cache. discard=IGNORE, not unmap (backlog 3.42, found 2026-09-28): the data disk is RESERVED
+# (falloc) so a full volume can never fail a database write, and unmap passes every guest TRIM
+# through to the host file as a hole punch. 06a's mkfs TRIMmed the whole device and released
+# all 161 GB of the reservation on each of host-1..3 within the hour; the guest's weekly
+# fstrim.timer would keep doing it. A reserved disk has nothing to give back - so ignore.
 DATA_DISK_ARGS=()
 if [ -n "$DATA_DISK" ]; then
-  DATA_DISK_ARGS=(--disk "path=$DATA_DISK,format=qcow2,bus=virtio,cache=none,io=native,discard=unmap")
+  DATA_DISK_ARGS=(--disk "path=$DATA_DISK,format=qcow2,bus=virtio,cache=none,io=native,discard=ignore")
 fi
 
 # host-passthrough: the guest sees the host CPU's real model and flags, not a generic one.

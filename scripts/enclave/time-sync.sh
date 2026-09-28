@@ -2,10 +2,14 @@
 # =========================================================================================
 # time-sync.sh - give the enclave one clock.
 #
-#   sudo ./time-sync.sh master [--upstream <host>...]
+#   sudo ./time-sync.sh master [--upstream <host>... [--slew]]
 #                                 this machine becomes the enclave time source. With
 #                                 --upstream it is disciplined by a real reference and
-#                                 serves that onward - clients need no change.
+#                                 serves that onward - clients need no change. --slew adopts
+#                                 it on a RUNNING enclave: never a jump, TIME_SLEW_PPM at most.
+#   sudo ./time-sync.sh reference [--remove]
+#                                 ON stage-01, LAB ONLY: serve real time to the time master
+#                                 and nothing else, so it can be re-anchored (3.39, AO-13).
 #   sudo ./time-sync.sh client    follow the enclave time source
 #        ./time-sync.sh verify    read-only: are we synchronised, and to what
 #        ./time-sync.sh drift     read-only: how far is this machine from a reference
@@ -54,6 +58,12 @@
 #   requires an authoritative source will not accept it. The fix is hardware - a GPS or PTP
 #   appliance on the enclave subnet - at which point TIME_MASTER points at that instead and
 #   nothing else changes. Until then, re-anchor at each gap-open (see `drift`).
+#
+#   DECIDED 2026-09-28 by the acting AO (AO-13, backlog 3.39), after the rate was measured at
+#   +0.583 s/day: PRODUCTION gets a receive-only GPS time source feeding host-4 through
+#   `master --upstream`. The LAB is re-anchored now from stage-01 - `reference` there, then
+#   `master --upstream <stage-01's enclave address> --slew` here. ClockReferenceLost fires if
+#   a configured reference is lost and host-4 falls back to its own crystal.
 # =========================================================================================
 set -euo pipefail
 
@@ -80,6 +90,8 @@ ALLOW="${TIME_ALLOW:-10.2.20.0/24}"
 MAXPOLL="${TIME_MAXPOLL:-16}"
 CONF=/etc/chrony/chrony.conf
 DROPIN=/etc/chrony/conf.d/10-enclave.conf
+REF_DROPIN=/etc/chrony/conf.d/10-enclave-reference.conf     # stage-01 only - `reference`
+SLEW_PPM="${TIME_SLEW_PPM:-1000}"                            # --slew: 1000 ppm = 1 ms per second
 
 say()  { printf '  %s\n' "$*"; }
 ok()   { printf '  [ok] %s\n' "$*"; }
@@ -154,14 +166,18 @@ cmd_master() {
   # is worse than any real reference, so chrony prefers any genuine source and falls back to the local clock only if
   # the reference dies - which is exactly the behaviour you want from an appliance that
   # can lose GPS lock.
-  local upstream=() u
+  local upstream=() u slew=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --upstream) upstream+=("${2:?--upstream needs a host}"); shift 2 ;;
       --upstream=*) upstream+=("${1#--upstream=}"); shift ;;
+      --slew) slew=1; shift ;;
       *) die "unknown argument: $1" ;;
     esac
   done
+  [ "$slew" = 0 ] || [ ${#upstream[@]} -gt 0 ] || die "--slew adopts a reference - it needs --upstream <host>"
+  [[ "$SLEW_PPM" =~ ^[0-9]+$ ]] && [ "$SLEW_PPM" -ge 1 ] && [ "$SLEW_PPM" -le 83333 ] \
+    || die "TIME_SLEW_PPM must be a whole number of ppm, 1-83333 (chrony's own ceiling) - got '$SLEW_PPM'"
   # systemd-detect-virt EXITS 1 WHEN IT FINDS NO VIRTUALISATION. It is reporting "no", not
   # failing, but `cmd || echo unknown` therefore fires on bare metal and appends a second
   # line - so $virt became "none\nunknown" and the guard rejected the one machine that
@@ -206,10 +222,20 @@ cmd_master() {
     echo "# Who may ask. The enclave subnet and nothing else."
     echo "allow $ALLOW"
     echo ""
-    echo "# Step rather than slew for the first few updates only. A large BACKWARD step on a"
-    echo "# running cluster is its own outage - etcd and Ceph both dislike it - so after the"
-    echo "# third update chrony slews and never jumps."
-    echo "makestep 1.0 3"
+    if [ "$slew" = 1 ]; then
+      echo "# ADOPTING A REFERENCE ON A RUNNING ENCLAVE (--slew, 2026-09-28). No makestep, so chrony"
+      echo "# NEVER jumps: a backward step puts audit timestamps out of order on every machine and"
+      echo "# is its own outage for etcd. maxslewrate bounds the correction instead - $SLEW_PPM ppm is"
+      echo "# $(awk -v p="$SLEW_PPM" 'BEGIN{printf "%.1f", 1/(p*1e-6)/3600}') h per second of offset. The bound is set by the clients: host-1..3 poll"
+      echo "# this machine every ~128 s and so trail it by at most ~$(awk -v p="$SLEW_PPM" 'BEGIN{printf "%.2f", p*1e-6*128}') s while it moves."
+      echo "# Re-run 'master --upstream ...' without --slew once converged to restore boot-time stepping."
+      echo "maxslewrate $SLEW_PPM"
+    else
+      echo "# Step rather than slew for the first few updates only. A large BACKWARD step on a"
+      echo "# running cluster is its own outage - etcd and Ceph both dislike it - so after the"
+      echo "# third update chrony slews and never jumps."
+      echo "makestep 1.0 3"
+    fi
     echo "rtcsync"
   } > "$DROPIN"
   chmod 0644 "$DROPIN"
@@ -220,6 +246,11 @@ cmd_master() {
   if [ ${#upstream[@]} -gt 0 ]; then
     ok "$(hostname -s) serves $ALLOW, disciplined by: ${upstream[*]}"
     say "    clients need NO change - they already point here"
+    if [ "$slew" = 1 ]; then
+      say "    SLEWING at up to $SLEW_PPM ppm - never a step. Watch it close:"
+      say "      chronyc -n tracking      ('System time' shrinks toward 0)"
+      say "      ClockOffsetHigh fires for $(hostname -s) until it is inside ${AL_CLOCK_MAX_OFFSET:-1} s - expected, it is the truth"
+    fi
   else
     ok "$(hostname -s) is the enclave time source, serving $ALLOW"
   fi
@@ -342,7 +373,14 @@ cmd_drift_log() {
   assert_stage01
   local synced refoff best="" a b r rtt off
   synced="$(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo unknown)"
-  refoff="$(timedatectl timesync-status 2>/dev/null | awk '/Offset:/ {print $2}' | head -1)"
+  # stage-01's own error against its reference. `timedatectl timesync-status` is timesyncd's and
+  # prints NOTHING under chrony - which `reference` installs - so read whichever daemon runs.
+  # chrony: + means stage-01 is fast of NTP time.
+  if systemctl is-active --quiet chrony 2>/dev/null; then
+    refoff="$(chronyc -n tracking 2>/dev/null | awk -F': ' '/^System time/ {split($2,a," "); printf "%s%.3fms", (a[3]=="slow" ? "-" : "+"), a[1]*1000}')"
+  else
+    refoff="$(timedatectl timesync-status 2>/dev/null | awk '/Offset:/ {print $2}' | head -1)"
+  fi
   for _ in $(seq 1 "$DRIFT_SAMPLES"); do
     a="$(date +%s.%N)"
     r="$(ssh -i "$DRIFT_KEY" -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=yes \
@@ -422,6 +460,73 @@ UNIT
   systemctl start enclave-time-drift.service && ok "first measurement taken: $(tail -1 "$DRIFT_LOG")"
 }
 
+# ---------------------------------------------------------------------------- reference
+# reference: ON stage-01, LAB ONLY (backlog 3.39, decided 2026-09-28). stage-01 is outside the
+# gap and on real time; this makes it serve that time to the enclave time master and to nothing
+# else, so host-4 can be re-anchored with `master --upstream $STAGE_01_ENCLAVE --slew`.
+# Production's answer is a GPS source (AO-13) and this is never run there. At cutover stage-01's
+# enclave address goes: host-4 falls back to its own clock and ClockReferenceLost says so until
+# its upstream line is replaced (GPS) or removed (`master` with no --upstream).
+cmd_reference() {
+  need_root
+  assert_stage01
+  local eaddr="${STAGE_01_ENCLAVE:?STAGE_01_ENCLAVE not set in enclave-addresses.env}"
+  local rule=(proto udp from "$MASTER" to "$eaddr" port 123)
+  if [ "${1:-}" = "--remove" ]; then
+    rm -f "$REF_DROPIN" && ok "removed $REF_DROPIN"
+    if ufw status 2>/dev/null | grep -q '^Status: active'; then
+      ufw delete allow "${rule[@]}" && ok "ufw: 123/udp from $MASTER removed"
+    fi
+    systemctl restart chrony && ok "chrony restarted - stage-01 serves no one"
+    return 0
+  fi
+  [ -z "${1:-}" ] || die "unknown argument: $1"
+  ip -4 -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | grep -qx "$eaddr" \
+    || die "stage-01 does not hold its enclave address $eaddr - $MASTER_NAME could not reach this reference"
+
+  if ! dpkg -s chrony >/dev/null 2>&1; then
+    say "installing chrony - it REPLACES systemd-timesyncd (the packages conflict), same upstream"
+    apt-get install -y chrony || die "chrony install failed"
+  fi
+  # stage-01 is ONLINE. Its stock pools (ntp.ubuntu.com) ARE its reference and stay as shipped -
+  # commenting them out is install_chrony's job inside the gap, never here.
+  grep -q '^confdir\|^include /etc/chrony/conf.d' "$CONF" 2>/dev/null \
+    || echo 'confdir /etc/chrony/conf.d' >> "$CONF"
+  install -d -m 0755 /etc/chrony/conf.d
+  {
+    echo "# stage-01 as a time reference for the enclave. Written by time-sync.sh reference on $(date -Is)."
+    echo "# LAB ONLY (backlog 3.39, AO-13): remove with 'time-sync.sh reference --remove'."
+    echo "#"
+    echo "# The time master and nothing else may ask."
+    echo "allow $MASTER"
+    echo "#"
+    echo "# NO 'local' LINE, DELIBERATELY. If stage-01 loses its own reference it must stop being"
+    echo "# one: chrony then answers 'unsynchronised', $MASTER_NAME rejects it and falls back to its"
+    echo "# own clock, and ClockReferenceLost says so. A 'local' line here would serve stage-01's"
+    echo "# free-running clock into the enclave as though it were UTC."
+  } > "$REF_DROPIN"
+  chmod 0644 "$REF_DROPIN"
+  ok "wrote $REF_DROPIN (allow $MASTER only)"
+  if ufw status 2>/dev/null | grep -q '^Status: active'; then
+    ufw allow "${rule[@]}" comment 'enclave time reference - lab only (time-sync.sh reference, 3.39)' \
+      && ok "ufw: 123/udp from $MASTER to $eaddr"
+  fi
+  systemctl restart chrony
+  systemctl enable chrony >/dev/null 2>&1 || true
+  say "waiting for stage-01 to synchronise to its own reference (up to 60 s)"
+  local tries=0
+  while [ "$tries" -lt 30 ]; do
+    timedatectl show -p NTPSynchronized --value 2>/dev/null | grep -q yes && break
+    tries=$((tries + 1)); sleep 2
+  done
+  chronyc -n sources 2>&1 | sed 's/^/    /'
+  chronyc -n tracking 2>&1 | grep -E '^(Reference ID|Stratum|System time|Leap status)' | sed 's/^/    /'
+  timedatectl show -p NTPSynchronized --value 2>/dev/null | grep -q yes \
+    || die "stage-01 is NOT synchronised - it must not be offered as a reference until it is"
+  ok "stage-01 serves real time to $MASTER_NAME ($MASTER) on $eaddr"
+  say "  next, ON $MASTER_NAME:  sudo ./scripts/enclave/time-sync.sh master --upstream $eaddr --slew"
+}
+
 cmd_drift() {
   local ref="${1:-}"
   [ -n "$ref" ] || die "usage: $0 drift <reference-host-or-ip>
@@ -443,8 +548,9 @@ case "${1:-}" in
   drift-report) cmd_drift_report ;;
   drift-timer)  cmd_drift_timer ;;
   master) shift; cmd_master "$@" ;;
+  reference) shift; cmd_reference "$@" ;;
   client) cmd_client ;;
   verify) cmd_verify ;;
   drift)  shift; cmd_drift "$@" ;;
-  *)      sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  *)      sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

@@ -385,6 +385,7 @@ AL_BOOT_LOSS_WINDOW="${AL_BOOT_LOSS_WINDOW:-86400}" # seconds after a boot that 
 AL_CRED_MAX_AGE="${AL_CRED_MAX_AGE:-86400}"         # a credentials file older than this was forgotten (3.35)
 AL_CLOCK_MAX_OFFSET="${AL_CLOCK_MAX_OFFSET:-1}"      # seconds from its chrony source - DISA's own threshold (3.39)
 AL_CLOCK_SYNC_STALE="${AL_CLOCK_SYNC_STALE:-43200}"  # no measurement from the source in 12 h (VMs poll every 4.5 h)
+AL_DATA_DISK_RESERVED="${AL_DATA_DISK_RESERVED:-0.98}" # allocated/apparent below this: a data disk is no longer reserved (3.42)
 AL_SCAN_STALE_DAYS="${AL_SCAN_STALE_DAYS:-30}"    # STIG checklist older than this
 AL_CERT_DAYS="${AL_CERT_DAYS:-30}"                # certificate inside this many days
 AL_AIDE_STALE="${AL_AIDE_STALE:-129600}"          # 36h - dailyaidecheck has missed a day
@@ -1284,6 +1285,22 @@ groups:
           action: >-
             Exactly one machine, TIME_MASTER (host-4), runs 'time-sync.sh master'; every other
             runs 'time-sync.sh client'. 'enclave_clock_reference' shows who follows what.
+      # THE REFERENCE, LOST (2026-09-28, AO-13). The production answer to drift is a GPS
+      # appliance feeding host-4; chrony falls back to 'local stratum' when it loses the
+      # source, which keeps the enclave CONSISTENT and silently starts it drifting from UTC
+      # again (+0.583 s/day measured). Every other clock rule stays green through that.
+      - alert: ClockReferenceLost
+        expr: enclave_clock_upstream_lost == 1
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ \$labels.machine }} has a time reference configured and is running on its own clock"
+          description: "The enclave time master is set to follow a real reference and none is selected - it fell back to its local clock. The enclave stays consistent but drifts from UTC again, about 0.58 s a day as measured 2026-09-28."
+          action: >-
+            'chronyc -n sources' on {{ \$labels.machine }}. Lab: is stage-01 up, still holding its
+            enclave address, and running 'time-sync.sh reference'? Production: the GPS
+            appliance's lock and antenna.
 
       # THE META-ALERT. Without it, every rule in this group fails silently: a frozen fact
       # file keeps serving its last values forever, so nothing breaches a threshold and the
@@ -1396,6 +1413,20 @@ groups:
             'sudo ./scripts/enclave/vm-backup.sh prune' keeps BACKUP_KEEP_CHAINS sets per
             domain. If prune has been running, the volume is simply too small for the chain
             depth configured.
+      # A DATABASE DISK THAT IS NO LONGER RESERVED (3.42, 2026-09-28). Created falloc so a
+      # full volume fails the backup copy or the compose, never a database write - and undone
+      # on all three hosts within the hour by guest TRIM through discard=unmap.
+      - alert: DataDiskNotReserved
+        expr: enclave_vm_data_disk_reserved_ratio < ${AL_DATA_DISK_RESERVED}
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ \$labels.disk }} on {{ \$labels.machine }} is no longer reserved ({{ \$value | humanizePercentage }} allocated)"
+          description: "A guest data disk is meant to hold every block it may ever need. This one has given space back to the volume, so a full volume can now fail the database's writes."
+          action: >-
+            'sudo virsh domblklist <vm> --details' and the disk's driver discard setting must be
+            'ignore'. Re-reserving an existing disk means the guest down - backlog 3.42.
 
   # ---------------------------------------------------------------- registry
   # Harbor keeps answering, keeps accepting pushes, and keeps reporting images clean whatever
@@ -1738,7 +1769,13 @@ cmd_facts() {
   hfile="$(mktemp)"
   if harbor_facts > "$hfile" 2>/dev/null; then harbor_ok=1; else : > "$hfile"; fi
 
-  LC_ALL=C HARBOR_OK="$harbor_ok" CRED_FILE="$ENCLAVE_CREDENTIALS" python3 - > "$tmp" <<'FACTSPY'
+  # The data-disk pool, for the reservation fact (backlog 3.42). Read in a subshell so
+  # vm-specs.env contributes this one value and nothing else to this shell.
+  local dpool=""
+  [ -r "$HERE/vm-specs.env" ] && dpool="$( . "$HERE/vm-specs.env" >/dev/null 2>&1; printf '%s' "${VM_POOL_DATA:-}")"
+
+  LC_ALL=C HARBOR_OK="$harbor_ok" CRED_FILE="$ENCLAVE_CREDENTIALS" DATA_POOL="$dpool" \
+    CHRONY_DROPIN="/etc/chrony/conf.d/10-enclave.conf" python3 - > "$tmp" <<'FACTSPY'
 import os, sys, glob, csv, time, subprocess, collections, calendar, json, re
 
 OUT = []
@@ -1971,11 +2008,38 @@ if len(fields) >= 14:
         reftime, systime = float(fields[3]), float(fields[4])
         lastoff, rootdelay, rootdisp = float(fields[5]), float(fields[10]), float(fields[11])
         leap = fields[13].strip()
-        master = refid.upper() == "7F7F0101"
+        # MASTER = CONFIGURED OR ACTING (2026-09-28). This used to be "the reference is LOCAL",
+        # which holds only while host-4 free-runs. The moment it follows a real reference -
+        # stage-01 in the lab, a GPS appliance in production (AO-13) - its reference is that
+        # source, and the enclave would report ZERO masters and fire ClockMasterNotSingle.
+        # Configured: `time-sync.sh master` wrote `local stratum` into this machine's drop-in,
+        # the same test `verify` uses. Acting: chrony is on its own crystal right now. Either
+        # counts, so a SECOND machine falling back to a local clock (MAAS's 'local stratum 8
+        # orphan', 2026-09-08) still makes two masters and still fires.
+        configured, upstreams = False, 0
+        try:
+            with open(os.environ.get("CHRONY_DROPIN") or "/etc/chrony/conf.d/10-enclave.conf") as f:
+                for line in f:
+                    w = line.split()
+                    if w[:2] == ["local", "stratum"]:
+                        configured = True
+                    elif w[:1] == ["server"]:
+                        upstreams += 1
+        except OSError:
+            pass
+        local_ref = refid.upper() == "7F7F0101"
+        master = configured or local_ref
         emit("enclave_clock_synced", 0 if leap.lower().startswith("not sync") else 1,
              help="1 unless chrony reports 'Not synchronised' - from chronyc, NOT node_timex_sync_status")
         emit("enclave_clock_master", 1 if master else 0,
-             help="1 on the machine whose chrony reference is LOCAL - the enclave time master. Exactly one should")
+             help="1 on the enclave time master: configured by time-sync.sh master, or running on its own clock. Exactly one should")
+        if configured:
+            # Only the configured master has upstreams worth counting - a client's drop-in
+            # carries one `server` line, host-4, and that is not a reference.
+            emit("enclave_clock_upstreams", upstreams,
+                 help="real time references in the master's drop-in: 0 free-running, GPS or stage-01 otherwise")
+            emit("enclave_clock_upstream_lost", 1 if (upstreams and local_ref) else 0,
+                 help="1 when the master has a reference configured and is running on its own clock instead")
         emit("enclave_clock_stratum", stratum, help="chrony stratum - the master's local stratum plus hops")
         emit("enclave_clock_offset_seconds", systime,
              help="this clock's offset from its chrony source (chronyc 'System time'). NOT an offset from UTC")
@@ -1985,7 +2049,7 @@ if len(fields) >= 14:
         emit("enclave_clock_root_delay_seconds", rootdelay, help="network delay back to the reference")
         emit("enclave_clock_last_sync_seconds", reftime,
              help="unix time chrony last took a measurement from its reference - its age is the staleness")
-        emit("enclave_clock_reference", 1, {"ref": "LOCAL" if master else (refname or refid)},
+        emit("enclave_clock_reference", 1, {"ref": "LOCAL" if local_ref else (refname or refid)},
              help="which source this clock follows")
         SRC["clock"] = 1
     except (ValueError, IndexError):
@@ -1994,6 +2058,25 @@ elif rc == 127:
     pass                          # no chronyc here: no clock facts at all, and no source_ok row claiming one
 else:
     SRC["clock"] = 0
+
+# ------------------------------------------------------------------ data disks RESERVED
+# Backlog 3.42, found 2026-09-28. A database disk is created preallocated (falloc) so that a
+# full volume can never fail a database write. On all three hosts the reservation was gone
+# within the hour: the disk was attached discard=unmap, and the guest's mkfs TRIMmed every
+# block straight through to the host file - 161 GB released per host, and nothing noticed.
+# Allocated against apparent size, per disk: a reserved qcow2 reads ~1.0, a punched one reads
+# whatever the guest has actually written. Hypervisors with a data pool only.
+dp = os.environ.get("DATA_POOL") or ""
+if dp and os.path.isdir(dp):
+    for p in sorted(glob.glob(os.path.join(dp, "*-data.qcow2"))):
+        try:
+            st = os.stat(p)
+            if st.st_size > 0:
+                emit("enclave_vm_data_disk_reserved_ratio", round(st.st_blocks * 512 / st.st_size, 4),
+                     {"disk": os.path.basename(p)},
+                     help="allocated / apparent size of a guest data disk - a reserved (falloc) disk reads ~1.0 (3.42)")
+        except OSError:
+            pass
 
 # ------------------------------------------------------------------------- USB storage
 # V-270718 checks modprobe.d and NEVER lsmod, so this reads the same place the control does.

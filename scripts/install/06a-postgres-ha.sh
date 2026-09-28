@@ -453,7 +453,11 @@ cmd_patroni() {
     n="$(printf '%s\n' "$cand" | grep -c . || true)"
     [ "$n" -eq 1 ] || die "expected exactly ONE blank data disk, found $n: ${cand:-none}. Refusing to guess which disk to format."
     say "formatting $cand ($(lsblk -dno SIZE "$cand")) as ext4, label $PG_LABEL - it is blank"
-    mkfs.ext4 -q -L "$PG_LABEL" "$cand"
+    # -E nodiscard: mkfs TRIMs the whole device by default, and on 2026-09-28 that TRIM went
+    # through the host's discard=unmap and released every reserved block of all three data
+    # disks (backlog 3.42). The host now attaches data disks discard=ignore; this is the second
+    # lock, so a disk attached the old way is still not un-reserved by being formatted.
+    mkfs.ext4 -q -E nodiscard -L "$PG_LABEL" "$cand"
     dev="$cand"
   fi
   install -d -m 0755 "$PG_MNT"

@@ -434,7 +434,10 @@ older than the one that had just finished.
 | `enclave_credentials_file_present` | — | `stat` of `/etc/enclave/credentials.env` — never opened | should be 1 only during hardening (3.35) |
 | `enclave_credentials_file_mtime_seconds` | — | the same file's mtime (`install` sets it at placement) | its age |
 | `enclave_clock_synced` | — | `chronyc -n -c tracking`, leap status | 0 = chrony has no usable source (3.39) |
-| `enclave_clock_master` | — | same, reference `LOCAL` (7F7F0101) | 1 on the time master; exactly one machine should |
+| `enclave_clock_master` | — | the drop-in's `local stratum` line **or** reference `LOCAL` (7F7F0101) | 1 on the time master; exactly one machine should. *Changed 2026-09-28:* it was "reference is LOCAL" alone, which reads 0 the moment host-4 follows a real reference (stage-01 in the lab, GPS in production). Configured or acting, so a second machine on its own clock still counts |
+| `enclave_clock_upstreams` | — | `server` lines in the **master's** drop-in | real references configured: 0 = free-running (master only) |
+| `enclave_clock_upstream_lost` | — | same, and reference `LOCAL` | 1 = a reference is configured and none is selected. The master fell back to its own crystal (master only) |
+| `enclave_vm_data_disk_reserved_ratio` | `disk` | `stat` of each `VM_POOL_DATA/*-data.qcow2`, allocated / apparent | ~1.0 = reserved (falloc). Lower = guest TRIM punched it (3.42, 2026-09-28). Hypervisors with a data pool only |
 | `enclave_clock_offset_seconds` | — | same, "System time" | offset from its **chrony source** — not from UTC |
 | `enclave_clock_last_sync_seconds` | — | same, reference time | when it last measured its source; the age is the staleness |
 | `enclave_clock_stratum` · `_last_offset_seconds` · `_root_delay_seconds` · `_root_dispersion_seconds` | — | same | chrony's own error terms |
@@ -580,6 +583,7 @@ pager that trains people to ignore it.
 | `HighCPU` | CPU > 85% | 10m | warning |
 | `MemoryPressure` | MemAvailable < 10% | 10m | warning |
 | `FilesystemFillingWarning` | free < 20% | 15m | warning |
+| `DataDiskNotReserved` | a guest data disk's allocated/apparent < `AL_DATA_DISK_RESERVED` (0.98) | 1h | warning |
 | `FilesystemFillingCritical` | free < 10% | 5m | critical |
 | `AuditFilesystemFilling` | `/var/log/audit` free < 25% | 5m | critical |
 | `FilesystemWillFillSoon` | `predict_linear` over 6h says full within 4h | 30m | warning |
@@ -601,7 +605,8 @@ pager that trains people to ignore it.
 | `ClockNotSynchronised` | chrony reports "Not synchronised" | 30m | warning |
 | `ClockOffsetHigh` | \|offset from its source\| > `AL_CLOCK_MAX_OFFSET` (1 s, DISA's threshold) | 15m | warning |
 | `ClockSyncStale` | a non-master has not measured its source in `AL_CLOCK_SYNC_STALE` (12 h) | 15m | warning |
-| `ClockMasterNotSingle` | not exactly one machine following `LOCAL` (only once any clock facts exist) | 30m | warning |
+| `ClockMasterNotSingle` | not exactly one time master, configured or on its own clock (only once any clock facts exist) | 30m | warning |
+| `ClockReferenceLost` | the master has a reference configured and is on its own clock (`enclave_clock_upstream_lost`) | 30m | warning |
 | `ComplianceFactsStale` | facts older than 1h | 15m | critical |
 | **backups** | | | |
 | `BackupMissed` | no complete set in 26h | 30m | critical |

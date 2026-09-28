@@ -1258,8 +1258,9 @@ groups:
           summary: "{{ \$labels.machine }}'s clock is {{ \$value | humanize }} s from its source"
           description: "More than ${AL_CLOCK_MAX_OFFSET} s between {{ \$labels.machine }} and the enclave time master - DISA's threshold for correcting it. etcd, Ceph and TLS fail on skew before anything else notices."
           action: >-
-            'chronyc -n tracking' on {{ \$labels.machine }}. chrony slews rather than steps once it
-            is running; a large offset that is not shrinking means it is not reaching host-4.
+            'chronyc -n tracking' on {{ \$labels.machine }}. Under STIG UBTU-24-600180 (makestep 1 -1)
+            chrony steps any offset over 1 s at its next update, so one that persists means it is
+            not accepting host-4 - look for ^? or ^~ in 'chronyc -n sources'.
       - alert: ClockSyncStale
         expr: >-
           enclave_clock_master == 0

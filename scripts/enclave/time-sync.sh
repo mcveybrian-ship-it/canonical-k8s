@@ -6,7 +6,8 @@
 #                                 this machine becomes the enclave time source. With
 #                                 --upstream it is disciplined by a real reference and
 #                                 serves that onward - clients need no change. --slew adopts
-#                                 it on a RUNNING enclave: never a jump, TIME_SLEW_PPM at most.
+#                                 it without a jump - and REFUSES on a STIG-hardened machine,
+#                                 where UBTU-24-600180's `makestep 1 -1` makes it a step anyway.
 #   sudo ./time-sync.sh reference [--remove]
 #                                 ON stage-01, LAB ONLY: serve real time to the time master
 #                                 and nothing else, so it can be re-anchored (3.39, AO-13).
@@ -61,9 +62,20 @@
 #
 #   DECIDED 2026-09-28 by the acting AO (AO-13, backlog 3.39), after the rate was measured at
 #   +0.583 s/day: PRODUCTION gets a receive-only GPS time source feeding host-4 through
-#   `master --upstream`. The LAB is re-anchored now from stage-01 - `reference` there, then
-#   `master --upstream <stage-01's enclave address> --slew` here. ClockReferenceLost fires if
-#   a configured reference is lost and host-4 falls back to its own crystal.
+#   `master --upstream`. The LAB was re-anchored the same day from stage-01 (`reference` there,
+#   `master --upstream <stage-01's enclave address>` here). ClockReferenceLost fires if a
+#   configured reference is lost and host-4 falls back to its own crystal.
+#
+#   ON THIS ENCLAVE A CORRECTION OVER 1 s IS A STEP, BY STIG. UBTU-24-600180 (SRG-OS-000356,
+#   rule chronyd_sync_clock) writes `makestep 1 -1` into /etc/chrony/chrony.conf on every
+#   hardened machine: step whenever the offset exceeds 1 s, forever. The drop-ins below cannot
+#   override it. Found the hard way 2026-09-28: `--slew` was meant to pull host-4 back 10.9 s
+#   at 1 ms/s, and host-4 stepped on its first update instead - while every client, polling
+#   every 1 min (host-1) to 18 h (the service VMs), stayed 10.9 s ahead and marked host-4
+#   "too variable" (^~) rather than follow. SO: a correction over 1 s is a COORDINATED STEP.
+#   `master` here, then `sudo systemctl restart chrony` on EVERY client at once, so the split
+#   lasts minutes, not the service VMs' poll interval. Do it in a window - every machine's
+#   audit trail gets one backward discontinuity of the correction's size.
 # =========================================================================================
 set -euo pipefail
 
@@ -131,7 +143,9 @@ install_chrony() {
   # Commented, not deleted - the original stays visible and the change is self-describing.
   # Only $CONF is touched; the enclave's own directives live in conf.d and are never matched.
   local n
-  n="$(grep -cE '^[[:space:]]*(server|pool)[[:space:]]' "$CONF" 2>/dev/null || echo 0)"
+  # `|| true`, not `|| echo 0`: grep -c PRINTS 0 and exits 1 on no match, so `|| echo 0` made
+  # n="0<newline>0" and the test below died with "integer expression expected" (2026-09-28).
+  n="$(grep -cE '^[[:space:]]*(server|pool)[[:space:]]' "$CONF" 2>/dev/null || true)"
   if [ "${n:-0}" -gt 0 ]; then
     # Timestamped copy first, so the original file can always be put back by hand.
     cp -a "$CONF" "/var/backups/chrony.conf.$(date +%Y%m%dT%H%M%S)"
@@ -176,6 +190,17 @@ cmd_master() {
     esac
   done
   [ "$slew" = 0 ] || [ ${#upstream[@]} -gt 0 ] || die "--slew adopts a reference - it needs --upstream <host>"
+  # THE STIG'S makestep WINS over anything a drop-in says (2026-09-28). Refuse rather than let
+  # an option promise a slew and deliver a step.
+  local stig_step=""
+  stig_step="$(grep -hE '^[[:space:]]*makestep[[:space:]]+[0-9.]+[[:space:]]+-1' "$CONF" 2>/dev/null | head -1 || true)"
+  [ "$slew" = 0 ] || [ -z "$stig_step" ] || die "--slew cannot work on this machine: $CONF has '$stig_step'.
+      That is STIG UBTU-24-600180 - step whenever the offset exceeds 1 s, forever - and no
+      drop-in overrides it. A correction over 1 s here IS a step, and the clients will not
+      follow until they next poll (up to 18 h). Do it as a coordinated step instead:
+        1. sudo ./time-sync.sh master --upstream <host>        (this machine steps)
+        2. sudo systemctl restart chrony   on EVERY client     (each steps within seconds)
+      in a maintenance window - every audit trail gets one backward jump. Runbook 2.10."
   [[ "$SLEW_PPM" =~ ^[0-9]+$ ]] && [ "$SLEW_PPM" -ge 1 ] && [ "$SLEW_PPM" -le 83333 ] \
     || die "TIME_SLEW_PPM must be a whole number of ppm, 1-83333 (chrony's own ceiling) - got '$SLEW_PPM'"
   # systemd-detect-virt EXITS 1 WHEN IT FINDS NO VIRTUALISATION. It is reporting "no", not
@@ -191,6 +216,11 @@ cmd_master() {
       $MASTER_NAME ($MASTER)."
 
   install_chrony
+  if [ ${#upstream[@]} -gt 0 ] && [ -n "$stig_step" ]; then
+    warn "$CONF has '$stig_step' (STIG UBTU-24-600180): if this machine is more than 1 s from"
+    warn "the new reference it STEPS at the first update, and every client stays on the old time"
+    warn "until it next polls. Restart chrony on EVERY client right after this (runbook 2.10)."
+  fi
   {
     echo "# Enclave time master. Written by time-sync.sh on $(date -Is)."
     echo "#"
@@ -463,7 +493,8 @@ UNIT
 # ---------------------------------------------------------------------------- reference
 # reference: ON stage-01, LAB ONLY (backlog 3.39, decided 2026-09-28). stage-01 is outside the
 # gap and on real time; this makes it serve that time to the enclave time master and to nothing
-# else, so host-4 can be re-anchored with `master --upstream $STAGE_01_ENCLAVE --slew`.
+# else, so host-4 can be re-anchored with `master --upstream $STAGE_01_ENCLAVE` - a coordinated
+# step on this STIG-hardened enclave, see THE HONEST LIMIT above.
 # Production's answer is a GPS source (AO-13) and this is never run there. At cutover stage-01's
 # enclave address goes: host-4 falls back to its own clock and ClockReferenceLost says so until
 # its upstream line is replaced (GPS) or removed (`master` with no --upstream).
@@ -524,7 +555,8 @@ cmd_reference() {
   timedatectl show -p NTPSynchronized --value 2>/dev/null | grep -q yes \
     || die "stage-01 is NOT synchronised - it must not be offered as a reference until it is"
   ok "stage-01 serves real time to $MASTER_NAME ($MASTER) on $eaddr"
-  say "  next, ON $MASTER_NAME:  sudo ./scripts/enclave/time-sync.sh master --upstream $eaddr --slew"
+  say "  next, ON $MASTER_NAME:  sudo ./scripts/enclave/time-sync.sh master --upstream $eaddr"
+  say "  then AT ONCE, on every client:  sudo systemctl restart chrony   (runbook 2.10 - it is a step)"
 }
 
 cmd_drift() {
@@ -539,8 +571,10 @@ cmd_drift() {
   chronyd -Q -t 10 "server $ref iburst" 2>&1 | sed 's/^/    /' || true
   say ""
   say "  A large offset is not automatically something to correct. Stepping a running"
-  say "  cluster's clock BACKWARD is its own outage. If the offset matters, correct it"
-  say "  during a maintenance window, master first, and let the clients follow."
+  say "  cluster's clock BACKWARD is its own outage, and on a hardened machine (STIG"
+  say "  UBTU-24-600180, makestep 1 -1) any correction over 1 s IS a step. Correct it in a"
+  say "  maintenance window: master first, then restart chrony on EVERY client at once -"
+  say "  'letting them follow' leaves them split from the master until they next poll."
 }
 
 case "${1:-}" in

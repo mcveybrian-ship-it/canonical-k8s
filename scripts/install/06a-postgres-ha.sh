@@ -279,6 +279,12 @@ PG_MON_OSUSER="${PG_MON_OSUSER:-prometheus}"        # the account prometheus-pos
 PG_MON_CONN_LIMIT="${PG_MON_CONN_LIMIT:-3}"
 PG_EXPORTER_PORT="${PG_EXPORTER_PORT:-9187}"
 PG_EXPORTER_ENV="${PG_EXPORTER_ENV:-/etc/default/prometheus-postgres-exporter}"
+# pgaudit for the monitoring role (decided 2026-09-28, a tailoring for the org baseline 6a.10):
+# 'none'. Measured on pg-01: one exporter scrape = 20 audit lines of pgmonitor reading statistics
+# views, ~4.5 MB/hour per node at a 15 s scrape - 6x the node's whole syslog - and the role holds
+# pg_monitor only, so it cannot read table data. Its LOGINS stay audited (log_connections).
+PG_MON_PGAUDIT="${PG_MON_PGAUDIT:-none}"
+PG_PGAUDIT_LOG="${PG_PGAUDIT_LOG:-ddl,role,read,write}"
 
 # The pg nodes, the K8S workers - from the address file, as `ip name` pairs.
 addr_pairs() {   # addr_pairs PREFIX_REGEX
@@ -359,7 +365,7 @@ bootstrap:
         log_connections: "on"
         log_disconnections: "on"
         shared_preload_libraries: pgaudit
-        pgaudit.log: ddl,role,read,write
+        pgaudit.log: $PG_PGAUDIT_LOG
         pgaudit.log_catalog: "on"
   initdb:
     - encoding: UTF8
@@ -459,6 +465,8 @@ BEGIN
 END
 \$\$;
 GRANT pg_monitor TO $PG_MON_ROLE;
+-- pgaudit.log is superuser-only: $PG_MON_ROLE cannot set it back, or set it for anyone else.
+ALTER ROLE $PG_MON_ROLE SET pgaudit.log = '$PG_MON_PGAUDIT';
 SQL
 SH
 }
@@ -606,6 +614,16 @@ cmd_patroni_check() {
     *" $PG_MON_ROLE="*" replicator="*" rewinder="*) ok "connection limits: $v (V-261857)" ;;
     *) warn "connection limits: '${v}' - $PG_MON_ROLE, replicator or rewinder is missing (V-261857; $PG_MON_ROLE comes from 'monitor')"; bad=1 ;;
   esac
+  # pgaudit: the global classes as decided, and pgmonitor the ONLY role with its own pgaudit setting
+  # (tailoring 2026-09-28) - a second exempted role is exactly the quiet change this should catch.
+  v="$(pg_sql "SELECT setting FROM pg_settings WHERE name='pgaudit.log'")"
+  [ "$v" = "$PG_PGAUDIT_LOG" ] && ok "pgaudit.log = $v" || { warn "pgaudit.log = '$v', expected '$PG_PGAUDIT_LOG'"; bad=1; }
+  v="$(pg_sql "SELECT string_agg(r.rolname||':'||c, ' ' ORDER BY r.rolname) FROM pg_db_role_setting s JOIN pg_roles r ON r.oid=s.setrole, unnest(s.setconfig) c WHERE c LIKE 'pgaudit.%'")"
+  case "$v" in
+    "$PG_MON_ROLE:pgaudit.log=$PG_MON_PGAUDIT") ok "pgaudit per-role: only $PG_MON_ROLE (pgaudit.log=$PG_MON_PGAUDIT - the decided tailoring)" ;;
+    "") warn "pgaudit per-role: $PG_MON_ROLE carries no pgaudit.log setting - 'monitor' sets it"; bad=1 ;;
+    *) warn "pgaudit per-role settings: '$v' - only $PG_MON_ROLE:pgaudit.log=$PG_MON_PGAUDIT is decided"; bad=1 ;;
+  esac
   for s in ssl ssl_min_protocol_version password_encryption log_destination logging_collector log_file_mode synchronous_commit; do
     say "  $(pg_sql "SELECT name||' = '||setting FROM pg_settings WHERE name='$s'")"
   done
@@ -654,7 +672,7 @@ cmd_monitor() {
   # ---- 2. the role, on the primary only ----
   if [ "$role" = primary ]; then
     render_monitor_sql | runuser -u postgres -- sh -s || die "could not create $PG_MON_ROLE"
-    ok "role $PG_MON_ROLE: pg_monitor, CONNECTION LIMIT $PG_MON_CONN_LIMIT, no password (created on the primary)"
+    ok "role $PG_MON_ROLE: pg_monitor, CONNECTION LIMIT $PG_MON_CONN_LIMIT, no password, pgaudit.log=$PG_MON_PGAUDIT (set on the primary)"
   else
     [ "$(pg_sql "SELECT count(*) FROM pg_roles WHERE rolname='$PG_MON_ROLE'")" = 1 ] \
       || die "$ME is a replica and $PG_MON_ROLE does not exist yet - run 'monitor' on the primary first"

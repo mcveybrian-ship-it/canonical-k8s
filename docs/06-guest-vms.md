@@ -238,6 +238,11 @@ verified list before it bootstraps. The firewall is never off; it is widened onc
 > **As built: [`docs/06a-postgres-ha.md`](06a-postgres-ha.md)** — how pg-01..03 went from this
 > mechanism to a running PostgreSQL cluster, with diagrams. The at-rest evidence below was read
 > 2026-09-28: both pools on host-1..3 sit on LVM over LUKS.
+>
+> **Data disks are RESERVED and attached `discard=ignore`** (backlog 3.42, 2026-09-28) — a guest's
+> TRIM once released every reserved block through `discard=unmap`. If a reservation is ever lost
+> (`DataDiskNotReserved` fires), `sudo ./03-compose-vm.sh <vm> --reserve-data` restores it with the
+> guest **shut off**; for a pg node, take it out with `06a leave` first (06a doc §9.2).
 
 The data disk must be mounted by UUID or LABEL before `finish` removes the seed (4.5) — the composer
 already warns; `finish` enforces it. The WAL archive and the at-rest evidence (`lsblk -s` shows

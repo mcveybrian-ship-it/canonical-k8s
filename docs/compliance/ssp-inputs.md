@@ -70,6 +70,10 @@ inventoried rather than assumed:
   BoringCrypto** — its TLS is Go's own, not a validated module. Configured to approved algorithms
   only (TLS 1.2 ECDHE-RSA AES-GCM, mutual TLS), except TLS 1.3 ChaCha20, which Go cannot disable.
   **Claim "approved algorithms, non-validated module" — POA&M ENG-68**, never "FIPS-validated".
+- **pgBackRest** (WAL archive and backups, B-06a slice 5) does **not** bring its own: it links the
+  host's OpenSSL (`libssl3t64`, a package dependency), so its TLS is the §1.2 module — say it the
+  §1.2 way. Listed here only so the inventory is complete. Its repositories are encrypted by the
+  volumes' LUKS (Kernel Crypto API, #5215), not by pgBackRest's own cipher (decided 2026-09-28).
 - **Container images** (Harbor on `svc-harbor-01`, and every workload image) carry their own
   userland libraries, which are **not** the host's validated modules. Their crypto must be listed
   and either justified or kept off the data path.
@@ -364,7 +368,7 @@ the backups, and in the mirrored second copy, indefinitely.
 | Live database | **The CAD application's own retention/purge**, keyed to case closure and the criminal/non-criminal flag, honouring holds. The enclave does not write deletes against a vendor schema. | ⬜ vendor must **demonstrate** it — an acceptance requirement |
 | Nightly VM backups | A **full backup whenever the newest full is older than 30 days** (`BACKUP_FULL_MAX_DAYS`), **2 chains kept** → a deleted record leaves every backup within **~60 days** | ⬜ build in `vm-backup.sh` |
 | Second copy (host-1) | mirrors the primary with `rsync --delete` — inherits the same bound | ✅ |
-| WAL archive | retained only back to the oldest retained base backup | ⬜ B-06a |
+| WAL archive | pgBackRest keeps 2 fulls per store; WAL is kept back to the oldest retained full (≈ 7–14 days) and pruned with it — on host-4 and host-3 alike | ✅ built 2026-09-28 (B-06a slice 5) |
 | Offsite copy (backlog 3.29) | media rotated at most every 60 days; retired media sanitised (3.19, MP-6) | ⬜ 3.29 |
 | Legal / litigation hold | per-record hold in the application; for backups, a **hold switch that suspends pruning** (backups cannot hold one record, so they hold all), logged with who and why | ⬜ build |
 | Drift | alert when the oldest backup exceeds ~70 days, or a hold outlives its review date | ⬜ build (alert path proven, B-09a) |
@@ -407,10 +411,19 @@ the three guests holding state nothing can regenerate (`svc-mgmt-01`'s issuing C
 directory, and the copy is verified by re-reading the far end rather than by trusting an exit
 status.
 
-**What remains true.** The WAL archive is still unbuilt and still destined for `host-4`
-(`poam.md` ENG-04), so the *roll-forward* half of this finding is untouched — and it is the half
-that should be designed off `host-4` before `pg-01..03` exist, while it costs nothing. Both
-copies also remain in one room, so §3.1 is unaffected: a second copy is not an offsite copy.
+~~**What remains true.** The WAL archive is still unbuilt and still destined for `host-4`
+(`poam.md` ENG-04), so the *roll-forward* half of this finding is untouched.~~
+
+✅ **Roll-forward half resolved — 2026-09-28 (B-06a slice 5).** pgBackRest archives every WAL file
+to **two live stores**, host-4 (its spare NVMe) and host-3, over TLS with enclave-CA certificates;
+each store takes its own weekly full and daily differential backups. **A point-in-time restore was
+proven from each store independently** — restored to a marked moment, the row written before it
+present and the row written after it absent (`docs/06a-postgres-ha.md` §10.7) — so losing `host-4`
+no longer loses the ability to roll forward (POA&M ENG-04 closed; ENG-02 reduced). Suggested
+controls **CP-9**, **CP-10**, CP-6.
+
+**What remains true.** Every copy is in one room, so §3.1 is unaffected: a second copy is not an
+offsite copy (backlog 3.29).
 
 ### 3.3 Backups are verified, and the verification has a known blind spot
 
@@ -882,6 +895,17 @@ Triaged 2026-09-14; the set is identical on every machine. Nothing further can b
 technically. Source: `docs/open-questions.md` Q25.
 
 ---
+
+### 5.2a 🗳️ The database's monitoring role is excluded from pgaudit session logging (2026-09-28)
+
+A tailoring for the PostgreSQL org baseline (backlog 6a.10), decided by the acting AO. `pgmonitor` —
+postgres-exporter's login, member of `pg_monitor` only, local-socket peer login only, CONNECTION
+LIMIT 3, no password — carries `pgaudit.log = 'none'` (superuser-only to set; it cannot undo it).
+**Measured first:** one scrape wrote 20 audit lines of the monitor reading statistics views,
+~4.5 MB/hour per node at a 15 s scrape — six times the node's entire syslog, kept a year (3.36c).
+**Proven after:** a scrape writes 0 audit lines, and the role's connections are still logged.
+Every other role keeps `ddl,role,read,write`, and `06a patroni-check` fails if any other role gains
+a pgaudit setting. Suggested controls AU-2, AU-12, AU-4.
 
 ### 5.3 ✅ No audit records are dropped while a machine boots (2026-09-26, backlog 3.33)
 

@@ -373,7 +373,7 @@ the gap. Q6 — the container-image bundle size — still gates Harbor's disk si
 | `svc-repo-01` | `10.2.20.162` | **air-gapped** | **SERVING 2026-09-03.** 318 GB mirror over nginx, 9/9 suites verified, keys at `/keys/`, the 3 PPA debs at `/debs/`. host-4 installs from it |
 | `svc-harbor-01` | `10.2.20.163` | **air-gapped** | On `host-4`. Harbor registry; hardened 2026-09-14 (the portability test, above) |
 | `svc-obs-01` | `10.2.20.164` | **air-gapped** | On `host-4`. Prometheus/Alertmanager/Grafana, and the audit-offload collector (`rrsync -wo /srv/audit-offload`) |
-| `pg-01..03` | `10.2.20.165-167` | **air-gapped** | **One per `host-1..3`.** ✅ **COMPOSED `--harden` 2026-09-27**, hardened themselves unattended (211/4, Evaluate-STIG Open 4). PostgreSQL 16 under Patroni with its own etcd — `06a-postgres-ha.sh`, slices 1–3 passed 2026-09-28; pg-01 is the leader at the time of writing, which **changes on failover** — ask `patronictl list`, do not assume |
+| `pg-01..03` | `10.2.20.165-167` | **air-gapped** | **One per `host-1..3`.** ✅ **COMPOSED `--harden` 2026-09-27**, hardened themselves unattended (211/4, Evaluate-STIG Open 4). PostgreSQL 16 under Patroni with its own etcd — `06a-postgres-ha.sh`, **slices 1–5 passed 2026-09-28**: monitored, failover proven by a power cut, backed up live to host-4 and host-3 with a point-in-time restore proven from each (`docs/06a-postgres-ha.md`). **The leader moves** — pg-01, pg-02 and pg-03 have each led on 2026-09-28; ask `patronictl list`, never assume |
 
 **THE MIRROR — 320 GB, seven archives.** Landscape added 2026-09-04 (Track B item 1).
 

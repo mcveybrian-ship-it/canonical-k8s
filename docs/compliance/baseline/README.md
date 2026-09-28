@@ -57,7 +57,7 @@ substance:
 | Configuration Management Plan | [`cm-plan.md`](cm-plan.md) | ✅ **Written 2026-09-17.** Points at the runbook, the parameter files, git history, AIDE and `apply-addresses.sh` rather than restating them. One caveat carried prominently: the GRUB `--unrestricted` state is package-managed and can revert silently |
 | Incident Response Plan | `ir-plan.md` | ⬜ Write for the inherited case by default; a system-specific IR plan for a one-operator air-gapped enclave is often inappropriate |
 | Risk Assessment Report | `rar.md` | ⬜ Raw material is good: recovery-path analysis, the TPM trade, replica-3 self-healing |
-| ISCM Strategy | [`iscm-strategy.md`](iscm-strategy.md) | ✅ **Written 2026-09-17.** Step 09a as built — 34 rules in 9 groups, facts every 15 min on five machines — with the notification gap (Q26) as its own section, and a section on the six false passes the stack produced while being built |
+| ISCM Strategy | [`iscm-strategy.md`](iscm-strategy.md) | ✅ **Written 2026-09-17.** Step 09a as built — 34 rules in 9 groups, facts every 15 min on five machines (**57 rules in 11 groups, 11 machines, 24 scrape targets as of 2026-09-28**) — with the notification gap (Q26) as its own section, and a section on the six false passes the stack produced while being built |
 | Hardware / Software Inventory | — | ⬜ **Generate, do not write.** A hand-written inventory drifts from the day it is written |
 | Boundary description + diagram | `boundary.md` | ⬜ Text exists in runbook §1.2/§3.1. The diagram is not mine to draw |
 

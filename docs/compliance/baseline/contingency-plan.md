@@ -40,10 +40,15 @@ objective — it is a description with an official-sounding name. Measure, then 
 design to the commitment. §4 gives the measured numbers that the commitment should be made
 against.
 
-**And CP-4 has no evidence of any kind, because no contingency test has ever been run.** Not a
-tabletop, not a restore, not a database failover, not a host-failure rehearsal. That is stated
-in §9 in its own section rather than buried, because it is the first thing an assessor will
-ask for and the answer is a plain no.
+~~**And CP-4 has no evidence of any kind, because no contingency test has ever been run.**~~
+**2026-09-28: the database's own contingency tests now exist — the rest of CP-4 still does not.**
+Run and recorded (`docs/06a-postgres-ha.md` §9–10): a **planned switchover**; a **power cut of the
+database leader** (`virsh destroy`), promoted and healed on two nodes in ~47 s with nobody touching
+it, the dead node rejoining by `pg_rewind`; the **synchronous-standby-lost alert** fired on purpose
+and cleared; and a **point-in-time restore from each backup store** independently. Still never run:
+a tabletop, a host-failure rehearsal, a restore of the live cluster (as opposed to a scratch
+copy), and any test of the service VMs' recovery beyond the 2026-09-20 restore (§9.2). That is stated
+in §9 in its own section.
 
 Three architectural limitations are stated in §2 and §3 rather than deferred to a risk
 appendix: both recovery paths terminate on one machine, the design does not survive a site
@@ -134,8 +139,10 @@ it off, losing every standby silently degrades the primary to asynchronous — t
 condition that lost the previous database. With it on, writes block instead. Off plus an alert
 is the right answer here **only because the monitoring stack exists**: a rule against Patroni's
 metrics catches the degradation inside fifteen minutes, and a blocked write path at 03:00 with
-one operator on site is the worse outcome. **That alert rule is owed and does not exist yet**,
-which means the decision is not yet defensible (runbook §9a.3, `poam.md` ENG-06).
+one operator on site is the worse outcome. ~~That alert rule is owed and does not exist yet~~ —
+✅ **built and proven live 2026-09-28** (`PostgresSyncStandbyLost`, critical after 5 min: it fired
+when both replicas were stopped on purpose and cleared when they returned; `poam.md` ENG-06 closed),
+so the decision is now defensible.
 
 Applications find the primary with no load balancer at all, using `libpq`'s native multi-host
 support with `target_session_attrs=read-write` — which resolves to the Patroni leader by
@@ -175,7 +182,7 @@ argument (runbook §10b).
 | Path | Lands on | Physical host |
 |---|---|---|
 | Whole-guest backup sets | `/mnt/vmbackup` | **host-4** |
-| The proposed PostgreSQL WAL archive | either `svc-repo-01` or host-4's freed M.2 space | **host-4** |
+| ~~The proposed PostgreSQL WAL archive~~ **The PostgreSQL WAL archive and backups — built 2026-09-28** | pgBackRest to **two live stores**: host-4's spare NVMe (repo1) **and** host-3 (repo2), each with its own backups | **host-4 AND host-3** |
 
 Lose host 4 and you lose the ability to restore **and** the ability to roll forward, while the
 databases on hosts 1–3 sit healthy and unrecoverable to any point but their own present state
@@ -192,6 +199,12 @@ A related detail that makes this worse rather than better: the ~500 GB freed on 
 M.2 by the disk split is genuinely **the best WAL-archive candidate available** — a dedicated
 device, off the database hosts, not mixed into the apt mirror. **It does not fix this
 limitation. It is still host 4** (runbook §9a.2).
+
+✅ **The database half is resolved — 2026-09-28 (B-06a slice 5).** The WAL archive went to host-4
+**and** host-3 as two live pgBackRest stores, each taking its own backups, and a **point-in-time
+restore was proven from each store on its own** — so losing host 4 no longer loses the database's
+roll-forward (`poam.md` ENG-04 closed, ENG-02 reduced). The whole-guest backups still land on host
+4 with a second copy on host-1, and **every copy is still in one room** (§3.2).
 
 ### 3.2 The design survives a single host failure. It does not survive a site event.
 
@@ -658,7 +671,7 @@ what the test should confirm or refute.
 
 ---
 
-## 9. CP-4 — testing. One test has been run; four have not.
+## 9. CP-4 — testing. Three have been run; three have not.
 
 **Until 2026-09-20 no contingency test of any kind had ever been performed. The guest-restore
 test has now been run and is recorded in §9.2. Everything else below is still untested, and
@@ -668,7 +681,8 @@ one passing test is not a tested plan.**
 |---|---|
 | Host-failure rehearsal (runbook §10) | **Never run** |
 | Guest restore from a backup set | ✅ **Run 2026-09-20** — all 4 service guests rebuilt from a 5-set chain and booted (§9.2). Slowest: `svc-repo-01`, 1 h 11 m |
-| PostgreSQL / Patroni failover | **Never run**, planned or unplanned |
+| PostgreSQL / Patroni failover | ✅ **Run 2026-09-28, planned and unplanned** — a timed switchover, and a power cut of the leader healed on two nodes in ~47 s with the dead node rejoining by `pg_rewind` (§9.3) |
+| PostgreSQL point-in-time restore | ✅ **Run 2026-09-28 from each backup store** into a scratch copy (§9.3). **A restore of the live cluster has not been run, or written as a procedure** |
 | Ceph degraded-state and recovery behaviour | **Never exercised** on four nodes |
 | Tabletop walkthrough | **Never held** |
 | Full site failover | Not applicable — there is no alternate site (§3.2) |
@@ -679,6 +693,19 @@ precisely because an untested failover already lost a database once (`ato-packag
 One thing has been *proved* incidentally and should not be mistaken for a test: host 4 has been
 rebooted once with all four guests returning. That is not a recovery exercise, and its own
 write-up says plainly that its success **cannot be explained** (§5.2).
+
+### 9.3 Test record — the database: failover, alerting and point-in-time restore, 2026-09-28
+
+Run on the lab cluster (pg-01..03, no application writing — so these prove promotion, rejoin,
+alerting and restorability, **not** zero data loss under load, which needs a write generator).
+Full record: `docs/06a-postgres-ha.md` §9.2–9.4 and §10.7.
+
+| Test | Result |
+|---|---|
+| Planned switchover pg-01 → pg-02 (`06a switchover`, to the sync standby) | timeline 1 → 2 at 16:35:29; pg-02 promoted in place, no restart; `PostgresFailoverHappened` fired |
+| Power cut of the leader pg-02 (`virsh destroy`) | pg-03 promoted **~34 s** after the loss (30 s TTL + one loop), timeline 3; pg-01 its sync standby at 13 s later — healed **~47 s** after the cut; etcd kept quorum on two members; pg-02 rejoined by **`pg_rewind` as `rewinder`, by certificate** (diverged at 0/50029E0, exit 0). `PostgresNoPrimary` did not fire (34 s < 1 m); `InstanceDown` did |
+| No synchronous standby (Patroni stopped on both replicas) | `PostgresSyncStandbyLost` pending 16:49:21, **critical in Alertmanager 16:54:13**, cleared 16:59:04 on their return |
+| Point-in-time restore (`06a backup-restore-test`) | marker rows either side of T = 18:49:47.404041; restored to T **from host-4's store and from host-3's store independently** (`--repo=1` / `--repo=2`): the row before T present, the row after absent, both times |
 
 ### 9.2 Test record — guest restore from backup, 2026-09-20
 

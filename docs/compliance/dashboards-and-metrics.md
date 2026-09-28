@@ -483,6 +483,22 @@ a volume holding hundreds of gigabytes, for the same answer.
 `virsh domjobinfo` **pads its fields**, and matching the line exactly once printed idle domains
 as in progress. The value is stripped of whitespace before comparison.
 
+### Database facts and scrape jobs — B-06a slices 4–5 (2026-09-28)
+
+The three pg nodes are scraped as `role: database` in three jobs: **`node`** (their OS, including
+`/var/lib/postgresql`, the filesystem whose filling stops PostgreSQL), **`patroni`** (each node's
+REST API `/metrics` over **https, verified** against the system trust store — `patroni_primary`,
+`patroni_sync_standby`, `patroni_replica`, `patroni_postgres_streaming`, `patroni_postgres_timeline`,
+`patroni_pending_restart`, `patroni_is_paused`) and **`postgres`** (postgres-exporter 0.15 as
+`pgmonitor` — `pg_up`, connections, locks, replication and `pg_stat_archiver_*`). 24 targets,
+all generated from the address file by `monitoring.sh scrape`.
+
+| metric | labels | source | meaning |
+|---|---|---|---|
+| `enclave_pgbackrest_status` | `stanza`, `repo` | `pgbackrest info` as postgres, on each **backup store** | pgBackRest's verdict on its repository: 0 ok; **99 = info unreadable** (never a missing number) |
+| `enclave_pgbackrest_last_backup_seconds` | `stanza`, `repo`, `type` | same | when the last `full` / `diff` finished in that repository |
+| `enclave_vm_data_pool_other_bytes` | `pool` | `statvfs` of `VM_POOL_DATA` minus its reserved data disks — hypervisors, real mount only | bytes on the database volume that are NOT a data disk. Baseline 28 KB (`lost+found`) |
+
 ### Patch posture — every in-gap machine
 
 | Metric | Labels | Source | Exact or dated? |
@@ -582,11 +598,11 @@ pager that trains people to ignore it.
 | **cpu / memory / filesystems** | | | |
 | `HighCPU` | CPU > 85% | 10m | warning |
 | `MemoryPressure` | MemAvailable < 10% | 10m | warning |
-| `FilesystemFillingWarning` | free < 20% | 15m | warning |
+| `FilesystemFillingWarning` | free < 20% — **except the database volume** (`AL_FS_RESERVED_MOUNTS`, from `VM_POOL_DATA`): full by design once its disks are reserved | 15m | warning |
 | `DataDiskNotReserved` | a guest data disk's allocated/apparent < `AL_DATA_DISK_RESERVED` (0.98) | 1h | warning |
-| `FilesystemFillingCritical` | free < 10% | 5m | critical |
+| `FilesystemFillingCritical` | free < 10% — same exception | 5m | critical |
 | `AuditFilesystemFilling` | `/var/log/audit` free < 25% | 5m | critical |
-| `FilesystemWillFillSoon` | `predict_linear` over 6h says full within 4h | 30m | warning |
+| `FilesystemWillFillSoon` | `predict_linear` over 6h says full within 4h. **Fires for up to 6 h after a data disk is reserved** — the line runs through the `fallocate` step — then clears | 30m | warning |
 | `FilesystemReadOnly` | `node_filesystem_readonly == 1` | 1m | critical |
 | **audit trail** | | | |
 | `AuditRecordsLost` | `delta(enclave_auditd_lost[1h]) > 0` | 5m | critical |
@@ -616,6 +632,22 @@ pager that trains people to ignore it.
 | `BackupTimerDisabled` | nightly timer inactive | 1h | warning |
 | `BackupVolumeFilling` | free below 200 GB | 30m | warning |
 | `BackupFactsMissing` | `absent(enclave_backup_dest_mounted)` | 1h | critical |
+| `DataVolumeForeignData` | > 5 GB on the database volume that is not a reserved data disk — 2026-09-27's failure | 15m | warning |
+| **database** (B-06a slice 4) | | | |
+| `PostgresSyncStandbyLost` | a primary with no synchronous standby — commits unprotected; **proven live 2026-09-28** | 5m | critical |
+| `PostgresNoPrimary` | no leader, longer than a failover | 1m | critical |
+| `PostgresMultiplePrimaries` | split brain | 1m | critical |
+| `PostgresReplicaNotStreaming` | a replica not streaming | 5m | warning |
+| `PostgresNotRunning` | Patroni up, PostgreSQL down | 5m | warning |
+| `PostgresFailoverHappened` | the timeline changed — any promotion | — | warning |
+| `PatroniPendingRestart` | a setting shown but not applied | 1h | warning |
+| `PatroniPaused` | automatic failover off | 30m | warning |
+| `PostgresExporterCannotConnect` | `pg_up == 0` | 5m | warning |
+| **database backups** (B-06a slice 5) | | | |
+| `DatabaseBackupMissed` | no backup finished on a store in 26 h | 15m | warning |
+| `DatabaseFullBackupStale` | no full in 8 days | 1h | warning |
+| `DatabaseBackupStoreError` | pgBackRest's verdict on a store is not ok (99 = unreadable) | 30m | critical |
+| `DatabaseArchivingFailing` | archive failures rising and nothing archived for 15 min | 5m | critical |
 | **registry** | | | |
 | `HarborUnhealthy` | Harbor's own verdict is not healthy | 10m | critical |
 | `HarborComponentUnhealthy` | any single component unhealthy | 10m | warning |

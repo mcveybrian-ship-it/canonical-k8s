@@ -385,6 +385,18 @@ device nodes inside their images.
 The script runs `mount -a` at the end. A broken `fstab` on a host with no default route is the
 same trip to the rack as a broken bridge, so it is proven before you reboot into it.
 
+### `cryptdisk` — a whole extra disk, encrypted like `crypt-data` (added 2026-09-28)
+
+For a disk added **after** the install — first use, host-4's spare 2 TB NVMe as the database backup
+store (B-06a slice 5). `CRYPT_DISKS='name:/dev/disk/by-id/<id>:/mount/point'` in
+`services-params.env` — a **stable id**, never `/dev/nvmeXnY`. It refuses any disk that is not
+completely blank; then LUKS2 aes-xts-plain64/512 with **PBKDF2-SHA256** (FIPS-approved, stated
+rather than cryptsetup's argon2id default), opened at boot by a random key file in `/etc/luks` on
+the TPM-unlocked OS disk, with the **site passphrase as a second slot**, `nofail` in crypttab and
+fstab, ext4 mounted `nodev,nosuid,noexec`. Not part of `all`: it formats a disk. The boot path can
+be proven without a reboot — close it, `systemctl start 'systemd-cryptsetup@<name>.service'`,
+`mount <point>` — as was done on host-4 (`docs/06a-postgres-ha.md` §10.2).
+
 ## 5. Run it
 
 ```bash

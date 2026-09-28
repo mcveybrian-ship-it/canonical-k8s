@@ -7,6 +7,10 @@ air gap actually is. It replaces the topology that ran from 2026-09-02 to 2026-0
 **Who it is for.** Anyone who has to work on this lab, at the rack or over SSH, without having
 watched it get built. It assumes no prior knowledge of the kit.
 
+> **Planned, not yet cabled (2026-09-28): §9** — a second switch as a separate storage network,
+> the USB 2.5 GbE adapters, and a lab recovery store (a NAS and the Dell R7515's RAID 10).
+> Everything in §1–§8 is still the wiring as it stands.
+
 > **Redactions.** This repository's `origin` is **public**. Two WAN public IP addresses and the
 > two IPsec peer names are held back here; they are in the FortiGate configuration and in
 > `docs/runbook.md` §3.1b, which is gitignored. Private (RFC1918) addressing is not redacted —
@@ -353,7 +357,137 @@ answers, the deny is working.
 
 ---
 
-## 9. Known gaps in this layout
+## 9. PLANNED — storage network, USB adapters and the lab recovery store (2026-09-28)
+
+> **Nothing in this section is cabled yet.** It is the agreed target. The management side (§1–§8)
+> does not change. Backlog 3.16 tracks progress; 3.48 is a related drive decision on host-4.
+
+### 9.1 The target picture
+
+```
+                         INTERNET  (wan1 ISP, wan2 Starlink)
+                                   │
+                        ┌─────────────────────┐
+                        │  FortiGate FG-60F   │
+                        └──┬─────┬─────┬──────┘
+                    internal3 internal4  dmz
+                           │     │       │
+          Dell R7515 ──────┘  build-01   │ ◄── GAP CABLE #1
+          (stage-01 VM, RAID 10)         │
+             │ 10 Gb RJ45 ◄── GAP CABLE #2
+ ════════════│═══════════ ENCLAVE ═══════│════════════════════════════════════
+   STORAGE SWITCH  GigaPlus (NEW)        MANAGEMENT SWITCH  TL-SG108S-M2 (as today)
+   10 × 2.5G + 2 × SFP+                  8 × 2.5G
+   ┌───────────────────────────────┐     ┌───────────────────────────────┐
+   │ SFP+ 2 ← module ← Dell        │     │ uplink ← FortiGate dmz        │
+   │ SFP+ 1 ← DAC    ← NAS         │     │ host-1..3 onboard 1G          │
+   │ host-1..4 USB adapters 2.5G   │     │ host-4 onboard 2.5G           │
+   │ NO other uplink               │     │ NAS onboard port              │
+   └───────────────────────────────┘     └───────────────────────────────┘
+     new subnet, chosen when the            10.2.20.0/24, unchanged
+     adapters are proven
+```
+
+| network | switch | carries |
+|---|---|---|
+| **Management** | TL-SG108S-M2 | everything running today — SSH, monitoring, the mirror, Harbor, the database cluster. **Unchanged** |
+| **Storage** | GigaPlus | the lab recovery store (§9.3), and later Ceph replication. **Connects to nothing else** |
+
+**The gap becomes two cables:** the FortiGate `dmz` cable and the Dell's storage cable, both
+labelled, unplugged together when the enclave must be truly isolated. (The product design still
+specifies a physical break with no routed path — this is the lab.)
+
+### 9.2 Every cable
+
+| device | management switch | storage switch |
+|---|---|---|
+| host-1 | onboard 1 Gb (today) | USB 2.5 Gb adapter (RTL8156BG, `r8152`) |
+| host-2 | onboard 1 Gb (today) | USB 2.5 Gb adapter |
+| host-3 | onboard 1 Gb (today) | USB 2.5 Gb adapter |
+| host-4 | onboard 2.5 Gb (today) | USB 2.5 Gb adapter |
+| NAS (lab only) | onboard port | SFP+ 1, **DAC cable**, 10 Gb |
+| Dell R7515 (lab only) | — (stays on FortiGate `internal3`) | SFP+ 2: a **10GBASE-T SFP+ module** + Cat6a to its RJ45 10 Gb card — **gap cable #2** |
+| FortiGate `dmz` | uplink (today) — **gap cable #1** | — |
+
+Speeds that matter: 1 Gb ≈ 110 MB/s (the old USB backup drive's speed, rejected as unworkable);
+a host's 2.5 Gb adapter ≈ 280 MB/s; NAS ↔ Dell at 10 Gb ≈ 1 GB/s.
+
+### 9.3 The lab recovery store — the NAS and the Dell (lab only, not part of the product)
+
+They hold **copies of the enclave's backups so the lab can be rebuilt**. They do not back up the
+running enclave; that is `vm-backup.sh` and pgBackRest.
+
+**The NAS — TrueNAS, built by Brian (plan of 2026-09-28):**
+
+| where | drives | pool | usable |
+|---|---|---|---|
+| motherboard M.2 × 2 | 2 × Samsung PM9A1 2 TB | **fast**, mirror pair 1 | |
+| Syba PCIe card, slots 1–2 | 2 × PM9A1 2 TB | fast, mirror pair 2 | **~6 TB** across 3 pairs |
+| Syba PCIe card, slots 3–4 | 2 × PM9A1 2 TB (still to buy) | fast, mirror pair 3 | |
+| motherboard SATA × 2 | 2 × recertified Seagate Exos 16–20 TB | **archive**, one mirror pair | ~16–20 TB |
+| motherboard SATA, remaining 7 | free for SATA SSDs later | | |
+| a PCIe slot | an SFP+ network card | → GigaPlus SFP+ 1 by DAC | |
+
+- **Fast pool:** 3 mirrored pairs — the motherboard pair together, the card drives paired with each
+  other. ZFS spreads I/O across all three; one drive per pair can fail. Each pair must match;
+  different pairs can differ in size, so 4 TB pairs can replace 2 TB pairs later.
+- **Archive pool:** its own HDD mirror — never mixed into the NVMe pool, which it would slow down.
+
+**Build steps:**
+
+1. **Heat:** M.2 heatsinks on the Syba card's drives if it has none, and a case fan across the card
+   — the PM9A1 runs hot under load.
+2. **The Syba card:** if it is a *bifurcation* card (no switch chip of its own), set the slot to
+   **x4/x4/x4/x4** in the NAS BIOS or only one drive appears. A card with its own switch chip needs
+   nothing.
+3. **Every drive on arrival** — check health and return anything that fails inside the return window:
+
+   ```bash
+   ### MACHINE: NAS (TrueNAS shell) ###
+   smartctl -a /dev/nvme0     # per drive: Percentage Used <= 10 %, Media Errors 0, note Power-On Hours
+   ```
+
+   For a seller with no returns, ask for each drive's SMART health before buying.
+4. **Create the pools:** *fast* = 3 mirrors of the PM9A1s; *archive* = 1 mirror of the Exos drives.
+5. **System Dataset on the fast pool, never the archive** (System → Advanced → Storage) — otherwise
+   TrueNAS keeps waking the hard drives.
+6. **Spin-down** for the archive drives: Storage → Disks → each HDD → **HDD Standby ≈ 60 min**, and
+   an Advanced Power Management level that allows standby. Not shorter: frequent spin-ups wear
+   drives more than staying on.
+7. **Group the wake-ups:** scrubs, SMART tests and copies to the archive pool on the same night,
+   once a week. The first access after sleep takes ~10–15 s.
+8. **Network:** SFP+ card → GigaPlus SFP+ 1 (DAC); onboard port → management switch.
+
+**The Dell R7515:** its RAID 10 is the second recovery store, reached NAS ↔ Dell at 10 Gb through
+the module in SFP+ 2.
+
+### 9.4 Order of work
+
+1. **Now:** place and power the GigaPlus. **Nothing plugged in; nothing on the management switch
+   moves.** Label it: *STORAGE — no uplink*.
+2. **NAS:** drives checked → build → pools → the TrueNAS settings above → cabled per §9.2.
+3. **Dell:** module into SFP+ 2, Cat6a to its 10 Gb card, labelled *gap cable #2*.
+4. **Adapters:** one per host into the GigaPlus → `ethtool -i` shows `r8152`, `ethtool` shows
+   `2500Mb/s` → a day of traffic → **then** the storage subnet and addresses (netplan, per-interface
+   ufw rows, PPSM entries — backlog 3.16).
+
+### 9.5 To buy
+
+- 2 × PM9A1 2 TB (card pair 3) · 2 × Exos 16–20 TB · an SFP+ card for the NAS and a DAC cable ·
+  a 10GBASE-T SFP+ module for the Dell (**check the GigaPlus supports these modules** — they run hot,
+  and some switches restrict them) · M.2 heatsinks if the Syba card has none.
+
+### 9.6 Related, not part of this wiring
+
+- **host-1..3:** both M.2 slots are full (256 GB OS + 1 TB data, `docs/02-host-install.md` §4b).
+  More disk there means a 1 TB → 2 TB swap, best done inside the 2.6 rebuild.
+- **host-4 (backlog 3.48):** its second 2 TB NVMe was reserved for `k8s-wk-04`'s Ceph OSD and became
+  the pgBackRest store on 2026-09-28. Next time host-4 is open: is there a free M.2 slot on its board
+  or PCIe card?
+
+---
+
+## 10. Known gaps in this layout
 
 | | |
 |---|---|
@@ -361,7 +495,7 @@ answers, the deny is working.
 
 ---
 
-## 10. Related documents
+## 11. Related documents
 
 - `docs/runbook.md` §3.1 — the build procedure, as executed, with the commands
 - `docs/runbook.md` §3.1a — what a second WAN does and does not buy

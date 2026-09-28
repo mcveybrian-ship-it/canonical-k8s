@@ -401,14 +401,32 @@ YML
 
 # Run once by Patroni on the primary after initdb (bootstrap.post_bootstrap). V-261857: no role
 # the build creates may have rolconnlimit = -1.
+# PATRONI RUNS THIS BEFORE IT CREATES THE REPLICATION AND REWIND ROLES - and creates them only if
+# this succeeds (patroni/postgresql/bootstrap.py post_bootstrap). The first live bootstrap on pg-01,
+# 2026-09-28, ALTERed a role that did not exist yet, exited 3, and Patroni cancelled the cluster.
+# So CREATE them here, with their limits; Patroni's own create-or-alter then runs ALTER ROLE ...
+# WITH LOGIN REPLICATION, which leaves CONNECTION LIMIT alone, and grants rewind its functions.
 render_post_bootstrap() {
   cat <<SH
 #!/bin/sh
-# MANAGED by 06a-postgres-ha.sh - run once by Patroni after initdb (V-261857 connection limits).
+# MANAGED by 06a-postgres-ha.sh - run once by Patroni after initdb, BEFORE it creates the
+# replication and rewind roles (V-261857 connection limits - see the script for why).
 set -e
 psql -v ON_ERROR_STOP=1 -X -q -d postgres <<'SQL'
-ALTER ROLE replicator CONNECTION LIMIT $PG_REPL_CONN_LIMIT;
-ALTER ROLE rewinder CONNECTION LIMIT $PG_REPL_CONN_LIMIT;
+DO \$\$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'replicator') THEN
+    CREATE ROLE replicator WITH LOGIN REPLICATION CONNECTION LIMIT $PG_REPL_CONN_LIMIT;
+  ELSE
+    ALTER ROLE replicator CONNECTION LIMIT $PG_REPL_CONN_LIMIT;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'rewinder') THEN
+    CREATE ROLE rewinder WITH LOGIN CONNECTION LIMIT $PG_REPL_CONN_LIMIT;
+  ELSE
+    ALTER ROLE rewinder CONNECTION LIMIT $PG_REPL_CONN_LIMIT;
+  END IF;
+END
+\$\$;
 SQL
 SH
 }
@@ -474,23 +492,33 @@ cmd_patroni() {
   chown root:postgres "$PATRONI_CONF.new"; chmod 0640 "$PATRONI_CONF.new"; mv -f "$PATRONI_CONF.new" "$PATRONI_CONF"
   runuser -u postgres -- patroni --validate-config "$PATRONI_CONF" 2>&1 | sed 's/^/     /' | head -20 || true
   install -d -m 0755 /etc/systemd/system/patroni.service.d
-  printf '[Unit]\n# 06a: no data disk, no Patroni - never initdb an empty cluster on the OS disk\nRequiresMountsFor=%s\nAfter=etcd.service\nWants=etcd.service\n' "$PG_MNT" \
+  # StartLimit: a bootstrap that keeps failing STOPS after five tries in ten minutes. The package's
+  # Restart=on-failure looped every few seconds on pg-01 (restart counter 34), each try running
+  # initdb and leaving a *.failed data dir - the same rule as D7: never retry forever.
+  printf '[Unit]\n# 06a: no data disk, no Patroni - never initdb an empty cluster on the OS disk\nRequiresMountsFor=%s\nAfter=etcd.service\nWants=etcd.service\nStartLimitIntervalSec=600\nStartLimitBurst=5\n[Service]\nRestartSec=15\n' "$PG_MNT" \
     > /etc/systemd/system/patroni.service.d/06a.conf
   systemctl daemon-reload
   ok "config: $PATRONI_CONF (member $name, scope $PG_SCOPE)"
 
   # ---- start, and wait for what this node should become ----
   systemctl enable patroni >/dev/null 2>&1
+  systemctl reset-failed patroni >/dev/null 2>&1 || true   # a start limit hit by an earlier failed run
   systemctl restart patroni
   say "waiting up to ${PG_WAIT}s for $name to run (the first node bootstraps; the others clone from it)"
+  # THE RIGHT ROLE, HELD. The first version accepted State 'running' and passed on pg-01 in the
+  # middle of a bootstrap that then failed - the table printed under "[ok] pg-01 is up" said
+  # "uninitialized ... Replica ... stopped". Now: Leader+running, or a replica STREAMING from a
+  # leader, and three polls in a row (15 s), so a moment in passing does not count.
+  local good=0
   for _ in $(seq 1 "$((PG_WAIT / 5))"); do
     if patronictl -c "$PATRONI_CONF" list -f json 2>/dev/null | python3 -c "
 import sys, json
 m = {x['Member']: x for x in json.load(sys.stdin)}
 x = m.get('$name', {})
-sys.exit(0 if x.get('State') in ('running', 'streaming') else 1)"; then
-      ok "$name is up"; patronictl -c "$PATRONI_CONF" list; return 0
-    fi
+ok = (x.get('Role') == 'Leader' and x.get('State') == 'running') or \
+     (x.get('Role') in ('Replica', 'Sync Standby') and x.get('State') == 'streaming')
+sys.exit(0 if ok else 1)"; then good=$((good + 1)); else good=0; fi
+    if [ "$good" -ge 3 ]; then ok "$name is up and has held it for 15 s"; patronictl -c "$PATRONI_CONF" list; return 0; fi
     sleep 5
   done
   journalctl -u patroni -n 30 --no-pager | sed 's/^/     /'

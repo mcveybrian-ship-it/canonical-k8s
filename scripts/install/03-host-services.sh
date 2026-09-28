@@ -13,6 +13,8 @@
 #     ./03-host-services.sh apt        point apt at the mirror
 #     ./03-host-services.sh libvirt    install the virtualisation stack
 #     ./03-host-services.sh datavg     create LVs on vg-data and mount them
+#     ./03-host-services.sh cryptdisk  encrypt, format and mount a whole EXTRA disk (CRYPT_DISKS)
+#                                      - host-4's spare NVMe, the database backup store (B-06a)
 #     ./03-host-services.sh bridge     replace the NIC with a bridge   <-- can cut you off
 #     ./03-host-services.sh pool       define the libvirt storage pool
 #     ./03-host-services.sh tmux       tmux + the shared /etc/tmux.conf
@@ -325,6 +327,68 @@ cmd_libvirt() {
 # datavg - carve DATA_LVS out of vg-data (the LUKS data disk the step-02 install created),
 # mkfs, and mount by UUID via fstab. Get DATA_LVS right the FIRST time: growing out of
 # 100%FREE later means shrinking a mounted ext4 (runbook 6.5).
+# ---- cryptdisk: a whole extra disk, encrypted the way crypt-data is (B-06a slice 5, 2026-09-28) --
+# crypt-data was made by the installer (02-build-seed.sh): LUKS with the site passphrase, then a
+# 4 KiB random key file in /etc/luks as a SECOND keyslot - /etc/luks lives on the TPM-unlocked OS
+# disk, so the key file opens the data disk at boot with nobody typing - and a crypttab line with
+# nofail, so a key problem degrades to "not mounted" instead of a boot that stops. This does the same
+# for a disk added later. CRYPT_DISKS='name:/dev/disk/by-id/...:/mount/point' (params file).
+#
+# A STABLE ID, NEVER /dev/nvmeXnY - those renumber between boots. And the disk must be COMPLETELY
+# blank - no partitions, no signatures of any kind, not open, not mounted - or it is refused: this
+# formats a whole disk, and the only safe version of that is one that cannot pick the wrong one.
+# FIPS: LUKS2, aes-xts-plain64 512-bit, PBKDF2-SHA256 - approved algorithms, stated rather than left
+# to cryptsetup's default (argon2id, which is not).
+cmd_cryptdisk() {
+  need_root cryptdisk; load_params
+  [ -n "${CRYPT_DISKS:-}" ] || die "CRYPT_DISKS is empty in $PARAMS - nothing to do.
+       Format: CRYPT_DISKS='name:/dev/disk/by-id/<id>:/mount/point'"
+  local spec name id mnt dev key luuid fuuid
+  for spec in $CRYPT_DISKS; do
+    IFS=: read -r name id mnt <<<"$spec"
+    [ -n "$name" ] && [ -n "$id" ] && [ -n "$mnt" ] || die "bad CRYPT_DISKS entry '$spec' - want name:/dev/disk/by-id/<id>:/mount/point"
+    case "$id" in /dev/disk/by-id/*) ;; *) die "$name: '$id' is not a /dev/disk/by-id path - device names renumber between boots" ;; esac
+    key="/etc/luks/$name.key"
+    # ---- already done? say so and verify, never redo ----
+    if grep -qE "^${name}[[:space:]]" /etc/crypttab 2>/dev/null; then
+      [ -e "/dev/mapper/$name" ] || cryptdisks_start "$name" >/dev/null 2>&1 || true
+      mountpoint -q "$mnt" || mount "$mnt" 2>/dev/null || true
+      mountpoint -q "$mnt" && ok "$name: already built - open and mounted at $mnt" \
+        || warn "$name: in crypttab but NOT mounted at $mnt - look before doing anything else"
+      continue
+    fi
+    [ -e "$id" ] || die "$name: no such disk $id"
+    dev="$(readlink -f "$id")"
+    [ "$(lsblk -dno TYPE "$dev")" = disk ] || die "$name: $id is not a whole disk ($dev)"
+    [ "$(lsblk -no NAME "$dev" | wc -l)" -eq 1 ] || die "$name: $dev has partitions or holders - refusing: it is not blank"
+    [ -z "$(wipefs -n "$dev" 2>/dev/null | tail -n +2)" ] || { wipefs -n "$dev"; die "$name: $dev carries signatures (above) - refusing: it is not blank"; }
+    findmnt -rn -S "$dev" >/dev/null 2>&1 && die "$name: $dev is mounted - refusing"
+    say "$name: $id -> $dev ($(lsblk -dno SIZE "$dev")), blank. Encrypting, formatting, mounting at $mnt"
+    # ---- the key file, then LUKS with it, then the site passphrase as a SECOND slot ----
+    install -d -m 0700 /etc/luks
+    ( umask 077; dd if=/dev/urandom of="$key" bs=512 count=8 status=none ); chmod 0400 "$key"
+    cryptsetup luksFormat --batch-mode --type luks2 --cipher aes-xts-plain64 --key-size 512 \
+      --pbkdf pbkdf2 --hash sha256 --label "$name" "$dev" "$key" || die "$name: luksFormat failed"
+    say "$name: now the SITE LUKS PASSPHRASE as a second keyslot - so it can always be opened by hand."
+    say "       cryptsetup asks for it twice. (The key file is slot 0 and opens it at boot.)"
+    cryptsetup luksAddKey --key-file "$key" --pbkdf pbkdf2 --hash sha256 "$dev" \
+      || die "$name: the passphrase slot was not added - the disk opens by key file only. Add one before relying on it: cryptsetup luksAddKey --key-file $key $dev"
+    cryptsetup open --key-file "$key" "$dev" "$name" || die "$name: could not open with the key file"
+    mkfs.ext4 -q -L "${name#crypt-}" "/dev/mapper/$name" || die "$name: mkfs failed"
+    luuid="$(cryptsetup luksUUID "$dev")"; fuuid="$(blkid -s UUID -o value "/dev/mapper/$name")"
+    cp -p /etc/crypttab "/etc/crypttab.bak-cryptdisk-$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+    cp -p /etc/fstab "/etc/fstab.bak-cryptdisk-$(date +%Y%m%d%H%M%S)"
+    echo "$name UUID=$luuid $key luks,discard,nofail" >> /etc/crypttab
+    echo "UUID=$fuuid  $mnt  ext4  defaults,nodev,nosuid,noexec,nofail  0 2" >> /etc/fstab
+    systemctl daemon-reload
+    install -d -m 0755 "$mnt"; mount "$mnt" || die "$name: could not mount $mnt"
+    mountpoint -q "$mnt" || die "$name: $mnt is not a mount point after mounting"
+    [ "$(cryptsetup luksDump "$dev" | grep -cE '^[[:space:]]+[0-9]+: luks2')" -ge 2 ] \
+      && ok "$name: two keyslots (key file + site passphrase)" || warn "$name: fewer than two keyslots - check: cryptsetup luksDump $dev"
+    ok "$name: LUKS2 aes-xts-plain64/512, PBKDF2-SHA256; opens at boot from $key; ext4 at $mnt ($(df -h --output=size "$mnt" | tail -1 | tr -d ' ')), nodev,nosuid,noexec"
+  done
+}
+
 cmd_datavg() {
   need_root datavg; load_params
   vgs "$DATA_VG" >/dev/null 2>&1 || die "volume group '$DATA_VG' does not exist.
@@ -746,6 +810,7 @@ case "${1:-}" in
   apt)     _assert_enclave_host; cmd_apt ;;
   libvirt) _assert_enclave_host; cmd_libvirt ;;
   datavg)  _assert_enclave_host; cmd_datavg ;;
+  cryptdisk) _assert_enclave_host; cmd_cryptdisk ;;
   bridge)  _assert_enclave_host; cmd_bridge ;;
   pool)    _assert_enclave_host; cmd_pool ;;
   tmux)    cmd_tmux ;;

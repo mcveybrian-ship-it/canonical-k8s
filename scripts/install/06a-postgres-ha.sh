@@ -15,6 +15,11 @@
 #                                                      sync standby unless one is named
 #     sudo ./06a-postgres-ha.sh leave                  take THIS node down for maintenance: refuses
 #                                                      unless the other two are healthy
+#   SLICE 5 - BACKUP (pgBackRest, TLS both ways, two live stores - decided 2026-09-28):
+#     sudo ./06a-postgres-ha.sh backup-node             on each pg node: pgBackRest + its TLS server
+#     sudo ./06a-postgres-ha.sh backup-store <fullchain> on each STORE (host-4, host-3): the store
+#     sudo ./06a-postgres-ha.sh backup-enable           on the PRIMARY: WAL archiving on (rolling restart)
+#     sudo ./06a-postgres-ha.sh backup-run [full|diff]  on each store: a backup now + the timers
 #
 # SLICE 2 - THE DATABASE'S OWN etcd, WITH MUTUAL TLS
 #
@@ -289,6 +294,19 @@ PG_EXPORTER_ENV="${PG_EXPORTER_ENV:-/etc/default/prometheus-postgres-exporter}"
 # pg_monitor only, so it cannot read table data. Its LOGINS stay audited (log_connections).
 PG_MON_PGAUDIT="${PG_MON_PGAUDIT:-none}"
 PG_PGAUDIT_LOG="${PG_PGAUDIT_LOG:-ddl,role,read,write}"
+# ---- slice 5: pgBackRest (decided 2026-09-28: TLS both ways; two live stores; LUKS underneath;
+# 2 weekly fulls + daily differentials). The stores and their repository paths, in repo order,
+# come from vm-specs.env - the planner reads the same line to reserve host-3's space.
+PG_BACKUP_STORES="${PG_BACKUP_STORES:-$(awk -F"'" '/^PG_BACKUP_STORES=/{print $2}' "$ENC/vm-specs.env" 2>/dev/null)}"
+PGBR_PORT="${PGBR_PORT:-8432}"
+PGBR_CONF="${PGBR_CONF:-/etc/pgbackrest/pgbackrest.conf}"
+PGBR_PKI="${PGBR_PKI:-/etc/pgbackrest/pki}"
+PGBR_LOG="${PGBR_LOG:-/var/log/pgbackrest}"
+PGBR_RETENTION_FULL="${PGBR_RETENTION_FULL:-2}"
+PGBR_FULL_DAY="${PGBR_FULL_DAY:-Sun}"                 # the weekly full; differentials the other days
+PGBR_BACKUP_MINUTE="${PGBR_BACKUP_MINUTE:-30}"        # store N runs at 00:MM + N hours (repo1 01:30, repo2 02:30)
+PG_ARCHIVE_TIMEOUT="${PG_ARCHIVE_TIMEOUT:-300}"       # a quiet database still ships a WAL file every 5 min
+PGBR_ARCHIVE_CMD="pgbackrest --stanza=${PG_SCOPE:-enclave-pg} archive-push %p"
 
 # The pg nodes, the K8S workers - from the address file, as `ip name` pairs.
 addr_pairs() {   # addr_pairs PREFIX_REGEX
@@ -370,6 +388,11 @@ bootstrap:
         log_disconnections: "on"
         shared_preload_libraries: pgaudit
         pgaudit.log: $PG_PGAUDIT_LOG
+        # slice 5 - WAL to both backup stores. On a rebuild the command fails until backup-node
+        # has run; PostgreSQL keeps the WAL and retries, so nothing is lost in between.
+        archive_mode: "on"
+        archive_command: "$PGBR_ARCHIVE_CMD"
+        archive_timeout: $PG_ARCHIVE_TIMEOUT
         pgaudit.log_catalog: "on"
   initdb:
     - encoding: UTF8
@@ -793,6 +816,220 @@ cmd_leave() {
   systemctl poweroff
 }
 
+# =========================================================================================
+# SLICE 5 - BACKUP: pgBackRest 2.50, TLS both ways, two live stores (decided 2026-09-28)
+#
+#   pg-01..03 ─ each WAL file ─► host-4 (repo1, spare NVMe)  and  host-3 (repo2, images pool)
+#   host-4 / host-3 ─ full / differential backups ─► reach INTO the primary
+#
+#   pgBackRest REQUIRES the backup command on the repository host, so traffic runs both ways and
+#   every machine in it runs pgBackRest's TLS server on $PGBR_PORT: the stores accept the pg nodes'
+#   certificates, the pg nodes accept the stores'. tls-server-auth names each certificate CN that
+#   may use stanza $PG_SCOPE - nothing else gets in. Names, not addresses, on the client side:
+#   the certificates carry DNS names, and every machine resolves the others from /etc/hosts.
+#   Encryption is the volumes' LUKS underneath - no pgBackRest passphrase to hold (decided).
+# =========================================================================================
+PGBR_STANZA="$PG_SCOPE"
+
+# store_lines -> "INDEX NAME ADDR PATH" per store, in repo order, from PG_BACKUP_STORES.
+store_lines() {
+  local i=0 st n k
+  for st in $PG_BACKUP_STORES; do
+    i=$((i + 1)); n="${st%%=*}"; k="$(printf '%s' "$n" | tr 'a-z-' 'A-Z_')"
+    printf '%s %s %s %s\n' "$i" "$n" "${!k:-}" "${st#*=}"
+  done
+}
+
+# install pgBackRest with its unit's self-start blocked: pgbackrest.service is `Restart=always`
+# with no start limit, so a server started before its TLS settings exist would fail every second.
+install_pgbackrest() {
+  if ! dpkg -s pgbackrest >/dev/null 2>&1; then
+    printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d; chmod 0755 /usr/sbin/policy-rc.d
+    DEBIAN_FRONTEND=noninteractive apt-get install -y pgbackrest \
+      || { rm -f /usr/sbin/policy-rc.d; die "apt could not install pgbackrest"; }
+    rm -f /usr/sbin/policy-rc.d
+  fi
+  ok "pgbackrest $(dpkg-query -W -f='${Version}' pgbackrest) installed"
+  id postgres >/dev/null 2>&1 || die "no OS user postgres - pgbackrest's dependency should have made it"
+  install -d -m 0750 -o postgres -g postgres "$PGBR_LOG"
+}
+
+# place_pgbr_pki FULLCHAIN KEY - the node certificate and a copy of its key, readable by postgres
+place_pgbr_pki() {
+  install -d -m 0750 -o root -g postgres "$PGBR_PKI"
+  install -m 0644 -o root -g root "$CA_ROOT" "$PGBR_PKI/ca.crt"
+  install -m 0644 -o root -g root "$1" "$PGBR_PKI/node.crt"
+  install -m 0640 -o root -g postgres "$2" "$PGBR_PKI/node.key"
+}
+
+# start_pgbr_server ADDR - the TLS server, then PROVE it listens on this address only
+start_pgbr_server() {
+  systemctl enable pgbackrest >/dev/null 2>&1
+  systemctl restart pgbackrest || die "pgbackrest (the TLS server) did not start - journalctl -u pgbackrest"
+  local l=""
+  for _ in $(seq 1 10); do l="$(ss -Htln "sport = :$PGBR_PORT" | awk '{print $4}' | sort -u | tr '\n' ' ')"; [ -n "$l" ] && break; sleep 1; done
+  [ "$l" = "$1:$PGBR_PORT " ] || die "the pgBackRest server listens on '${l:-nothing}', expected $1:$PGBR_PORT only"
+  ok "pgBackRest TLS server listening on $1:$PGBR_PORT only"
+}
+
+# render_pgbr_node NAME ADDR - a pg node's pgbackrest.conf
+render_pgbr_node() {
+  local i n a pth
+  printf '# MANAGED by 06a-postgres-ha.sh backup-node (B-06a slice 5). Edits are overwritten.\n[global]\n'
+  while read -r i n a pth; do
+    printf 'repo%s-host=%s.%s\nrepo%s-host-type=tls\nrepo%s-host-port=%s\n' "$i" "$n" "${ENCLAVE_DOMAIN:-enclave.internal}" "$i" "$i" "$PGBR_PORT"
+    printf 'repo%s-host-cert-file=%s/node.crt\nrepo%s-host-key-file=%s/node.key\nrepo%s-host-ca-file=%s/ca.crt\n' "$i" "$PGBR_PKI" "$i" "$PGBR_PKI" "$i" "$PGBR_PKI"
+  done < <(store_lines)
+  printf 'log-path=%s\nlog-level-file=info\n' "$PGBR_LOG"
+  printf '# the stores reach in for backups - only their certificates, only this stanza\n'
+  printf 'tls-server-address=%s\ntls-server-port=%s\n' "$2" "$PGBR_PORT"
+  printf 'tls-server-cert-file=%s/node.crt\ntls-server-key-file=%s/node.key\ntls-server-ca-file=%s/ca.crt\n' "$PGBR_PKI" "$PGBR_PKI" "$PGBR_PKI"
+  while read -r i n a pth; do printf 'tls-server-auth=%s.%s=%s\n' "$n" "${ENCLAVE_DOMAIN:-enclave.internal}" "$PGBR_STANZA"; done < <(store_lines)
+  printf '\n[%s]\npg1-path=%s\npg1-socket-path=/var/run/postgresql\n' "$PGBR_STANZA" "$PG_DATA"
+}
+
+# render_pgbr_store INDEX ADDR PATH - a store's pgbackrest.conf
+render_pgbr_store() {
+  local k=0 kk
+  printf '# MANAGED by 06a-postgres-ha.sh backup-store (B-06a slice 5). Edits are overwritten.\n[global]\n'
+  printf 'repo%s-path=%s\nrepo%s-retention-full=%s\nrepo%s-retention-full-type=count\n' "$1" "$3" "$1" "$PGBR_RETENTION_FULL" "$1"
+  printf 'start-fast=y\ncompress-type=zst\nprocess-max=2\nlog-path=%s\nlog-level-file=info\n' "$PGBR_LOG"
+  printf '# the pg nodes push WAL here - only their certificates, only this stanza\n'
+  printf 'tls-server-address=%s\ntls-server-port=%s\n' "$2" "$PGBR_PORT"
+  printf 'tls-server-cert-file=%s/node.crt\ntls-server-key-file=%s/node.key\ntls-server-ca-file=%s/ca.crt\n' "$PGBR_PKI" "$PGBR_PKI" "$PGBR_PKI"
+  for kk in $(grep -oE '^PG_[0-9]+=' "$ADDRS" | tr -d '=' | sort); do
+    printf 'tls-server-auth=%s.%s=%s\n' "$(printf '%s' "$kk" | tr 'A-Z_' 'a-z-')" "${ENCLAVE_DOMAIN:-enclave.internal}" "$PGBR_STANZA"
+  done
+  printf '\n[%s]\n' "$PGBR_STANZA"
+  for kk in $(grep -oE '^PG_[0-9]+=' "$ADDRS" | tr -d '=' | sort); do
+    k=$((k + 1))
+    printf 'pg%s-host=%s.%s\npg%s-host-type=tls\npg%s-host-port=%s\n' "$k" "$(printf '%s' "$kk" | tr 'A-Z_' 'a-z-')" "${ENCLAVE_DOMAIN:-enclave.internal}" "$k" "$k" "$PGBR_PORT"
+    printf 'pg%s-host-cert-file=%s/node.crt\npg%s-host-key-file=%s/node.key\npg%s-host-ca-file=%s/ca.crt\n' "$k" "$PGBR_PKI" "$k" "$PGBR_PKI" "$k" "$PGBR_PKI"
+    printf 'pg%s-path=%s\npg%s-socket-path=/var/run/postgresql\n' "$k" "$PG_DATA" "$k"
+  done
+}
+
+# write_pgbr_conf < rendered text - 0640 root:postgres, atomically
+write_pgbr_conf() {
+  install -d -m 0755 "$(dirname "$PGBR_CONF")"
+  cat > "$PGBR_CONF.new"; chown root:postgres "$PGBR_CONF.new"; chmod 0640 "$PGBR_CONF.new"
+  mv -f "$PGBR_CONF.new" "$PGBR_CONF"
+  ok "config: $PGBR_CONF"
+}
+
+pgbr() { runuser -u postgres -- pgbackrest --stanza="$PGBR_STANZA" "$@"; }
+
+cmd_backup_node() {
+  need_root; whoami_pg
+  [ -n "$PG_BACKUP_STORES" ] || die "PG_BACKUP_STORES is empty (vm-specs.env) - where would the backups go?"
+  local key="$SSL_DIR/$ME.key"
+  [ -r "$ETCD_PKI/member.crt" ] && [ -r "$key" ] || die "no node certificate/key from slice 2"
+  install_pgbackrest
+  place_pgbr_pki "$ETCD_PKI/member.crt" "$key"
+  render_pgbr_node "$ME" "$ME_ADDR" | write_pgbr_conf
+  start_pgbr_server "$ME_ADDR"
+  say "stores this node will push WAL to: $(store_lines | awk '{printf "repo%s=%s ", $1, $2}')"
+}
+
+# on a store: which one am I? - by address, like whoami_pg; never a typed name
+whoami_store() {
+  local i n a pth mine
+  mine="$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1)"
+  while read -r i n a pth; do
+    if [ -n "$a" ] && printf '%s\n' "$mine" | grep -qx "$a"; then
+      ST_IDX="$i"; ST_NAME="$n"; ST_ADDR="$a"; ST_PATH="$pth"; return 0
+    fi
+  done < <(store_lines)
+  die "this machine ($(hostname -s)) is not a backup store in PG_BACKUP_STORES ($PG_BACKUP_STORES)"
+}
+
+cmd_backup_store() {
+  need_root; whoami_store
+  local fc="${1:-}" key="$SSL_DIR/$ST_NAME.key" parent
+  [ -n "$fc" ] && [ -r "$fc" ] || die "usage: sudo $0 backup-store <$ST_NAME.fullchain.crt from svc-mgmt-01>"
+  [ -r "$key" ] || die "no key at $key - make it on THIS machine first: sudo $ENC/ca.sh request $ST_NAME"
+  check_member_cert "$fc" "$key" "$ST_ADDR" "$CA_ROOT"
+  # A STORE MUST NEVER LAND ON AN OS DISK: the repository's parent has to be its own mount.
+  parent="$(dirname "$ST_PATH")"
+  mountpoint -q "$parent" || die "$parent is not a mount point - the repository $ST_PATH would land on the OS disk.
+       host-4: sudo ./03-host-services.sh cryptdisk first (CRYPT_DISKS in services-params.env)."
+  install_pgbackrest
+  install -d -m 0750 -o postgres -g postgres "$ST_PATH"
+  ok "repository repo$ST_IDX: $ST_PATH on $parent ($(df -h --output=avail "$parent" | tail -1 | tr -d ' ') free)"
+  place_pgbr_pki "$fc" "$key"
+  render_pgbr_store "$ST_IDX" "$ST_ADDR" "$ST_PATH" | write_pgbr_conf
+  start_pgbr_server "$ST_ADDR"
+  # the stanza, created from HERE (the repository host): it reaches every pg node's server, finds
+  # the primary and records the cluster's identity - so this also proves the TLS path store -> nodes.
+  pgbr --repo="$ST_IDX" stanza-create 2>&1 | sed 's/^/     /' \
+    || die "stanza-create failed - are backup-node's servers up on all three pg nodes? (ss -tln on a pg node)"
+  pgbr --repo="$ST_IDX" info 2>&1 | sed 's/^/     /'
+  ok "store repo$ST_IDX on $ST_NAME ready - next: backup-enable on the primary, then backup-run here"
+}
+
+cmd_backup_enable() {
+  need_root; whoami_pg
+  local j v leader m
+  j="$(cluster_json)"; v="$(cluster_verdict "$j")"
+  case "$v" in ok*) ;; *) patronictl -c "$PATRONI_CONF" list; die "the cluster is not healthy (${v#bad }) - a rolling restart now is not safe" ;; esac
+  read -r _ leader _ <<<"$v"
+  [ "$leader" = "$ME" ] || die "run this on the primary - $leader is the leader"
+  # ---- the settings, in the DCS - where a running cluster's parameters live ----
+  # config.yml's bootstrap section applies only when a cluster is first created (render_patroni
+  # carries the same values so a rebuild has them); an existing cluster changes through the DCS.
+  patronictl -c "$PATRONI_CONF" edit-config "$PG_SCOPE" --force \
+    -s "postgresql.parameters.archive_mode=on" \
+    -s "postgresql.parameters.archive_command=$PGBR_ARCHIVE_CMD" \
+    -s "postgresql.parameters.archive_timeout=$PG_ARCHIVE_TIMEOUT" 2>&1 | sed 's/^/     /'
+  ok "DCS: archive_mode=on, archive_command='$PGBR_ARCHIVE_CMD', archive_timeout=$PG_ARCHIVE_TIMEOUT"
+  sleep 12   # one Patroni loop: every member notices the change and flags a pending restart
+  # ---- archive_mode needs a RESTART: replicas one at a time, the leader last ----
+  for m in $(printf '%s' "$j" | python3 -c 'import sys,json; print(" ".join(x["Member"] for x in json.load(sys.stdin) if x.get("Role")!="Leader"))'); do
+    say "restarting $m (a replica)"
+    patronictl -c "$PATRONI_CONF" restart "$PG_SCOPE" "$m" --force 2>&1 | sed 's/^/     /'
+    for _ in $(seq 1 60); do
+      [ "$(cluster_verdict "$(cluster_json)" | cut -d' ' -f1)" = ok ] && break; sleep 2
+    done
+    [ "$(cluster_verdict "$(cluster_json)" | cut -d' ' -f1)" = ok ] || die "$m did not come back healthy in 120 s - stopping the rolling restart here"
+    ok "$m back, streaming"
+  done
+  say "restarting $leader (the leader - writes pause for a few seconds)"
+  patronictl -c "$PATRONI_CONF" restart "$PG_SCOPE" "$leader" --force 2>&1 | sed 's/^/     /'
+  for _ in $(seq 1 60); do [ "$(cluster_verdict "$(cluster_json)" | cut -d' ' -f1)" = ok ] && break; sleep 2; done
+  [ "$(cluster_verdict "$(cluster_json)" | cut -d' ' -f1)" = ok ] || die "the cluster is not healthy after the leader's restart - look: patronictl list"
+  patronictl -c "$PATRONI_CONF" list
+  [ "$(pg_sql "SHOW archive_mode")" = on ] || die "archive_mode is not on after the restart"
+  ok "archive_mode = on, applied (no restart pending)"
+  # ---- PROVE it: pgBackRest's own check forces a WAL switch and waits for it in EVERY repo ----
+  pgbr check 2>&1 | sed 's/^/     /' || die "pgbackrest check failed - WAL is not reaching every store (the output above names which)"
+  ok "a WAL file was archived to every store (pgbackrest check)"
+}
+
+cmd_backup_run() {
+  need_root; whoami_store
+  local type="${1:-full}" u
+  case "$type" in full|diff) ;; *) die "usage: sudo $0 backup-run [full|diff]" ;; esac
+  say "a $type backup to repo$ST_IDX now - reaching into the primary"
+  pgbr --repo="$ST_IDX" --type="$type" backup 2>&1 | sed 's/^/     /' || die "the backup failed - the lines above say why"
+  pgbr --repo="$ST_IDX" info 2>&1 | sed 's/^/     /'
+  # ---- the timers: the weekly full, differentials the other days, stores an hour apart ----
+  local hh; hh="$(printf '%02d' "$ST_IDX")"
+  for u in full diff; do
+    printf '[Unit]\nDescription=pgBackRest %s backup of %s to repo%s (06a, B-06a slice 5)\nAfter=network-online.target pgbackrest.service\n[Service]\nType=oneshot\nUser=postgres\nExecStart=/usr/bin/pgbackrest --stanza=%s --repo=%s --type=%s backup\n' \
+      "$u" "$PGBR_STANZA" "$ST_IDX" "$PGBR_STANZA" "$ST_IDX" "$u" > "/etc/systemd/system/pgbackrest-$u.service"
+    if [ "$u" = full ]; then
+      printf '[Unit]\nDescription=weekly full backup (06a)\n[Timer]\nOnCalendar=%s *-*-* %s:%s:00\nPersistent=true\n[Install]\nWantedBy=timers.target\n' "$PGBR_FULL_DAY" "$hh" "$PGBR_BACKUP_MINUTE" > "/etc/systemd/system/pgbackrest-$u.timer"
+    else
+      printf '[Unit]\nDescription=daily differential backup (06a)\n[Timer]\nOnCalendar=%s *-*-* %s:%s:00\nPersistent=true\n[Install]\nWantedBy=timers.target\n' "$(printf 'Mon Tue Wed Thu Fri Sat Sun' | tr ' ' '\n' | grep -vx "$PGBR_FULL_DAY" | tr '\n' ',' | sed 's/,$//')" "$hh" "$PGBR_BACKUP_MINUTE" > "/etc/systemd/system/pgbackrest-$u.timer"
+    fi
+    chmod 0644 "/etc/systemd/system/pgbackrest-$u.service" "/etc/systemd/system/pgbackrest-$u.timer"
+  done
+  systemctl daemon-reload
+  systemctl enable --now pgbackrest-full.timer pgbackrest-diff.timer >/dev/null 2>&1 || die "could not enable the backup timers"
+  systemctl list-timers 'pgbackrest-*' --no-pager | sed 's/^/     /'
+  ok "repo$ST_IDX: full on $PGBR_FULL_DAY, differential the other days, at $hh:$PGBR_BACKUP_MINUTE; $PGBR_RETENTION_FULL fulls kept"
+}
+
 case "${1:-}" in
   etcd)       shift; cmd_etcd "$@" ;;
   etcd-check) cmd_etcd_check ;;
@@ -801,5 +1038,9 @@ case "${1:-}" in
   monitor)       cmd_monitor ;;
   switchover)    shift; cmd_switchover "$@" ;;
   leave)         cmd_leave ;;
-  *) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  backup-node)   cmd_backup_node ;;
+  backup-store)  shift; cmd_backup_store "$@" ;;
+  backup-enable) cmd_backup_enable ;;
+  backup-run)    shift; cmd_backup_run "$@" ;;
+  *) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

@@ -399,13 +399,20 @@ cmd_plan() {
   # THE RING BACKUP COPY IS REAL BYTES ON THIS HOST'S IMAGES POOL (3.42). With PLACE_BACKUP_SECOND
   # ring, every host running guests also receives the previous host's copy - host-1 held host-4's
   # 173.7 GB on 2026-09-27, and this planner said "plan holds" without counting a byte of it.
-  if [ "${PLACE_BACKUP_SECOND:-}" = ring ] && [ -n "$pool_avail" ]; then
-    local psize reserve_copy="${BACKUP_COPY_RESERVE_GB:-200}"
+  # AND A DATABASE BACKUP STORE (B-06a slice 5) whose repository sits on this host's images pool.
+  local reserve_pg=0 st
+  for st in ${PG_BACKUP_STORES:-}; do
+    [ "${st%%=*}" = "$me" ] || continue
+    case "${st#*=}" in "$POOL"/*) reserve_pg="${PG_BACKUP_RESERVE_GB:-100}" ;; esac
+  done
+  if { [ "${PLACE_BACKUP_SECOND:-}" = ring ] || [ "$reserve_pg" -gt 0 ]; } && [ -n "$pool_avail" ]; then
+    local psize reserve_copy=0
+    [ "${PLACE_BACKUP_SECOND:-}" = ring ] && reserve_copy="${BACKUP_COPY_RESERVE_GB:-200}"
     psize="$(df -BG --output=size "$POOL" 2>/dev/null | tail -1 | tr -dc 0-9 || true)"
-    if [ -n "$psize" ] && [ $(( dk + reserve_copy )) -le "$psize" ]; then
-      ok "pool $POOL: ${psize} GB holds ${dk} GB of OS-disk ceilings plus a ${reserve_copy} GB backup-copy reserve (BACKUP_COPY_RESERVE_GB)"
+    if [ -n "$psize" ] && [ $(( dk + reserve_copy + reserve_pg )) -le "$psize" ]; then
+      ok "pool $POOL: ${psize} GB holds ${dk} GB of OS-disk ceilings + ${reserve_copy} GB backup-copy reserve + ${reserve_pg} GB database-backup reserve"
     else
-      warn "pool $POOL: ${psize:-?} GB vs ${dk} GB of OS-disk ceilings + ${reserve_copy} GB backup-copy reserve - over-committed; the copy is real bytes, the OS disks are sparse. Watch it"
+      warn "pool $POOL: ${psize:-?} GB vs ${dk} GB of OS-disk ceilings + ${reserve_copy} GB backup-copy + ${reserve_pg} GB database-backup reserve - over-committed; the reserves are real bytes, the OS disks are sparse. Watch it"
     fi
   fi
   printf '\n'

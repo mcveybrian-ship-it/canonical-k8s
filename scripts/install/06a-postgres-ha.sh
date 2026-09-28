@@ -522,6 +522,18 @@ sys.exit(0 if ok else 1)"; then good=$((good + 1)); else good=0; fi
     sleep 5
   done
   journalctl -u patroni -n 30 --no-pager | sed 's/^/     /'
+  # A STALE `initialize` KEY. Found 2026-09-28: Patroni was stopped in the middle of a bootstrap it
+  # had claimed, so the claim stayed in etcd, and every later start sat on "waiting for leader to
+  # bootstrap" with no leader anywhere. Patroni removes the key when a bootstrap FAILS, not when it
+  # is killed. Say so - but never clear it automatically: another node may really be bootstrapping.
+  if journalctl -u patroni -n 30 --no-pager 2>/dev/null | grep -q 'waiting for leader to bootstrap' \
+     && ! etcd_ctl get "/enclave/$PG_SCOPE/leader" --keys-only 2>/dev/null | grep -q .; then
+    say ""
+    say "  'waiting for leader to bootstrap' with NO leader: if no other node is running Patroni, a"
+    say "  bootstrap that was killed left its claim (/enclave/$PG_SCOPE/initialize) in etcd. Stop"
+    say "  Patroni, confirm there is no leader key, then delete /enclave/$PG_SCOPE/ with etcdctl and"
+    say "  remove $PG_DATA before re-running - the cluster never initialized, so nothing is lost."
+  fi
   die "$name did not come up in ${PG_WAIT}s - the journal above says why"
 }
 
@@ -538,6 +550,13 @@ cmd_patroni_check() {
   case ",$v," in *,md5,*|*,password,*|*,trust,*) warn "pg_hba has a weak method: $v (V-261892)"; bad=1 ;; *) ok "pg_hba methods: $v - no md5, password or trust" ;; esac
   v="$(pg_sql "SELECT string_agg(DISTINCT type, ',') FROM pg_hba_file_rules")"
   case ",$v," in *,host,*|*,hostnossl,*) warn "pg_hba has non-TLS host lines: $v"; bad=1 ;; *) ok "pg_hba line types: $v - TLS only over the network" ;; esac
+  # V-261857: the roles the build creates carry an explicit CONNECTION LIMIT (post_bootstrap)
+  v="$(pg_sql "SELECT string_agg(rolname||'='||rolconnlimit, ' ' ORDER BY rolname) FROM pg_roles WHERE rolname IN ('replicator','rewinder')")"
+  case " $v " in
+    *"=-1"*) warn "connection limits: $v - a role has none (V-261857)"; bad=1 ;;
+    *" replicator="*" rewinder="*) ok "connection limits: $v (V-261857)" ;;
+    *) warn "connection limits: '${v}' - replicator or rewinder is missing (V-261857)"; bad=1 ;;
+  esac
   for s in ssl ssl_min_protocol_version password_encryption log_destination logging_collector log_file_mode synchronous_commit; do
     say "  $(pg_sql "SELECT name||' = '||setting FROM pg_settings WHERE name='$s'")"
   done

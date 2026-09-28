@@ -474,7 +474,7 @@ per-guest timeout and boot timeout are parameters in `vm-specs.env`.
 |---|---|---|
 | 1 | `svc-obs-01` | It scrapes the other four and runs the alert rules. Stopping it first keeps a *planned* outage out of Prometheus as a fake incident |
 | 2 | `svc-harbor-01` | Containerised PostgreSQL under docker-compose; the service must stop eleven containers and give the database a clean close. The slowest and most delicate stop — give it the most room |
-| 3 | `svc-mgmt-01` | The Pro contract server and enclave DNS. ⚠️ MAAS's PostgreSQL was removed 2026-09-18; `postgresql@16-main` may still be installed — confirm before assuming a database needs a clean stop |
+| 3 | `svc-mgmt-01` | The Pro contract server and enclave DNS. MAAS's PostgreSQL was purged 2026-09-23 (backlog 6b.2) — **confirmed 2026-09-28: no PostgreSQL package or process on `svc-mgmt-01`**, so there is no database here to close first |
 | 4 | `svc-repo-01` | nginx over static files. Nothing to lose, and it is what everything else installs from, so it stays up longest |
 
 **But the order is the small half.** `virsh shutdown` is **asynchronous** — it sends ACPI and

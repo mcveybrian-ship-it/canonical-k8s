@@ -954,6 +954,11 @@ cmd_backup_store() {
   mountpoint -q "$parent" || die "$parent is not a mount point - the repository $ST_PATH would land on the OS disk.
        host-4: sudo ./03-host-services.sh cryptdisk first (CRYPT_DISKS in services-params.env)."
   install_pgbackrest
+  # pgbackrest pulls postgresql-common, which ENABLES Debian's postgresql.service - on a store that
+  # runs no PostgreSQL server that is a database unit enabled on a hypervisor, and nothing more.
+  if ! dpkg -s postgresql-16 >/dev/null 2>&1 && systemctl is-enabled --quiet postgresql 2>/dev/null; then
+    systemctl disable postgresql >/dev/null 2>&1 && ok "Debian's postgresql.service disabled - no PostgreSQL server on a store"
+  fi
   install -d -m 0750 -o postgres -g postgres "$ST_PATH"
   ok "repository repo$ST_IDX: $ST_PATH on $parent ($(df -h --output=avail "$parent" | tail -1 | tr -d ' ') free)"
   place_pgbr_pki "$fc" "$key"
@@ -961,9 +966,11 @@ cmd_backup_store() {
   start_pgbr_server "$ST_ADDR"
   # the stanza, created from HERE (the repository host): it reaches every pg node's server, finds
   # the primary and records the cluster's identity - so this also proves the TLS path store -> nodes.
-  pgbr --repo="$ST_IDX" stanza-create 2>&1 | sed 's/^/     /' \
-    || die "stanza-create failed - are backup-node's servers up on all three pg nodes? (ss -tln on a pg node)"
-  pgbr --repo="$ST_IDX" info 2>&1 | sed 's/^/     /'
+  # (no --repo: stanza-create always works on every repository in the config - here, just this one.
+  # And the failure message names no cause: the first version guessed "servers down" while the real
+  # reason, an invalid option, was printed on the line above it. The output IS the diagnosis.)
+  pgbr stanza-create 2>&1 | sed 's/^/     /' || die "stanza-create failed - the lines above say why"
+  pgbr info 2>&1 | sed 's/^/     /'
   ok "store repo$ST_IDX on $ST_NAME ready - next: backup-enable on the primary, then backup-run here"
 }
 
@@ -1001,7 +1008,7 @@ cmd_backup_enable() {
   [ "$(pg_sql "SHOW archive_mode")" = on ] || die "archive_mode is not on after the restart"
   ok "archive_mode = on, applied (no restart pending)"
   # ---- PROVE it: pgBackRest's own check forces a WAL switch and waits for it in EVERY repo ----
-  pgbr check 2>&1 | sed 's/^/     /' || die "pgbackrest check failed - WAL is not reaching every store (the output above names which)"
+  pgbr check 2>&1 | sed 's/^/     /' || die "pgbackrest check failed - the lines above say which store and why"
   ok "a WAL file was archived to every store (pgbackrest check)"
 }
 
@@ -1011,7 +1018,7 @@ cmd_backup_run() {
   case "$type" in full|diff) ;; *) die "usage: sudo $0 backup-run [full|diff]" ;; esac
   say "a $type backup to repo$ST_IDX now - reaching into the primary"
   pgbr --repo="$ST_IDX" --type="$type" backup 2>&1 | sed 's/^/     /' || die "the backup failed - the lines above say why"
-  pgbr --repo="$ST_IDX" info 2>&1 | sed 's/^/     /'
+  pgbr info 2>&1 | sed 's/^/     /'
   # ---- the timers: the weekly full, differentials the other days, stores an hour apart ----
   local hh; hh="$(printf '%02d' "$ST_IDX")"
   for u in full diff; do

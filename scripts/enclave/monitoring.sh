@@ -12,12 +12,13 @@
 #     sudo ./monitoring.sh alert-test on|off  PROVE an alert reaches the dashboard, and clears
 #     ./monitoring.sh status                 what is running here and where it is bound
 #     sudo ./monitoring.sh rules             Prometheus alert rules, validated, counted live
+#     sudo ./monitoring.sh scrape            regenerate prometheus.yml only, validate, reload
 #     sudo ./monitoring.sh facts             publish the compliance facts as metrics, once
 #     sudo ./monitoring.sh facts-timer       the 15-minute timer that runs `facts`
 #     sudo ./monitoring.sh dashboards        provision the repo's Grafana dashboards
 #
 #     WHICH MACHINE: exporter and facts-timer on EVERY in-gap machine; libvirt on each
-#     hypervisor (host-1..4); collector, alerting, alert-test, rules and dashboards on the
+#     hypervisor (host-1..4); collector, scrape, alerting, alert-test, rules and dashboards on the
 #     collector, svc-obs-01. Build order: runbook 10a ("AS BUILT, 2026-09-14"). Controls:
 #     CA-7 and SI-4 (iscm-strategy.md). The alert path is backlog B-09a.
 #
@@ -54,7 +55,7 @@ TEXTFILE_DIR="${TEXTFILE_DIR:-/var/lib/node_exporter/textfile}"
 # THE SYSTEMD COLLECTOR IS DELIBERATELY NARROWED. Unrestricted it emits several series for
 # every unit on the box - hundreds of them, most of which nobody will ever look at, on a
 # Prometheus with a 90d retention. Named units only: the ones a machine exists to run.
-SYSTEMD_UNITS="${SYSTEMD_UNITS:-(auditd|chrony|sshd|ssh|ufw|nginx|docker|containerd|grafana-server|prometheus|prometheus-alertmanager|prometheus-node-exporter|prometheus-libvirt-exporter|libvirtd|virtqemud|postgresql.*|maas-.*|named|bind9|dailyaidecheck|vm-backup|enclave-facts)\\.(service|timer)}"
+SYSTEMD_UNITS="${SYSTEMD_UNITS:-(auditd|chrony|sshd|ssh|ufw|nginx|docker|containerd|grafana-server|prometheus|prometheus-alertmanager|prometheus-node-exporter|prometheus-libvirt-exporter|prometheus-postgres-exporter|etcd|patroni|libvirtd|virtqemud|postgresql.*|maas-.*|named|bind9|dailyaidecheck|vm-backup|enclave-facts)\\.(service|timer)}"
 LV_PORT="${LIBVIRT_EXPORTER_PORT:-9177}"
 
 # THE DATASOURCE UID IS A CONTRACT between the provisioning file and every dashboard JSON.
@@ -352,8 +353,16 @@ svc-mgmt-01	contracts
 svc-repo-01	mirror
 svc-harbor-01	registry
 svc-obs-01	observability
+pg-01	database
+pg-02	database
+pg-03	database
 EOF
 }
+# The database nodes additionally serve Patroni's /metrics (8008, TLS) and postgres-exporter
+# (9187) - backlog B-06a slice 4. Derived from the role above, so a fourth node is one line.
+scrape_databases() { scrape_targets | awk -F'\t' '$2=="database"{print $1}'; }
+PATRONI_PORT="${PATRONI_PORT:-8008}"
+PG_EXPORTER_PORT="${PG_EXPORTER_PORT:-9187}"
 # Hypervisors additionally run the libvirt exporter - per-guest metrics FROM the host.
 scrape_hypervisors() { printf 'host-1\nhost-2\nhost-3\nhost-4\n'; }
 
@@ -386,6 +395,9 @@ AL_CRED_MAX_AGE="${AL_CRED_MAX_AGE:-86400}"         # a credentials file older t
 AL_CLOCK_MAX_OFFSET="${AL_CLOCK_MAX_OFFSET:-1}"      # seconds from its chrony source - DISA's own threshold (3.39)
 AL_CLOCK_SYNC_STALE="${AL_CLOCK_SYNC_STALE:-43200}"  # no measurement from the source in 12 h (VMs poll every 4.5 h)
 AL_DATA_DISK_RESERVED="${AL_DATA_DISK_RESERVED:-0.98}" # allocated/apparent below this: a data disk is no longer reserved (3.42)
+AL_PG_SYNC_LOST_FOR="${AL_PG_SYNC_LOST_FOR:-5m}"      # a primary with no synchronous standby this long (B-06a slice 4)
+AL_PG_NO_PRIMARY_FOR="${AL_PG_NO_PRIMARY_FOR:-1m}"    # longer than Patroni's own failover (ttl 30 s + a loop)
+AL_PG_REPLICA_FOR="${AL_PG_REPLICA_FOR:-5m}"          # a replica not streaming, or a node with PostgreSQL down
 AL_SCAN_STALE_DAYS="${AL_SCAN_STALE_DAYS:-30}"    # STIG checklist older than this
 AL_CERT_DAYS="${AL_CERT_DAYS:-30}"                # certificate inside this many days
 AL_AIDE_STALE="${AL_AIDE_STALE:-129600}"          # 36h - dailyaidecheck has missed a day
@@ -558,32 +570,10 @@ grafana_admin_password() {
 
 cmd_grafana_admin() { need_root; grafana_admin_password; }
 
-cmd_collector() {
-  guard_in_gap; need_root
-  local me ip; me="$(hostname -s)"; ip="$(my_enclave_ip)"
-  [ -n "$ip" ] || die "no enclave address for '$me' in enclave-addresses.env"
-  [ "$me" = "${SVC_OBS_01_NAME:-svc-obs-01}" ] || warn "this is $me, not svc-obs-01 - continuing anyway"
-
-  say "installing the collector on $me ($ip)"
-  DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    prometheus prometheus-alertmanager prometheus-node-exporter 2>&1 | tail -3
-
-  # ---- bindings. EVERY ONE of these packages defaults to all interfaces ------------------
-  # node-exporter, prometheus, alertmanager and grafana all bind *:PORT out of the box, and
-  # alertmanager opens a CLUSTER port (9094) on top for HA gossip. That is the postfix finding
-  # (6.3e) five times over. Prometheus and alertmanager have no business being reachable from
-  # anywhere - Grafana proxies to them over loopback.
-  set_args /etc/default/prometheus \
-    "--web.listen-address=127.0.0.1:9090 --storage.tsdb.retention.time=$PROM_RETENTION_TIME --storage.tsdb.retention.size=$PROM_RETENTION_SIZE"
-  # An EMPTY --cluster.listen-address switches the 9094 HA gossip listener off - one node.
-  set_args /etc/default/prometheus-alertmanager \
-    "--web.listen-address=127.0.0.1:9093 --cluster.listen-address="
-  # THE SAME FLAGS `exporter` WOULD SET - not just the listen address. Setting only the
-  # address here is what silently disabled the compliance facts on this machine once.
-  set_args /etc/default/prometheus-node-exporter "$(ne_args "$ip")"
-
-  # ---- scrape config, generated from enclave-addresses.env -------------------------------
-  local cfg=/etc/prometheus/prometheus.yml
+# prometheus.yml, generated. Shared by `collector` (the full install) and `scrape` (this file
+# alone) - one writer, so the two can never disagree about what is scraped.
+write_prometheus_config() {  # <this machine's short name>
+  local me="$1" cfg=/etc/prometheus/prometheus.yml
   [ -f "$cfg" ] && cp -a "$cfg" "/var/backups/prometheus.yml.$(date +%Y%m%dT%H%M%S)"
   {
     printf '# Generated by scripts/enclave/monitoring.sh - do not edit by hand.\n'
@@ -623,6 +613,25 @@ cmd_collector() {
       printf "      - targets: ['%s:%s']\n        labels: {machine: %s, role: hypervisor}\n" \
              "$a" "$LV_PORT" "$m"
     done < <(scrape_hypervisors)
+    # ---- THE DATABASE (B-06a slice 4). Patroni's REST API is TLS with the node certificate;
+    # Prometheus verifies it against the system trust store, which carries the enclave root
+    # (curl without -k from svc-obs-01 answered 200, 2026-09-28) - no insecure_skip_verify.
+    printf '\n  # Patroni: leader, sync standby, timeline, WAL positions - the sync-degradation alert\n'
+    printf '  - job_name: patroni\n    scheme: https\n    static_configs:\n'
+    while IFS= read -r m; do
+      key="$(printf '%s' "$m" | tr '[:lower:]-' '[:upper:]_')"
+      a="$(eval "printf '%s' \"\${$key:-}\"")"
+      [ -n "$a" ] || continue
+      printf "      - targets: ['%s:%s']\n        labels: {machine: %s, role: database}\n" "$a" "$PATRONI_PORT" "$m"
+    done < <(scrape_databases)
+    printf '\n  # postgres-exporter: connections, locks, replication, per-database statistics\n'
+    printf '  - job_name: postgres\n    static_configs:\n'
+    while IFS= read -r m; do
+      key="$(printf '%s' "$m" | tr '[:lower:]-' '[:upper:]_')"
+      a="$(eval "printf '%s' \"\${$key:-}\"")"
+      [ -n "$a" ] || continue
+      printf "      - targets: ['%s:%s']\n        labels: {machine: %s, role: database}\n" "$a" "$PG_EXPORTER_PORT" "$m"
+    done < <(scrape_databases)
   } > "$cfg"
   chown root:root "$cfg"; chmod 0644 "$cfg"
   # THE SYNTAX GATE. Same idea as visudo -c and sh -n: never reload a config that has not
@@ -630,6 +639,55 @@ cmd_collector() {
   promtool check config "$cfg" >/dev/null 2>&1 \
     && ok "prometheus.yml generated and valid" \
     || { promtool check config "$cfg" 2>&1 | sed 's/^/       /'; die "generated config is INVALID - not reloading"; }
+}
+
+# scrape: regenerate prometheus.yml ONLY - validate, reload, then show every target's health.
+# For adding scrape targets without re-running the whole collector install.
+cmd_scrape() {
+  guard_in_gap; need_root
+  local me; me="$(hostname -s)"
+  [ "$me" = "${SVC_OBS_01_NAME:-svc-obs-01}" ] || warn "this is $me, not svc-obs-01 - continuing anyway"
+  command -v promtool >/dev/null 2>&1 || die "promtool not found - is prometheus installed?"
+  write_prometheus_config "$me"
+  systemctl reload prometheus || die "prometheus did not reload"
+  say "waiting 45 s for every target to be scraped at least twice"
+  sleep 45
+  curl -s 'http://127.0.0.1:9090/api/v1/targets?state=active' | python3 -c '
+import sys, json
+t = json.load(sys.stdin)["data"]["activeTargets"]
+down = [x for x in t if x["health"] != "up"]
+print("  [ok] %d target(s) scraped, %d up" % (len(t), len(t) - len(down)))
+for x in sorted(down, key=lambda x: (x["labels"].get("job",""), x["labels"].get("machine",""))):
+    print("  [!!] DOWN  %-10s %-14s %s" % (x["labels"].get("job"), x["labels"].get("machine"), (x.get("lastError") or "")[:90]))
+'
+}
+
+cmd_collector() {
+  guard_in_gap; need_root
+  local me ip; me="$(hostname -s)"; ip="$(my_enclave_ip)"
+  [ -n "$ip" ] || die "no enclave address for '$me' in enclave-addresses.env"
+  [ "$me" = "${SVC_OBS_01_NAME:-svc-obs-01}" ] || warn "this is $me, not svc-obs-01 - continuing anyway"
+
+  say "installing the collector on $me ($ip)"
+  DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    prometheus prometheus-alertmanager prometheus-node-exporter 2>&1 | tail -3
+
+  # ---- bindings. EVERY ONE of these packages defaults to all interfaces ------------------
+  # node-exporter, prometheus, alertmanager and grafana all bind *:PORT out of the box, and
+  # alertmanager opens a CLUSTER port (9094) on top for HA gossip. That is the postfix finding
+  # (6.3e) five times over. Prometheus and alertmanager have no business being reachable from
+  # anywhere - Grafana proxies to them over loopback.
+  set_args /etc/default/prometheus \
+    "--web.listen-address=127.0.0.1:9090 --storage.tsdb.retention.time=$PROM_RETENTION_TIME --storage.tsdb.retention.size=$PROM_RETENTION_SIZE"
+  # An EMPTY --cluster.listen-address switches the 9094 HA gossip listener off - one node.
+  set_args /etc/default/prometheus-alertmanager \
+    "--web.listen-address=127.0.0.1:9093 --cluster.listen-address="
+  # THE SAME FLAGS `exporter` WOULD SET - not just the listen address. Setting only the
+  # address here is what silently disabled the compliance facts on this machine once.
+  set_args /etc/default/prometheus-node-exporter "$(ne_args "$ip")"
+
+  # ---- scrape config, generated from enclave-addresses.env -------------------------------
+  write_prometheus_config "$me"
   # AND ALERTMANAGER'S. Before 2026-09-24 this step did not exist, so the package's example
   # config - receivers that deliver to example.org - was what every enclave ran (B-09a).
   command -v amtool >/dev/null 2>&1 && write_alertmanager_config
@@ -1428,6 +1486,110 @@ groups:
           action: >-
             'sudo virsh domblklist <vm> --details' and the disk's driver discard setting must be
             'ignore'. Re-reserving an existing disk means the guest down - backlog 3.42.
+
+  # ---------------------------------------------------------------- database
+  # B-06a slice 4 (2026-09-28). From Patroni's /metrics and postgres-exporter, per node, labelled
+  # scope=enclave-pg. The first rule is the one that makes synchronous_mode_strict OFF defensible
+  # (runbook 9a.3, decided 2026-09-27): with strict off, losing every synchronous standby makes the
+  # primary accept writes ASYNCHRONOUSLY and say nothing - this is what says something.
+  - name: enclave-database
+    rules:
+      - alert: PostgresSyncStandbyLost
+        expr: >-
+          (sum by (scope) (patroni_primary) >= 1)
+          unless on (scope) (sum by (scope) (patroni_sync_standby) >= 1)
+        for: ${AL_PG_SYNC_LOST_FOR}
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ \$labels.scope }}: the primary has NO synchronous standby - commits are no longer protected"
+          description: "synchronous_mode_strict is off (decided 2026-09-27), so with no synchronous standby the primary keeps accepting writes asynchronously. A primary failure now LOSES committed transactions."
+          action: >-
+            'sudo patronictl -c /etc/patroni/config.yml list' on any pg node. Bring a replica back
+            (its VM, then etcd, then patroni) - Patroni names it synchronous again by itself.
+      - alert: PostgresNoPrimary
+        expr: sum by (scope) (patroni_primary) < 1
+        for: ${AL_PG_NO_PRIMARY_FOR}
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ \$labels.scope }} has no primary - the database accepts no writes"
+          description: "Patroni is reporting from the nodes and none is the leader for longer than a normal failover takes. Usually etcd has lost its quorum (two of three members down) or Patroni is paused."
+          action: >-
+            On a pg node: '06a-postgres-ha.sh etcd-check' for the quorum, then
+            'sudo patronictl -c /etc/patroni/config.yml list'.
+      - alert: PostgresMultiplePrimaries
+        expr: sum by (scope) (patroni_primary) > 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ \$labels.scope }} reports {{ \$value }} primaries - SPLIT BRAIN"
+          description: "More than one node believes it is the leader. The design exists to make this impossible (etcd's leader lock); if it fires, writes may be landing on two diverging databases."
+          action: >-
+            Stop application writes first. Then 'patronictl list' from every pg node and
+            'etcd-check' - do not restart anything until the leader lock's holder is known.
+      - alert: PostgresReplicaNotStreaming
+        expr: (patroni_replica == 1) and on (instance) (patroni_postgres_streaming == 0)
+        for: ${AL_PG_REPLICA_FOR}
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ \$labels.machine }} is a replica and is not streaming from the leader"
+          description: "It is falling behind with every commit and cannot become the synchronous standby. A replica that stays behind long enough needs a fresh copy."
+          action: >-
+            'sudo patronictl -c /etc/patroni/config.yml list' - its Lag column. The replicator
+            login is by certificate: an expired or replaced node certificate fails here first.
+      - alert: PostgresNotRunning
+        expr: patroni_postgres_running == 0
+        for: ${AL_PG_REPLICA_FOR}
+        labels:
+          severity: warning
+        annotations:
+          summary: "PostgreSQL is not running on {{ \$labels.machine }} (Patroni is)"
+          description: "Patroni answers but its PostgreSQL is down - a failed start, a full data disk, or a missing data-disk mount (patroni.service requires it)."
+          action: >-
+            'journalctl -u patroni' with sudo on {{ \$labels.machine }}, and 'findmnt /var/lib/postgresql'.
+      - alert: PostgresFailoverHappened
+        expr: changes(patroni_postgres_timeline[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ \$labels.machine }} changed timeline - a failover or switchover happened"
+          description: "Every promotion starts a new timeline. A planned switchover fires this too; an unplanned one is the only notice a failover that worked will ever give."
+          action: >-
+            'patronictl list' and 'patronictl history' - who is leader now, and why it changed.
+      - alert: PatroniPendingRestart
+        expr: patroni_pending_restart == 1
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ \$labels.machine }} has a configuration change that needs a restart to apply"
+          description: "The setting SHOWS the new value and is not in effect yet - the false pass 6a.7 warned about (shared_preload_libraries, for one)."
+          action: >-
+            'patronictl restart enclave-pg {{ \$labels.machine }}' in a quiet moment - replicas first, the leader last.
+      - alert: PatroniPaused
+        expr: patroni_is_paused == 1
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Patroni is PAUSED on {{ \$labels.machine }} - automatic failover is off"
+          description: "Maintenance mode left on. The cluster will not fail over while it is paused."
+          action: >-
+            'patronictl resume enclave-pg' when the maintenance is done.
+      - alert: PostgresExporterCannotConnect
+        expr: pg_up == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "postgres-exporter on {{ \$labels.machine }} cannot log in to PostgreSQL"
+          description: "The exporter runs and cannot reach the database as pgmonitor - every database statistic from this node is missing."
+          action: >-
+            'journalctl -u prometheus-postgres-exporter' with sudo; the login is peer over the
+            local socket, OS user prometheus mapped to pgmonitor by Patroni's pg_ident.
 
   # ---------------------------------------------------------------- registry
   # Harbor keeps answering, keeps accepting pushes, and keeps reporting images clean whatever
@@ -2571,6 +2733,7 @@ case "${1:-status}" in
   exporter) shift; cmd_exporter "$@" ;;
   libvirt)  shift; cmd_libvirt "$@" ;;
   collector) shift; cmd_collector "$@" ;;
+  scrape)    shift; cmd_scrape "$@" ;;
   grafana-admin) shift; cmd_grafana_admin "$@" ;;
   rules)      shift; cmd_rules "$@" ;;
   alerting)   shift; cmd_alerting "$@" ;;
@@ -2579,5 +2742,5 @@ case "${1:-status}" in
   facts-timer) shift; cmd_facts_timer "$@" ;;
   dashboards) shift; cmd_dashboards "$@" ;;
   status)   shift; cmd_status "$@" ;;
-  *) printf 'usage: %s {exporter|libvirt|collector|grafana-admin|rules|alerting|alert-test on|off|facts|facts-timer|dashboards|status}\n' "$0" >&2; exit 2 ;;
+  *) printf 'usage: %s {exporter|libvirt|collector|scrape|grafana-admin|rules|alerting|alert-test on|off|facts|facts-timer|dashboards|status}\n' "$0" >&2; exit 2 ;;
 esac

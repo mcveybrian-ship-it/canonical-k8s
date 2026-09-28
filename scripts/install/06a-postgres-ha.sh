@@ -9,6 +9,8 @@
 #     sudo ./06a-postgres-ha.sh etcd-check             quorum, members, and the TLS it enforces
 #     sudo ./06a-postgres-ha.sh patroni                PostgreSQL 16 under Patroni - pg-01 FIRST
 #     sudo ./06a-postgres-ha.sh patroni-check          leader, sync standby, and the STIG traps
+#     sudo ./06a-postgres-ha.sh monitor                postgres-exporter, local-only, no password
+#                                                      - the PRIMARY first (it creates the role)
 #
 # SLICE 2 - THE DATABASE'S OWN etcd, WITH MUTUAL TLS
 #
@@ -270,6 +272,13 @@ PATRONI_PKI="${PATRONI_PKI:-/etc/patroni/pki}"
 PG_MAX_CONN="${PG_MAX_CONN:-100}"
 PG_REPL_CONN_LIMIT="${PG_REPL_CONN_LIMIT:-10}"
 PG_WAIT="${PG_WAIT:-300}"
+# The monitoring login (slice 4, decided 2026-09-28): a read-only role with pg_monitor, reached
+# ONLY over the local socket by the exporter's OS account through a pg_ident map - no password.
+PG_MON_ROLE="${PG_MON_ROLE:-pgmonitor}"
+PG_MON_OSUSER="${PG_MON_OSUSER:-prometheus}"        # the account prometheus-postgres-exporter runs as
+PG_MON_CONN_LIMIT="${PG_MON_CONN_LIMIT:-3}"
+PG_EXPORTER_PORT="${PG_EXPORTER_PORT:-9187}"
+PG_EXPORTER_ENV="${PG_EXPORTER_ENV:-/etc/default/prometheus-postgres-exporter}"
 
 # The pg nodes, the K8S workers - from the address file, as `ip name` pairs.
 addr_pairs() {   # addr_pairs PREFIX_REGEX
@@ -386,6 +395,8 @@ postgresql:
   # md5, password or trust line exists. Nothing matches = rejected.
   pg_hba:
     - local all postgres peer
+    # the exporter, as OS user $PG_MON_OSUSER, logs in as $PG_MON_ROLE - local socket only (slice 4)
+    - local postgres $PG_MON_ROLE peer map=$PG_MON_ROLE
 YML
   while read -r ip n; do
     printf '    - hostssl replication replicator %s/32 cert map=pgnodes\n' "$ip"
@@ -393,6 +404,7 @@ YML
   done < <(addr_pairs 'PG_[0-9]+')
   while read -r ip n; do printf '    - hostssl all all %s/32 scram-sha-256\n' "$ip"; done < <(addr_pairs 'K8S_WK_[0-9]+')
   printf '  pg_ident:\n'
+  printf '    - %s %s %s\n' "$PG_MON_ROLE" "$PG_MON_OSUSER" "$PG_MON_ROLE"
   while read -r ip n; do
     printf '    - pgnodes %s.%s replicator\n' "$n" "${ENCLAVE_DOMAIN:-enclave.internal}"
     printf '    - pgnodes %s.%s rewinder\n' "$n" "${ENCLAVE_DOMAIN:-enclave.internal}"
@@ -427,6 +439,26 @@ BEGIN
   END IF;
 END
 \$\$;
+SQL
+$(render_monitor_sql)
+SH
+}
+
+# The monitoring role - read-only statistics (pg_monitor), a connection limit (V-261857), no
+# password. Used by post_bootstrap on a new cluster and by `monitor` on an existing one.
+render_monitor_sql() {
+  cat <<SH
+psql -v ON_ERROR_STOP=1 -X -q -d postgres <<'SQL'
+DO \$\$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = '$PG_MON_ROLE') THEN
+    CREATE ROLE $PG_MON_ROLE WITH LOGIN CONNECTION LIMIT $PG_MON_CONN_LIMIT;
+  ELSE
+    ALTER ROLE $PG_MON_ROLE WITH LOGIN CONNECTION LIMIT $PG_MON_CONN_LIMIT;
+  END IF;
+END
+\$\$;
+GRANT pg_monitor TO $PG_MON_ROLE;
 SQL
 SH
 }
@@ -555,11 +587,11 @@ cmd_patroni_check() {
   v="$(pg_sql "SELECT string_agg(DISTINCT type, ',') FROM pg_hba_file_rules")"
   case ",$v," in *,host,*|*,hostnossl,*) warn "pg_hba has non-TLS host lines: $v"; bad=1 ;; *) ok "pg_hba line types: $v - TLS only over the network" ;; esac
   # V-261857: the roles the build creates carry an explicit CONNECTION LIMIT (post_bootstrap)
-  v="$(pg_sql "SELECT string_agg(rolname||'='||rolconnlimit, ' ' ORDER BY rolname) FROM pg_roles WHERE rolname IN ('replicator','rewinder')")"
+  v="$(pg_sql "SELECT string_agg(rolname||'='||rolconnlimit, ' ' ORDER BY rolname) FROM pg_roles WHERE rolname IN ('$PG_MON_ROLE','replicator','rewinder')")"
   case " $v " in
     *"=-1"*) warn "connection limits: $v - a role has none (V-261857)"; bad=1 ;;
-    *" replicator="*" rewinder="*) ok "connection limits: $v (V-261857)" ;;
-    *) warn "connection limits: '${v}' - replicator or rewinder is missing (V-261857)"; bad=1 ;;
+    *" $PG_MON_ROLE="*" replicator="*" rewinder="*) ok "connection limits: $v (V-261857)" ;;
+    *) warn "connection limits: '${v}' - $PG_MON_ROLE, replicator or rewinder is missing (V-261857; $PG_MON_ROLE comes from 'monitor')"; bad=1 ;;
   esac
   for s in ssl ssl_min_protocol_version password_encryption log_destination logging_collector log_file_mode synchronous_commit; do
     say "  $(pg_sql "SELECT name||' = '||setting FROM pg_settings WHERE name='$s'")"
@@ -577,10 +609,79 @@ cmd_patroni_check() {
   [ "$bad" -eq 0 ] || exit 1
 }
 
+# =========================================================================================
+# SLICE 4 - postgres-exporter (decided 2026-09-28: its own role, local peer, no password)
+#
+#   1. patroni.yml gains one local pg_hba line and one pg_ident map (OS user prometheus ->
+#      role pgmonitor); Patroni applies them on reload - never an edit to pg_hba.conf.
+#   2. On the PRIMARY: the role, idempotently. Replicas receive it by replication.
+#   3. The exporter, installed with its self-start BLOCKED - its postinst starts it with an
+#      empty connection string on every interface - then bound to this node's IP only.
+# =========================================================================================
+cmd_monitor() {
+  need_root; whoami_pg
+  local role v
+  role="$(pg_sql "SELECT CASE WHEN pg_is_in_recovery() THEN 'replica' ELSE 'primary' END" 2>/dev/null || true)"
+  [ -n "$role" ] || die "PostgreSQL is not answering on $ME - slice 3 first (patroni-check)"
+
+  # ---- 1. the login path, through Patroni ----
+  cp -p "$PATRONI_CONF" "$PATRONI_CONF.bak-06a-$(date +%Y%m%d%H%M%S)"
+  render_patroni "$ME" "$ME_ADDR" > "$PATRONI_CONF.new"
+  chown root:postgres "$PATRONI_CONF.new"; chmod 0640 "$PATRONI_CONF.new"; mv -f "$PATRONI_CONF.new" "$PATRONI_CONF"
+  runuser -u postgres -- patroni --validate-config "$PATRONI_CONF" 2>&1 | sed 's/^/     /' | head -20 || true
+  render_post_bootstrap > /etc/patroni/post-bootstrap.sh     # a rebuilt cluster gets the role at bootstrap
+  systemctl reload patroni
+  for _ in $(seq 1 12); do
+    v="$(pg_sql "SELECT count(*) FROM pg_hba_file_rules WHERE type='local' AND '$PG_MON_ROLE'=ANY(user_name)")"
+    [ "$v" = 1 ] && break; sleep 5
+  done
+  [ "$v" = 1 ] || die "Patroni did not apply the $PG_MON_ROLE pg_hba line within 60 s (journalctl -u patroni)"
+  ok "pg_hba: local $PG_MON_ROLE by peer, mapped from OS user $PG_MON_OSUSER - applied by Patroni"
+
+  # ---- 2. the role, on the primary only ----
+  if [ "$role" = primary ]; then
+    render_monitor_sql | runuser -u postgres -- sh -s || die "could not create $PG_MON_ROLE"
+    ok "role $PG_MON_ROLE: pg_monitor, CONNECTION LIMIT $PG_MON_CONN_LIMIT, no password (created on the primary)"
+  else
+    [ "$(pg_sql "SELECT count(*) FROM pg_roles WHERE rolname='$PG_MON_ROLE'")" = 1 ] \
+      || die "$ME is a replica and $PG_MON_ROLE does not exist yet - run 'monitor' on the primary first"
+    ok "role $PG_MON_ROLE present (replicated from the primary)"
+  fi
+
+  # ---- 3. the exporter ----
+  if ! dpkg -s prometheus-postgres-exporter >/dev/null 2>&1; then
+    printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d; chmod 0755 /usr/sbin/policy-rc.d
+    DEBIAN_FRONTEND=noninteractive apt-get install -y prometheus-postgres-exporter \
+      || { rm -f /usr/sbin/policy-rc.d; die "apt could not install prometheus-postgres-exporter"; }
+    rm -f /usr/sbin/policy-rc.d
+    ok "prometheus-postgres-exporter $(dpkg-query -W -f='${Version}' prometheus-postgres-exporter) installed, its self-start blocked"
+  fi
+  id "$PG_MON_OSUSER" >/dev/null 2>&1 || die "no OS user $PG_MON_OSUSER - the exporter package should have made it"
+  [ -f "$PG_EXPORTER_ENV" ] && cp -p "$PG_EXPORTER_ENV" "/var/backups/$(basename "$PG_EXPORTER_ENV").$(date +%Y%m%dT%H%M%S)"
+  {
+    echo "# MANAGED by 06a-postgres-ha.sh monitor (B-06a slice 4). No password: peer over the local"
+    echo "# socket, OS user $PG_MON_OSUSER mapped to role $PG_MON_ROLE by Patroni's pg_ident."
+    echo "DATA_SOURCE_NAME='host=/var/run/postgresql user=$PG_MON_ROLE dbname=postgres'"
+    echo "ARGS='--web.listen-address=$ME_ADDR:$PG_EXPORTER_PORT'"
+  } > "$PG_EXPORTER_ENV.new"
+  chown "root:$PG_MON_OSUSER" "$PG_EXPORTER_ENV.new"; chmod 0640 "$PG_EXPORTER_ENV.new"; mv -f "$PG_EXPORTER_ENV.new" "$PG_EXPORTER_ENV"
+  systemctl enable prometheus-postgres-exporter >/dev/null 2>&1
+  systemctl restart prometheus-postgres-exporter
+  local up=""
+  for _ in $(seq 1 12); do
+    up="$(curl -s --max-time 5 "http://$ME_ADDR:$PG_EXPORTER_PORT/metrics" 2>/dev/null | awk '$1=="pg_up"{print $2}')"
+    [ "$up" = 1 ] && break; sleep 5
+  done
+  [ "$up" = 1 ] || { journalctl -u prometheus-postgres-exporter -n 15 --no-pager | sed 's/^/     /'; die "the exporter is not reaching PostgreSQL (pg_up=${up:-no answer}) - the log above says why"; }
+  ok "postgres-exporter on $ME_ADDR:$PG_EXPORTER_PORT: pg_up 1 - logged in as $PG_MON_ROLE with no password"
+  ss -Htln "sport = :$PG_EXPORTER_PORT" | awk '{print "     listening: "$4}'
+}
+
 case "${1:-}" in
   etcd)       shift; cmd_etcd "$@" ;;
   etcd-check) cmd_etcd_check ;;
   patroni)       cmd_patroni ;;
   patroni-check) cmd_patroni_check ;;
-  *) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  monitor)       cmd_monitor ;;
+  *) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

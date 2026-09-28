@@ -386,6 +386,8 @@ AL_FS_WARN_PCT="${AL_FS_WARN_PCT:-20}"    # free space warning
 # FilesystemWillFillSoon still covers it. The path is vm-specs.env's VM_POOL_DATA - the composer's own.
 AL_FS_RESERVED_MOUNTS="${AL_FS_RESERVED_MOUNTS:-$( [ -r "$HERE/vm-specs.env" ] && ( . "$HERE/vm-specs.env" >/dev/null 2>&1; printf '%s' "${VM_POOL_DATA:-}") )}"
 AL_DATA_POOL_OTHER_BYTES="${AL_DATA_POOL_OTHER_BYTES:-5000000000}"  # 5 GB of non-disk data on it (measured baseline: 0)
+AL_DB_BACKUP_STALE="${AL_DB_BACKUP_STALE:-93600}"        # 26 h: a store missed its nightly database backup (B-06a slice 5)
+AL_DB_FULL_STALE="${AL_DB_FULL_STALE:-691200}"           # 8 d: the weekly full is overdue
 AL_FS_CRIT_PCT="${AL_FS_CRIT_PCT:-10}"    # free space critical
 AL_FS_WARN_FOR="${AL_FS_WARN_FOR:-15m}"
 AL_FS_CRIT_FOR="${AL_FS_CRIT_FOR:-5m}"
@@ -1504,6 +1506,51 @@ groups:
           action: >-
             'sudo du -x -h -d1 {{ \$labels.pool }}' on {{ \$labels.machine }}; move anything that is not
             a *-data.qcow2 elsewhere (vm-backup's SECOND_DIR is /var/lib/libvirt/images/backup-copy).
+      # THE DATABASE'S BACKUPS (B-06a slice 5, 2026-09-28): two stores, each backing up nightly and
+      # receiving every WAL file. Proven restorable to a point in time from each; these say when
+      # that stops being true.
+      - alert: DatabaseBackupMissed
+        expr: time() - max by (machine, stanza, repo) (enclave_pgbackrest_last_backup_seconds) > ${AL_DB_BACKUP_STALE}
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ \$labels.machine }} repo{{ \$labels.repo }}: no database backup has finished in {{ \$value | humanizeDuration }}"
+          description: "The store backs up nightly (full on Sunday, differential otherwise). A missed night narrows every point-in-time restore to the WAL since the last backup that did finish."
+          action: >-
+            On {{ \$labels.machine }}: 'systemctl status pgbackrest-diff pgbackrest-full' and
+            'sudo -u postgres pgbackrest --stanza={{ \$labels.stanza }} info'.
+      - alert: DatabaseFullBackupStale
+        expr: time() - enclave_pgbackrest_last_backup_seconds{type="full"} > ${AL_DB_FULL_STALE}
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ \$labels.machine }} repo{{ \$labels.repo }}: the last FULL database backup is {{ \$value | humanizeDuration }} old"
+          description: "Differentials are measured against the last full; retention keeps 2 fulls. A missing weekly full grows every differential and stretches restore time."
+          action: >-
+            'sudo ~/canonical-k8s/scripts/install/06a-postgres-ha.sh backup-run full' on {{ \$labels.machine }}.
+      - alert: DatabaseBackupStoreError
+        expr: enclave_pgbackrest_status != 0
+        for: 30m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ \$labels.machine }}: pgBackRest reports repo{{ \$labels.repo }} NOT ok (code {{ \$value }})"
+          description: "pgBackRest's own verdict on the repository - missing backups, a WAL gap, or 99 when its info could not be read at all. Restores from this store are not assured."
+          action: >-
+            'sudo -u postgres pgbackrest --stanza={{ \$labels.stanza }} info' on {{ \$labels.machine }} - the message names the problem.
+      - alert: DatabaseArchivingFailing
+        expr: increase(pg_stat_archiver_failed_count[15m]) > 0 and on (instance) pg_stat_archiver_last_archive_age > 900
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ \$labels.machine }}: WAL is failing to reach the backup stores"
+          description: "archive_command is failing and nothing has been archived for 15 minutes. PostgreSQL keeps the unarchived WAL, so /var/lib/postgresql fills; and a restore cannot reach past the last WAL that did arrive."
+          action: >-
+            On {{ \$labels.machine }}: 'sudo -u postgres pgbackrest --stanza=enclave-pg check' names the store that is
+            refusing; then 'systemctl status pgbackrest' on that store (host-4 or host-3) and its port 8432.
 
   # ---------------------------------------------------------------- database
   # B-06a slice 4 (2026-09-28). From Patroni's /metrics and postgres-exporter, per node, labelled
@@ -2239,6 +2286,40 @@ elif rc == 127:
     pass                          # no chronyc here: no clock facts at all, and no source_ok row claiming one
 else:
     SRC["clock"] = 0
+
+# ------------------------------------------------------------------ database backup stores
+# B-06a slice 5 (2026-09-28). On a pgBackRest STORE (its config names a repoN-path), `pgbackrest info`
+# as postgres: each repository's status, and when its last backup of each type finished. A store
+# whose info cannot be read reports status 99 - a missing number would look like a quiet store.
+PGBR_CONF = "/etc/pgbackrest/pgbackrest.conf"
+try:
+    conf = open(PGBR_CONF).read()
+except OSError:
+    conf = ""
+if re.search(r"(?m)^repo[0-9]+-path=", conf):
+    stanzas = [x for x in re.findall(r"(?m)^\[([^\]]+)\]", conf) if x != "global"]
+    for st in stanzas[:1]:
+        rc, o, e = run(["runuser", "-u", "postgres", "--", "pgbackrest", "--stanza=" + st, "--output=json", "info"], timeout=60)
+        try:
+            info = json.loads(o)[0] if rc == 0 else None
+        except (ValueError, IndexError):
+            info = None
+        if info is None:
+            emit("enclave_pgbackrest_status", 99, {"stanza": st, "repo": "all"},
+                 help="pgBackRest status per repository on this store: 0 ok, 99 = info unreadable (B-06a slice 5)")
+            SRC["pgbackrest"] = 0
+            continue
+        for r in (info.get("status", {}).get("repo") or []):
+            emit("enclave_pgbackrest_status", int(r.get("code", 99)), {"stanza": st, "repo": str(r.get("key", "?"))},
+                 help="pgBackRest status per repository on this store: 0 ok, 99 = info unreadable (B-06a slice 5)")
+        last = {}
+        for b in (info.get("backup") or []):
+            key = (str((b.get("database") or {}).get("repo-key", "?")), b.get("type", "?"))
+            last[key] = max(last.get(key, 0), int((b.get("timestamp") or {}).get("stop", 0)))
+        for (repo, typ), ts in sorted(last.items()):
+            emit("enclave_pgbackrest_last_backup_seconds", ts, {"stanza": st, "repo": repo, "type": typ},
+                 help="unix time the last pgBackRest backup of this type finished in this repository")
+        SRC["pgbackrest"] = 1
 
 # ------------------------------------------------------------------ data disks RESERVED
 # Backlog 3.42, found 2026-09-28. A database disk is created preallocated (falloc) so that a

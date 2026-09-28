@@ -235,6 +235,10 @@ verified list before it bootstraps. The firewall is never off; it is widened onc
 
 ## 7. The PostgreSQL guests (06a)
 
+> **As built: [`docs/06a-postgres-ha.md`](06a-postgres-ha.md)** — how pg-01..03 went from this
+> mechanism to a running PostgreSQL cluster, with diagrams. The at-rest evidence below was read
+> 2026-09-28: both pools on host-1..3 sit on LVM over LUKS.
+
 The data disk must be mounted by UUID or LABEL before `finish` removes the seed (4.5) — the composer
 already warns; `finish` enforces it. The WAL archive and the at-rest evidence (`lsblk -s` shows
 `crypt` under both disks) stay as backlog B-06a and 6a.9 describe.

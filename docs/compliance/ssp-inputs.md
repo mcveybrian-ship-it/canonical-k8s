@@ -66,6 +66,10 @@ inventoried rather than assumed:
 - **Kubernetes** takes its cryptography from its `core22` base snap — **22.04**'s FIPS build, not
   the host's 24.04 modules (backlog 3.25). Whether that build maps to an active 22.04 certificate
   is **Canonical question Q-CORE (b)**; do not claim it until answered.
+- **The PostgreSQL cluster's etcd** (pg-01..03, Patroni's consensus store) is Go 1.22.2 **without
+  BoringCrypto** — its TLS is Go's own, not a validated module. Configured to approved algorithms
+  only (TLS 1.2 ECDHE-RSA AES-GCM, mutual TLS), except TLS 1.3 ChaCha20, which Go cannot disable.
+  **Claim "approved algorithms, non-validated module" — POA&M ENG-68**, never "FIPS-validated".
 - **Container images** (Harbor on `svc-harbor-01`, and every workload image) carry their own
   userland libraries, which are **not** the host's validated modules. Their crypto must be listed
   and either justified or kept off the data path.

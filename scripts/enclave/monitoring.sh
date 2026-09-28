@@ -2309,8 +2309,21 @@ if re.search(r"(?m)^repo[0-9]+-path=", conf):
                  help="pgBackRest status per repository on this store: 0 ok, 99 = info unreadable (B-06a slice 5)")
             SRC["pgbackrest"] = 0
             continue
-        for r in (info.get("status", {}).get("repo") or []):
-            emit("enclave_pgbackrest_status", int(r.get("code", 99)), {"stanza": st, "repo": str(r.get("key", "?"))},
+        # WHERE THE PER-REPOSITORY VERDICT LIVES: the first version read status.repo[] only, and on the
+        # real 2.50 stores that emitted NOTHING - the backup times arrived and the status did not, so
+        # DatabaseBackupStoreError could never have fired (caught live 2026-09-28). Read both layouts,
+        # repo[].status and status.repo[], and fall back to the stanza's own verdict - never nothing.
+        codes = {}
+        for r in (info.get("repo") or []):
+            if isinstance(r, dict) and "key" in r and isinstance(r.get("status"), dict):
+                codes[str(r["key"])] = int(r["status"].get("code", 99))
+        for r in ((info.get("status") or {}).get("repo") or []):
+            if isinstance(r, dict) and "key" in r:
+                codes.setdefault(str(r["key"]), int(r.get("code", 99)))
+        if not codes:
+            codes["all"] = int((info.get("status") or {}).get("code", 99))
+        for k, c in sorted(codes.items()):
+            emit("enclave_pgbackrest_status", c, {"stanza": st, "repo": k},
                  help="pgBackRest status per repository on this store: 0 ok, 99 = info unreadable (B-06a slice 5)")
         last = {}
         for b in (info.get("backup") or []):

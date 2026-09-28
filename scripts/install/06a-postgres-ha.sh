@@ -463,6 +463,19 @@ SQL
 SH
 }
 
+# patroni --validate-config also checks it could BIND its REST and PostgreSQL ports, which it
+# cannot while Patroni is running on them - so on a live node it always prints "Port ... is
+# already in use" twice. Drop exactly those lines, say so, and let every other finding through.
+validate_patroni_config() {
+  local out
+  out="$(runuser -u postgres -- patroni --validate-config "$PATRONI_CONF" 2>&1 || true)"
+  if systemctl is-active --quiet patroni && printf '%s\n' "$out" | grep -q 'is already in use'; then
+    out="$(printf '%s\n' "$out" | grep -v 'is already in use' || true)"
+    say "validate-config: the port-in-use findings are Patroni itself holding 8008/5432 - expected on a live node"
+  fi
+  [ -z "$out" ] || printf '%s\n' "$out" | sed 's/^/     /' | head -20
+}
+
 # psql as the postgres OS user over the local socket (peer)
 pg_sql() { runuser -u postgres -- psql -X -A -t -q -d postgres -c "$1"; }
 
@@ -526,7 +539,7 @@ cmd_patroni() {
   chown root:postgres /etc/patroni/post-bootstrap.sh; chmod 0750 /etc/patroni/post-bootstrap.sh
   render_patroni "$name" "$ME_ADDR" > "$PATRONI_CONF.new"
   chown root:postgres "$PATRONI_CONF.new"; chmod 0640 "$PATRONI_CONF.new"; mv -f "$PATRONI_CONF.new" "$PATRONI_CONF"
-  runuser -u postgres -- patroni --validate-config "$PATRONI_CONF" 2>&1 | sed 's/^/     /' | head -20 || true
+  validate_patroni_config
   install -d -m 0755 /etc/systemd/system/patroni.service.d
   # StartLimit: a bootstrap that keeps failing STOPS after five tries in ten minutes. The package's
   # Restart=on-failure looped every few seconds on pg-01 (restart counter 34), each try running
@@ -628,11 +641,11 @@ cmd_monitor() {
   cp -p "$PATRONI_CONF" "$PATRONI_CONF.bak-06a-$(date +%Y%m%d%H%M%S)"
   render_patroni "$ME" "$ME_ADDR" > "$PATRONI_CONF.new"
   chown root:postgres "$PATRONI_CONF.new"; chmod 0640 "$PATRONI_CONF.new"; mv -f "$PATRONI_CONF.new" "$PATRONI_CONF"
-  runuser -u postgres -- patroni --validate-config "$PATRONI_CONF" 2>&1 | sed 's/^/     /' | head -20 || true
+  validate_patroni_config
   render_post_bootstrap > /etc/patroni/post-bootstrap.sh     # a rebuilt cluster gets the role at bootstrap
   systemctl reload patroni
   for _ in $(seq 1 12); do
-    v="$(pg_sql "SELECT count(*) FROM pg_hba_file_rules WHERE type='local' AND '$PG_MON_ROLE'=ANY(user_name)")"
+    v="$(pg_sql "SELECT count(*) FROM pg_hba_file_rules WHERE type='local' AND '$PG_MON_ROLE'=ANY(user_name)" || true)"
     [ "$v" = 1 ] && break; sleep 5
   done
   [ "$v" = 1 ] || die "Patroni did not apply the $PG_MON_ROLE pg_hba line within 60 s (journalctl -u patroni)"
@@ -669,7 +682,10 @@ cmd_monitor() {
   systemctl restart prometheus-postgres-exporter
   local up=""
   for _ in $(seq 1 12); do
-    up="$(curl -s --max-time 5 "http://$ME_ADDR:$PG_EXPORTER_PORT/metrics" 2>/dev/null | awk '$1=="pg_up"{print $2}')"
+    # `|| true` INSIDE the pipeline: the first poll comes before the exporter listens, curl
+    # fails, and under set -e + pipefail that killed the script SILENTLY - no [ok], no [x] -
+    # after the work was done (pg-01, 2026-09-28). A failed poll means "not yet", not "stop".
+    up="$({ curl -s --max-time 5 "http://$ME_ADDR:$PG_EXPORTER_PORT/metrics" 2>/dev/null || true; } | awk '$1=="pg_up"{print $2}')"
     [ "$up" = 1 ] && break; sleep 5
   done
   [ "$up" = 1 ] || { journalctl -u prometheus-postgres-exporter -n 15 --no-pager | sed 's/^/     /'; die "the exporter is not reaching PostgreSQL (pg_up=${up:-no answer}) - the log above says why"; }

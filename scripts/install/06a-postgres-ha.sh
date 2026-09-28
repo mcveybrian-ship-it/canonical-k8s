@@ -6,7 +6,9 @@
 #     (03-compose-vm.sh --harden, then --finish). Runbook 9a is the design; 9a.2a the traps.
 #
 #     sudo ./06a-postgres-ha.sh etcd <fullchain.crt>   install and start this node's etcd member
-#          ./06a-postgres-ha.sh etcd-check             quorum, members, and the TLS it enforces
+#     sudo ./06a-postgres-ha.sh etcd-check             quorum, members, and the TLS it enforces
+#     sudo ./06a-postgres-ha.sh patroni                PostgreSQL 16 under Patroni - pg-01 FIRST
+#     sudo ./06a-postgres-ha.sh patroni-check          leader, sync standby, and the STIG traps
 #
 # SLICE 2 - THE DATABASE'S OWN etcd, WITH MUTUAL TLS
 #
@@ -230,8 +232,304 @@ cmd_etcd_check() {
   say "FIPS: approved algorithms in Go's TLS - NOT a validated module (SC-13, POA&M)."
 }
 
+# =========================================================================================
+# SLICE 3 - PATRONI AND POSTGRESQL 16 (runbook 9a.3; the traps are 9a.2a / backlog 6a.7)
+#
+#   Decided 2026-09-27 (HANDOFF 3): automatic failover, synchronous_mode on, strict OFF (an
+#   alert will watch the degradation - slice 4), 5432 from the four K8S workers and the three pg
+#   nodes only, and NODE-TO-NODE AUTHENTICATION BY CERTIFICATE: replication and rewind connect
+#   with each node's enclave-CA identity from slice 2 (pg_hba `cert`, mapped to the roles by
+#   pg_ident), the REST API needs a client certificate for anything that changes state. There
+#   is no shared password anywhere - nothing to make, carry, keep or rotate.
+#
+#   TRAPS BUILT IN FROM THE START, not remediated later:
+#     - Ubuntu's postgresql-16 creates and starts a "16 main" cluster on install. A drop-in in
+#       /etc/postgresql-common/createcluster.d (read by the generated createcluster.conf) sets
+#       create_main_cluster = false BEFORE postgresql-16 is installed, so it never exists. The
+#       data directory is Patroni's own (PG_DATA), never Debian's 16/main.
+#     - Patroni OWNS postgresql.conf and pg_hba.conf and rewrites them on restart: every setting
+#       below lives in patroni.yml / the DCS, never in a file edited by hand (6a.7 trap 3).
+#     - V-261892: no md5, password or trust line exists - peer locally, cert between nodes,
+#       scram-sha-256 for applications, hostssl only.
+#     - V-261967 vs 25 rules: log_destination 'stderr,syslog' + logging_collector on +
+#       log_file_mode 0600 (6a.7 trap 2), and the union log_line_prefix (6a.2a section 6).
+#     - pgaudit preloaded; patroni-check reads pg_settings.pending_restart, the false-pass
+#       detector (a node can SHOW the right value and not have applied it).
+#     - V-261857: explicit CONNECTION LIMITs on the replication and rewind roles (post_bootstrap).
+#     - THE DATA DISK: mounted by LABEL (it moved vdc -> vdb when finish removed the seed), with
+#       NO nofail, and patroni.service RequiresMountsFor it - a missing disk stops Patroni instead
+#       of letting it initdb an empty database on the OS disk.
+# =========================================================================================
+PG_MNT="${PG_MNT:-/var/lib/postgresql}"
+PG_LABEL="${PG_LABEL:-pgdata}"
+PG_DATA="${PG_DATA:-$PG_MNT/16/enclave-pg}"
+PG_BIN="${PG_BIN:-/usr/lib/postgresql/16/bin}"
+PG_SCOPE="${PG_SCOPE:-enclave-pg}"
+PATRONI_CONF="${PATRONI_CONF:-/etc/patroni/config.yml}"
+PATRONI_PKI="${PATRONI_PKI:-/etc/patroni/pki}"
+PG_MAX_CONN="${PG_MAX_CONN:-100}"
+PG_REPL_CONN_LIMIT="${PG_REPL_CONN_LIMIT:-10}"
+PG_WAIT="${PG_WAIT:-300}"
+
+# The pg nodes, the K8S workers - from the address file, as `ip name` pairs.
+addr_pairs() {   # addr_pairs PREFIX_REGEX
+  local k
+  for k in $(grep -oE "^($1)=" "$ADDRS" | tr -d '=' | sort); do printf '%s %s\n' "${!k}" "$(printf '%s' "$k" | tr 'A-Z_' 'a-z-')"; done
+}
+
+# patroni.yml, rendered. A function so it can be validated away from a pg node.
+# render_patroni NAME ADDR
+render_patroni() {
+  local name="$1" addr="$2" ip n
+  cat <<YML
+# MANAGED by 06a-postgres-ha.sh patroni (backlog B-06a slice 3). Edits are overwritten by the
+# next run - and Patroni itself rewrites postgresql.conf and pg_hba.conf from this file.
+scope: $PG_SCOPE
+namespace: /enclave/
+name: $name
+restapi:
+  listen: $addr:8008
+  connect_address: $addr:8008
+  certfile: $PATRONI_PKI/node.crt
+  keyfile: $PATRONI_PKI/node.key
+  cafile: $PATRONI_PKI/ca.crt
+  # optional = a client certificate is REQUIRED for every endpoint that changes state
+  # (switchover, restart, reload, config); reads (/health, /primary, /metrics) stay open
+  # to what ufw lets in: the three pg nodes and svc-obs-01.
+  verify_client: optional
+  allowlist:
+YML
+  while read -r ip n; do printf '    - %s\n' "$ip"; done < <(addr_pairs 'PG_[0-9]+')
+  cat <<YML
+ctl:
+  cacert: $PATRONI_PKI/ca.crt
+  certfile: $PATRONI_PKI/node.crt
+  keyfile: $PATRONI_PKI/node.key
+etcd3:
+  protocol: https
+  hosts:
+YML
+  while read -r ip n; do printf '    - %s:2379\n' "$ip"; done < <(addr_pairs 'PG_[0-9]+')
+  cat <<YML
+  cacert: $PATRONI_PKI/ca.crt
+  cert: $PATRONI_PKI/node.crt
+  key: $PATRONI_PKI/node.key
+bootstrap:
+  dcs:
+    # CONSERVATIVE ON PURPOSE (runbook 9a.3): a promotion needs ~30 s of genuine leader loss.
+    ttl: 30
+    loop_wait: 10
+    retry_timeout: 10
+    maximum_lag_on_failover: 1048576
+    # 9a.1 correction 2: synchronous replication is expressed HERE - Patroni overwrites a
+    # hand-set synchronous_standby_names. strict is deliberately absent (off) - decided.
+    synchronous_mode: true
+    synchronous_node_count: 1
+    postgresql:
+      use_pg_rewind: true
+      use_slots: true
+      parameters:
+        synchronous_commit: "on"
+        max_connections: $PG_MAX_CONN
+        password_encryption: scram-sha-256
+        ssl: "on"
+        ssl_min_protocol_version: TLSv1.2
+        ssl_cert_file: $PATRONI_PKI/node.crt
+        ssl_key_file: $PATRONI_PKI/node.key
+        ssl_ca_file: $PATRONI_PKI/ca.crt
+        wal_level: replica
+        wal_log_hints: "on"
+        hot_standby: "on"
+        max_wal_senders: 10
+        max_replication_slots: 10
+        # 6a.7 trap 2 and 6a.2a section 6 - decided once, here
+        log_destination: stderr,syslog
+        logging_collector: "on"
+        log_file_mode: "0600"
+        log_line_prefix: "%m %a %u %d %r %p %s %c %h "
+        log_connections: "on"
+        log_disconnections: "on"
+        shared_preload_libraries: pgaudit
+        pgaudit.log: ddl,role,read,write
+        pgaudit.log_catalog: "on"
+  initdb:
+    - encoding: UTF8
+    - data-checksums
+    - auth-local: peer
+    - auth-host: scram-sha-256
+  post_bootstrap: $PATRONI_PKI/../post-bootstrap.sh
+postgresql:
+  listen: $addr:5432
+  connect_address: $addr:5432
+  use_unix_socket: true
+  data_dir: $PG_DATA
+  bin_dir: $PG_BIN
+  pgpass: $PG_MNT/.pgpass.patroni
+  authentication:
+    superuser:
+      username: postgres
+    replication:
+      username: replicator
+      sslmode: verify-full
+      sslcert: $PATRONI_PKI/node.crt
+      sslkey: $PATRONI_PKI/node.key
+      sslrootcert: $PATRONI_PKI/ca.crt
+    rewind:
+      username: rewinder
+      sslmode: verify-full
+      sslcert: $PATRONI_PKI/node.crt
+      sslkey: $PATRONI_PKI/node.key
+      sslrootcert: $PATRONI_PKI/ca.crt
+  parameters:
+    unix_socket_directories: /var/run/postgresql
+  # V-261892: peer locally, cert between nodes, scram for applications, hostssl only - no
+  # md5, password or trust line exists. Nothing matches = rejected.
+  pg_hba:
+    - local all postgres peer
+YML
+  while read -r ip n; do
+    printf '    - hostssl replication replicator %s/32 cert map=pgnodes\n' "$ip"
+    printf '    - hostssl all rewinder %s/32 cert map=pgnodes\n' "$ip"
+  done < <(addr_pairs 'PG_[0-9]+')
+  while read -r ip n; do printf '    - hostssl all all %s/32 scram-sha-256\n' "$ip"; done < <(addr_pairs 'K8S_WK_[0-9]+')
+  printf '  pg_ident:\n'
+  while read -r ip n; do
+    printf '    - pgnodes %s.%s replicator\n' "$n" "${ENCLAVE_DOMAIN:-enclave.internal}"
+    printf '    - pgnodes %s.%s rewinder\n' "$n" "${ENCLAVE_DOMAIN:-enclave.internal}"
+  done < <(addr_pairs 'PG_[0-9]+')
+}
+
+# Run once by Patroni on the primary after initdb (bootstrap.post_bootstrap). V-261857: no role
+# the build creates may have rolconnlimit = -1.
+render_post_bootstrap() {
+  cat <<SH
+#!/bin/sh
+# MANAGED by 06a-postgres-ha.sh - run once by Patroni after initdb (V-261857 connection limits).
+set -e
+psql -v ON_ERROR_STOP=1 -X -q -d postgres <<'SQL'
+ALTER ROLE replicator CONNECTION LIMIT $PG_REPL_CONN_LIMIT;
+ALTER ROLE rewinder CONNECTION LIMIT $PG_REPL_CONN_LIMIT;
+SQL
+SH
+}
+
+# psql as the postgres OS user over the local socket (peer)
+pg_sql() { runuser -u postgres -- psql -X -A -t -q -d postgres -c "$1"; }
+
+cmd_patroni() {
+  need_root; whoami_pg
+  local name="$ME" key="$SSL_DIR/$ME.key"
+  etcd_ctl endpoint health >/dev/null 2>&1 || die "this node's etcd is not healthy - slice 2 first: sudo $0 etcd-check"
+  [ -r "$ETCD_PKI/member.crt" ] && [ -r "$key" ] || die "no node certificate/key from slice 2 ($ETCD_PKI/member.crt, $key)"
+
+  # ---- the data disk, by label, never on the OS disk ----
+  local dev cand n
+  dev="$(blkid -L "$PG_LABEL" 2>/dev/null || true)"
+  if [ -z "$dev" ]; then
+    # exactly ONE whole disk with no partitions, no filesystem and no mount - or refuse
+    cand="$(lsblk -dnpo NAME,TYPE | awk '$2=="disk"{print $1}' | while read -r d; do
+              [ "$(lsblk -no NAME "$d" | wc -l)" -eq 1 ] || continue
+              [ -z "$(blkid -o value -s TYPE "$d" 2>/dev/null)" ] || continue
+              findmnt -rn -S "$d" >/dev/null 2>&1 && continue
+              echo "$d"; done)"
+    n="$(printf '%s\n' "$cand" | grep -c . || true)"
+    [ "$n" -eq 1 ] || die "expected exactly ONE blank data disk, found $n: ${cand:-none}. Refusing to guess which disk to format."
+    say "formatting $cand ($(lsblk -dno SIZE "$cand")) as ext4, label $PG_LABEL - it is blank"
+    mkfs.ext4 -q -L "$PG_LABEL" "$cand"
+    dev="$cand"
+  fi
+  install -d -m 0755 "$PG_MNT"
+  if ! grep -qE "^LABEL=${PG_LABEL}[[:space:]]" /etc/fstab; then
+    cp -p /etc/fstab "/etc/fstab.bak-06a-$(date +%Y%m%d%H%M%S)"
+    printf 'LABEL=%s  %s  ext4  defaults,nodev,nosuid,noexec  0 2\n' "$PG_LABEL" "$PG_MNT" >> /etc/fstab
+    systemctl daemon-reload
+  fi
+  mountpoint -q "$PG_MNT" || mount "$PG_MNT"
+  findmnt -n -S "LABEL=$PG_LABEL" -T "$PG_MNT" >/dev/null || [ "$(findmnt -n -o SOURCE "$PG_MNT")" = "$dev" ] \
+    || die "$PG_MNT is not the $PG_LABEL disk"
+  ok "data disk: $dev (LABEL=$PG_LABEL) mounted at $PG_MNT, $(df -h --output=size "$PG_MNT" | tail -1 | tr -d ' ')"
+
+  # ---- packages, with Ubuntu's default cluster switched off BEFORE postgresql-16 ----
+  install -d -m 0755 /etc/postgresql-common/createcluster.d
+  printf '# 06a-postgres-ha.sh: Patroni owns the only cluster on this node\ncreate_main_cluster = false\n' \
+    > /etc/postgresql-common/createcluster.d/00-no-main-cluster.conf
+  DEBIAN_FRONTEND=noninteractive apt-get install -y postgresql-16 postgresql-16-pgaudit patroni python3-etcd \
+    || die "apt could not install postgresql-16 postgresql-16-pgaudit patroni python3-etcd"
+  if pg_lsclusters -h 2>/dev/null | grep -q .; then
+    pg_lsclusters | sed 's/^/     /'
+    die "a Debian-managed cluster exists - Patroni must be the only thing running PostgreSQL here. Look before removing it."
+  fi
+  systemctl disable --now postgresql >/dev/null 2>&1 || true
+  chown postgres:postgres "$PG_MNT"
+  ok "postgresql-16 $(dpkg-query -W -f='${Version}' postgresql-16), patroni $(dpkg-query -W -f='${Version}' patroni), pgaudit installed; no Debian cluster"
+
+  # ---- the node's identity for postgres and patroni (slice 2's certificate) ----
+  install -d -m 0750 -o root -g postgres "$PATRONI_PKI"
+  install -m 0644 -o root -g root "$CA_ROOT" "$PATRONI_PKI/ca.crt"
+  install -m 0644 -o root -g root "$ETCD_PKI/member.crt" "$PATRONI_PKI/node.crt"
+  install -m 0640 -o root -g postgres "$key" "$PATRONI_PKI/node.key"
+  render_post_bootstrap > /etc/patroni/post-bootstrap.sh
+  chown root:postgres /etc/patroni/post-bootstrap.sh; chmod 0750 /etc/patroni/post-bootstrap.sh
+  render_patroni "$name" "$ME_ADDR" > "$PATRONI_CONF.new"
+  chown root:postgres "$PATRONI_CONF.new"; chmod 0640 "$PATRONI_CONF.new"; mv -f "$PATRONI_CONF.new" "$PATRONI_CONF"
+  runuser -u postgres -- patroni --validate-config "$PATRONI_CONF" 2>&1 | sed 's/^/     /' | head -20 || true
+  install -d -m 0755 /etc/systemd/system/patroni.service.d
+  printf '[Unit]\n# 06a: no data disk, no Patroni - never initdb an empty cluster on the OS disk\nRequiresMountsFor=%s\nAfter=etcd.service\nWants=etcd.service\n' "$PG_MNT" \
+    > /etc/systemd/system/patroni.service.d/06a.conf
+  systemctl daemon-reload
+  ok "config: $PATRONI_CONF (member $name, scope $PG_SCOPE)"
+
+  # ---- start, and wait for what this node should become ----
+  systemctl enable patroni >/dev/null 2>&1
+  systemctl restart patroni
+  say "waiting up to ${PG_WAIT}s for $name to run (the first node bootstraps; the others clone from it)"
+  for _ in $(seq 1 "$((PG_WAIT / 5))"); do
+    if patronictl -c "$PATRONI_CONF" list -f json 2>/dev/null | python3 -c "
+import sys, json
+m = {x['Member']: x for x in json.load(sys.stdin)}
+x = m.get('$name', {})
+sys.exit(0 if x.get('State') in ('running', 'streaming') else 1)"; then
+      ok "$name is up"; patronictl -c "$PATRONI_CONF" list; return 0
+    fi
+    sleep 5
+  done
+  journalctl -u patroni -n 30 --no-pager | sed 's/^/     /'
+  die "$name did not come up in ${PG_WAIT}s - the journal above says why"
+}
+
+cmd_patroni_check() {
+  need_root; whoami_pg
+  local bad=0 role v
+  patronictl -c "$PATRONI_CONF" list || die "patronictl could not read the cluster"
+  role="$(pg_sql "SELECT CASE WHEN pg_is_in_recovery() THEN 'replica' ELSE 'primary' END")"
+  say "$ME is the $role"
+  # 6a.7: pending_restart is the false-pass detector - the right value, not yet applied
+  v="$(pg_sql "SELECT setting||' pending_restart='||pending_restart FROM pg_settings WHERE name='shared_preload_libraries'")"
+  case "$v" in *pgaudit*"pending_restart=f"*) ok "shared_preload_libraries: $v" ;; *) warn "shared_preload_libraries: $v"; bad=1 ;; esac
+  v="$(pg_sql "SELECT string_agg(DISTINCT auth_method, ',') FROM pg_hba_file_rules")"
+  case ",$v," in *,md5,*|*,password,*|*,trust,*) warn "pg_hba has a weak method: $v (V-261892)"; bad=1 ;; *) ok "pg_hba methods: $v - no md5, password or trust" ;; esac
+  v="$(pg_sql "SELECT string_agg(DISTINCT type, ',') FROM pg_hba_file_rules")"
+  case ",$v," in *,host,*|*,hostnossl,*) warn "pg_hba has non-TLS host lines: $v"; bad=1 ;; *) ok "pg_hba line types: $v - TLS only over the network" ;; esac
+  for s in ssl ssl_min_protocol_version password_encryption log_destination logging_collector log_file_mode synchronous_commit; do
+    say "  $(pg_sql "SELECT name||' = '||setting FROM pg_settings WHERE name='$s'")"
+  done
+  if [ "$role" = primary ]; then
+    # A real synchronous write, with no object left behind (6a.2a: no stig_test tables): emit a
+    # WAL message, then require a SYNC standby to have replayed past it.
+    local lsn
+    lsn="$(pg_sql "SELECT pg_logical_emit_message(true, '06a', 'sync-check')")"
+    pg_sql "SELECT application_name||' '||sync_state||' '||state||' replayed='||(replay_lsn >= '$lsn'::pg_lsn) FROM pg_stat_replication ORDER BY application_name" \
+      | sed 's/^/     standby: /'
+    [ "$(pg_sql "SELECT count(*) FROM pg_stat_replication WHERE sync_state='sync' AND replay_lsn >= '$lsn'::pg_lsn")" -ge 1 ] \
+      && ok "a synchronous standby has replayed a commit made just now" || { warn "no synchronous standby has the commit"; bad=1; }
+  fi
+  [ "$bad" -eq 0 ] || exit 1
+}
+
 case "${1:-}" in
   etcd)       shift; cmd_etcd "$@" ;;
   etcd-check) cmd_etcd_check ;;
-  *) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  patroni)       cmd_patroni ;;
+  patroni-check) cmd_patroni_check ;;
+  *) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

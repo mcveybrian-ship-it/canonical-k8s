@@ -20,6 +20,8 @@
 #     sudo ./06a-postgres-ha.sh backup-store <fullchain> on each STORE (host-4, host-3): the store
 #     sudo ./06a-postgres-ha.sh backup-enable           on the PRIMARY: WAL archiving on (rolling restart)
 #     sudo ./06a-postgres-ha.sh backup-run [full|diff]  on each store: a backup now + the timers
+#     sudo ./06a-postgres-ha.sh backup-restore-test     on the PRIMARY: restore to a point in time
+#                                                      from EACH store, into scratch, and prove it
 #
 # SLICE 2 - THE DATABASE'S OWN etcd, WITH MUTUAL TLS
 #
@@ -1037,6 +1039,68 @@ cmd_backup_run() {
   ok "repo$ST_IDX: full on $PGBR_FULL_DAY, differential the other days, at $hh:$PGBR_BACKUP_MINUTE; $PGBR_RETENTION_FULL fulls kept"
 }
 
+# ---- the proof: a point-in-time restore from EACH store (B-06a slice 5) --------------------------
+# A backup nobody has restored from is a hope. On the primary: a throwaway database gets a row
+# 'before-target', the time T is taken, a row 'after-target' follows, and that WAL is archived. Then,
+# from each store in turn, the backup + WAL are restored TO T into a scratch directory on the data
+# disk - never the live one - started as a throwaway instance on a private socket with archiving
+# OFF (a promoted copy must never push its new timeline into the real stores), and read: it must
+# hold 'before-target' and NOT 'after-target'. Everything it made is removed afterwards.
+PITR_PROBE_DB="${PITR_PROBE_DB:-pitr_probe}"
+PITR_PORT="${PITR_PORT:-5499}"
+cmd_backup_restore_test() {
+  need_root; whoami_pg
+  local j v leader scratch="$PG_MNT/pitr-restore-test" sockd="$PG_MNT/pitr-restore-sock" T seg i n a pth rows rc
+  j="$(cluster_json)"; v="$(cluster_verdict "$j")"
+  case "$v" in ok*) ;; *) die "the cluster is not healthy (${v#bad }) - fix that first" ;; esac
+  read -r _ leader _ <<<"$v"
+  [ "$leader" = "$ME" ] || die "run this on the primary - $leader is the leader"
+  [ "$scratch" != "$PG_DATA" ] && [ "${scratch#"$PG_DATA"}" = "$scratch" ] || die "the scratch path overlaps the live data directory - refusing"
+  [ ! -e "$scratch" ] || die "$scratch exists - a previous test left it. Look, then remove it by hand."
+  [ "$(pg_sql "SELECT count(*) FROM pg_database WHERE datname='$PITR_PROBE_DB'")" = 0 ] || die "database $PITR_PROBE_DB exists - a previous test left it. Look, then drop it by hand."
+  pdb() { runuser -u postgres -- psql -X -A -t -q -v ON_ERROR_STOP=1 -d "$PITR_PROBE_DB" -c "$1"; }
+  # ---- 1. the marker ----
+  pg_sql "CREATE DATABASE $PITR_PROBE_DB" >/dev/null
+  pdb "CREATE TABLE probe (v text, at timestamptz DEFAULT clock_timestamp())"
+  pdb "INSERT INTO probe (v) VALUES ('before-target')"
+  sleep 2; T="$(pg_sql "SELECT to_char(clock_timestamp() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US')")+00"; sleep 2
+  pdb "INSERT INTO probe (v) VALUES ('after-target')"
+  seg="$(pg_sql "SELECT pg_walfile_name(pg_switch_wal())")"
+  ok "marker: 'before-target', then T = $T, then 'after-target' - in WAL $seg"
+  for _ in $(seq 1 60); do
+    [ "$(pg_sql "SELECT coalesce(last_archived_wal,'') >= '$seg' FROM pg_stat_archiver")" = t ] && break; sleep 1
+  done
+  [ "$(pg_sql "SELECT coalesce(last_archived_wal,'') >= '$seg' FROM pg_stat_archiver")" = t ] || die "$seg was not archived within 60 s - pg_stat_archiver says: $(pg_sql "SELECT failed_count||' failures, last '||coalesce(last_failed_wal,'-') FROM pg_stat_archiver")"
+  ok "$seg archived to the stores"
+  # ---- 2. restore to T from EACH store, and read it ----
+  rc=0
+  while read -r i n a pth; do
+    install -d -m 0700 -o postgres -g postgres "$scratch" "$sockd"
+    say "repo$i ($n): restoring to $T into $scratch"
+    runuser -u postgres -- pgbackrest --stanza="$PGBR_STANZA" --repo="$i" --pg1-path="$scratch" \
+      --type=time --target="$T" --target-action=promote restore 2>&1 | sed 's/^/     /' \
+      || { rm -rf "$scratch" "$sockd"; rc=1; warn "repo$i: the restore failed - the lines above say why"; continue; }
+    say "     restore_command written: $(grep -h '^restore_command' "$scratch/postgresql.auto.conf" | cut -c1-140)"
+    runuser -u postgres -- "$PG_BIN/pg_ctl" -D "$scratch" -w -t 180 -l "$scratch.log" \
+      -o "-p $PITR_PORT -c listen_addresses='' -c unix_socket_directories='$sockd' -c archive_mode=off -c archive_command='' -c synchronous_standby_names='' -c ssl=off -c logging_collector=off -c log_destination=stderr" start >/dev/null \
+      || { tail -20 "$scratch.log" | sed 's/^/     /'; rm -rf "$scratch" "$sockd" "$scratch.log"; rc=1; warn "repo$i: the restored copy did not start - its log is above"; continue; }
+    for _ in $(seq 1 60); do
+      [ "$(runuser -u postgres -- psql -X -A -t -h "$sockd" -p "$PITR_PORT" -d postgres -c 'SELECT pg_is_in_recovery()' 2>/dev/null)" = f ] && break; sleep 1
+    done
+    rows="$(runuser -u postgres -- psql -X -A -t -h "$sockd" -p "$PITR_PORT" -d "$PITR_PROBE_DB" -c "SELECT string_agg(v, ',' ORDER BY at) FROM probe" 2>&1)"
+    runuser -u postgres -- "$PG_BIN/pg_ctl" -D "$scratch" -m fast -w stop >/dev/null 2>&1 || true
+    rm -rf "$scratch" "$sockd" "$scratch.log"
+    if [ "$rows" = before-target ]; then
+      ok "repo$i ($n): restored to T - 'before-target' present, 'after-target' absent. Point-in-time restore PROVEN"
+    else
+      rc=1; warn "repo$i ($n): the restored copy holds '$rows' - expected exactly 'before-target'"
+    fi
+  done < <(store_lines)
+  # ---- 3. leave nothing behind ----
+  pg_sql "DROP DATABASE $PITR_PROBE_DB" >/dev/null && ok "database $PITR_PROBE_DB dropped; scratch removed"
+  [ "$rc" -eq 0 ] || die "the restore test FAILED for at least one store - see above"
+}
+
 case "${1:-}" in
   etcd)       shift; cmd_etcd "$@" ;;
   etcd-check) cmd_etcd_check ;;
@@ -1049,5 +1113,6 @@ case "${1:-}" in
   backup-store)  shift; cmd_backup_store "$@" ;;
   backup-enable) cmd_backup_enable ;;
   backup-run)    shift; cmd_backup_run "$@" ;;
-  *) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  backup-restore-test) cmd_backup_restore_test ;;
+  *) sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

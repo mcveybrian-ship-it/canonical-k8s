@@ -17,6 +17,8 @@
 #         host's Pro token and the answer file. Watch the console log.
 #     sudo ./03-compose-vm.sh pg-01 --finish [--no-reboot]    after DONE: checks from outside,
 #         shreds the seed + provisioning disk, proves it still boots, prints the register line
+#     sudo ./03-compose-vm.sh pg-01 --reserve-data [--no-start]  guest SHUT OFF: its data disk
+#         gets discard=ignore and its reservation back (backlog 3.42), checked, then started
 #
 # There are fourteen of these in vm-specs.env, so it is a composer rather than a one-off. Everything
 # comes from two files and nothing is typed twice:
@@ -37,6 +39,7 @@ set -euo pipefail
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENCLAVE_DIR="${ENCLAVE_DIR:-$SELF/../enclave}"
 DRY=0; DESTROY=0; VM=""; PLAN_ARG=""; HARDEN=0; CRED_DIR="${CRED_DIR:-/mnt/cred/site}"; FINISH=0; NO_REBOOT=0
+RESERVE=0; NO_START=0
 
 say()  { printf '  %s\n' "$*"; }
 ok()   { printf '  [ok] %s\n' "$*"; }
@@ -387,7 +390,7 @@ cmd_plan() {
           if [ "$(( alloc * 100 / appar ))" -ge 98 ]; then
             ok "data disk $(basename "$ddisk"): reserved ($(( alloc / 1024 / 1024 / 1024 )) of $(( appar / 1024 / 1024 / 1024 )) GiB allocated)"
           else
-            warn "data disk $(basename "$ddisk"): NOT reserved - $(( alloc / 1024 / 1024 / 1024 )) of $(( appar / 1024 / 1024 / 1024 )) GiB allocated. Guest TRIM through discard=unmap punched it (3.42); re-reserving means the guest down"; fail=1
+            warn "data disk $(basename "$ddisk"): NOT reserved - $(( alloc / 1024 / 1024 / 1024 )) of $(( appar / 1024 / 1024 / 1024 )) GiB allocated. Guest TRIM through discard=unmap punched it (3.42). Repair, guest SHUT OFF: sudo $0 <vm> --reserve-data"; fail=1
           fi
         done
       fi
@@ -410,6 +413,63 @@ cmd_plan() {
   ok "plan holds on $me"
 }
 
+# ---- --reserve-data: give a data disk back its reservation (backlog 3.42, 2026-09-28) ------
+# The data disks were created falloc and attached discard=unmap, and the guest's mkfs TRIM punched
+# every unwritten block back out: pg-01..03 read 0.1-0.2 % allocated. The repair, guest OFF:
+#   1. the definition: the data disk's discard -> ignore (virt-xml, selected by PATH - the device
+#      name moved vdc -> vdb when finish removed the seed), then READ BACK from the XML;
+#   2. the file: fallocate over its whole length. It fills the holes and changes no data - proven
+#      offline 2026-09-28 on qemu-img 8.2.2 (the hosts' version): TRIM took a falloc image to 12 %,
+#      fallocate to 100 %, both data patterns read back intact, qemu-img check clean, and a later
+#      256 MB guest write landed INSIDE the file (qcow2 reuses the freed clusters);
+#   3. qemu-img check, the allocation measured again, and the guest started unless --no-start.
+# It REFUSES a running guest. The pg nodes go down one at a time with Patroni's knowledge -
+# docs/06a-postgres-ha.md says in which order and why.
+disk_alloc() {  # FILE -> "ALLOCATED_BYTES APPARENT_BYTES"
+  local b B sz; read -r b B sz < <(stat -c '%b %B %s' "$1") || return 1
+  printf '%s %s\n' "$(( b * B ))" "$sz"
+}
+cmd_reserve_data() {
+  [ -n "$DATA_DISK" ] || die "$VM has no data disk in vm-specs.env - nothing to reserve"
+  [ -f "$DATA_DISK" ] || die "no data disk at $DATA_DISK"
+  local st alloc appar need avail cur out rc=0
+  st="$(virsh domstate "$VM" 2>&1 || true)"
+  [ "$st" = "shut off" ] || die "$VM is '$st' - it must be SHUT OFF first (sudo virsh shutdown $VM, wait for 'shut off').
+       For a pg node, take it out of the cluster's way first - docs/06a-postgres-ha.md."
+  read -r alloc appar < <(disk_alloc "$DATA_DISK")
+  say "before: $DATA_DISK  $(( alloc / 1048576 )) of $(( appar / 1048576 )) MiB allocated ($(( alloc * 100 / appar )) %)"
+  need=$(( appar > alloc ? appar - alloc : 0 ))
+  avail="$(df -B1 --output=avail "$(dirname "$DATA_DISK")" | tail -1 | tr -dc 0-9)"
+  [ "${avail:-0}" -gt "$need" ] || die "the pool has $(( ${avail:-0} / 1073741824 )) GiB free and the reservation needs $(( need / 1073741824 )) GiB - not starting"
+  cur="$(virsh dumpxml --inactive "$VM" | xmllint --xpath "string(//disk[source/@file='$DATA_DISK']/driver/@discard)" - 2>/dev/null || true)"
+  if [ "$DRY" -eq 1 ]; then
+    say "(dry run) discard is '${cur:-unset}'; would set it to ignore, fallocate $(( need / 1073741824 )) GiB of holes, qemu-img check, then start $VM"
+    return 0
+  fi
+  # ---- 1. the definition ----
+  if [ "$cur" != ignore ]; then
+    virt-xml "$VM" --edit path="$DATA_DISK" --disk discard=ignore --print-diff --define \
+      || die "virt-xml could not change $VM's data disk"
+  fi
+  cur="$(virsh dumpxml --inactive "$VM" | xmllint --xpath "string(//disk[source/@file='$DATA_DISK']/driver/@discard)" - 2>/dev/null || true)"
+  [ "$cur" = ignore ] || die "$VM's data disk still reads discard='${cur:-unset}' - stopping before the file is touched"
+  ok "definition: $(basename "$DATA_DISK") discard=ignore (read back from $VM's XML)"
+  # ---- 2. the file ----
+  fallocate -l "$appar" "$DATA_DISK" || die "fallocate failed on $DATA_DISK"
+  # ---- 3. check, measure, start ----
+  out="$(qemu-img check "$DATA_DISK" 2>&1)" || rc=$?
+  printf '%s\n' "$out" | sed 's/^/     /'
+  [ "$rc" -eq 0 ] || die "qemu-img check exited $rc on $DATA_DISK - NOT starting $VM"
+  read -r alloc appar < <(disk_alloc "$DATA_DISK")
+  [ $(( alloc * 100 / appar )) -ge 98 ] || die "still only $(( alloc * 100 / appar )) % allocated after fallocate - NOT starting $VM"
+  ok "reserved: $(( alloc / 1048576 )) of $(( appar / 1048576 )) MiB allocated ($(( alloc * 100 / appar )) %), qemu-img check clean"
+  if [ "$NO_START" -eq 1 ]; then
+    say "not started (--no-start):  sudo virsh start $VM"
+  else
+    virsh start "$VM" >/dev/null && ok "$VM started" || die "virsh start $VM failed"
+  fi
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
     -n|--dry-run) DRY=1; shift ;;
@@ -418,13 +478,15 @@ while [ $# -gt 0 ]; do
     --harden)     HARDEN=1; shift ;;
     --finish)     FINISH=1; shift ;;
     --no-reboot)  NO_REBOOT=1; shift ;;
+    --reserve-data) RESERVE=1; shift ;;
+    --no-start)   NO_START=1; shift ;;
     --cred-dir)   [ $# -ge 2 ] || die "--cred-dir needs a directory"; CRED_DIR="$2"; shift 2 ;;
-    -h|--help)    sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)    sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     -*)           die "unknown option $1" ;;
     *)            VM="$1"; shift ;;
   esac
 done
-[ -n "$VM" ] || { sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+[ -n "$VM" ] || { sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
 
 
 [ -r "$ENCLAVE_DIR/enclave-addresses.env" ] || die "no enclave-addresses.env in $ENCLAVE_DIR"
@@ -503,6 +565,10 @@ fi
 if [ "$FINISH" -eq 1 ]; then
   [ "$(id -u)" -eq 0 ] || die "--finish reads the console logs (0600 after a rotation) - run with sudo, -n included"
   cmd_finish && exit 0 || exit 1
+fi
+if [ "$RESERVE" -eq 1 ]; then
+  [ "$(id -u)" -eq 0 ] || die "--reserve-data changes the VM definition and its disk - run with sudo, -n included"
+  cmd_reserve_data && exit 0 || exit 1
 fi
 
 

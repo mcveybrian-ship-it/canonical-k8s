@@ -11,6 +11,10 @@
 #     sudo ./06a-postgres-ha.sh patroni-check          leader, sync standby, and the STIG traps
 #     sudo ./06a-postgres-ha.sh monitor                postgres-exporter, local-only, no password
 #                                                      - the PRIMARY first (it creates the role)
+#     sudo ./06a-postgres-ha.sh switchover [pg-0N]     planned leader handover, TIMED - to the
+#                                                      sync standby unless one is named
+#     sudo ./06a-postgres-ha.sh leave                  take THIS node down for maintenance: refuses
+#                                                      unless the other two are healthy
 #
 # SLICE 2 - THE DATABASE'S OWN etcd, WITH MUTUAL TLS
 #
@@ -711,11 +715,91 @@ cmd_monitor() {
   ss -Htln "sport = :$PG_EXPORTER_PORT" | awk '{print "     listening: "$4}'
 }
 
+# =========================================================================================
+# SLICE 4 - maintenance without an outage: one node at a time, and never the wrong one.
+#
+#   The cluster survives ONE node down: etcd keeps 2 of 3, PostgreSQL keeps a leader and a
+#   synchronous standby. It does not survive two. So taking a node down is refused unless the
+#   OTHER two are healthy right now - a guard in the script, not a line in a runbook, because
+#   the day it matters is the day someone is in a hurry.
+# =========================================================================================
+
+# cluster_json: `patronictl list` as JSON (Member, Role, State, Lag in MB). Dies if unreadable.
+cluster_json() { patronictl -c "$PATRONI_CONF" list -f json 2>/dev/null || die "patronictl could not read the cluster"; }
+
+# cluster_verdict JSON [EXCLUDE] -> "ok <leader> <sync>" or "bad <reason>". Healthy = one Leader
+# running, and every other member (except EXCLUDE) a Replica/Sync Standby streaming at 0 MB lag.
+cluster_verdict() {
+  printf '%s' "$1" | python3 -c '
+import sys, json
+m = json.load(sys.stdin); ex = sys.argv[1] if len(sys.argv) > 1 else ""
+leaders = [x for x in m if x.get("Role") == "Leader"]
+sync = [x["Member"] for x in m if x.get("Role") == "Sync Standby"]
+if len(leaders) != 1: print("bad %d leaders" % len(leaders)); sys.exit()
+if leaders[0].get("State") != "running": print("bad leader %s is %s" % (leaders[0]["Member"], leaders[0].get("State"))); sys.exit()
+for x in m:
+    if x["Member"] in (ex, leaders[0]["Member"]): continue
+    if x.get("Role") not in ("Replica", "Sync Standby") or x.get("State") != "streaming" or (x.get("Lag in MB") or 0) != 0:
+        print("bad %s is %s/%s lag %s" % (x["Member"], x.get("Role"), x.get("State"), x.get("Lag in MB"))); sys.exit()
+if len(m) < 3: print("bad only %d members" % len(m)); sys.exit()
+print("ok %s %s" % (leaders[0]["Member"], sync[0] if sync else "-"))
+' "${2:-}"
+}
+
+cmd_switchover() {
+  need_root; whoami_pg
+  local cand="${1:-}" j v leader sync t0 tl="" tr="" now
+  j="$(cluster_json)"; v="$(cluster_verdict "$j")"
+  case "$v" in ok*) ;; *) patronictl -c "$PATRONI_CONF" list; die "the cluster is not healthy (${v#bad }) - a switchover now could leave it with no leader" ;; esac
+  read -r _ leader sync <<<"$v"
+  [ -n "$cand" ] || cand="$sync"
+  [ "$cand" != "-" ] || die "there is no synchronous standby to hand over to - name a candidate, or wait for one"
+  [ "$cand" != "$leader" ] || die "$cand is already the leader"
+  say "switchover: $leader -> $cand ($( [ "$cand" = "$sync" ] && echo 'the synchronous standby - no commit can be lost' || echo 'NOT the sync standby - Patroni will refuse if it is behind'))"
+  t0="$(date +%s.%N)"
+  patronictl -c "$PATRONI_CONF" switchover "$PG_SCOPE" --leader "$leader" --candidate "$cand" --force 2>&1 | sed 's/^/     /'
+  for _ in $(seq 1 240); do
+    j="$(patronictl -c "$PATRONI_CONF" list -f json 2>/dev/null || true)"
+    now="$(date +%s.%N)"
+    if [ -z "$tl" ] && printf '%s' "$j" | python3 -c 'import sys,json; m={x["Member"]:x for x in json.load(sys.stdin)}; x=m.get(sys.argv[1],{}); sys.exit(0 if x.get("Role")=="Leader" and x.get("State")=="running" else 1)' "$cand" 2>/dev/null; then
+      tl="$(echo "$now - $t0" | bc -l)"
+    fi
+    if [ -n "$tl" ] && [ "$(cluster_verdict "$j" | cut -d' ' -f1)" = ok ]; then tr="$(echo "$now - $t0" | bc -l)"; break; fi
+    sleep 0.5
+  done
+  patronictl -c "$PATRONI_CONF" list
+  [ -n "$tl" ] || die "$cand did not become a running leader within 120 s"
+  ok "$cand is the leader $(printf '%.1f' "$tl") s after the switchover was asked for"
+  [ -n "$tr" ] && ok "every member healthy again (the old leader streaming, lag 0) after $(printf '%.1f' "$tr") s" \
+               || warn "$cand leads, but the cluster was not fully healthy within 120 s - look at the list above"
+}
+
+cmd_leave() {
+  need_root; whoami_pg
+  local j v leader
+  j="$(cluster_json)"
+  v="$(cluster_verdict "$j" "$ME")"
+  case "$v" in ok*) ;; *) patronictl -c "$PATRONI_CONF" list; die "refusing: without $ME the cluster must still be healthy, and it is not (${v#bad })" ;; esac
+  read -r _ leader _ <<<"$v"
+  [ "$leader" != "$ME" ] || die "$ME is the LEADER - hand it over first:  sudo $0 switchover"
+  ETCDCTL_API=3 etcdctl --endpoints="$(client_endpoints)" --cacert "$ETCD_PKI/ca.crt" --cert "$ETCD_PKI/member.crt" \
+    --key "$ETCD_PKI/member.key" endpoint health >/dev/null 2>&1 \
+    || die "refusing: not every etcd member is healthy - taking $ME down could cost the quorum (etcd-check)"
+  ok "$ME is not the leader ($leader is); the other two are healthy; all three etcd members healthy"
+  systemctl stop patroni && ok "patroni stopped - PostgreSQL shut down with it"
+  pgrep -u postgres -x postgres >/dev/null && die "a postgres process is still running after Patroni stopped - look before going further"
+  systemctl stop etcd && ok "etcd stopped - two members keep the quorum"
+  say "powering $ME off. Then, on its host:  sudo ./03-compose-vm.sh $ME --reserve-data"
+  systemctl poweroff
+}
+
 case "${1:-}" in
   etcd)       shift; cmd_etcd "$@" ;;
   etcd-check) cmd_etcd_check ;;
   patroni)       cmd_patroni ;;
   patroni-check) cmd_patroni_check ;;
   monitor)       cmd_monitor ;;
-  *) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  switchover)    shift; cmd_switchover "$@" ;;
+  leave)         cmd_leave ;;
+  *) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

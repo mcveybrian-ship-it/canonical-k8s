@@ -379,6 +379,13 @@ AL_CPU_FOR="${AL_CPU_FOR:-10m}"           # ...but only if it lasts. A build spi
 AL_MEM_PCT="${AL_MEM_PCT:-10}"            # MemAvailable below this fraction of total
 AL_MEM_FOR="${AL_MEM_FOR:-10m}"
 AL_FS_WARN_PCT="${AL_FS_WARN_PCT:-20}"    # free space warning
+# THE DATABASE VOLUME IS FULL BY DESIGN (3.42, decided 2026-09-28). Its data disks are reserved in
+# full, so it sits at ~18 % free forever and the %-free rules would fire forever - and an alert that
+# never stops is how the real one went unnoticed for 12 hours on 2026-09-27. Those two rules skip it;
+# DataVolumeForeignData watches it instead (anything on it that is NOT a reserved data disk), and
+# FilesystemWillFillSoon still covers it. The path is vm-specs.env's VM_POOL_DATA - the composer's own.
+AL_FS_RESERVED_MOUNTS="${AL_FS_RESERVED_MOUNTS:-$( [ -r "$HERE/vm-specs.env" ] && ( . "$HERE/vm-specs.env" >/dev/null 2>&1; printf '%s' "${VM_POOL_DATA:-}") )}"
+AL_DATA_POOL_OTHER_BYTES="${AL_DATA_POOL_OTHER_BYTES:-5000000000}"  # 5 GB of non-disk data on it (measured baseline: 0)
 AL_FS_CRIT_PCT="${AL_FS_CRIT_PCT:-10}"    # free space critical
 AL_FS_WARN_FOR="${AL_FS_WARN_FOR:-15m}"
 AL_FS_CRIT_FOR="${AL_FS_CRIT_FOR:-5m}"
@@ -1032,7 +1039,7 @@ groups:
   - name: enclave-filesystems
     rules:
       - alert: FilesystemFillingWarning
-        expr: (node_filesystem_avail_bytes{fstype!~"vfat|tmpfs|squashfs|overlay"} / node_filesystem_size_bytes) * 100 < ${AL_FS_WARN_PCT}
+        expr: (node_filesystem_avail_bytes{fstype!~"vfat|tmpfs|squashfs|overlay",mountpoint!~"${AL_FS_RESERVED_MOUNTS:-^$}"} / node_filesystem_size_bytes) * 100 < ${AL_FS_WARN_PCT}
         for: ${AL_FS_WARN_FOR}
         labels:
           severity: warning
@@ -1045,7 +1052,7 @@ groups:
             /etc/logrotate.d/rsyslog still carries its 'su' line before hunting elsewhere.
 
       - alert: FilesystemFillingCritical
-        expr: (node_filesystem_avail_bytes{fstype!~"vfat|tmpfs|squashfs|overlay"} / node_filesystem_size_bytes) * 100 < ${AL_FS_CRIT_PCT}
+        expr: (node_filesystem_avail_bytes{fstype!~"vfat|tmpfs|squashfs|overlay",mountpoint!~"${AL_FS_RESERVED_MOUNTS:-^$}"} / node_filesystem_size_bytes) * 100 < ${AL_FS_CRIT_PCT}
         for: ${AL_FS_CRIT_FOR}
         labels:
           severity: critical
@@ -1486,6 +1493,17 @@ groups:
           action: >-
             'sudo virsh domblklist <vm> --details' and the disk's driver discard setting must be
             'ignore'. Re-reserving an existing disk means the guest down - backlog 3.42.
+      - alert: DataVolumeForeignData
+        expr: enclave_vm_data_pool_other_bytes > ${AL_DATA_POOL_OTHER_BYTES}
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ \$labels.machine }}: {{ \$value | humanize1024 }}B on the database volume is not a database disk"
+          description: "The database volume holds reserved data disks and nothing else. Something else is on it - on 2026-09-27 it was the ring backup copy (3.42). The database cannot be starved (its disk is reserved), but whatever wrote here will fail when the volume fills."
+          action: >-
+            'sudo du -x -h -d1 {{ \$labels.pool }}' on {{ \$labels.machine }}; move anything that is not
+            a *-data.qcow2 elsewhere (vm-backup's SECOND_DIR is /var/lib/libvirt/images/backup-copy).
 
   # ---------------------------------------------------------------- database
   # B-06a slice 4 (2026-09-28). From Patroni's /metrics and postgres-exporter, per node, labelled
@@ -2231,15 +2249,30 @@ else:
 # whatever the guest has actually written. Hypervisors with a data pool only.
 dp = os.environ.get("DATA_POOL") or ""
 if dp and os.path.isdir(dp):
+    disks = 0
     for p in sorted(glob.glob(os.path.join(dp, "*-data.qcow2"))):
         try:
             st = os.stat(p)
+            disks += st.st_blocks * 512
             if st.st_size > 0:
                 emit("enclave_vm_data_disk_reserved_ratio", round(st.st_blocks * 512 / st.st_size, 4),
                      {"disk": os.path.basename(p)},
                      help="allocated / apparent size of a guest data disk - a reserved (falloc) disk reads ~1.0 (3.42)")
         except OSError:
             pass
+    # WHAT ELSE IS ON THE DATABASE VOLUME. Used bytes minus the reserved data disks: 0.000 GB on all
+    # three hosts when measured 2026-09-28. The failure it names is 2026-09-27's - the ring backup
+    # copy landing on this volume - which the %-free rules can no longer see (the volume is full by design).
+    # Only on a volume of its own: on a directory of the OS disk "used" is the whole OS disk. The
+    # composer refuses such a pool (3.43), so this is belt and braces, not a case expected to occur.
+    try:
+        if not os.path.ismount(dp):
+            raise OSError("not a mount point")
+        vs = os.statvfs(dp)
+        emit("enclave_vm_data_pool_other_bytes", max(0, (vs.f_blocks - vs.f_bfree) * vs.f_frsize - disks),
+             {"pool": dp}, help="bytes on the database volume that are NOT a reserved data disk (3.42)")
+    except OSError:
+        pass
 
 # ------------------------------------------------------------------------- USB storage
 # V-270718 checks modprobe.d and NEVER lsmod, so this reads the same place the control does.

@@ -1,12 +1,14 @@
 # Step 06a — PostgreSQL HA on pg-01..03, as built
 
-> **BUILT 2026-09-27/28 — slices 1–3 of 6 passed.** Three guests, one per physical host, each
+> **BUILT 2026-09-27/28 — slices 1–4 of 6 passed.** Three guests, one per physical host, each
 > running PostgreSQL 16 under Patroni with the database's own three-member etcd. pg-01 bootstrapped
 > the cluster; the other two cloned from it and stream from it; one is synchronous. The nodes
 > authenticate to each other **by certificate only** — there is no shared password anywhere.
-> **Slices 4–6 are not built:** failover rehearsal and monitoring (4), WAL archive and
-> point-in-time restore (5), the PostgreSQL STIG scan (6). **There is no backup of the database
-> today** (§14).
+> **Slice 4 passed 2026-09-28** (§9): monitored end to end, the data disks re-reserved without an
+> outage, a timed planned switchover, a real power-cut failover with the dead leader rejoining by
+> `pg_rewind`, and the "no synchronous standby" alert fired and cleared on purpose. **Not built:**
+> WAL archive and point-in-time restore (5), the PostgreSQL STIG scan (6). **There is no backup
+> of the database today** (§15).
 >
 > **The procedure is `scripts/install/06a-postgres-ha.sh`.** This document explains what it and
 > the steps before it did, in order, with the evidence. Every fact below was read from the script,
@@ -36,8 +38,8 @@
                   │ │ etcd 3.4  │ │       │ │ etcd 3.4  │ │       │ │ etcd 3.4  │ │
                   │ └───────────┘ │       │ └───────────┘ │       │ └───────────┘ │
                   └───────────────┘       └───────────────┘       └───────────────┘
-  role 2026-09-28     LEADER                  replica              SYNC STANDBY
-                        │                        ▲                       ▲
+  role 17:00 UTC      SYNC STANDBY            replica              LEADER  (timeline 3)
+                        ▲                        ▲                       │
                         └── WAL stream, 5432/tcp, TLS, certificate auth ─┘
 
   etcd:   one member on each node, 2380/tcp between them (raft), 2379/tcp for Patroni
@@ -47,7 +49,8 @@
 
 The roles move. Patroni chooses the leader and which replica is synchronous; after a failover, or
 simply over time, they will not be what this picture shows — on 2026-09-28 the synchronous standby
-changed from pg-02 to pg-03 without a failover (§13). **Ask the cluster, never assume** (§12).
+changed from pg-02 to pg-03 without a failover, and in slice 4 the lead went pg-01 → pg-02
+(planned) → pg-03 (a power cut). **Ask the cluster, never assume** (§13).
 
 The addresses come from `scripts/enclave/enclave-addresses.env` (`PG_01..03`); the placement, one
 per host with anti-affinity, from `scripts/enclave/vm-specs.env` (`PLACE_PG_0N`, `ANTI_AFFINITY`).
@@ -68,13 +71,15 @@ host-4 deliberately holds none of them (runbook §9a).
  │  │     └─ postgres       STARTED BY PATRONI, not by systemd   <own IP>:5432              │
  │  │           data /var/lib/postgresql/16/enclave-pg                                      │
  │  │                                                                                       │
+ │  ├─ prometheus-postgres-exporter  user prometheus  <own IP>:9187  (login pgmonitor, peer)│
+ │  ├─ prometheus-node-exporter      user prometheus  <own IP>:9100                        │
  │  └─ postgresql.service   disabled — Debian's wrapper; there is no Debian cluster         │
  │                                                                                          │
  │  vda  40 GB   the OS                                                                     │
  │  vdb 150 GB   ext4, LABEL=pgdata, mounted at /var/lib/postgresql  nodev,nosuid,noexec    │
  └──────────────────────────────────────────────────────────────────────────────────────────┘
- Nothing else listens on the network except sshd (22). node-exporter (9100) and
- postgres-exporter (9187) have firewall rows but are NOT installed yet — slice 4.
+ Nothing else listens on the network except sshd (22). Both exporters (slice 4) are scraped
+ only by svc-obs-01; ufw admits nobody else to 9100 or 9187.
 ```
 
 ### 1.3 Where the disks really are
@@ -92,8 +97,10 @@ host-2 and host-3 shows `lvm → crypt → part → disk` under both mounts (rea
 evidence B-06a owed for V-261901/930/931. The guest does not encrypt again.
 
 The data disk is a **separate volume** from the OS disk on purpose (runbook §9a.2), and it is
-meant to be **reserved** — every block allocated when it is created, so that a full volume can
-fail a backup copy but never a database write. **Today it is not** — see §13, item 6.
+**reserved** — every block allocated on the host — so that a full volume can fail a backup copy
+but never a database write. It was undone once by guest TRIM and **restored in slice 4 (§9.2):
+each data disk is 153,623 of 153,623 MiB allocated.** Because the volume is now full by design, it
+is watched by what is *on* it rather than by free space (§9.5).
 
 ---
 
@@ -123,16 +130,21 @@ fail a backup copy but never a database write. **Today it is not** — see §13,
   F   pg-01 FIRST      06a-postgres-ha.sh patroni                              bootstraps → Leader
       pg-02, pg-03     06a-postgres-ha.sh patroni                              clone → streaming
   G   pg-01, 02, 03    06a-postgres-ha.sh patroni-check                        traps + a sync commit
+  H   pg-01..03        monitoring.sh exporter + facts-timer                    node-exporter :9100
+      pg-01 (primary)  06a-postgres-ha.sh monitor, then pg-02, pg-03           postgres-exporter :9187
+      svc-obs-01       monitoring.sh scrape, then rules                        24 targets, 53 rules
+  I   per node         06a leave (node) → 03-compose-vm.sh --reserve-data      one node at a time,
+                         (host) ; 06a switchover before the leader's turn        no outage
 ```
 
 Steps A–C are step 06's mechanism (`docs/06-guest-vms.md`) applied to the three database guests —
-**slice 1**. D–E are **slice 2**, F–G **slice 3**. Each is described below with the command as it
+**slice 1**. D–E are **slice 2**, F–G **slice 3**, H–I and the failure tests **slice 4** (§9). Each is described below with the command as it
 was run, what it does, what it writes, what it refuses, and how it was verified.
 
 **Before any of it** (all done and verified before 2026-09-27; runbook §6.5, backlog 3.42/3.43):
 host-1..3 hardened and VM-ready (libvirt, `br0`, `images` and `images-data` pools on separate
 mounted volumes, the base image in place, `/etc/enclave-profile` saying `VM_PROFILE=lab`); the
-PPSM register carrying 2379, 2380, 8008 and 9187 (§10); the enclave issuing CA on svc-mgmt-01; the
+PPSM register carrying 2379, 2380, 8008 and 9187 (§11); the enclave issuing CA on svc-mgmt-01; the
 mirror on svc-repo-01 carrying every package in §8.3. **`03-compose-vm.sh plan` on each host is
 the check** — it refuses a data pool that is not a mounted volume or is too small.
 
@@ -212,7 +224,7 @@ fi
    data pool is a **mounted volume**, not a directory on the OS drive; it fits.
 2. Asks the guest admin password **before** creating anything (3 tries; backlog 3.38).
 3. Creates the OS disk from the base image (`images` pool) and the **data disk**
-   `images-data/pg-0N-data.qcow2`, 150 GB, `preallocation=falloc` (reserved — §13 item 6).
+   `images-data/pg-0N-data.qcow2`, 150 GB, `preallocation=falloc` (reserved — §14 item 6).
 4. Writes the cloud-init seed: hostname, admin account (hash and keys), the mirror as the only apt
    source, `/etc/hosts`, the enclave resolver, the enclave CA as trusted.
 5. Builds the **provisioning disk** `ENCLAVE-PROV` — a read-only ISO (`genisoimage -R`) staged on
@@ -281,7 +293,7 @@ its data disk only, SSH answering.
 
 ## 6. Step D — each node's certificate (slice 2)
 
-One key and one certificate per node carry every TLS role the node has (§9). The key is made **on
+One key and one certificate per node carry every TLS role the node has (§10). The key is made **on
 the node** and never leaves it; only the CSR (public) and the certificate (public) travel.
 
 ```
@@ -337,12 +349,12 @@ fi
 
 | field | value |
 |---|---|
-| subject CN | `pg-01.enclave.internal` — **this exact string is what `pg_ident` maps to the database roles** (§9.3) |
+| subject CN | `pg-01.enclave.internal` — **this exact string is what `pg_ident` maps to the database roles** (§10.3) |
 | SAN | `DNS:pg-01.enclave.internal, DNS:pg-01, IP:10.2.20.165` — `ca.sh request` adds the name, the FQDN and the node's own IP |
 | key | RSA 3072, made on the node |
 | purpose | `serverAuth` **and** `clientAuth` — `--peer`. Every etcd member is a server to its peers and a client to them at once; a plain server certificate fails the peer handshake with an error naming the *cipher*, not the purpose |
 | chain | leaf + issuing CA; verifies to the enclave root |
-| valid until | **2027-09-28** — and nothing watches it yet (§15) |
+| valid until | **2027-09-28** — and nothing watches it yet (§16) |
 
 `--peer` is a flag, not the default, deliberately: giving every certificate in the enclave
 `clientAuth` would let any service's key authenticate *as a client* to any other.
@@ -498,7 +510,7 @@ a second, empty cluster (runbook §9a.3).
 7. **Starts Patroni and waits for the right role, held.** Up to 300 s, polling `patronictl list`:
    this node must be **Leader and running**, or **Replica / Sync Standby and streaming** — for three
    polls in a row (15 s), so a moment in passing does not count. On failure it prints the journal
-   and names the stale-`initialize` trap if that is what it sees (§13 item 2).
+   and names the stale-`initialize` trap if that is what it sees (§14 item 2).
 
 ### 8.2 `config.yml` — every setting, and why
 
@@ -533,7 +545,7 @@ setting lives here (or in the DCS), never in a file edited by hand — about six
 | `postgresql.listen` | `<own IP>:5432` | not `0.0.0.0` |
 | `data_dir` / `bin_dir` | `/var/lib/postgresql/16/enclave-pg` / `/usr/lib/postgresql/16/bin` | Patroni's own directory, never Debian's `16/main` |
 | `authentication.superuser` | `postgres` | local only, by peer |
-| `authentication.replication` / `.rewind` | `replicator` / `rewinder`, `sslmode verify-full`, `sslcert/sslkey/sslrootcert` = the node certificate | **no password** — the node's certificate is the credential (§9.3) |
+| `authentication.replication` / `.rewind` | `replicator` / `rewinder`, `sslmode verify-full`, `sslcert/sslkey/sslrootcert` = the node certificate | **no password** — the node's certificate is the credential (§10.3) |
 
 ### 8.3 What was installed (read from all three nodes, 2026-09-28)
 
@@ -569,7 +581,7 @@ backlog **6a.11**, open.
 ```
 
 **`post_bootstrap` runs BEFORE Patroni creates its own roles.** The first version ALTERed roles
-that did not exist yet, exited non-zero, and Patroni cancelled the bootstrap (§13 item 1). So it
+that did not exist yet, exited non-zero, and Patroni cancelled the bootstrap (§14 item 1). So it
 **creates** them, with their connection limits (V-261857); Patroni's own create-or-alter then leaves
 the limit alone.
 
@@ -596,9 +608,204 @@ system identifier `7690418360759139912`; every check passed on all three; connec
 
 ---
 
-## 9. Who talks to whom, and how each proves who it is
+## 9. Slice 4 — watched, maintained, and broken on purpose (2026-09-28)
 
-### 9.1 The flows
+### 9.1 Monitoring
+
+**The OS agent, as on every enclave machine** — node-exporter bound to the node's own IP and the
+15-minute compliance-facts timer:
+
+```bash
+### MACHINE: pg-01 (10.2.20.165) ###   — then pg-02, pg-03
+if [ "$(hostname -s)" != pg-01 ]; then echo "WRONG MACHINE: $(hostname -s)"; else
+  cd ~/canonical-k8s && sudo ./scripts/enclave/monitoring.sh exporter && sudo ./scripts/enclave/monitoring.sh facts-timer
+fi
+```
+
+**The database exporter — `06a monitor`, on the PRIMARY first** (it creates the role; the
+replicas receive it by replication and only check it is there):
+
+```bash
+### MACHINE: pg-0N — the primary first, then the two replicas ###
+if ! hostname -s | grep -qx 'pg-0[123]'; then echo "WRONG MACHINE: $(hostname -s)"; else
+  sudo ~/canonical-k8s/scripts/install/06a-postgres-ha.sh monitor
+fi
+```
+
+It does three things, and changes nothing else:
+
+1. **The login path, through Patroni** — `config.yml` is backed up (`config.yml.bak-06a-<time>`)
+   and re-rendered with one `pg_hba` line, `local postgres pgmonitor peer map=pgmonitor`, and one
+   `pg_ident` map, `pgmonitor prometheus pgmonitor`. Patroni is **reloaded, not restarted**; the
+   script waits until the line is live in `pg_hba_file_rules`. **No PostgreSQL restarted** —
+   the postmaster start times were unchanged on all three.
+2. **The role, on the primary only** — `pgmonitor`: `LOGIN`, `CONNECTION LIMIT 3`, member of
+   `pg_monitor` (statistics only — it cannot read table data), **no password, not superuser**.
+3. **postgres-exporter 0.15.0** — installed with its self-start **blocked** (its postinst starts it
+   with an empty connection string on every interface), then `/etc/default/prometheus-postgres-exporter`
+   (0640 root:prometheus): `DATA_SOURCE_NAME='host=/var/run/postgresql user=pgmonitor dbname=postgres'`,
+   listening on the node's own IP only. The run passes only on `pg_up 1`.
+
+**pgaudit and the monitor — a decided tailoring (2026-09-28, for the org baseline 6a.10).**
+Measured on pg-01: one exporter scrape wrote **20 audit lines** (~945 bytes each) of `pgmonitor`
+reading statistics views — **~4.5 MB/hour per node** at a 15 s scrape, about **6×** the node's
+entire syslog, doubled by PostgreSQL's own log files, kept a year under backlog 3.37. Decided:
+`ALTER ROLE pgmonitor SET pgaudit.log = 'none'` (superuser-only; the role cannot undo it).
+**Proven live on all three: a scrape now writes 0 audit lines, and its login is still logged**
+(`connection authorized: user=pgmonitor`). `patroni-check` fails if the global classes change from
+`ddl,role,read,write` or if **any other** role gains a pgaudit setting.
+
+**The collector** scrapes three new jobs, generated from the address file:
+
+```bash
+### MACHINE: svc-obs-01 (10.2.20.164) ###
+if [ "$(hostname -s)" != svc-obs-01 ]; then echo "WRONG MACHINE: $(hostname -s)"; else
+  cd ~/canonical-k8s && sudo ./scripts/enclave/monitoring.sh scrape && sudo ./scripts/enclave/monitoring.sh rules
+fi
+```
+
+| job | target | what |
+|---|---|---|
+| `node` | pg-0N:9100 | the OS — CPU, memory, **`/var/lib/postgresql` free space** |
+| `patroni` | pg-0N:8008, **https, certificate verified** against the system trust store (no `insecure_skip_verify`) | leader, sync standby, timeline, WAL positions, paused, pending restart |
+| `postgres` | pg-0N:9187 | connections, locks, replication, per-database statistics |
+
+Result: **24 targets, 24 up; 53 rules.** (New targets read ~75–90 % "busy" for their first five
+minutes — `rate()` over 5 minutes of a 2-minute-old series. The raw counters said 95.5 % idle;
+`HighCPU`'s 10-minute `for` absorbs it.)
+
+**The database alerts** (`monitoring.sh`, group `enclave-database`):
+
+| alert | fires when | for | severity |
+|---|---|---|---|
+| **`PostgresSyncStandbyLost`** | a primary with no synchronous standby — commits no longer protected. **The alert that makes strict mode OFF defensible** | 5 m | critical |
+| `PostgresNoPrimary` | no leader — longer than a normal failover | 1 m | critical |
+| `PostgresMultiplePrimaries` | more than one leader — split brain | 1 m | critical |
+| `PostgresReplicaNotStreaming` | a replica not streaming | 5 m | warning |
+| `PostgresNotRunning` | Patroni up, PostgreSQL down | 5 m | warning |
+| `PostgresFailoverHappened` | the timeline changed — any promotion, planned or not | — | warning |
+| `PatroniPendingRestart` | a setting shown but not applied | 1 h | warning |
+| `PatroniPaused` | automatic failover switched off | 30 m | warning |
+| `PostgresExporterCannotConnect` | `pg_up 0` | 5 m | warning |
+| `DataDiskNotReserved` | a data disk under 98 % allocated (§9.2) | 1 h | warning |
+| `DataVolumeForeignData` | > 5 GB on the database volume that is not a data disk (§9.5) | 15 m | warning |
+
+All promtool-tested both ways with a control that must fail, then proven live below.
+
+### 9.2 Maintenance without an outage — the data disks re-reserved
+
+The disks had lost their reservation (§14 item 6). The repair needs the guest **off**, so each
+node was taken out and brought back **one at a time**. Two guards make it safe, and both live in
+the scripts, not in the runbook:
+
+- **`06a leave`** (on the node) refuses if the node is the **leader**, if either other member is not
+  running/streaming at **lag 0**, or if any etcd member is unhealthy — so it can never take down a
+  second node. Tested against eight cluster shapes, including "pg-03 already stopped → `leave` on
+  pg-02 refused". Then: Patroni stopped (PostgreSQL shuts down with it), etcd stopped, power off.
+- **`03-compose-vm.sh <vm> --reserve-data`** (on the host) refuses a guest that is not shut off;
+  sets the data disk's `discard=ignore` with virt-xml, **selecting the disk by path**, and reads it
+  back from the XML before touching the file; `fallocate`s the file; `qemu-img check`; ≥98 % or it
+  will not start the guest. Proven offline first on the hosts' qemu-img 8.2.2 (TRIM reproduced to
+  12 %, fallocate → 100 %, data intact, a later 256 MB write stayed inside the file).
+- **`06a switchover`** hands the lead to the synchronous standby (no commit can be lost), through
+  Patroni's REST API with the node's client certificate, and times it.
+
+```bash
+### MACHINE: pg-0N (the node) ###
+sudo ~/canonical-k8s/scripts/install/06a-postgres-ha.sh leave            # the leader first runs: ... switchover
+```
+
+```bash
+### MACHINE: host-N (its host) ###
+if ! hostname -s | grep -qx 'host-[123]'; then echo "WRONG MACHINE: $(hostname -s)"; else
+  vm=pg-0N   # this host's pg node
+  for i in $(seq 1 36); do [ "$(sudo virsh domstate $vm)" = "shut off" ] && break; sleep 5; done
+  cd ~/canonical-k8s/scripts/install && sudo ./03-compose-vm.sh $vm --reserve-data
+fi
+```
+
+| order | node | what happened |
+|---|---|---|
+| 1 | pg-02 (async replica) | back 16:30:59, lag 0 — 100 % reserved |
+| 2 | pg-03 (sync standby) | **Patroni moved sync to pg-02 by itself**; back 16:33:52 as a replica — 100 % |
+| 3 | `switchover` pg-01 → pg-02 | **timeline 1 → 2 at 16:35:29** (Patroni history); pg-02 promoted **in place, no restart**; `PostgresFailoverHappened` fired on all three |
+| 4 | pg-01 (now a replica) | back 16:36:55, lag 0 — 100 % |
+
+`DataDiskNotReserved` cleared at the next facts refresh. (The switchover's own two timings print
+from the script; that output was not captured on 2026-09-28.)
+
+### 9.3 A real crash — the leader's power cut
+
+`virsh destroy` on the leader's host — an instant power-off: PostgreSQL, Patroni and etcd die
+mid-flight, the way a host failure looks. A watcher on svc-obs-01 logged every state change
+(read-only; one SSH session; it polls each node's `/patroni` every ~0.5 s):
+
+```bash
+### MACHINE: host-2 (the leader's host at the time) ###
+if [ "$(hostname -s)" != host-2 ]; then echo "WRONG MACHINE: $(hostname -s)"
+elif [ "$(sudo virsh domstate pg-02)" != running ]; then echo "pg-02 is not running"
+else echo "PLUG PULLED at $(date -u +%T.%N | cut -c1-11) UTC"; sudo virsh destroy pg-02; fi
+```
+
+| UTC | what the watcher saw |
+|---|---|
+| 16:40:46.3 | pg-02 (leader, timeline 2) stops answering. pg-01 and pg-03 wait out its leader lock |
+| **16:41:19.1** | Patroni history: timeline 2 ends at WAL `0/50029E0`; **pg-03 promoted** (the sync standby — in synchronous mode the only one allowed) |
+| 16:41:20.4 | pg-03 answering as leader, **timeline 3 — ~34 s after the loss** (30 s TTL + one loop) |
+| 16:41:33.0 | pg-01 follows onto timeline 3 and **becomes pg-03's sync standby**, lag 0 — **healed on two nodes ~47 s after the power cut**, nobody touching it |
+| 16:44:06–12 | pg-02 powered on: Patroni finds itself demoted, **runs `pg_rewind`**, rejoins as a replica on timeline 3, lag 0 |
+
+**etcd lost a member and kept its quorum** — without that, no promotion could have happened.
+
+**`pg_rewind`, from pg-02's own journal:** `running pg_rewind from dbname=postgres user=rewinder
+host=10.2.20.167 ... sslmode=verify-full sslcert=/etc/patroni/pki/node.crt` → `servers diverged at
+WAL location 0/50029E0 on timeline 2` (exactly where Patroni's history says timeline 2 ended) →
+`exit code=0` → `started streaming WAL from primary ... on timeline 3`. **The certificate-only
+rewind login, used for real.** The WAL pg-02 held beyond the divergence had never been confirmed by
+a standby, so under synchronous commit it cannot have held a committed transaction.
+
+**Alerts:** `PostgresFailoverHappened` fired; `InstanceDown` fired for pg-02's three targets at
+2 minutes and reached Alertmanager; `PostgresNoPrimary` did **not** fire (34 s < its 1 m);
+`PostgresSyncStandbyLost` and `PostgresReplicaNotStreaming` went pending for the 13 s before pg-01
+became sync and **cleared by themselves**.
+
+**The honest limit:** nothing was writing during the crash. This proves promotion, rejoin and
+alerting — **not zero data loss under load**. That rests on synchronous mode and on `patroni-check`
+having proven the sync standby replays a commit made just before. A crash under a write load needs
+a write generator (§16).
+
+### 9.4 The "no synchronous standby" alert, proven
+
+Patroni **stopped on both replicas** (the VMs and etcd left up — powering two VMs off would cost
+etcd its quorum and test something else). pg-03 kept its leader lock, lost its synchronous
+standby, and — strict mode being off — went on accepting writes **asynchronously**:
+
+| UTC | |
+|---|---|
+| 16:46:36 / 16:48:52 | Patroni stopped on pg-02, then pg-01 |
+| 16:49:21 | `PostgresSyncStandbyLost` **pending** — pg-03 reporting no replication at all |
+| **16:54:13** | **firing — in Alertmanager as critical**: *"the primary has NO synchronous standby - commits are no longer protected"* |
+| 16:58:22 / 16:58:45 | Patroni started on pg-01, then pg-02; pg-01 sync again, both lag 0 |
+| 16:59:04 | **cleared** |
+
+That completes the argument for strict mode off: the degradation it permits can no longer be silent.
+
+### 9.5 The database volume, once it is full by design
+
+Reserved disks leave each host's database volume ~18 % free **for good**, and the general %-free
+alert fired on host-1..3 with no way to clear — the same alert that went unheeded for 12 hours on
+2026-09-27. Decided 2026-09-28: the two %-free rules **skip** the database volume (from
+`VM_POOL_DATA`, the composer's own setting), and **`DataVolumeForeignData`** alerts on anything on it
+that is **not** a reserved data disk (above 5 GB — measured baseline 28 KB, the filesystem's
+`lost+found`). That is exactly 2026-09-27's failure. The database cannot be starved by that volume
+any more — its disk is reserved — and **the filesystem whose filling does stop PostgreSQL,
+`/var/lib/postgresql` inside each pg node, keeps every %-free and predictive alert.**
+
+---
+
+## 10. Who talks to whom, and how each proves who it is
+
+### 10.1 The flows
 
 ```
   FROM               TO             PORT       WHAT                        AUTHENTICATION
@@ -609,12 +816,13 @@ system identifier `7690418360759139912`; every check passed on all three; connec
   replica            leader         5432/tcp   WAL stream, basebackup      hostssl + CERT → replicator
   old leader         new leader     5432/tcp   pg_rewind after failover    hostssl + CERT → rewinder
   Patroni            local postgres  socket    management                  peer (OS user postgres)
-  svc-obs-01         Patroni        8008/tcp   /metrics            slice 4  reads open, TLS
-  svc-obs-01         exporters      9100,9187  metrics             slice 4  NOT INSTALLED YET
+  svc-obs-01         Patroni        8008/tcp   /metrics                    TLS, verified; reads need no cert
+  svc-obs-01         exporters      9100,9187  node + database metrics     ufw: svc-obs-01 only
+  postgres-exporter  local postgres  socket    statistics (pg_monitor)     peer, prometheus → pgmonitor
   k8s-wk-01..04      leader         5432/tcp   applications         B-07    hostssl + scram-sha-256
 ```
 
-### 9.2 One key, used five ways
+### 10.2 One key, used five ways
 
 ```
  /etc/ssl/enclave/pg-0N.key   (0640 root:root — made here by ca.sh request, never copied off)
@@ -630,9 +838,9 @@ system identifier `7690418360759139912`; every check passed on all three; connec
 
 Two copies on the same machine, each readable by exactly one service account. When the
 certificate is renewed (before 2027-09-28), **both** copies and **both** certificates must be
-replaced and both services restarted — there is no procedure for that yet (§15).
+replaced and both services restarted — there is no procedure for that yet (§16).
 
-### 9.3 `pg_hba` and `pg_ident` — the whole access list
+### 10.3 `pg_hba` and `pg_ident` — the whole access list
 
 Generated by Patroni from `config.yml`; the full list, in order. **Anything that matches no line
 is rejected.**
@@ -640,12 +848,14 @@ is rejected.**
 | type | database | user | address | method | who uses it |
 |---|---|---|---|---|---|
 | `local` | all | `postgres` | — | `peer` | Patroni and an administrator, as the OS user `postgres` on the node |
+| `local` | postgres | `pgmonitor` | — | `peer map=pgmonitor` | postgres-exporter, as the OS user `prometheus` (slice 4) |
 | `hostssl` | replication | `replicator` | each pg node /32 | `cert map=pgnodes` | replicas streaming and cloning |
 | `hostssl` | all | `rewinder` | each pg node /32 | `cert map=pgnodes` | `pg_rewind` after a failover |
 | `hostssl` | all | all | each K8S worker /32 | `scram-sha-256` | applications — **no application database or user exists yet** |
 
 ```
- pg_ident  map pgnodes:   pg-01.enclave.internal → replicator     pg-01.enclave.internal → rewinder
+ pg_ident  map pgmonitor: prometheus (OS user) → pgmonitor
+           map pgnodes:   pg-01.enclave.internal → replicator     pg-01.enclave.internal → rewinder
                           pg-02.enclave.internal → replicator     pg-02.enclave.internal → rewinder
                           pg-03.enclave.internal → replicator     pg-03.enclave.internal → rewinder
 ```
@@ -658,7 +868,7 @@ non-TLS network line exists.
 
 ---
 
-## 10. Ports and firewall
+## 11. Ports and firewall
 
 Each pg node has 20 ufw rules from `stig-tailor.sh ufw` (its table in `stig-tailor.sh`, sources
 from the address file). Every port is in the PPSM register `scripts/enclave/ppsm-services.tsv`, and
@@ -668,19 +878,19 @@ hardening pass, default deny.
 | port | rule | from | rules | what |
 |---|---|---|---|---|
 | 22/tcp | limit | any | 1 | SSH — `limit` is 6 new connections per 30 s per source |
-| 9100/tcp | limit | svc-obs-01 | 1 | node-exporter — **not installed yet** |
+| 9100/tcp | limit | svc-obs-01 | 1 | node-exporter (slice 4) |
 | 5432/tcp | **allow** | k8s-wk-01..04, pg-01..03 | 7 | PostgreSQL. `allow`, not `limit`: a connection pool reconnecting after a failover must not be banned |
 | 2379/tcp | allow | pg-01..03 | 3 | etcd client API |
 | 2380/tcp | allow | pg-01..03 | 3 | etcd peer |
 | 8008/tcp | allow | pg-01..03, svc-obs-01 | 4 | Patroni REST API |
-| 9187/tcp | limit | svc-obs-01 | 1 | postgres-exporter — **not installed yet** |
+| 9187/tcp | limit | svc-obs-01 | 1 | postgres-exporter (slice 4) |
 
 2379, 2380, 8008 and 9187 are in the register with CAL `-`: no PPSM Category Assurance List entry
 could be verified from inside the gap.
 
 ---
 
-## 11. Files on a pg node
+## 12. Files on a pg node
 
 Read from pg-01..03 on 2026-09-28 (identical on all three), except where marked.
 
@@ -699,6 +909,8 @@ Read from pg-01..03 on 2026-09-28 (identical on all three), except where marked.
 | `/etc/patroni/config.yml` | 0640 root:postgres | `06a patroni` | Patroni's configuration (§8.2) |
 | `/etc/patroni/post-bootstrap.sh` | 0750 root:postgres | `06a patroni` | creates the two roles (§8.4) |
 | `/etc/systemd/system/patroni.service.d/06a.conf` | 0600 root:root | `06a patroni` | mount requirement, start limit (§8.1) |
+| `/etc/patroni/config.yml.bak-06a-<time>` | 0640 root:postgres | `06a monitor` | the previous config, kept before each re-render |
+| `/etc/default/prometheus-postgres-exporter` | 0640 root:prometheus | `06a monitor` | the exporter's login (no secret — peer) and listen address |
 | `/etc/patroni/config.yml.in`, `dcs.yml` | 0644 root:root | the Ubuntu `patroni` package | Ubuntu's templates — **not used** |
 
 The two 0600 files are written under the hardened umask (077); only root and systemd read them,
@@ -706,7 +918,7 @@ which is all they need.
 
 ---
 
-## 12. Operating it
+## 13. Operating it
 
 **Who is the leader right now** — never assume, the roles move:
 
@@ -730,6 +942,15 @@ curl -sk https://10.2.20.165:8008/cluster
 sudo ~/canonical-k8s/scripts/install/06a-postgres-ha.sh etcd-check
 ```
 
+**Take a node down for maintenance** (§9.2) — `leave` refuses the leader and refuses unless the
+other two are healthy; hand the lead over first with `switchover`:
+
+```bash
+### MACHINE: the pg node ###
+sudo ~/canonical-k8s/scripts/install/06a-postgres-ha.sh switchover   # only if it is the leader
+sudo ~/canonical-k8s/scripts/install/06a-postgres-ha.sh leave        # powers the VM off
+```
+
 **Do not:**
 
 - edit `postgresql.conf` or `pg_hba.conf` by hand — Patroni rewrites both on its next start. A
@@ -737,14 +958,14 @@ sudo ~/canonical-k8s/scripts/install/06a-postgres-ha.sh etcd-check
 - `systemctl start postgresql` or `pg_ctl` — Patroni starts and stops PostgreSQL; a second
   postmaster is the failure this design exists to avoid;
 - stop etcd on two nodes at once — that is the quorum;
-- delete keys under `/enclave/enclave-pg/` while any Patroni is running (§13 item 2 is the only
+- delete keys under `/enclave/enclave-pg/` while any Patroni is running (§14 item 2 is the only
   time to);
 - read the journals as `encadmin` and trust the answer — `journalctl` is permission-denied without
   sudo on a hardened guest, and a count taken that way is zero because nothing was read.
 
 ---
 
-## 13. What went wrong on the way, and what the build now does about it
+## 14. What went wrong on the way, and what the build now does about it
 
 | # | what happened | fixed by |
 |---|---|---|
@@ -753,12 +974,14 @@ sudo ~/canonical-k8s/scripts/install/06a-postgres-ha.sh etcd-check
 | 3 | etcd's package starts its own single-node etcd on install | installed under `policy-rc.d`; own data directory |
 | 4 | Ubuntu's `postgresql-16` creates `16/main` | `create_main_cluster = false` before install; refuse if any cluster exists |
 | 5 | The draft named `python3-etcd3` | `python3-etcd` — what Patroni 3.2.2 depends on |
-| 6 | **The data disks are no longer reserved (found 2026-09-28).** The host attached them `discard=unmap`; `mkfs.ext4` TRIMs the whole device by default, and the TRIM punched holes straight through the falloc reservation — 161 GB released on each host within the hour slice 3 formatted it. The files are now **0.1–0.2 % allocated** | new disks: `discard=ignore` and `mkfs -E nodiscard`; `03-compose-vm.sh plan` checks the files; alert `DataDiskNotReserved` (firing for all three, correctly). **The three existing disks are re-reserved inside slice 4** (decided) — until then the only protection is that nothing else now writes to their volume (backlog 3.42) |
+| 6 | **The data disks are no longer reserved (found 2026-09-28).** The host attached them `discard=unmap`; `mkfs.ext4` TRIMs the whole device by default, and the TRIM punched holes straight through the falloc reservation — 161 GB released on each host within the hour slice 3 formatted it. The files are now **0.1–0.2 % allocated** | new disks: `discard=ignore` and `mkfs -E nodiscard`; `03-compose-vm.sh plan` checks the files; alert `DataDiskNotReserved`. **The three existing disks re-reserved in slice 4 without an outage (§9.2) — 100 % each** |
 | 7 | **The clock correction of 2026-09-28** stepped every machine back 10.9 s (backlog 3.39) | the cluster stayed on timeline 1, no failover, no restarts, lag 0. The synchronous standby is now pg-03 (was pg-02); when and why is not known without reading the journal with sudo |
+| 8 | **`06a monitor`'s first run on pg-01 ended silently** after doing its work: the first exporter poll came before the exporter listened, and under `set -e` + `pipefail` the failed `curl` ended the script with no `[ok]` and no `[x]` | a failed poll now means "not yet"; the state was verified from outside before anything was re-run |
+| 9 | **The reserved volume tripped the %-free alert for good** | §9.5 — watched by what is on it instead |
 
 ---
 
-## 14. There is no backup of the database today
+## 15. There is no backup of the database today
 
 **pg-01..03 are not covered by any backup.** `vm-backup.sh` runs on host-4 only and protects its
 four service VMs (`enclave_backup_domains_protected` = 4, all svc-*; read 2026-09-28). There is
@@ -770,17 +993,16 @@ real the day an application writes. Backlog **3.46**.
 
 ---
 
-## 15. Not done yet
+## 16. Not done yet
 
 | | what | where |
 |---|---|---|
-| ⬜ | **Slice 4:** switchover, a timed hard failover, loss of an etcd member, postgres-exporter and Patroni `/metrics` scraped by svc-obs-01, the **synchronous-degradation alert** that makes `synchronous_mode_strict` off defensible — **and re-reserving the three data disks** one node at a time | B-06a, 3.42 |
+| ⬜ | **A crash under a write load** — slice 4 proved promotion and rejoin with no writes running; zero loss under load needs a write generator | B-06a |
 | ⬜ | **Slice 5:** WAL archive (pgbackrest) and a point-in-time restore | B-06a, 1.2 |
 | ⬜ | **Slice 6:** the PostgreSQL 16 STIG scan (the XCCDF needs a CAC download), the org baseline, the Crunchy-vs-Ubuntu tailoring statement | B-06a, 6a.1, 6a.10, 6a.11 |
 | ⬜ | **Any backup at all** | 3.46 |
 | ⬜ | **Certificate renewal** — the node certificates expire **2027-09-28**, in two places per node, and the cert-expiry facts do not look in `/etc/etcd/pki` or `/etc/patroni/pki` | B-06a |
 | ⬜ | **Unattended certificates** — step D is three hand-carried round trips; the unattended rebuild cannot make them | 2.6 |
-| ⬜ | node-exporter on the pg nodes, and their scrape targets — they report nothing to Prometheus yet | 3.39 |
 | ⬜ | A FIPS-built etcd from Canonical | Q-CORE (h), not sent; ENG-68 |
 | ⬜ | Application database, users and the connection string (`target_session_attrs=read-write` across the three nodes, runbook §9a.3) | B-07 |
 | 🗳️ | Production sizing — the lab runs 2 vCPU / 4 GiB / 40 GB / 150 GB; `vm-specs.env`'s default of 8 GiB / 60 GB / 400 GB is explicitly not a production sizing | 2.8 |

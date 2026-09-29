@@ -23,6 +23,7 @@
 #     sudo ./06a-postgres-ha.sh backup-restore-test     on the PRIMARY: restore to a point in time
 #                                                      from EACH store, into scratch, and prove it
 #   SLICE 6 PREP - THE APPLICATION'S DATABASE (real records: prints NUMBERS ONLY, see below):
+#     sudo ./06a-postgres-ha.sh extensions                    on EVERY pg node: PG_EXTENSION_PACKAGES
 #     sudo ./06a-postgres-ha.sh app-restore rehearse          on the LEADER: a made-up dump through
 #                                                      the whole path - proves no row reaches a screen or log
 #     sudo ./06a-postgres-ha.sh app-restore census <file>     what a plain-SQL dump is and needs
@@ -1136,6 +1137,7 @@ cmd_backup_restore_test() {
 #   client. A cluster dump (pg_dumpall, several databases) is refused.
 # =========================================================================================
 APP_LOG_DIR="${APP_LOG_DIR:-/var/log/enclave-app-restore}"
+PG_EXTENSION_PACKAGES="${PG_EXTENSION_PACKAGES:-$(awk -F"'" '/^PG_EXTENSION_PACKAGES=/{print $2}' "$ENC/vm-specs.env" 2>/dev/null)}"
 APP_LOAD_PGAUDIT="${APP_LOAD_PGAUDIT:-ddl,role}"
 APP_SPACE_FACTOR="${APP_SPACE_FACTOR:-4}"        # free bytes needed on the data disk per byte of dump
 APP_REHEARSAL_DB="${APP_REHEARSAL_DB:-app_rehearsal}"
@@ -1200,24 +1202,34 @@ def names(s):
     s = re.split(r"\s+(?:WITH\s+\w+\s+(?:OPTION|TRUE|FALSE)|CASCADE|RESTRICT)\b", s.rstrip().rstrip(";"))[0]
     return [unq(t) for t in re.findall(TOK, s) if t.startswith('"') or t.lower() not in NOTROLE]
 c = collections.Counter(); refs, defined, colls, hdr, exts = set(), set(), set(), {}, []
-in_copy = in_insert = False; this = 0; srcdb = None; dbopts = {}
+in_copy = in_insert = False; this = 0; srcdb = None; dbopts = {}; cur = None; spatial = set(); copy_spatial = False
+SPATIAL = re.compile(r"\b(?:public\.)?(?:geometry|geography|raster|topogeometry)\b")
 with open(path, "rb") as fh:
     for raw in fh:
         c["lines"] += 1
-        if raw.endswith(b"\r\n"): c["crlf"] += 1
         if in_copy:                                   # COPY data: rows, counted and never parsed
             if raw.rstrip(b"\r\n") == b"\\.":
                 in_copy = False; c["tables_with_rows"] += 1 if this else 0
             else:
-                c["rows"] += 1; this += 1
+                c["rows"] += 1; this += 1; c["spatial_rows"] += copy_spatial
+                # pg_dump escapes a CR inside a value as \r, so a raw CR ending a ROW was added in
+                # transit - and would land in the row's last column. That is what refuses a load.
+                c["crlf_copy"] += raw.endswith(b"\r\n")
             continue
+        c["crlf_text"] += raw.endswith(b"\r\n")      # inside the dump's own SQL text: kept as written
         l = raw.decode("utf-8", "replace").rstrip("\r\n")
         if in_insert:                                 # a multi-line INSERT value: data, not parsed
             in_insert = not l.rstrip().endswith(");"); continue
         if l.startswith("INSERT INTO "):
             c["insert"] += 1; in_insert = not l.rstrip().endswith(");"); continue
         if l.startswith("COPY ") and l.endswith(" FROM stdin;"):
+            m = re.match(r"COPY ((?:" + TOK + r")(?:\.(?:" + TOK + r"))?)", l)
+            copy_spatial = bool(m and m.group(1) in spatial)
             in_copy = True; this = 0; c["copy"] += 1; continue
+        m = re.match(r"CREATE (?:UNLOGGED )?TABLE ((?:" + TOK + r")(?:\.(?:" + TOK + r"))?) \($", l)
+        if m: cur = m.group(1)                        # inside a table definition until its ")" line
+        elif cur and l.startswith(")"): cur = None
+        elif cur and SPATIAL.search(l): spatial.add(cur)
         if l.startswith("--"):
             m = re.match(r"-- Dumped from database version (\S+)", l); hdr.update({"from": m.group(1)} if m else {})
             m = re.match(r"-- Dumped by pg_dump version (\S+)", l); hdr.update({"by": m.group(1)} if m else {})
@@ -1275,13 +1287,16 @@ if c["create_role"]: P("", "%d CREATE ROLE in the file, %d carrying a password" 
 if c["restrict"]:
     ok = tuple(int(x) for x in re.findall(r"\d+", psqlv)[:2]) >= (16, 10)
     P("psql", "the dump uses \\restrict (pg_dump 16.10+/17.6+); psql %s here %s" % (psqlv, "understands it" if ok else "does NOT - upgrade postgresql-client-16"))
-P("line ends", "CRLF on %s lines" % n(c["crlf"]) if c["crlf"] else "LF")
+if spatial: P("PostGIS", "%d tables have PostGIS columns, holding %s rows - without PostGIS they and their rows fail to load" % (len(spatial), n(c["spatial_rows"])))
+if c["crlf_copy"]: P("line ends", "CRLF on %s DATA rows - added in transit" % n(c["crlf_copy"]))
+elif c["crlf_text"]: P("line ends", "LF; CRLF on %s lines of the dump's own SQL text (function or comment source written on Windows) - kept as written, harmless" % n(c["crlf_text"]))
+else: P("line ends", "LF")
 why = []
 if c["cluster_header"] or c["create_db"] > 1:
     why.append("a cluster dump (pg_dumpall), %d databases - one database per load" % c["create_db"])
 elif c["connect"] and not c["create_db"]:
     why.append("it switches database (\\connect) without creating one")
-if c["crlf"]: why.append("Windows line endings - re-send it in BINARY mode (an ASCII transfer rewrote it)")
+if c["crlf_copy"]: why.append("Windows line endings on data rows - re-send it in BINARY mode (an ASCII transfer rewrote it)")
 if in_copy: why.append("it ends inside a COPY block - the file is truncated")
 if c["lines"] == 0: why.append("it is empty")
 if why:
@@ -1404,6 +1419,22 @@ for n in open(sys.argv[1], encoding="utf-8"):
   say "   2. when you have read the error lines you need:  sudo $0 app-restore shred $f $log"
 }
 
+# ---- extensions the application needs (PG_EXTENSION_PACKAGES, vm-specs.env) - on EVERY pg node:
+# a standby that a failover promotes must hold the same libraries as the leader it replaces.
+cmd_extensions() {
+  need_root; whoami_pg
+  local before after
+  [ -n "$PG_EXTENSION_PACKAGES" ] || die "PG_EXTENSION_PACKAGES is empty in vm-specs.env - nothing to install"
+  before="$(pg_sql "SELECT name FROM pg_available_extensions ORDER BY 1")"
+  say "$ME: installing $PG_EXTENSION_PACKAGES from the enclave mirror (server libraries only, no recommends)"
+  # shellcheck disable=SC2086
+  DEBIAN_FRONTEND=noninteractive timeout 900 apt-get install -y --no-install-recommends $PG_EXTENSION_PACKAGES 2>&1 | sed 's/^/     /' \
+    || die "apt-get failed or timed out - the lines above say why"
+  after="$(pg_sql "SELECT name FROM pg_available_extensions ORDER BY 1")"
+  ok "$ME: $(comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after") | grep -c . || true) extensions newly available: $(comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after") | tr '\n' ' ')"
+  say "   AIDE will report the new files at its next run - expected, this change"
+}
+
 cmd_app_census() {
   need_root; whoami_pg
   app_file_ok "${1:-}"
@@ -1512,6 +1543,7 @@ case "${1:-}" in
   backup-enable) cmd_backup_enable ;;
   backup-run)    shift; cmd_backup_run "$@" ;;
   backup-restore-test) cmd_backup_restore_test ;;
+  extensions)    cmd_extensions ;;
   app-restore)   shift; cmd_app_restore "$@" ;;
-  *) sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  *) sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

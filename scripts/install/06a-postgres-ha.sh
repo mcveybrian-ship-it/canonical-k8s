@@ -29,6 +29,7 @@
 #     sudo ./06a-postgres-ha.sh app-restore census <file>     what a plain-SQL dump is and needs
 #     sudo ./06a-postgres-ha.sh app-restore load <file> <db>  on the LEADER, into a NEW database
 #     sudo ./06a-postgres-ha.sh app-restore summary [log]     reprint a load's summary from its log
+#     sudo ./06a-postgres-ha.sh app-restore drop <db>         for a reload: only one app-restore made
 #     sudo ./06a-postgres-ha.sh app-restore shred <file>...   the dump and the load log, when done
 #
 # SLICE 2 - THE DATABASE'S OWN etcd, WITH MUTUAL TLS
@@ -1146,10 +1147,14 @@ APP_REHEARSAL_DB="${APP_REHEARSAL_DB:-app_rehearsal}"
 # dump (APP_ORIG_DB set - by environment, not argv, so the name is not in the process list):
 # its CREATE DATABASE and \connect become comments, and DATABASE <original> in ALTER DATABASE /
 # COMMENT / GRANT / REVOKE / SECURITY LABEL lines becomes the new name. COPY data and INSERT
-# statements are never touched.
+# statements are never touched. And for CREATE EXTENSION postgis*: pgaudit.log is set to 'none' for
+# that one statement and restored right after (APP_AUDIT) - PostGIS's installer REFUSES to run under
+# pgaudit (P0001 'Set pgaudit.log to none before installing PostGIS'; the first real load, 2026-09-29).
+# A bounded, recorded audit exception: the load log shows every place it applied.
 APP_FILTER_PY="$(cat <<'FILTERPY'
 import os, re, sys
 orig, new = os.environ.get("APP_ORIG_DB", "").encode(), os.environ["APP_NEW_DB"].encode()
+audit = os.environ.get("APP_AUDIT", "ddl,role").encode()
 out = sys.stdout.buffer; in_copy = in_insert = False
 for raw in sys.stdin.buffer:
     if in_copy:
@@ -1160,6 +1165,9 @@ for raw in sys.stdin.buffer:
         in_insert = not raw.rstrip().endswith(b");")
     elif raw.startswith(b"COPY ") and raw.rstrip(b"\r\n").endswith(b" FROM stdin;"):
         in_copy = True
+    elif re.match(rb"CREATE EXTENSION (IF NOT EXISTS )?\"?postgis", raw):
+        raw = (b"SET pgaudit.log = 'none';  -- [06a app-restore] PostGIS will not install under pgaudit\n" + raw
+               + b"SET pgaudit.log = '" + audit + b"';  -- [06a app-restore] audit restored\n")
     elif orig and raw.startswith((b"CREATE DATABASE ", b"\\connect ")):
         raw = b"-- [06a app-restore] skipped the dump's own " + (b"CREATE DATABASE" if raw.startswith(b"CREATE") else b"\\connect") + b"\n"
     elif orig and raw.startswith((b"ALTER DATABASE ", b"COMMENT ON DATABASE ", b"GRANT ", b"REVOKE ", b"SECURITY LABEL ")):
@@ -1325,7 +1333,8 @@ NAME = {"42704": "undefined_object - a role, type or collation that does not exi
         "42601": "syntax_error", "22P02": "invalid_text_representation - a value its column rejects",
         "23505": "unique_violation", "23503": "foreign_key_violation", "23502": "not_null_violation",
         "22021": "character_not_in_repertoire", "42P16": "invalid_table_definition",
-        "?????": "(no SQLSTATE - read the load log)"}
+        "?????": "(no SQLSTATE - read the load log)",
+        "psql": "psql itself, not the server - e.g. 'invalid command' after a COPY whose table was missing"}
 # psql prefixes "psql:<stdin>:LINE: " only when it reads a file (-f); piped input gets none. Accept
 # both - and count an error line with no readable SQLSTATE rather than let it vanish: the first
 # live rehearsal (2026-09-29) reported "0 errors, a clean load" because every error lacked the prefix.
@@ -1334,6 +1343,9 @@ for l in open(log, encoding="utf-8", errors="replace"):
     m = re.match(r"(?:psql:\S*: )?(?:ERROR|FATAL):\s+(?:([0-9A-Z]{5}):)?", l)
     if m: codes[m.group(1) or "?????"] += 1; continue
     if re.match(r"(?:psql:\S*: )?WARNING:", l): warns += 1; continue
+    # psql's OWN errors carry no ERROR: - e.g. 'invalid command \.' when a COPY's table was missing
+    if re.match(r"psql:\S*: (?!(?:ERROR|FATAL|WARNING|NOTICE|INFO|DETAIL|HINT|CONTEXT|LOCATION|STATEMENT):)", l):
+        codes["psql"] += 1; continue
     m = re.fullmatch(r"COPY (\d+)\n?", l)
     if m: copies += 1; rows += int(m.group(1))
 print("  load (numbers only - safe to paste):")
@@ -1341,7 +1353,7 @@ print("     %-11s %s" % ("time", secs + " s" if secs else "not recorded in this 
 print("     %-11s %s loaded by %d COPY statements" % ("rows", "{:,}".format(rows), copies))
 print("     %-11s %d%s" % ("errors", sum(codes.values()), "" if codes else " - a clean load"))
 for k, v in sorted(codes.items(), key=lambda x: -x[1]):
-    print("     %-11s %5d x %s %s" % ("", v, k, NAME.get(k, "- read the load log")))
+    print("     %-11s %5d x %s %s" % ("", v, k.ljust(5), NAME.get(k, "- read the load log")))
 print("     %-11s %d" % ("warnings", warns))
 SUMMARYPY
 }
@@ -1386,7 +1398,7 @@ for n in open(sys.argv[1], encoding="utf-8"):
   opts="-c pgaudit.log=$APP_LOAD_PGAUDIT -c log_min_messages=log -c log_min_error_statement=panic"
   say "loading into $db - the full psql output goes to $log (root 0600: it can quote rows)"
   t0="$(date +%s)"
-  APP_ORIG_DB="$orig" APP_NEW_DB="$db" python3 -c "$APP_FILTER_PY" < "$f" 2>> "$log" \
+  APP_ORIG_DB="$orig" APP_NEW_DB="$db" APP_AUDIT="$APP_LOAD_PGAUDIT" python3 -c "$APP_FILTER_PY" < "$f" 2>> "$log" \
     | runuser -u postgres -- env PGOPTIONS="$opts" psql -X -v ON_ERROR_STOP=0 -v VERBOSITY=verbose -d "$db" -f - >> "$log" 2>&1 || rc=$?
   secs=$(( $(date +%s) - t0 ))
   printf -- '-- [06a app-restore] load seconds=%s exit=%s\n' "$secs" "$rc" >> "$log"   # so `summary` can reprint it
@@ -1458,6 +1470,26 @@ cmd_app_summary() {
   case "$(readlink -f "$log")" in "$APP_LOG_DIR"/*) ;; *) die "$log is not a load log under $APP_LOG_DIR" ;; esac
   say "load log $(basename "$log"), last written $(date -u -r "$log" +%Y-%m-%dT%H:%M:%SZ)"
   app_summary "$log" "$(sed -n 's/^-- \[06a app-restore\] load seconds=\([0-9]*\).*$/\1/p' "$log" | tail -1)"
+}
+
+# Drop a database app-restore loaded - for a reload. Refuses anything app-restore did not create
+# (there must be a load log for it), the system databases, and a standby; asks for the name typed.
+cmd_app_drop() {
+  need_root; whoami_pg
+  local db="${1:-}" j v leader ans
+  [ -n "$db" ] || die "usage: sudo $0 app-restore drop <database>"
+  printf '%s' "$db" | grep -qxE '[a-z_][a-z0-9_]{0,62}' || die "database name '$db': lower-case letters, digits and _ only"
+  case "$db" in postgres|template0|template1) die "$db is a system database - refusing" ;; esac
+  j="$(cluster_json)"; v="$(cluster_verdict "$j")"
+  case "$v" in ok*) ;; *) die "the cluster is not healthy (${v#bad }) - fix that first" ;; esac
+  read -r _ leader _ <<<"$v"
+  [ "$leader" = "$ME" ] || die "run this on the leader - $leader leads"
+  [ "$(pg_sql "SELECT count(*) FROM pg_database WHERE datname='$db'")" = 1 ] || die "there is no database $db"
+  ls "$APP_LOG_DIR/$db"-*.log >/dev/null 2>&1 || die "$db was not loaded by app-restore (no $APP_LOG_DIR/$db-*.log) - refusing"
+  say "$db: $(pg_sql "SELECT pg_size_pretty(pg_database_size('$db'))"), loaded by app-restore. Its backups in the stores are untouched."
+  read -r -p "  type the database name to drop it: " ans
+  [ "$ans" = "$db" ] || die "name mismatch - nothing dropped"
+  pg_sql "DROP DATABASE $db" && ok "$db dropped - the roles it made stay (NOLOGIN), a reload reuses them"
 }
 
 cmd_app_shred() {
@@ -1545,8 +1577,9 @@ cmd_app_restore() {
     load)     app_load "$@" ;;
     rehearse) cmd_app_rehearse ;;
     summary)  cmd_app_summary "$@" ;;
+    drop)     cmd_app_drop "$@" ;;
     shred)    cmd_app_shred "$@" ;;
-    *) die "usage: sudo $0 app-restore rehearse | census <file> | load <file> <database> | summary [log] | shred <file>..." ;;
+    *) die "usage: sudo $0 app-restore rehearse | census <file> | load <file> <database> | summary [log] | drop <database> | shred <file>..." ;;
   esac
 }
 
@@ -1565,5 +1598,5 @@ case "${1:-}" in
   backup-restore-test) cmd_backup_restore_test ;;
   extensions)    cmd_extensions ;;
   app-restore)   shift; cmd_app_restore "$@" ;;
-  *) sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  *) sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

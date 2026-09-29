@@ -359,7 +359,7 @@ answers, the deny is working.
 
 ## 9. PLANNED — storage network, USB adapters and the lab recovery store (2026-09-28)
 
-> **Nothing in this section is cabled yet.** It is the agreed target. The management side (§1–§8)
+> **The GigaPlus and the four adapters are cabled (2026-09-29); the NAS and the Dell are not.** It is the agreed target. The management side (§1–§8)
 > does not change. Backlog 3.16 tracks progress; 3.48 is a related drive decision on host-4.
 
 ### 9.1 The target picture
@@ -401,10 +401,10 @@ specifies a physical break with no routed path — this is the lab.)
 
 | device | management switch | storage switch |
 |---|---|---|
-| host-1 | onboard 1 Gb (today) | USB 2.5 Gb adapter (RTL8156BG, `r8152`) |
-| host-2 | onboard 1 Gb (today) | USB 2.5 Gb adapter |
-| host-3 | onboard 1 Gb (today) | USB 2.5 Gb adapter |
-| host-4 | onboard 2.5 Gb (today) | USB 2.5 Gb adapter |
+| host-1 | onboard 1 Gb (today) | USB 2.5 Gb adapter (RTL8156BG, `r8152`) — `enx00e04d00a591` |
+| host-2 | onboard 1 Gb (today) | USB 2.5 Gb adapter — `enx00e04d01420e` |
+| host-3 | onboard 1 Gb (today) | USB 2.5 Gb adapter — `enx00e04d00a257` |
+| host-4 | onboard 2.5 Gb (today) | USB 2.5 Gb adapter — `enx00e04d00a418`, in the **top-of-case USB 3 port** (the chipset controller); the back panel's four USB 3 ports share one controller with both backup drives |
 | NAS (lab only) | onboard port | SFP+ 1, **DAC cable**, 10 Gb |
 | Dell R7515 (lab only) | — (stays on FortiGate `internal3`) | SFP+ 2: a **10GBASE-T SFP+ module** + Cat6a to its RJ45 10 Gb card — **gap cable #2** |
 | FortiGate `dmz` | uplink (today) — **gap cable #1** | — |

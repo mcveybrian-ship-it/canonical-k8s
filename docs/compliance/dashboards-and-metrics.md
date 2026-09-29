@@ -626,7 +626,7 @@ pager that trains people to ignore it.
 | `ClockSyncStale` | a non-master has not measured its source in `AL_CLOCK_SYNC_STALE` (12 h) | 15m | warning |
 | `ClockMasterNotSingle` | not exactly one time master, configured or on its own clock (only once any clock facts exist) | 30m | warning |
 | `ClockReferenceLost` | the master has a reference configured and is on its own clock (`enclave_clock_upstream_lost`) | 30m | warning |
-| `ClockSourceNotFollowed` | a machine that is not the master follows no source (`enclave_clock_source_selected == 0`) — the 09-28 case | 30m | warning |
+| `ClockSourceNotFollowed` | a machine that is not the master follows no source (`enclave_clock_source_selected == 0`) — the 09-28 case · proven live 2026-09-29 on svc-repo-01: fired at 30 min, reached Alertmanager, cleared within a minute of recovery | 30m | warning |
 | `ClockSourceOffsetHigh` | over `AL_CLOCK_MAX_OFFSET` (1 s) from its source, by chrony's own measurement | 15m | warning |
 | `ComplianceFactsStale` | facts older than 1h | 15m | critical |
 | **backups** | | | |

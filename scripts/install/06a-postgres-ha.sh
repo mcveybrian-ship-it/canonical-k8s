@@ -1129,13 +1129,41 @@ cmd_backup_restore_test() {
 #   dump is touched: the marker must reach the load log and must NOT reach the screen, the
 #   PostgreSQL log or syslog - while this run's DDL must still reach the audit (the control).
 #
-#   Plain-SQL, ONE database only. A cluster dump (pg_dumpall) or pg_dump -C creates its own
-#   databases and roles - census says so and load refuses; extend it when one actually arrives.
+#   Plain-SQL, ONE database. A pg_dump --create dump (CREATE DATABASE + \connect at the top - how
+#   the application's arrived) loads under the name you give: its CREATE DATABASE and \connect are
+#   skipped (its locale does not exist here anyway) and its ALTER DATABASE / GRANT ... ON DATABASE
+#   lines are pointed at the new database. The original name is never printed - it may name the
+#   client. A cluster dump (pg_dumpall, several databases) is refused.
 # =========================================================================================
 APP_LOG_DIR="${APP_LOG_DIR:-/var/log/enclave-app-restore}"
 APP_LOAD_PGAUDIT="${APP_LOAD_PGAUDIT:-ddl,role}"
 APP_SPACE_FACTOR="${APP_SPACE_FACTOR:-4}"        # free bytes needed on the data disk per byte of dump
 APP_REHEARSAL_DB="${APP_REHEARSAL_DB:-app_rehearsal}"
+# The stream between the dump and psql. Passes every byte through EXCEPT, for a pg_dump --create
+# dump (APP_ORIG_DB set - by environment, not argv, so the name is not in the process list):
+# its CREATE DATABASE and \connect become comments, and DATABASE <original> in ALTER DATABASE /
+# COMMENT / GRANT / REVOKE / SECURITY LABEL lines becomes the new name. COPY data and INSERT
+# statements are never touched.
+APP_FILTER_PY="$(cat <<'FILTERPY'
+import os, re, sys
+orig, new = os.environ.get("APP_ORIG_DB", "").encode(), os.environ["APP_NEW_DB"].encode()
+out = sys.stdout.buffer; in_copy = in_insert = False
+for raw in sys.stdin.buffer:
+    if in_copy:
+        in_copy = raw.rstrip(b"\r\n") != b"\\."
+    elif in_insert:
+        in_insert = not raw.rstrip().endswith(b");")
+    elif raw.startswith(b"INSERT INTO "):
+        in_insert = not raw.rstrip().endswith(b");")
+    elif raw.startswith(b"COPY ") and raw.rstrip(b"\r\n").endswith(b" FROM stdin;"):
+        in_copy = True
+    elif orig and raw.startswith((b"CREATE DATABASE ", b"\\connect ")):
+        raw = b"-- [06a app-restore] skipped the dump's own " + (b"CREATE DATABASE" if raw.startswith(b"CREATE") else b"\\connect") + b"\n"
+    elif orig and raw.startswith((b"ALTER DATABASE ", b"COMMENT ON DATABASE ", b"GRANT ", b"REVOKE ", b"SECURITY LABEL ")):
+        raw = re.sub(rb"\bDATABASE " + re.escape(orig) + rb"(?=[\s;])", b"DATABASE " + new, raw)
+    out.write(raw)
+FILTERPY
+)"
 APP_REHEARSING="${APP_REHEARSING:-0}"             # set by `rehearse` for its own load run
 
 app_file_ok() {
@@ -1172,7 +1200,7 @@ def names(s):
     s = re.split(r"\s+(?:WITH\s+\w+\s+(?:OPTION|TRUE|FALSE)|CASCADE|RESTRICT)\b", s.rstrip().rstrip(";"))[0]
     return [unq(t) for t in re.findall(TOK, s) if t.startswith('"') or t.lower() not in NOTROLE]
 c = collections.Counter(); refs, defined, colls, hdr, exts = set(), set(), set(), {}, []
-in_copy = in_insert = False; this = 0
+in_copy = in_insert = False; this = 0; srcdb = None; dbopts = {}
 with open(path, "rb") as fh:
     for raw in fh:
         c["lines"] += 1
@@ -1201,6 +1229,12 @@ with open(path, "rb") as fh:
                       ("policy", r"CREATE POLICY "), ("sequence", r"CREATE SEQUENCE "), ("create_db", r"CREATE DATABASE "),
                       ("connect", r"\\connect "), ("restrict", r"\\restrict ")):
             if re.match(rx, l): c[k] += 1
+        m = re.match(r"CREATE DATABASE (" + TOK + r")(.*)", l)
+        if m:                                         # pg_dump --create: keep the token, print only its settings
+            srcdb = m.group(1)
+            for k in ("ENCODING", "LOCALE_PROVIDER", "LOCALE", "LC_COLLATE", "ICU_LOCALE"):
+                mm = re.search(r"\b" + k + r" = '?([^' ;]+)'?", m.group(2))
+                if mm: dbopts[k.lower()] = mm.group(1)
         m = re.match(r"CREATE EXTENSION (?:IF NOT EXISTS )?(" + TOK + ")", l)
         if m: exts.append(unq(m.group(1)))
         m = re.match(r"CREATE ROLE (" + TOK + ")", l)
@@ -1228,6 +1262,7 @@ missing = sorted((refs - existing) - defined)
 vendor = sorted(r for r in allroles if VENDOR.search(r))
 print("  census (numbers only - safe to paste):")
 P("source", "PostgreSQL %s, dumped by pg_dump %s" % (hdr.get("from", "?"), hdr.get("by", "?")))
+if srcdb: P("database", "the dump creates its own (pg_dump --create, name not shown): %s - it loads under the name you give" % (", ".join("%s %s" % kv for kv in dbopts.items()) or "no settings"))
 P("size", "%s, %s lines" % (human(os.path.getsize(path)), n(c["lines"])))
 P("rows", "%s in %s COPY blocks (%s tables with rows); %s INSERT statements" % (n(c["rows"]), n(c["copy"]), n(c["tables_with_rows"]), n(c["insert"])))
 P("objects", "%d schemas, %d tables, %d indexes, %d functions, %d views, %d triggers, %d policies, %d sequences" % tuple(c[k] for k in ("schema", "table", "index", "function", "view", "trigger", "policy", "sequence")))
@@ -1242,8 +1277,10 @@ if c["restrict"]:
     P("psql", "the dump uses \\restrict (pg_dump 16.10+/17.6+); psql %s here %s" % (psqlv, "understands it" if ok else "does NOT - upgrade postgresql-client-16"))
 P("line ends", "CRLF on %s lines" % n(c["crlf"]) if c["crlf"] else "LF")
 why = []
-if c["cluster_header"] or c["create_db"] or c["connect"]:
-    why.append("it creates its own database(s) - a cluster dump (pg_dumpall) or pg_dump -C")
+if c["cluster_header"] or c["create_db"] > 1:
+    why.append("a cluster dump (pg_dumpall), %d databases - one database per load" % c["create_db"])
+elif c["connect"] and not c["create_db"]:
+    why.append("it switches database (\\connect) without creating one")
 if c["crlf"]: why.append("Windows line endings - re-send it in BINARY mode (an ASCII transfer rewrote it)")
 if in_copy: why.append("it ends inside a COPY block - the file is truncated")
 if c["lines"] == 0: why.append("it is empty")
@@ -1251,7 +1288,10 @@ if why:
     print("  [x] this script will NOT load it: " + "; ".join(why)); sys.exit(3)
 if out_f != "/dev/null":
     with open(out_f, "w", encoding="utf-8") as o: o.write("".join(r + "\n" for r in missing))
-print("  [ok] loadable: one database, rows as %s" % ("COPY" if c["copy"] else "INSERT" if c["insert"] else "none (schema only)"))
+    if srcdb:
+        with open(out_f + ".dbname", "w", encoding="utf-8") as o: o.write(srcdb)
+print("  [ok] loadable: one database, rows as %s%s" % ("COPY" if c["copy"] else "INSERT" if c["insert"] else "none (schema only)",
+      " - its CREATE DATABASE and \\connect will be skipped, its ALTER DATABASE lines pointed at the new one" if srcdb else ""))
 CENSUSPY
   rm -rf "$tmp"
   return "$rc"
@@ -1264,7 +1304,7 @@ import collections, re, sys
 log, secs = sys.argv[1], int(sys.argv[2])
 NAME = {"42704": "undefined_object - a role, type or collation that does not exist",
         "42P01": "undefined_table", "42883": "undefined_function",
-        "58P01": "undefined_file - an extension not installed here", "0A000": "feature_not_supported",
+        "58P01": "undefined_file", "0A000": "feature_not_supported - e.g. an extension not available here (measured live 2026-09-29)",
         "42501": "insufficient_privilege", "42710": "duplicate_object", "42P07": "duplicate_table",
         "42601": "syntax_error", "22P02": "invalid_text_representation - a value its column rejects",
         "23505": "unique_violation", "23503": "foreign_key_violation", "23502": "not_null_violation",
@@ -1292,7 +1332,7 @@ SUMMARYPY
 
 app_load() {
   need_root; whoami_pg
-  local f="${1:-}" db="${2:-}" j v leader tmp log size free need made=0 t0 secs lsn0 a0 a1 seg rc=0 opts
+  local f="${1:-}" db="${2:-}" j v leader tmp log size free need made=0 t0 secs lsn0 a0 a1 seg rc=0 opts orig=""
   [ -n "$f" ] && [ -n "$db" ] || die "usage: sudo $0 app-restore load <file> <database>"
   printf '%s' "$db" | grep -qxE '[a-z_][a-z0-9_]{0,62}' || die "database name '$db': lower-case letters, digits and _ only"
   j="$(cluster_json)"; v="$(cluster_verdict "$j")"
@@ -1308,6 +1348,7 @@ app_load() {
   install -d -m 0700 "$APP_LOG_DIR"
   tmp="$(mktemp -d)"
   app_census "$f" "$tmp/missing" || { rm -rf "$tmp"; die "not loaded - the census says why, above"; }
+  [ -s "$tmp/missing.dbname" ] && orig="$(cat "$tmp/missing.dbname")"
   log="$APP_LOG_DIR/$db-$(date -u +%Y%m%dT%H%M%SZ).log"
   : > "$log"; chmod 0600 "$log"
   # ---- 1. the roles it refers to, as NOLOGIN - names passed to psql on stdin, never printed ----
@@ -1329,7 +1370,8 @@ for n in open(sys.argv[1], encoding="utf-8"):
   opts="-c pgaudit.log=$APP_LOAD_PGAUDIT -c log_min_messages=log -c log_min_error_statement=panic"
   say "loading into $db - the full psql output goes to $log (root 0600: it can quote rows)"
   t0="$(date +%s)"
-  runuser -u postgres -- env PGOPTIONS="$opts" psql -X -v ON_ERROR_STOP=0 -v VERBOSITY=verbose -d "$db" -f - < "$f" >> "$log" 2>&1 || rc=$?
+  APP_ORIG_DB="$orig" APP_NEW_DB="$db" python3 -c "$APP_FILTER_PY" < "$f" 2>> "$log" \
+    | runuser -u postgres -- env PGOPTIONS="$opts" psql -X -v ON_ERROR_STOP=0 -v VERBOSITY=verbose -d "$db" -f - >> "$log" 2>&1 || rc=$?
   secs=$(( $(date +%s) - t0 ))
   [ "$rc" -eq 0 ] || warn "psql itself exited $rc (a lost connection or a fatal error, not a failed statement) - the load is INCOMPLETE; the log says where it stopped"
   app_summary "$log" "$secs"
@@ -1384,11 +1426,11 @@ cmd_app_shred() {
 # ---- the rehearsal: the whole path, a made-up dump, and the privacy claims proven ----------------
 cmd_app_rehearse() {
   need_root; whoami_pg
-  local tmp f out rc=0 r made=() log srv bad=0 tag marker schema n
+  local tmp f out rc=0 r made=() log srv bad=0 tag marker schema srcdb n
   [ "$(pg_sql "SELECT count(*) FROM pg_database WHERE datname='$APP_REHEARSAL_DB'")" = 0 ] \
     || die "database $APP_REHEARSAL_DB exists - a previous rehearsal left it. Look, then drop it by hand."
   tag="$(od -An -N4 -tx4 /dev/urandom | tr -d ' ')"
-  marker="ENCLAVE-REHEARSAL-ROW-MARKER-$tag"; schema="rehearsal_$tag"
+  marker="ENCLAVE-REHEARSAL-ROW-MARKER-$tag"; schema="rehearsal_$tag"; srcdb="rehearsal_src_$tag"
   for r in "Rehearsal Owner" rehearsal_reader azure_pg_admin; do   # drop afterwards only the ones WE made
     [ "$(pg_sql "SELECT count(*) FROM pg_roles WHERE rolname='$r'")" = 1 ] || made+=("$r")
   done
@@ -1396,6 +1438,8 @@ cmd_app_rehearse() {
   {
     printf -- '--\n-- PostgreSQL database dump\n--\n\n-- Dumped from database version 16.4\n-- Dumped by pg_dump version 16.4\n\n'
     printf "SET client_encoding = 'UTF8';\nSET standard_conforming_strings = on;\nSELECT pg_catalog.set_config('search_path', '', false);\n\n"
+    printf "CREATE DATABASE %s WITH TEMPLATE = template0 ENCODING = 'UTF8' LOCALE_PROVIDER = libc LOCALE = 'en_US.utf8';\n" "$srcdb"
+    printf 'ALTER DATABASE %s OWNER TO "Rehearsal Owner";\n\\connect %s\n\n' "$srcdb" "$srcdb"
     printf 'CREATE EXTENSION IF NOT EXISTS enclave_rehearsal_absent WITH SCHEMA public;\n'
     printf 'CREATE SCHEMA %s;\nALTER SCHEMA %s OWNER TO "Rehearsal Owner";\n' "$schema" "$schema"
     printf 'CREATE TABLE %s.people (\n    id integer NOT NULL,\n    label text\n);\nALTER TABLE %s.people OWNER TO "Rehearsal Owner";\n' "$schema" "$schema"
@@ -1406,7 +1450,7 @@ cmd_app_rehearse() {
     printf 'COPY %s.broken (id) FROM stdin;\n%s\n\\.\n\n' "$schema" "$marker"
     printf 'GRANT USAGE ON SCHEMA %s TO rehearsal_reader;\nGRANT SELECT ON TABLE %s.people TO rehearsal_reader;\nGRANT ALL ON SCHEMA %s TO azure_pg_admin;\n' "$schema" "$schema" "$schema"
   } > "$f"
-  say "rehearsal: a made-up dump - 1,000 good rows, one bad row carrying the marker, three roles, one absent extension"
+  say "rehearsal: a made-up pg_dump --create dump - 1,000 good rows, one bad row carrying the marker, three roles, one absent extension"
   # A SEPARATE PROCESS, not a subshell: under `|| rc=$?` bash ignores set -e for everything the
   # command runs, so an in-process load would carry on past its own failures.
   out="$(APP_REHEARSING=1 bash "$SELF/$(basename "$0")" app-restore load "$f" "$APP_REHEARSAL_DB" 2>&1)" || rc=$?
@@ -1420,6 +1464,9 @@ cmd_app_rehearse() {
   chk "2 errors counted - the absent extension and the marker row" "$(printf '%s' "$out" | grep -qE 'errors +2$' && echo pass)"
   chk "the bad row counted as 1 x 22P02" "$(printf '%s' "$out" | grep -qE '1 x 22P02' && echo pass)"
   chk "CONTROL: the marker IS in the load log - psql really quoted it" "$([ -n "$log" ] && grep -q "$marker" "$log" && echo pass)"
+  chk "the dump's own CREATE DATABASE was skipped - no database $srcdb" "$([ "$(pg_sql "SELECT count(*) FROM pg_database WHERE datname='$srcdb'")" = 0 ] && echo pass)"
+  chk "its ALTER DATABASE ... OWNER TO landed on $APP_REHEARSAL_DB" "$([ "$(pg_sql "SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname='$APP_REHEARSAL_DB'")" = 'Rehearsal Owner' ] && echo pass)"
+  chk "the rows are in $APP_REHEARSAL_DB, and nothing leaked into the postgres database" "$([ "$(runuser -u postgres -- psql -X -A -t -q -d "$APP_REHEARSAL_DB" -c "SELECT count(*) FROM $schema.people" 2>/dev/null)" = 1000 ] && [ "$(pg_sql "SELECT count(*) FROM pg_namespace WHERE nspname='$schema'")" = 0 ] && echo pass)"
   chk "the marker is NOT on the screen" "$(printf '%s' "$out" | grep -q "$marker" || echo pass)"
   # CONTROL 2: an ordinary session's error DOES reach the server log - so the no-leak check below
   # is one that can fail. Its own made-up value, which the marker check cannot match.
@@ -1433,7 +1480,7 @@ cmd_app_rehearse() {
   n="$(cat "${srv[@]}" 2>/dev/null | grep -c "$marker" || true)"
   chk "the marker is NOT in the PostgreSQL log or syslog ($n lines)" "$([ "${n:-0}" -eq 0 ] && echo pass)"
   # ---- leave nothing behind ----
-  pg_sql "DROP DATABASE IF EXISTS $APP_REHEARSAL_DB" >/dev/null
+  pg_sql "DROP DATABASE IF EXISTS $APP_REHEARSAL_DB" >/dev/null; pg_sql "DROP DATABASE IF EXISTS $srcdb" >/dev/null
   for r in "${made[@]}"; do pg_sql "DROP ROLE IF EXISTS \"$r\"" >/dev/null; done
   shred -u "$f"; rm -rf "$tmp"; [ -n "$log" ] && shred -u "$log"
   ok "cleaned up: database $APP_REHEARSAL_DB dropped, ${#made[@]} rehearsal role(s) dropped, the dump and its log shredded"

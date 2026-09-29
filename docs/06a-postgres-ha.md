@@ -980,6 +980,87 @@ the stanza's verdict.
 
 ---
 
+## 10a. Slice 6 prep — the application's database, loaded without its content leaving the gap (2026-09-29)
+
+### 10a.1 What and why
+
+The application's own database — a full plain-SQL `pg_dump --create` of its Azure PostgreSQL 14
+database, **real records** — loaded at full size into the cluster. It is the real test of slice 5
+(backup time, WAL volume) and what the slice-6 STIG scan must see: the real roles, grants and
+ownership. **Every `app-restore` subcommand prints numbers only**, so its output is safe to paste
+anywhere. The dump goes from the operator's workstation straight to the leader's home directory, in a
+binary transfer, and never passes through stage-01. The database's name is in HANDOFF §3 only.
+
+### 10a.2 The commands
+
+```bash
+### MACHINE: the leader (pg-03 on 2026-09-29) ###
+sudo ./scripts/install/06a-postgres-ha.sh app-restore rehearse            # the whole path, a made-up dump
+sudo ./scripts/install/06a-postgres-ha.sh app-restore census ~/<dump>.sql # what it is and needs - reads only
+```
+
+```bash
+### MACHINE: pg-01, pg-02, pg-03 — each ###
+sudo ./scripts/install/06a-postgres-ha.sh extensions   # PG_EXTENSION_PACKAGES (vm-specs.env): PostGIS here
+```
+
+```bash
+### MACHINE: the leader ###
+sudo ./scripts/install/06a-postgres-ha.sh app-restore load ~/<dump>.sql <database>
+sudo ./scripts/install/06a-postgres-ha.sh app-restore summary              # reprint it from the log
+sudo ./scripts/install/06a-postgres-ha.sh app-restore drop <database>      # for a reload - only one it loaded
+sudo ./scripts/install/06a-postgres-ha.sh app-restore shred <file>...      # the dump and the logs, when done
+```
+
+`load` refuses a standby, an existing database, a cluster dump (`pg_dumpall`) and data rows with Windows
+line endings. A `--create` dump loads under the name given: its `CREATE DATABASE` and `\connect` are
+skipped and its `ALTER DATABASE` / `GRANT … ON DATABASE` lines pointed at the new database. The roles
+it refers to are created `NOLOGIN`, counted, never named.
+
+### 10a.3 Where the rows can go, and where they cannot
+
+| place | what reaches it |
+|---|---|
+| the screen | numbers only — sizes, times, counts, errors counted by SQLSTATE |
+| the load log, `/var/log/enclave-app-restore/<db>-<time>.log` | everything psql printed — root `0600`, because a failed COPY's `CONTEXT` line quotes the row |
+| the PostgreSQL log and syslog | not the session's errors (which quote the bad value): the load runs with `log_min_messages=log` and `log_min_error_statement=panic` |
+| the audit trail | `pgaudit.log=ddl,role` for the load session: structure and role changes audited, rows not |
+| the original database name | never printed; passed to the stream filter by environment, not on the command line |
+
+### 10a.4 Proven live by `rehearse` on pg-03
+
+A made-up `--create` dump — 1,000 rows, one bad row carrying a unique marker, three roles, an extension
+that does not exist — through the real path, then twelve checks: the load ran to the end; 1,000 rows;
+2 errors counted; the bad row as 1 × 22P02; the dump's own `CREATE DATABASE` skipped; its `OWNER TO`
+landed on the new database; the rows in it and nothing in `postgres`; the marker **in** the load log
+(control) and **not** on the screen, and **not** in the PostgreSQL log or syslog; an ordinary session's
+error **is** in the server log and this run's DDL **is** in the audit (the two controls that prove the
+no-leak checks can fail). Then everything it made is dropped and shredded.
+
+### 10a.5 The result
+
+| | |
+|---|---|
+| rows | **1,167,589** — the census's count, by all 305 COPY statements |
+| errors | **0** |
+| time | **49 s** |
+| database | 344 MB — 335 tables (the application's 298 and PostGIS's), 599 indexes |
+| WAL | 292 MB, archived to both stores, 0 failures; both standbys at lag 0 |
+| full backups | **8 s** to repo1, **12 s** to repo2 — **75.5 MB** each (389.5 MB of database) |
+
+### 10a.6 Findings for slice 6
+
+- **PostGIS refuses to install under pgaudit** (P0001) — the first load's 14 errors were all this one
+  refusal and its knock-ons. The load sets `pgaudit.log` to `none` for `CREATE EXTENSION postgis*`
+  statements only and restores it straight after, recorded in the load log. Any build that installs
+  PostGIS needs the same exception: a tailoring entry for the baseline (backlog 3.49).
+- **PostGIS is 69 packages on every node, and the application has 1 table with a PostGIS column,
+  holding 0 rows** — ask its owners whether it is needed (3.49).
+- **The stores now hold real records, and pgBackRest does not encrypt them** (`cipher: none` — LUKS
+  underneath). No copy to the lab recovery store until repository encryption is on (3.50).
+
+---
+
 ## 11. Who talks to whom, and how each proves who it is
 
 ### 11.1 The flows
@@ -1096,6 +1177,8 @@ Read from pg-01..03 on 2026-09-28 (identical on all three), except where marked.
 | `/etc/pgbackrest/pki/` | 0750 root:postgres | `06a backup-node` | `ca.crt`, `node.crt`, `node.key` (0640) — the third copy of the node key |
 | `/var/log/pgbackrest/` | 0750 postgres | `06a backup-node` | pgBackRest's own logs |
 | `/etc/patroni/config.yml.in`, `dcs.yml` | 0644 root:root | the Ubuntu `patroni` package | Ubuntu's templates — **not used** |
+| `/var/log/enclave-app-restore/` | 0700 root | `06a app-restore` | the load logs, 0600 — they **can quote rows** (§10a.3) |
+| the application's dump, in the leader's home directory | 0600 | the operator, then `app-restore census` | kept until slice 6's scans, then shredded (`app-restore shred`) |
 
 The two 0600 files are written under the hardened umask (077); only root and systemd read them,
 which is all they need.
@@ -1178,6 +1261,11 @@ written as a procedure (§16).
 | 11 | **The backup-store status fact emitted nothing** on the real stores (it read a JSON layout 2.50 does not use), so `DatabaseBackupStoreError` could never fire | caught by reading the live metrics after rollout; reads both layouts and falls back to the stanza's verdict (§10.8) |
 | 12 | `FilesystemWillFillSoon` fired on host-1..3's database volumes after the re-reserve: `predict_linear` over 6 h drew a line through the 150 GB step of `fallocate` | an artefact of any reservation — it clears once the step leaves the 6-hour window, and recurs only when a data disk is created. Left as is: it is the fast-fill safety net for that volume |
 | 13 | apt on the hosts prints **"Pending kernel upgrade … expected 6.8.0-138-generic"** | a false alarm: `needrestart` ranks the installed generic kernel above the running FIPS one; GRUB boots `GRUB_FLAVOUR_ORDER="fips"` — **do not "fix" it by removing or reordering kernels** |
+| 14 | **The first rehearsal's summary said "0 errors, a clean load"** with errors in the log: psql prefixes `psql:<stdin>:N:` only with `-f`, and the dump was piped | `-f -`, the prefix optional, an unreadable ERROR line counted as `?????`; the rehearsal asserts the count. A test fixture typed from memory had carried the same assumption |
+| 15 | **The real dump was refused twice by the script's own checks** — as "creates its own database" (it was an ordinary `pg_dump --create`), then for Windows line endings on 21 lines of the application's own function source | `--create` loads under the given name; line endings are refused only on data rows, where they would corrupt values |
+| 16 | **`06a extensions`: apt stopped (state `T`) after installing**, then reported a failure that never happened — `timeout` runs it in a background process group and apt resets the terminal when dpkg ends | apt gets no terminal: `< /dev/null`, `Dpkg::Use-Pty=0` |
+| 17 | **The first real load: 14 errors**, every one PostGIS refusing to install under pgaudit, and its knock-ons | the `CREATE EXTENSION postgis*` audit exception (§10a.6); reloaded with 0 errors |
+| 18 | The load's terminal timed out before its summary was read | `app-restore summary` reprints it from the log; loads now record their duration there |
 
 ---
 
@@ -1186,13 +1274,15 @@ written as a procedure (§16).
 | | what | where |
 |---|---|---|
 | ⬜ | **A crash under a write load** — slice 4 proved promotion and rejoin with no writes running; zero loss under load needs a write generator | B-06a |
-| ⬜ | **Slice 6:** the PostgreSQL 16 STIG scan (the XCCDF needs a CAC download), the org baseline, the Crunchy-vs-Ubuntu tailoring statement | B-06a, 6a.1, 6a.10, 6a.11 |
+| ⬜ | **Slice 6:** the PostgreSQL 16 STIG scan (the XCCDF needs a CAC download), the org baseline, the Crunchy-vs-Ubuntu tailoring statement. The application's database is loaded (§10a); the empty-cluster scan needs it dropped and reloaded from the dump, which stays on the leader until then | B-06a, 6a.1, 6a.10, 6a.11 |
 | ⬜ | **A written restore procedure** — replacing the cluster from a store after a disaster (slice 5 proved the backups restore; recovering the live cluster from them is a different operation), and a **scheduled** restore drill rather than a manual one | B-06a |
-| ⬜ | **host-3's store sizing** — 100 GB reserved on its images pool; with application data this becomes a real number to size, alongside 2.8 | B-06a, 2.8 |
-| ⬜ | **Certificate renewal** — the pg nodes' and the stores' certificates expire **2027-09-28**, in three places per pg node, and the cert-expiry facts do not look in `/etc/etcd/pki`, `/etc/patroni/pki` or `/etc/pgbackrest/pki` | B-06a |
+| ⬜ | **host-3's store sizing** — 100 GB reserved on its images pool. Measured 2026-09-29: 344 MB of the application's database is 75.5 MB per full; size it alongside 2.8 | B-06a, 2.8 |
+| ⬜ | **Certificate renewal** — the pg nodes' and the stores' certificates expire **2027-09-28**, in three places per pg node. Watched since 2026-09-29 (`CertificateExpiringSoon`, 30 days ahead, backlog 3.45); renewal itself is still manual | B-06a |
 | ⬜ | **Unattended certificates** — step D is three hand-carried round trips; the unattended rebuild cannot make them | 2.6 |
 | ⬜ | A FIPS-built etcd from Canonical | Q-CORE (h), not sent; ENG-68 |
-| ⬜ | Application database, users and the connection string (`target_session_attrs=read-write` across the three nodes, runbook §9a.3) | B-07 |
+| ⬜ | Application users with logins and the connection string (`target_session_attrs=read-write` across the three nodes, runbook §9a.3) — the database itself is loaded (§10a) | B-07 |
+| ❓ | **PostGIS** — the audit exception as a tailoring entry, and whether the application needs it at all | 3.49 |
+| 🔴 | **pgBackRest repository encryption** before any copy to the lab recovery store | 3.50 |
 | 🗳️ | Production sizing — the lab runs 2 vCPU / 4 GiB / 40 GB / 150 GB; `vm-specs.env`'s default of 8 GiB / 60 GB / 400 GB is explicitly not a production sizing | 2.8 |
 
-**Key:** ⬜ open · 🗳️ a decision owed.
+**Key:** ⬜ open · 🗳️ a decision owed · ❓ a question for someone else · 🔴 blocks something.

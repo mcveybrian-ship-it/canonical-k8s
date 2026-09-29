@@ -440,12 +440,17 @@ running enclave; that is `vm-backup.sh` and pgBackRest.
 2. **The Syba card:** if it is a *bifurcation* card (no switch chip of its own), set the slot to
    **x4/x4/x4/x4** in the NAS BIOS or only one drive appears. A card with its own switch chip needs
    nothing.
-3. **Every drive on arrival** — check health and return anything that fails inside the return window:
+3. **Every drive on arrival — on build-01, in the USB enclosure** (seconds). Return anything with media
+   errors or more than 10 % wear inside the return window. Reports go to `~/nvme-reports/`, named by serial:
 
    ```bash
-   ### MACHINE: NAS (TrueNAS shell) ###
-   smartctl -a /dev/nvme0     # per drive: Percentage Used <= 10 %, Media Errors 0, note Power-On Hours
+   ### MACHINE: build-01 (10.2.10.124) ###
+   cd ~ && sudo ./canonical-k8s/scripts/lab/nvme-tool.sh health sdb
    ```
+
+3a. **Erase each drive in the NAS, before creating the pools.** An NVMe format or sanitize takes seconds in
+   an M.2 slot and cannot pass a USB bridge. From the TrueNAS shell; the tool's `wipe nvmeN` should run there
+   too — confirm when the NAS is up.
 
    For a seller with no returns, ask for each drive's SMART health before buying.
 4. **Create the pools:** *fast* = 3 mirrors of the PM9A1s; *archive* = 1 mirror of the Exos drives.

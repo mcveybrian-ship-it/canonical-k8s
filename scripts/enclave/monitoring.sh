@@ -1369,6 +1369,32 @@ groups:
             'chronyc -n sources' on {{ \$labels.machine }}. Lab: is stage-01 up, still holding its
             enclave address, and running 'time-sync.sh reference'? Production: the GPS
             appliance's lock and antenna.
+      # FOLLOWING, NOT JUST SYNCHRONISED (3.45, 2026-09-29). A client that rejects host-4 keeps a
+      # Normal leap status and a tiny "System time", so ClockOffsetHigh and ClockNotSynchronised
+      # cannot see it - on 2026-09-28 ten machines were 10.9 s off host-4 and every rule was green.
+      - alert: ClockSourceNotFollowed
+        expr: enclave_clock_source_selected == 0 and on (instance) enclave_clock_master == 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ \$labels.machine }} is not following any time source"
+          description: "chrony has rejected every source (too variable, unreachable or a falseticker) and is running on its own estimate. Its clock now drifts away from the rest of the enclave while still reporting itself synchronised."
+          action: >-
+            'chronyc -n sources' on {{ \$labels.machine }}: '^~' after a large correction clears on
+            'sudo systemctl restart chrony' (a step, under STIG makestep 1 -1 - runbook 2.10);
+            '^?' means host-4 is unreachable - ufw and the network first.
+      - alert: ClockSourceOffsetHigh
+        expr: abs(enclave_clock_source_offset_seconds) > ${AL_CLOCK_MAX_OFFSET}
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ \$labels.machine }} measures its source {{ \$labels.source }} {{ \$value | humanize }} s away"
+          description: "The clock and its time source disagree by more than ${AL_CLOCK_MAX_OFFSET} s (DISA's threshold) - the measurement ClockOffsetHigh cannot see, because that rule reads chrony's own estimate."
+          action: >-
+            'chronyc -n sources' on {{ \$labels.machine }}. A persistent offset with state ~ is the
+            09-28 case: restart chrony there (it steps). Correct the master first if the source is wrong.
 
       # THE META-ALERT. Without it, every rule in this group fails silently: a frozen fact
       # file keeps serving its last values forever, so nothing breaches a threshold and the
@@ -2105,8 +2131,16 @@ if csvs:
 # ------------------------------------------------------------------ certificate expiry
 # The runbook carries an expiry calendar that is correct on the day it is written. This is
 # the same three dates, measured.
+# AND THE SERVICE-OWNED COPIES (added 2026-09-29): the database's certificates live where etcd,
+# Patroni and pgBackRest read them - /etc/etcd/pki, /etc/patroni/pki, /etc/pgbackrest/pki - and
+# /etc/ssl/enclave holds only the key and CSR on those machines, so none was watched (all expire
+# 2027-09-28). Their ca.crt is the enclave root, already watched once, so it is skipped. Labelled
+# by DIRECTORY as well as file: a pg node has two files named node.crt, and two samples with one
+# label set make node-exporter reject the WHOLE facts file - every fact on the machine gone dark.
 certs = sorted(set(glob.glob("/etc/ssl/enclave/*.crt")
-                   + glob.glob("/usr/local/share/ca-certificates/*.crt")))
+                   + glob.glob("/usr/local/share/ca-certificates/*.crt")
+                   + [f for d in ("/etc/etcd/pki", "/etc/patroni/pki", "/etc/pgbackrest/pki")
+                      for f in glob.glob(d + "/*.crt") if os.path.basename(f) != "ca.crt"]))
 if certs:
     ok_any = 0
     for f in certs:
@@ -2129,7 +2163,7 @@ if certs:
                         cn = part.split("=", 1)[1].strip().split(",")[0]
         if end:
             emit("enclave_cert_expiry_seconds", end,
-                 {"file": os.path.basename(f), "cn": cn or "unknown"},
+                 {"file": os.path.basename(f), "dir": os.path.dirname(f), "cn": cn or "unknown"},
                  help="unix time at which this certificate stops being valid")
             ok_any = 1
     SRC["certs"] = ok_any
@@ -2280,6 +2314,24 @@ if len(fields) >= 14:
         emit("enclave_clock_reference", 1, {"ref": "LOCAL" if local_ref else (refname or refid)},
              help="which source this clock follows")
         SRC["clock"] = 1
+        # WHETHER IT IS ACTUALLY FOLLOWING ITS SOURCE (backlog 3.45, 2026-09-29). tracking says what
+        # chrony believes; sources says what it is doing with each server. On 2026-09-28 ten machines
+        # marked host-4 `~` (too variable) after a 10.9 s step and ran on their own estimate: tracking
+        # read "System time 0.000003 s" while sources read "^~ ... +10.9s". Every clock alert stayed
+        # green. Columns: mode, state (* selected, + combined, - not, ? unreachable, x falseticker,
+        # ~ too variable), address, stratum, poll, reach, last rx, adjusted offset, measured, error.
+        rs, so, _ = run(["chronyc", "-n", "-c", "sources"])
+        if rs == 0:
+            srcs = [r for r in csv.reader(so.strip().splitlines()) if len(r) >= 8 and r[0] in ("^", "=")]
+            emit("enclave_clock_sources", len(srcs), help="NTP sources configured in chrony (0 on a free-running master)")
+            emit("enclave_clock_source_selected", 1 if any(r[1] == "*" for r in srcs) else 0,
+                 help="1 when chrony is actually following a source (state *); 0 when every source is ~ ? x or -")
+            for r in srcs:
+                try:
+                    emit("enclave_clock_source_offset_seconds", float(r[7]), {"source": r[2], "state": r[1]},
+                         help="chrony's latest offset to this source - 10.9 s on 2026-09-28, microseconds normally")
+                except ValueError:
+                    pass
     except (ValueError, IndexError):
         SRC["clock"] = 0          # chronyc answered and the answer did not parse - say so, emit no numbers
 elif rc == 127:

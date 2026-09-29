@@ -426,7 +426,7 @@ older than the one that had just finished.
 | `enclave_auditd_backlog` | — | `auditctl -s` | current queue depth |
 | `enclave_auditd_backlog_limit` | — | `auditctl -s` | the ceiling backlog is heading for |
 | `enclave_auditd_failure` | — | `auditctl -s` | kernel failure mode |
-| `enclave_cert_expiry_seconds` | `file`, `cn` | `openssl x509` over `/etc/ssl/enclave/*.crt` and `/usr/local/share/ca-certificates/*.crt` | unix time of expiry |
+| `enclave_cert_expiry_seconds` | `file`, `dir`, `cn` | `openssl x509` over `/etc/ssl/enclave/*.crt` and `/usr/local/share/ca-certificates/*.crt` | unix time of expiry — **now also `/etc/etcd/pki`, `/etc/patroni/pki`, `/etc/pgbackrest/pki`; new label `dir`** (2026-09-29) |
 | `enclave_aide_last_run_seconds` | — | `systemctl show dailyaidecheck.service` | start of the last run |
 | `enclave_aide_last_exit_code` | — | same | 0 = clean |
 | `enclave_aide_db_age_seconds` | `db` | mtime of `/var/lib/aide/aide.db*` | baseline age |
@@ -442,6 +442,9 @@ older than the one that had just finished.
 | `enclave_clock_last_sync_seconds` | — | same, reference time | when it last measured its source; the age is the staleness |
 | `enclave_clock_stratum` · `_last_offset_seconds` · `_root_delay_seconds` · `_root_dispersion_seconds` | — | same | chrony's own error terms |
 | `enclave_clock_reference` | `ref` | same | who this clock follows (`LOCAL` on the master) |
+| `enclave_clock_sources` | — | `chronyc -n -c sources` | NTP sources configured (0 on a free-running master) — 3.45, 2026-09-29 |
+| `enclave_clock_source_selected` | — | same | 1 only when chrony is actually following a source (`*`); 0 when every source is `~`, `?`, `x` or `-` |
+| `enclave_clock_source_offset_seconds` | `source`, `state` | same | the latest offset to each source — 10.9 s on 2026-09-28, microseconds normally |
 
 **Why not node-exporter's `node_timex_*` (measured 2026-09-27, 3.39):** chrony steers by frequency
 and never fills the kernel's offset field, so `node_timex_offset_seconds` read **0 on all eight
@@ -623,6 +626,8 @@ pager that trains people to ignore it.
 | `ClockSyncStale` | a non-master has not measured its source in `AL_CLOCK_SYNC_STALE` (12 h) | 15m | warning |
 | `ClockMasterNotSingle` | not exactly one time master, configured or on its own clock (only once any clock facts exist) | 30m | warning |
 | `ClockReferenceLost` | the master has a reference configured and is on its own clock (`enclave_clock_upstream_lost`) | 30m | warning |
+| `ClockSourceNotFollowed` | a machine that is not the master follows no source (`enclave_clock_source_selected == 0`) — the 09-28 case | 30m | warning |
+| `ClockSourceOffsetHigh` | over `AL_CLOCK_MAX_OFFSET` (1 s) from its source, by chrony's own measurement | 15m | warning |
 | `ComplianceFactsStale` | facts older than 1h | 15m | critical |
 | **backups** | | | |
 | `BackupMissed` | no complete set in 26h | 30m | critical |

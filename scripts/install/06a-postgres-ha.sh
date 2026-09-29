@@ -22,6 +22,12 @@
 #     sudo ./06a-postgres-ha.sh backup-run [full|diff]  on each store: a backup now + the timers
 #     sudo ./06a-postgres-ha.sh backup-restore-test     on the PRIMARY: restore to a point in time
 #                                                      from EACH store, into scratch, and prove it
+#   SLICE 6 PREP - THE APPLICATION'S DATABASE (real records: prints NUMBERS ONLY, see below):
+#     sudo ./06a-postgres-ha.sh app-restore rehearse          on the LEADER: a made-up dump through
+#                                                      the whole path - proves no row reaches a screen or log
+#     sudo ./06a-postgres-ha.sh app-restore census <file>     what a plain-SQL dump is and needs
+#     sudo ./06a-postgres-ha.sh app-restore load <file> <db>  on the LEADER, into a NEW database
+#     sudo ./06a-postgres-ha.sh app-restore shred <file>...   the dump and the load log, when done
 #
 # SLICE 2 - THE DATABASE'S OWN etcd, WITH MUTUAL TLS
 #
@@ -1101,6 +1107,346 @@ cmd_backup_restore_test() {
   [ "$rc" -eq 0 ] || die "the restore test FAILED for at least one store - see above"
 }
 
+# =========================================================================================
+# SLICE 6 PREP - THE APPLICATION'S DATABASE, AND NONE OF ITS CONTENT ON ANY SCREEN (2026-09-29)
+#
+#   The application's dump holds real people's records. It is restored at full size because that
+#   is the real test of slice 5 (backup time, WAL volume) and what the slice-6 STIG scan must see
+#   (the real roles, grants and ownership). Everything these subcommands PRINT is numbers - sizes,
+#   times, counts, error counts by SQLSTATE - so their output is safe to paste anywhere. Rows
+#   exist in two places only:
+#     * the database itself;
+#     * the load log under $APP_LOG_DIR, root 0600 - psql quotes the offending ROW in a failed
+#       COPY's CONTEXT line, so its full output never goes to a terminal.
+#   The load session keeps rows out of the PostgreSQL log and the audit trail too (all three
+#   are superuser-settable, per session):
+#     pgaudit.log=$APP_LOAD_PGAUDIT        DDL and role changes still audited; COPY/INSERT not, so
+#                                          an INSERT-format dump's values never enter the audit log
+#     log_min_messages=log                 the session's ERRORs - which quote the bad VALUE - are
+#                                          not written; pgaudit's LOG-level entries still are
+#     log_min_error_statement=panic        and no statement text with an error
+#   `rehearse` proves all of it with a made-up dump carrying a unique marker row, before a real
+#   dump is touched: the marker must reach the load log and must NOT reach the screen, the
+#   PostgreSQL log or syslog - while this run's DDL must still reach the audit (the control).
+#
+#   Plain-SQL, ONE database only. A cluster dump (pg_dumpall) or pg_dump -C creates its own
+#   databases and roles - census says so and load refuses; extend it when one actually arrives.
+# =========================================================================================
+APP_LOG_DIR="${APP_LOG_DIR:-/var/log/enclave-app-restore}"
+APP_LOAD_PGAUDIT="${APP_LOAD_PGAUDIT:-ddl,role}"
+APP_SPACE_FACTOR="${APP_SPACE_FACTOR:-4}"        # free bytes needed on the data disk per byte of dump
+APP_REHEARSAL_DB="${APP_REHEARSAL_DB:-app_rehearsal}"
+APP_REHEARSING="${APP_REHEARSING:-0}"             # set by `rehearse` for its own load run
+
+app_file_ok() {
+  local f="${1:-}" r
+  [ -n "$f" ] || die "name the dump file"
+  [ -f "$f" ] && [ ! -L "$f" ] || die "$f: not a regular file, or a symlink - refusing"
+  r="$(readlink -f "$f")"
+  case "$r" in "$PG_MNT"/*|/etc/*|/usr/*) die "$r is under $PG_MNT, /etc or /usr - a dump belongs in a home or temp directory" ;; esac
+  chmod 0600 "$r"
+}
+
+# app_census FILE [NAMES_OUT] - reads the dump, prints numbers only. The names of roles that would
+# have to be created go to NAMES_OUT (a root-only temp file of load's), never to the screen.
+# Returns 3 when this script will not load the file.
+app_census() {
+  local f="$1" out="${2:-/dev/null}" tmp rc=0
+  tmp="$(mktemp -d)"
+  pg_sql "SELECT rolname FROM pg_roles" > "$tmp/roles"
+  pg_sql "SELECT name FROM pg_available_extensions" > "$tmp/exts"
+  pg_sql "SELECT collname FROM pg_collation" > "$tmp/colls"
+  python3 - "$f" "$tmp/roles" "$tmp/exts" "$tmp/colls" "$out" "$(psql --version | awk '{print $3}')" <<'CENSUSPY' || rc=$?
+import collections, os, re, sys
+path, roles_f, exts_f, colls_f, out_f, psqlv = sys.argv[1:7]
+rd = lambda p: {l.rstrip("\n") for l in open(p, encoding="utf-8", errors="replace") if l.strip()}
+existing, available, collations = rd(roles_f), rd(exts_f), rd(colls_f)
+if not existing or not available:
+    print("  [x] could not read this cluster's roles or extensions - is PostgreSQL up here?"); sys.exit(3)
+# Vendor and platform roles are products, not people - the only role names ever printed.
+VENDOR = re.compile(r"^(azure|pg_|rds|cloudsql|alloydb)|^(postgres|replication)$")
+NOTROLE = {"public", "current_user", "session_user", "current_role", "group", "default", "none"}
+TOK = r'"(?:[^"]|"")+"|[A-Za-z_][A-Za-z0-9_$]*'
+unq = lambda t: t[1:-1].replace('""', '"') if t.startswith('"') else t.lower()
+def names(s):
+    s = re.split(r"\s+(?:WITH\s+\w+\s+(?:OPTION|TRUE|FALSE)|CASCADE|RESTRICT)\b", s.rstrip().rstrip(";"))[0]
+    return [unq(t) for t in re.findall(TOK, s) if t.startswith('"') or t.lower() not in NOTROLE]
+c = collections.Counter(); refs, defined, colls, hdr, exts = set(), set(), set(), {}, []
+in_copy = in_insert = False; this = 0
+with open(path, "rb") as fh:
+    for raw in fh:
+        c["lines"] += 1
+        if raw.endswith(b"\r\n"): c["crlf"] += 1
+        if in_copy:                                   # COPY data: rows, counted and never parsed
+            if raw.rstrip(b"\r\n") == b"\\.":
+                in_copy = False; c["tables_with_rows"] += 1 if this else 0
+            else:
+                c["rows"] += 1; this += 1
+            continue
+        l = raw.decode("utf-8", "replace").rstrip("\r\n")
+        if in_insert:                                 # a multi-line INSERT value: data, not parsed
+            in_insert = not l.rstrip().endswith(");"); continue
+        if l.startswith("INSERT INTO "):
+            c["insert"] += 1; in_insert = not l.rstrip().endswith(");"); continue
+        if l.startswith("COPY ") and l.endswith(" FROM stdin;"):
+            in_copy = True; this = 0; c["copy"] += 1; continue
+        if l.startswith("--"):
+            m = re.match(r"-- Dumped from database version (\S+)", l); hdr.update({"from": m.group(1)} if m else {})
+            m = re.match(r"-- Dumped by pg_dump version (\S+)", l); hdr.update({"by": m.group(1)} if m else {})
+            c["cluster_header"] += l.startswith("-- PostgreSQL database cluster dump")
+            continue
+        for k, rx in (("table", r"CREATE (UNLOGGED )?TABLE "), ("schema", r"CREATE SCHEMA "),
+                      ("index", r"CREATE (UNIQUE )?INDEX "), ("function", r"CREATE (OR REPLACE )?(FUNCTION|PROCEDURE|AGGREGATE) "),
+                      ("view", r"CREATE (OR REPLACE )?(MATERIALIZED )?VIEW "), ("trigger", r"CREATE (CONSTRAINT )?TRIGGER "),
+                      ("policy", r"CREATE POLICY "), ("sequence", r"CREATE SEQUENCE "), ("create_db", r"CREATE DATABASE "),
+                      ("connect", r"\\connect "), ("restrict", r"\\restrict ")):
+            if re.match(rx, l): c[k] += 1
+        m = re.match(r"CREATE EXTENSION (?:IF NOT EXISTS )?(" + TOK + ")", l)
+        if m: exts.append(unq(m.group(1)))
+        m = re.match(r"CREATE ROLE (" + TOK + ")", l)
+        if m: defined.add(unq(m.group(1))); c["create_role"] += 1
+        if re.match(r"(CREATE|ALTER) ROLE ", l) and " PASSWORD " in l: c["password"] += 1
+        for m in re.finditer(r"\bCOLLATE (?:pg_catalog\.)?(" + TOK + ")", l):
+            colls.add(m.group(1)[1:-1] if m.group(1).startswith('"') else m.group(1))
+        for m in re.finditer(r"\bOWNER TO (" + TOK + ")", l): refs.update(names(m.group(1)))
+        for m in re.finditer(r"\b(?:FOR ROLE|FOR USER|GRANTED BY|AUTHORIZATION|SET ROLE|USER MAPPING FOR) (" + TOK + ")", l):
+            refs.update(names(m.group(1)))
+        m = re.match(r"SET SESSION AUTHORIZATION '((?:[^']|'')+)'", l)
+        if m: refs.add(m.group(1).replace("''", "'"))
+        if l.startswith(("GRANT ", "REVOKE ", "ALTER DEFAULT PRIVILEGES ")):
+            kw = " FROM " if re.search(r"(^|\s)REVOKE\s", l) else " TO "
+            i = l.rfind(kw)
+            if i >= 0: refs.update(names(l[i + len(kw):].split(" GRANTED BY ")[0]))
+def human(b):
+    for u in ("B", "KB", "MB", "GB", "TB"):
+        if b < 1024 or u == "TB": return ("%d %s" % (b, u)) if u == "B" else ("%.1f %s" % (b, u))
+        b /= 1024.0
+n = lambda x: "{:,}".format(x)
+P = lambda k, v: print("     %-11s %s" % (k, v))
+allroles = refs | defined
+missing = sorted((refs - existing) - defined)
+vendor = sorted(r for r in allroles if VENDOR.search(r))
+print("  census (numbers only - safe to paste):")
+P("source", "PostgreSQL %s, dumped by pg_dump %s" % (hdr.get("from", "?"), hdr.get("by", "?")))
+P("size", "%s, %s lines" % (human(os.path.getsize(path)), n(c["lines"])))
+P("rows", "%s in %s COPY blocks (%s tables with rows); %s INSERT statements" % (n(c["rows"]), n(c["copy"]), n(c["tables_with_rows"]), n(c["insert"])))
+P("objects", "%d schemas, %d tables, %d indexes, %d functions, %d views, %d triggers, %d policies, %d sequences" % tuple(c[k] for k in ("schema", "table", "index", "function", "view", "trigger", "policy", "sequence")))
+P("extensions", ", ".join("%s (%s)" % (e, "available" if e in available else "NOT AVAILABLE here") for e in exts) or "none")
+odd = [x for x in colls if x not in collations and x != "default"]
+P("collations", "%d referenced, %d not on this node%s" % (len(colls), len(odd), " - those objects will fail to create" if odd else ""))
+P("roles", "%d referenced - vendor/platform: %s; application: %d (names not shown)" % (len(allroles), ", ".join(vendor) or "none", len(allroles) - len(vendor)))
+P("", "%d already on this cluster; %d would be created NOLOGIN" % (len(allroles & existing), len(missing)))
+if c["create_role"]: P("", "%d CREATE ROLE in the file, %d carrying a password" % (c["create_role"], c["password"]))
+if c["restrict"]:
+    ok = tuple(int(x) for x in re.findall(r"\d+", psqlv)[:2]) >= (16, 10)
+    P("psql", "the dump uses \\restrict (pg_dump 16.10+/17.6+); psql %s here %s" % (psqlv, "understands it" if ok else "does NOT - upgrade postgresql-client-16"))
+P("line ends", "CRLF on %s lines" % n(c["crlf"]) if c["crlf"] else "LF")
+why = []
+if c["cluster_header"] or c["create_db"] or c["connect"]:
+    why.append("it creates its own database(s) - a cluster dump (pg_dumpall) or pg_dump -C")
+if c["crlf"]: why.append("Windows line endings - re-send it in BINARY mode (an ASCII transfer rewrote it)")
+if in_copy: why.append("it ends inside a COPY block - the file is truncated")
+if c["lines"] == 0: why.append("it is empty")
+if why:
+    print("  [x] this script will NOT load it: " + "; ".join(why)); sys.exit(3)
+if out_f != "/dev/null":
+    with open(out_f, "w", encoding="utf-8") as o: o.write("".join(r + "\n" for r in missing))
+print("  [ok] loadable: one database, rows as %s" % ("COPY" if c["copy"] else "INSERT" if c["insert"] else "none (schema only)"))
+CENSUSPY
+  rm -rf "$tmp"
+  return "$rc"
+}
+
+# app_summary LOG SECONDS - the load log, reduced to numbers.
+app_summary() {
+  python3 - "$1" "$2" <<'SUMMARYPY'
+import collections, re, sys
+log, secs = sys.argv[1], int(sys.argv[2])
+NAME = {"42704": "undefined_object - a role, type or collation that does not exist",
+        "42P01": "undefined_table", "42883": "undefined_function",
+        "58P01": "undefined_file - an extension not installed here", "0A000": "feature_not_supported",
+        "42501": "insufficient_privilege", "42710": "duplicate_object", "42P07": "duplicate_table",
+        "42601": "syntax_error", "22P02": "invalid_text_representation - a value its column rejects",
+        "23505": "unique_violation", "23503": "foreign_key_violation", "23502": "not_null_violation",
+        "22021": "character_not_in_repertoire", "42P16": "invalid_table_definition"}
+codes = collections.Counter(); copies = rows = warns = 0
+for l in open(log, encoding="utf-8", errors="replace"):
+    m = re.match(r"psql:\S*: (?:ERROR|FATAL):\s+([0-9A-Z]{5}):", l)
+    if m: codes[m.group(1)] += 1; continue
+    if re.match(r"psql:\S*: WARNING:", l): warns += 1; continue
+    m = re.fullmatch(r"COPY (\d+)\n?", l)
+    if m: copies += 1; rows += int(m.group(1))
+print("  load (numbers only - safe to paste):")
+print("     %-11s %d s" % ("time", secs))
+print("     %-11s %s loaded by %d COPY statements" % ("rows", "{:,}".format(rows), copies))
+print("     %-11s %d%s" % ("errors", sum(codes.values()), "" if codes else " - a clean load"))
+for k, v in sorted(codes.items(), key=lambda x: -x[1]):
+    print("     %-11s %5d x %s %s" % ("", v, k, NAME.get(k, "- read the load log")))
+print("     %-11s %d" % ("warnings", warns))
+SUMMARYPY
+}
+
+app_load() {
+  need_root; whoami_pg
+  local f="${1:-}" db="${2:-}" j v leader tmp log size free need made=0 t0 secs lsn0 a0 a1 seg rc=0 opts
+  [ -n "$f" ] && [ -n "$db" ] || die "usage: sudo $0 app-restore load <file> <database>"
+  printf '%s' "$db" | grep -qxE '[a-z_][a-z0-9_]{0,62}' || die "database name '$db': lower-case letters, digits and _ only"
+  j="$(cluster_json)"; v="$(cluster_verdict "$j")"
+  case "$v" in ok*) ;; *) die "the cluster is not healthy (${v#bad }) - fix that first" ;; esac
+  read -r _ leader _ <<<"$v"
+  [ "$leader" = "$ME" ] || die "run this on the leader - $leader leads, $ME is a standby"
+  [ "$(pg_sql "SELECT count(*) FROM pg_database WHERE datname='$db'")" = 0 ] \
+    || die "database $db already exists - a load goes into a NEW database only. If it is a failed earlier attempt, look, then drop it by hand."
+  app_file_ok "$f"; f="$(readlink -f "$f")"
+  size="$(stat -c %s "$f")"; free="$(df -B1 --output=avail "$PG_MNT" | tail -1 | tr -d ' ')"; need=$(( size * APP_SPACE_FACTOR ))
+  [ "$free" -ge "$need" ] || die "$PG_MNT has $(numfmt --to=iec "$free")B free; a $(numfmt --to=iec "$size")B dump wants $(numfmt --to=iec "$need")B (x$APP_SPACE_FACTOR)"
+  umask 077
+  install -d -m 0700 "$APP_LOG_DIR"
+  tmp="$(mktemp -d)"
+  app_census "$f" "$tmp/missing" || { rm -rf "$tmp"; die "not loaded - the census says why, above"; }
+  log="$APP_LOG_DIR/$db-$(date -u +%Y%m%dT%H%M%SZ).log"
+  : > "$log"; chmod 0600 "$log"
+  # ---- 1. the roles it refers to, as NOLOGIN - names passed to psql on stdin, never printed ----
+  if [ -s "$tmp/missing" ]; then
+    made="$(wc -l < "$tmp/missing")"
+    python3 -c '
+import sys
+for n in open(sys.argv[1], encoding="utf-8"):
+    n = n.rstrip("\n")
+    if n: print("CREATE ROLE \"%s\" NOLOGIN;" % n.replace("\"", "\"\""))' "$tmp/missing" > "$tmp/roles.sql"
+    runuser -u postgres -- psql -X -v ON_ERROR_STOP=1 -d postgres < "$tmp/roles.sql" >> "$log" 2>&1 \
+      || { rm -rf "$tmp"; die "creating the $made missing roles failed - the reason is in $log (root only)"; }
+    ok "$made role(s) the dump refers to created NOLOGIN (names not shown)"
+  fi
+  rm -rf "$tmp"
+  # ---- 2. the database and the load ----
+  pg_sql "CREATE DATABASE $db TEMPLATE template0" >/dev/null
+  lsn0="$(pg_sql "SELECT pg_current_wal_lsn()")"; a0="$(pg_sql "SELECT archived_count||' '||failed_count FROM pg_stat_archiver")"
+  opts="-c pgaudit.log=$APP_LOAD_PGAUDIT -c log_min_messages=log -c log_min_error_statement=panic"
+  say "loading into $db - the full psql output goes to $log (root 0600: it can quote rows)"
+  t0="$(date +%s)"
+  runuser -u postgres -- env PGOPTIONS="$opts" psql -X -v ON_ERROR_STOP=0 -v VERBOSITY=verbose -d "$db" < "$f" >> "$log" 2>&1 || rc=$?
+  secs=$(( $(date +%s) - t0 ))
+  [ "$rc" -eq 0 ] || warn "psql itself exited $rc (a lost connection or a fatal error, not a failed statement) - the load is INCOMPLETE; the log says where it stopped"
+  app_summary "$log" "$secs"
+  runuser -u postgres -- psql -X -q -d "$db" -c ANALYZE >> "$log" 2>&1 || warn "ANALYZE failed - see $log"
+  # ---- 3. what it made: numbers from the catalog, never from the application's tables ----
+  say "     database    $(pg_sql "SELECT pg_size_pretty(pg_database_size('$db'))||', '||pg_encoding_to_char(encoding)||', collation '||datcollate FROM pg_database WHERE datname='$db'")"
+  say "     catalog     $(runuser -u postgres -- psql -X -A -t -q -d "$db" -c "SELECT count(*) FILTER (WHERE c.relkind IN ('r','p'))||' tables, '||count(*) FILTER (WHERE c.relkind='i')||' indexes, '||count(*) FILTER (WHERE c.relkind IN ('v','m'))||' views' FROM pg_class c JOIN pg_namespace s ON s.oid=c.relnamespace WHERE s.nspname NOT IN ('pg_catalog','information_schema') AND s.nspname NOT LIKE 'pg_toast%'")"
+  say "     roles made  $made (NOLOGIN)"
+  say "     WAL         $(pg_sql "SELECT pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), '$lsn0'))") generated by the load"
+  # ---- 4. did it reach the standbys and the stores? ----
+  for _ in $(seq 1 300); do
+    v="$(cluster_verdict "$({ patronictl -c "$PATRONI_CONF" list -f json 2>/dev/null || echo '[]'; })")"
+    case "$v" in ok*) break ;; esac; sleep 1
+  done
+  case "$v" in ok*) ok "both standbys streaming at 0 MB lag" ;; *) warn "the standbys have not caught up after 300 s (${v#bad })" ;; esac
+  seg="$(pg_sql "SELECT pg_walfile_name(pg_switch_wal())")"
+  for _ in $(seq 1 120); do
+    [ "$(pg_sql "SELECT coalesce(last_archived_wal,'') >= '$seg' FROM pg_stat_archiver")" = t ] && break; sleep 1
+  done
+  a1="$(pg_sql "SELECT archived_count||' '||failed_count FROM pg_stat_archiver")"
+  if [ "$(pg_sql "SELECT coalesce(last_archived_wal,'') >= '$seg' FROM pg_stat_archiver")" = t ]; then
+    ok "WAL archived to the stores: $(( ${a1% *} - ${a0% *} )) segments, $(( ${a1#* } - ${a0#* } )) failures"
+  else
+    warn "the last WAL segment was not archived within 120 s - $(( ${a1#* } - ${a0#* } )) archive failures during the load"
+  fi
+  [ "$rc" -eq 0 ] || die "psql did not finish the file - read $log before anything else"
+  [ "$APP_REHEARSING" = 1 ] && return 0
+  ok "loaded. Next:"
+  say "   1. on host-4:  sudo ./scripts/install/06a-postgres-ha.sh backup-run full   (the real-size backup, timed)"
+  say "   2. when you have read the error lines you need:  sudo $0 app-restore shred $f $log"
+}
+
+cmd_app_census() {
+  need_root; whoami_pg
+  app_file_ok "${1:-}"
+  app_census "$(readlink -f "$1")"
+}
+
+cmd_app_shred() {
+  need_root
+  [ "$#" -gt 0 ] || die "usage: sudo $0 app-restore shred <file>..."
+  local f r
+  # every argument is checked BEFORE anything is shredded
+  for f in "$@"; do
+    [ -f "$f" ] && [ ! -L "$f" ] || die "$f: not a regular file, or a symlink - nothing shredded"
+    r="$(readlink -f "$f")"
+    case "$r" in /home/*|/tmp/*|/var/tmp/*|"$APP_LOG_DIR"/*) ;; *) die "$r: shred takes a dump under /home, /tmp or /var/tmp, or a log under $APP_LOG_DIR - nothing shredded" ;; esac
+  done
+  for f in "$@"; do r="$(readlink -f "$f")"; shred -u "$r" && ok "shredded: $r"; done
+}
+
+# ---- the rehearsal: the whole path, a made-up dump, and the privacy claims proven ----------------
+cmd_app_rehearse() {
+  need_root; whoami_pg
+  local tmp f out rc=0 r made=() log srv bad=0 tag marker schema n
+  [ "$(pg_sql "SELECT count(*) FROM pg_database WHERE datname='$APP_REHEARSAL_DB'")" = 0 ] \
+    || die "database $APP_REHEARSAL_DB exists - a previous rehearsal left it. Look, then drop it by hand."
+  tag="$(od -An -N4 -tx4 /dev/urandom | tr -d ' ')"
+  marker="ENCLAVE-REHEARSAL-ROW-MARKER-$tag"; schema="rehearsal_$tag"
+  for r in "Rehearsal Owner" rehearsal_reader azure_pg_admin; do   # drop afterwards only the ones WE made
+    [ "$(pg_sql "SELECT count(*) FROM pg_roles WHERE rolname='$r'")" = 1 ] || made+=("$r")
+  done
+  tmp="$(mktemp -d)"; f="$tmp/rehearsal.sql"
+  {
+    printf -- '--\n-- PostgreSQL database dump\n--\n\n-- Dumped from database version 16.4\n-- Dumped by pg_dump version 16.4\n\n'
+    printf "SET client_encoding = 'UTF8';\nSET standard_conforming_strings = on;\nSELECT pg_catalog.set_config('search_path', '', false);\n\n"
+    printf 'CREATE EXTENSION IF NOT EXISTS enclave_rehearsal_absent WITH SCHEMA public;\n'
+    printf 'CREATE SCHEMA %s;\nALTER SCHEMA %s OWNER TO "Rehearsal Owner";\n' "$schema" "$schema"
+    printf 'CREATE TABLE %s.people (\n    id integer NOT NULL,\n    label text\n);\nALTER TABLE %s.people OWNER TO "Rehearsal Owner";\n' "$schema" "$schema"
+    printf 'CREATE TABLE %s.broken (\n    id integer NOT NULL\n);\n\n' "$schema"
+    printf 'COPY %s.people (id, label) FROM stdin;\n' "$schema"
+    seq 1 1000 | awk '{printf "%d\tlabel-%d\n", $1, $1}'
+    printf '\\.\n\n'
+    printf 'COPY %s.broken (id) FROM stdin;\n%s\n\\.\n\n' "$schema" "$marker"
+    printf 'GRANT USAGE ON SCHEMA %s TO rehearsal_reader;\nGRANT SELECT ON TABLE %s.people TO rehearsal_reader;\nGRANT ALL ON SCHEMA %s TO azure_pg_admin;\n' "$schema" "$schema" "$schema"
+  } > "$f"
+  say "rehearsal: a made-up dump - 1,000 good rows, one bad row carrying the marker, three roles, one absent extension"
+  # A SEPARATE PROCESS, not a subshell: under `|| rc=$?` bash ignores set -e for everything the
+  # command runs, so an in-process load would carry on past its own failures.
+  out="$(APP_REHEARSING=1 bash "$SELF/$(basename "$0")" app-restore load "$f" "$APP_REHEARSAL_DB" 2>&1)" || rc=$?
+  printf '%s\n' "$out"
+  log="$(ls -t "$APP_LOG_DIR/$APP_REHEARSAL_DB"-*.log 2>/dev/null | head -1)"
+  sleep 3                                                          # rsyslog writes asynchronously
+  say "the checks:"
+  chk() { if [ "$2" = pass ]; then ok "$1"; else warn "FAILED: $1"; bad=1; fi; }
+  chk "the load ran to the end (exit $rc)" "$([ "$rc" -eq 0 ] && echo pass)"
+  chk "1,000 rows loaded" "$(printf '%s' "$out" | grep -qE 'rows +1,000 loaded by 1 COPY' && echo pass)"
+  chk "the bad row counted as 1 x 22P02" "$(printf '%s' "$out" | grep -qE '1 x 22P02' && echo pass)"
+  chk "CONTROL: the marker IS in the load log - psql really quoted it" "$([ -n "$log" ] && grep -q "$marker" "$log" && echo pass)"
+  chk "the marker is NOT on the screen" "$(printf '%s' "$out" | grep -q "$marker" || echo pass)"
+  # CONTROL 2: an ordinary session's error DOES reach the server log - so the no-leak check below
+  # is one that can fail. Its own made-up value, which the marker check cannot match.
+  runuser -u postgres -- psql -X -q -d postgres -c "SELECT 'ENCLAVE-REHEARSAL-CONTROL-$tag'::integer" >/dev/null 2>&1 || true
+  sleep 3
+  srv=("$PG_DATA"/log/* /var/log/syslog /var/log/messages)
+  n="$(cat "${srv[@]}" 2>/dev/null | grep -c "ENCLAVE-REHEARSAL-CONTROL-$tag" || true)"
+  chk "CONTROL: an ordinary session's error IS in the server log ($n lines) - the no-leak check can fail" "$([ "${n:-0}" -ge 1 ] && echo pass)"
+  n="$(cat "${srv[@]}" 2>/dev/null | grep -c "$schema.people" || true)"
+  chk "CONTROL: this run's DDL IS in the server log ($n lines) - the audit still works, and the check reads the live log" "$([ "${n:-0}" -ge 1 ] && echo pass)"
+  n="$(cat "${srv[@]}" 2>/dev/null | grep -c "$marker" || true)"
+  chk "the marker is NOT in the PostgreSQL log or syslog ($n lines)" "$([ "${n:-0}" -eq 0 ] && echo pass)"
+  # ---- leave nothing behind ----
+  pg_sql "DROP DATABASE IF EXISTS $APP_REHEARSAL_DB" >/dev/null
+  for r in "${made[@]}"; do pg_sql "DROP ROLE IF EXISTS \"$r\"" >/dev/null; done
+  shred -u "$f"; rm -rf "$tmp"; [ -n "$log" ] && shred -u "$log"
+  ok "cleaned up: database $APP_REHEARSAL_DB dropped, ${#made[@]} rehearsal role(s) dropped, the dump and its log shredded"
+  [ "$bad" -eq 0 ] || die "the REHEARSAL FAILED - do not load a real dump until the failure above is understood"
+  ok "REHEARSAL PASSED - a real dump can be loaded the same way"
+}
+
+cmd_app_restore() {
+  local sub="${1:-}"; shift || true
+  case "$sub" in
+    census)   cmd_app_census "$@" ;;
+    load)     app_load "$@" ;;
+    rehearse) cmd_app_rehearse ;;
+    shred)    cmd_app_shred "$@" ;;
+    *) die "usage: sudo $0 app-restore rehearse | census <file> | load <file> <database> | shred <file>..." ;;
+  esac
+}
+
 case "${1:-}" in
   etcd)       shift; cmd_etcd "$@" ;;
   etcd-check) cmd_etcd_check ;;
@@ -1114,5 +1460,6 @@ case "${1:-}" in
   backup-enable) cmd_backup_enable ;;
   backup-run)    shift; cmd_backup_run "$@" ;;
   backup-restore-test) cmd_backup_restore_test ;;
-  *) sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  app-restore)   shift; cmd_app_restore "$@" ;;
+  *) sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

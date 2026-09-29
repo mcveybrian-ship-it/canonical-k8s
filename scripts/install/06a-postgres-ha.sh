@@ -28,6 +28,7 @@
 #                                                      the whole path - proves no row reaches a screen or log
 #     sudo ./06a-postgres-ha.sh app-restore census <file>     what a plain-SQL dump is and needs
 #     sudo ./06a-postgres-ha.sh app-restore load <file> <db>  on the LEADER, into a NEW database
+#     sudo ./06a-postgres-ha.sh app-restore summary [log]     reprint a load's summary from its log
 #     sudo ./06a-postgres-ha.sh app-restore shred <file>...   the dump and the load log, when done
 #
 # SLICE 2 - THE DATABASE'S OWN etcd, WITH MUTUAL TLS
@@ -1316,7 +1317,7 @@ CENSUSPY
 app_summary() {
   python3 - "$1" "$2" <<'SUMMARYPY'
 import collections, re, sys
-log, secs = sys.argv[1], int(sys.argv[2])
+log, secs = sys.argv[1], sys.argv[2]
 NAME = {"42704": "undefined_object - a role, type or collation that does not exist",
         "42P01": "undefined_table", "42883": "undefined_function",
         "58P01": "undefined_file", "0A000": "feature_not_supported - e.g. an extension not available here (measured live 2026-09-29)",
@@ -1336,7 +1337,7 @@ for l in open(log, encoding="utf-8", errors="replace"):
     m = re.fullmatch(r"COPY (\d+)\n?", l)
     if m: copies += 1; rows += int(m.group(1))
 print("  load (numbers only - safe to paste):")
-print("     %-11s %d s" % ("time", secs))
+print("     %-11s %s" % ("time", secs + " s" if secs else "not recorded in this log (a load before 2026-09-29 22:30Z)"))
 print("     %-11s %s loaded by %d COPY statements" % ("rows", "{:,}".format(rows), copies))
 print("     %-11s %d%s" % ("errors", sum(codes.values()), "" if codes else " - a clean load"))
 for k, v in sorted(codes.items(), key=lambda x: -x[1]):
@@ -1388,6 +1389,7 @@ for n in open(sys.argv[1], encoding="utf-8"):
   APP_ORIG_DB="$orig" APP_NEW_DB="$db" python3 -c "$APP_FILTER_PY" < "$f" 2>> "$log" \
     | runuser -u postgres -- env PGOPTIONS="$opts" psql -X -v ON_ERROR_STOP=0 -v VERBOSITY=verbose -d "$db" -f - >> "$log" 2>&1 || rc=$?
   secs=$(( $(date +%s) - t0 ))
+  printf -- '-- [06a app-restore] load seconds=%s exit=%s\n' "$secs" "$rc" >> "$log"   # so `summary` can reprint it
   [ "$rc" -eq 0 ] || warn "psql itself exited $rc (a lost connection or a fatal error, not a failed statement) - the load is INCOMPLETE; the log says where it stopped"
   app_summary "$log" "$secs"
   runuser -u postgres -- psql -X -q -d "$db" -c ANALYZE >> "$log" 2>&1 || warn "ANALYZE failed - see $log"
@@ -1427,8 +1429,13 @@ cmd_extensions() {
   [ -n "$PG_EXTENSION_PACKAGES" ] || die "PG_EXTENSION_PACKAGES is empty in vm-specs.env - nothing to install"
   before="$(pg_sql "SELECT name FROM pg_available_extensions ORDER BY 1")"
   say "$ME: installing $PG_EXTENSION_PACKAGES from the enclave mirror (server libraries only, no recommends)"
+  # NO TERMINAL for apt: `timeout` runs it in a background process group, and apt resets the
+  # terminal when dpkg finishes - the kernel then STOPS it (state T) with the packages already
+  # installed, and the timeout reports a failure that did not happen (2026-09-29, all three nodes).
+  # stdin from /dev/null and Dpkg::Use-Pty=0 mean apt never touches the tty.
   # shellcheck disable=SC2086
-  DEBIAN_FRONTEND=noninteractive timeout 900 apt-get install -y --no-install-recommends $PG_EXTENSION_PACKAGES 2>&1 | sed 's/^/     /' \
+  DEBIAN_FRONTEND=noninteractive timeout 900 apt-get install -y --no-install-recommends -o Dpkg::Use-Pty=0 \
+    $PG_EXTENSION_PACKAGES < /dev/null 2>&1 | sed 's/^/     /' \
     || die "apt-get failed or timed out - the lines above say why"
   after="$(pg_sql "SELECT name FROM pg_available_extensions ORDER BY 1")"
   ok "$ME: $(comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after") | grep -c . || true) extensions newly available: $(comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after") | tr '\n' ' ')"
@@ -1439,6 +1446,18 @@ cmd_app_census() {
   need_root; whoami_pg
   app_file_ok "${1:-}"
   app_census "$(readlink -f "$1")"
+}
+
+# Reprint a load's numbers-only summary from its log - the terminal that showed it can be gone
+# (the first real load's was: a session timeout, 2026-09-29). The newest log unless one is named.
+cmd_app_summary() {
+  need_root
+  local log="${1:-}"
+  [ -n "$log" ] || log="$(ls -t "$APP_LOG_DIR"/*.log 2>/dev/null | head -1 || true)"
+  [ -n "$log" ] && [ -f "$log" ] || die "no load log in $APP_LOG_DIR"
+  case "$(readlink -f "$log")" in "$APP_LOG_DIR"/*) ;; *) die "$log is not a load log under $APP_LOG_DIR" ;; esac
+  say "load log $(basename "$log"), last written $(date -u -r "$log" +%Y-%m-%dT%H:%M:%SZ)"
+  app_summary "$log" "$(sed -n 's/^-- \[06a app-restore\] load seconds=\([0-9]*\).*$/\1/p' "$log" | tail -1)"
 }
 
 cmd_app_shred() {
@@ -1525,8 +1544,9 @@ cmd_app_restore() {
     census)   cmd_app_census "$@" ;;
     load)     app_load "$@" ;;
     rehearse) cmd_app_rehearse ;;
+    summary)  cmd_app_summary "$@" ;;
     shred)    cmd_app_shred "$@" ;;
-    *) die "usage: sudo $0 app-restore rehearse | census <file> | load <file> <database> | shred <file>..." ;;
+    *) die "usage: sudo $0 app-restore rehearse | census <file> | load <file> <database> | summary [log] | shred <file>..." ;;
   esac
 }
 
@@ -1545,5 +1565,5 @@ case "${1:-}" in
   backup-restore-test) cmd_backup_restore_test ;;
   extensions)    cmd_extensions ;;
   app-restore)   shift; cmd_app_restore "$@" ;;
-  *) sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  *) sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

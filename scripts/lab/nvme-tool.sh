@@ -390,12 +390,14 @@ cmd_wipe() {
       if dd if=/dev/zero of="$NS" bs=16M count="$size" iflag=count_bytes oflag=direct conv=fsync status=progress; then
         ok "Overwrote every block in $(( SECONDS - t0 ))s"
       else
-        bad "the overwrite stopped early - dmesg | tail -50"; return 1
+        bad "the overwrite stopped early - a disconnect, or the drive refused a write: dmesg | tail -50, then run the wipe again"; return 1
       fi
       ;;
     discard)
       local out
-      out=$(blkdiscard -f "$NS" 2>&1) || { echo "$out" | sed 's/^/     /'; bad "blkdiscard failed (above) - the bridge or drive does not pass a discard; use --method overwrite"; return 1; }
+      # A refused discard is the BRIDGE's limit, not the drive's fault: stop, and do not count it
+      # against the drive (the first RTL9210 enclosure refuses it - 'Operation not supported').
+      out=$(blkdiscard -f "$NS" 2>&1) || { echo "$out" | sed 's/^/     /'; die "the discard was refused (above) - nothing was changed. Not the drive's fault: use --method overwrite"; }
       ok "Discarded every block in $(( SECONDS - t0 ))s"
       ;;
   esac
@@ -439,7 +441,7 @@ case $cmd in
 esac
 
 hdr "Summary"
-if   (( FAILS > 0 )); then echo "  ${RED}${BLD}$FAILS failure(s), $WARNS warning(s)${RST} - consider returning this drive."
+if   (( FAILS > 0 )); then echo "  ${RED}${BLD}$FAILS failure(s), $WARNS warning(s)${RST} - read them above: a failed health or read check is grounds to return the drive."
 elif (( WARNS > 0 )); then echo "  ${YEL}${BLD}$WARNS warning(s)${RST} - review above."
 else echo "  ${GRN}${BLD}All checks passed.${RST}"; fi
 if [[ -n ${REPORT:-} ]]; then

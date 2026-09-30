@@ -134,29 +134,29 @@ PLATFORM = set(platform.split())
 SYSDB = {"postgres", "template0", "template1"}
 
 # ---- masking: the application's names never leave this node --------------------------------
-names = {}
+# ROLES AND DATABASES ARE MASKED SEPARATELY: a role may share its database's name (the first live
+# scan, 2026-09-30, found exactly that - one table had written the role as "application database 1").
+rnames, dnames = {}, {}
 if mask == "1":
     n = 0
     for r in F["roles"] or []:
         nm = r["name"]
         if nm in PLATFORM or nm.startswith("pg_") or nm.startswith("azure"):
             continue
-        n += 1; names[nm] = "application role %d" % n
+        n += 1; rnames[nm] = "application role %d" % n
     n = 0
     for d in F["databases"] or []:
         if d in SYSDB: continue
-        n += 1; names[d] = "application database %d" % n
+        n += 1; dnames[d] = "application database %d" % n
     old = os.umask(0o077)
     with open(mapfile, "w") as m:
         m.write("# pg-stig.sh name map - root only, never collected. masked -> real\n")
-        for real, masked in names.items(): m.write("%s\t%s\n" % (masked, real))
+        for real, masked in list(rnames.items()) + list(dnames.items()): m.write("%s\t%s\n" % (masked, real))
     os.umask(old)
-def M(s):
-    if not isinstance(s, str): return s
-    for real, masked in sorted(names.items(), key=lambda kv: -len(kv[0])):
-        s = re.sub(r'(?<![\w$])' + re.escape(real) + r'(?![\w$])', masked, s)
-    return s
-def Mlist(xs): return [M(x) for x in (xs or [])]
+def MR(s): return rnames.get(s, s) if isinstance(s, str) else s
+def MD(s): return dnames.get(s, s) if isinstance(s, str) else s
+def M(s): return MR(s)
+def Mlist(xs, f=None): return [(f or MR)(x) for x in (xs or [])]
 
 # ---- helpers ---------------------------------------------------------------------------------
 def val(n):
@@ -206,7 +206,7 @@ rs = F.get("role_settings") or []
 overrides = [x for x in rs if any(str(c).startswith("pgaudit.") for c in (x.get("config") or []))]
 ov_note = ""
 if overrides:
-    ov_note = "Role-level pgaudit overrides: " + "; ".join("%s: %s" % (M(x["role"]), ", ".join(x["config"])) for x in overrides)
+    ov_note = "Role-level pgaudit overrides: " + "; ".join("%s%s: %s" % (MR(x["role"]), "" if x["db"] == "*" else " in " + MD(x["db"]), ", ".join(x["config"])) for x in overrides)
     ov_note += ". The monitor role's 'none' is the decided tailoring (acting AO 2026-09-28, backlog 6a.10)."
 
 # ---- A. the settings rules -------------------------------------------------------------------
@@ -269,7 +269,7 @@ res("V-261891", "open" if f else "not_a_finding", ev + ("\n\nFINDING: " + "; ".j
 
 # pg_hba: no md5 or password - read from pg_hba_file_rules, the file as the server parsed it
 hba = F["hba"] or []
-lines = ["line %s: %s %s %s %s %s%s" % (h["line"], h["type"], ",".join(Mlist(h["db"])), ",".join(Mlist(h["user"])),
+lines = ["line %s: %s %s %s %s %s%s" % (h["line"], h["type"], ",".join(Mlist(h["db"], MD)), ",".join(Mlist(h["user"], MR)),
          h["addr"] or "", h["method"], (" [ERROR: %s]" % h["error"]) if h["error"] else "") for h in hba]
 bad = [h for h in hba if (h["method"] or "") in ("md5", "password")]
 errs = [h for h in hba if h["error"]]
@@ -327,6 +327,13 @@ doc = {"tool": "pg-stig.sh", "tool_version": toolver, "stig": "CD_Postgres_16_V1
 path = os.path.join(out, "pg16-results-%s.json" % now)
 with open(path, "w") as o: json.dump(doc, o, indent=1)
 u = pwd.getpwnam(owner); os.chown(path, u.pw_uid, u.pw_gid); os.chmod(path, 0o644)
+# ---- SELF-CHECK: no real application name may be in what leaves this node ----
+txt = open(path).read()
+leaks = sum(len(re.findall(r"(?<![\w$])" + re.escape(real) + r"(?![\w$])", txt)) for real in list(rnames) + list(dnames))
+if leaks:
+    os.remove(path)
+    sys.exit("  [x] masking FAILED: %d occurrence(s) of a real application name in the results - the file was deleted; nothing was written" % leaks)
+print("  [ok] masking verified: %d application role(s) and %d database(s) masked, 0 real names in the results file" % (len(rnames), len(dnames)))
 print(path)
 SCANPY
   rm -rf "$tmp"

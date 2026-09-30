@@ -23,6 +23,7 @@
 #     sudo ./06a-postgres-ha.sh backup-restore-test     on the PRIMARY: restore to a point in time
 #                                                      from EACH store, into scratch, and prove it
 #   SLICE 6 PREP - THE APPLICATION'S DATABASE (real records: prints NUMBERS ONLY, see below):
+#     sudo ./06a-postgres-ha.sh stig-settings                 on the LEADER: the STIG's org-defined values
 #     sudo ./06a-postgres-ha.sh extensions                    on EVERY pg node: PG_EXTENSION_PACKAGES
 #     sudo ./06a-postgres-ha.sh app-restore rehearse          on the LEADER: a made-up dump through
 #                                                      the whole path - proves no row reaches a screen or log
@@ -305,6 +306,18 @@ PG_EXPORTER_ENV="${PG_EXPORTER_ENV:-/etc/default/prometheus-postgres-exporter}"
 # pg_monitor only, so it cannot read table data. Its LOGINS stay audited (log_connections).
 PG_MON_PGAUDIT="${PG_MON_PGAUDIT:-none}"
 PG_PGAUDIT_LOG="${PG_PGAUDIT_LOG:-ddl,role,read,write}"
+# The Postgres 16 STIG's org-defined values - DECIDED 2026-09-30 by the acting AO, from pg-stig.sh's
+# first scan (its four Opens). Baseline 6a.10 records them. Applied by `stig-settings`; render_patroni
+# and post_bootstrap carry the same, so a rebuild starts with them.
+PG_TCP_KEEPALIVES_IDLE="${PG_TCP_KEEPALIVES_IDLE:-300}"         # V-261899: a vanished client is dropped
+PG_TCP_KEEPALIVES_INTERVAL="${PG_TCP_KEEPALIVES_INTERVAL:-30}"  #   within idle + interval x count = 6.5 min
+PG_TCP_KEEPALIVES_COUNT="${PG_TCP_KEEPALIVES_COUNT:-3}"
+PG_STATEMENT_TIMEOUT="${PG_STATEMENT_TIMEOUT:-60min}"           # V-261899; an admin raises it per session
+PG_CLIENT_MIN_MESSAGES="${PG_CLIENT_MIN_MESSAGES:-error}"       # V-261908/909; an admin lowers it per session
+# V-261857. PostgreSQL does NOT enforce a role's CONNECTION LIMIT on a superuser - postgres's real bound
+# is superuser_reserved_connections inside max_connections. Set so the catalog carries a documented
+# value instead of -1, and the baseline says exactly that rather than pretend it limits anything.
+PG_SUPERUSER_CONN_LIMIT="${PG_SUPERUSER_CONN_LIMIT:-10}"
 # ---- slice 5: pgBackRest (decided 2026-09-28: TLS both ways; two live stores; LUKS underneath;
 # 2 weekly fulls + daily differentials). The stores and their repository paths, in repo order,
 # come from vm-specs.env - the planner reads the same line to reserve host-3's space.
@@ -405,6 +418,12 @@ bootstrap:
         archive_command: "$PGBR_ARCHIVE_CMD"
         archive_timeout: $PG_ARCHIVE_TIMEOUT
         pgaudit.log_catalog: "on"
+        # slice 6 - the Postgres 16 STIG's org-defined values (stig-settings, decided 2026-09-30)
+        tcp_keepalives_idle: $PG_TCP_KEEPALIVES_IDLE
+        tcp_keepalives_interval: $PG_TCP_KEEPALIVES_INTERVAL
+        tcp_keepalives_count: $PG_TCP_KEEPALIVES_COUNT
+        statement_timeout: $PG_STATEMENT_TIMEOUT
+        client_min_messages: $PG_CLIENT_MIN_MESSAGES
   initdb:
     - encoding: UTF8
     - data-checksums
@@ -481,6 +500,8 @@ BEGIN
   ELSE
     ALTER ROLE rewinder CONNECTION LIMIT $PG_REPL_CONN_LIMIT;
   END IF;
+  -- V-261857: documented, not enforced - PostgreSQL exempts superusers from role limits
+  ALTER ROLE postgres CONNECTION LIMIT $PG_SUPERUSER_CONN_LIMIT;
 END
 \$\$;
 SQL
@@ -1386,7 +1407,7 @@ app_load() {
 import sys
 for n in open(sys.argv[1], encoding="utf-8"):
     n = n.rstrip("\n")
-    if n: print("CREATE ROLE \"%s\" NOLOGIN;" % n.replace("\"", "\"\""))' "$tmp/missing" > "$tmp/roles.sql"
+    if n: print("CREATE ROLE \"%s\" NOLOGIN CONNECTION LIMIT 0;" % n.replace("\"", "\"\""))' "$tmp/missing" > "$tmp/roles.sql"
     runuser -u postgres -- psql -X -v ON_ERROR_STOP=1 -d postgres < "$tmp/roles.sql" >> "$log" 2>&1 \
       || { rm -rf "$tmp"; die "creating the $made missing roles failed - the reason is in $log (root only)"; }
     ok "$made role(s) the dump refers to created NOLOGIN (names not shown)"
@@ -1395,7 +1416,10 @@ for n in open(sys.argv[1], encoding="utf-8"):
   # ---- 2. the database and the load ----
   pg_sql "CREATE DATABASE $db TEMPLATE template0" >/dev/null
   lsn0="$(pg_sql "SELECT pg_current_wal_lsn()")"; a0="$(pg_sql "SELECT archived_count||' '||failed_count FROM pg_stat_archiver")"
-  opts="-c pgaudit.log=$APP_LOAD_PGAUDIT -c log_min_messages=log -c log_min_error_statement=panic"
+  # client_min_messages=warning: the cluster default is error (V-261908), which would hide the
+  # warnings this summary counts. statement_timeout=0: one COPY of a large table may run past the
+  # cluster's 60 min - a superuser maintenance session, bounded by the load itself.
+  opts="-c pgaudit.log=$APP_LOAD_PGAUDIT -c log_min_messages=log -c log_min_error_statement=panic -c client_min_messages=warning -c statement_timeout=0"
   say "loading into $db - the full psql output goes to $log (root 0600: it can quote rows)"
   t0="$(date +%s)"
   APP_ORIG_DB="$orig" APP_NEW_DB="$db" APP_AUDIT="$APP_LOAD_PGAUDIT" python3 -c "$APP_FILTER_PY" < "$f" 2>> "$log" \
@@ -1583,6 +1607,51 @@ cmd_app_restore() {
   esac
 }
 
+# ---- the Postgres 16 STIG's org-defined settings (slice 6, decided 2026-09-30) -------------------
+# pg-stig.sh's first scan found four Opens, all values the STIG leaves to the site. Fixed where they
+# live: the DCS for the parameters (a reload - no restart, no outage) and the catalog for the role
+# limits. Safe to re-run. Prints every value before and after.
+stig_settings_state() {
+  pg_sql "SELECT string_agg(name || '=' || coalesce(nullif(reset_val, ''), setting) || coalesce(' ' || nullif(unit, ''), '') || CASE WHEN pending_restart THEN ' (PENDING RESTART)' ELSE '' END, '  ' ORDER BY name) FROM pg_settings WHERE name IN ('tcp_keepalives_idle','tcp_keepalives_interval','tcp_keepalives_count','statement_timeout','client_min_messages')" | sed 's/^/     /'
+  pg_sql "SELECT 'unlimited (-1): ' || count(*) FILTER (WHERE rolconnlimit = -1) || ' of ' || count(*) || ' roles (pg_* excluded); postgres = ' || max(rolconnlimit) FILTER (WHERE rolname = 'postgres') FROM pg_roles WHERE rolname !~ '^pg_'" | sed 's/^/     /'
+}
+cmd_stig_settings() {
+  need_root; whoami_pg
+  local j v leader n ms sql
+  j="$(cluster_json)"; v="$(cluster_verdict "$j")"
+  case "$v" in ok*) ;; *) die "the cluster is not healthy (${v#bad }) - fix that first" ;; esac
+  read -r _ leader _ <<<"$v"
+  [ "$leader" = "$ME" ] || die "run this on the leader - $leader leads"
+  say "before:"; stig_settings_state
+  # ---- 1. the parameters, in the DCS: every member reloads them within one Patroni loop ----
+  patronictl -c "$PATRONI_CONF" edit-config "$PG_SCOPE" --force \
+    -s "postgresql.parameters.tcp_keepalives_idle=$PG_TCP_KEEPALIVES_IDLE" \
+    -s "postgresql.parameters.tcp_keepalives_interval=$PG_TCP_KEEPALIVES_INTERVAL" \
+    -s "postgresql.parameters.tcp_keepalives_count=$PG_TCP_KEEPALIVES_COUNT" \
+    -s "postgresql.parameters.statement_timeout=$PG_STATEMENT_TIMEOUT" \
+    -s "postgresql.parameters.client_min_messages=$PG_CLIENT_MIN_MESSAGES" 2>&1 | sed 's/^/     /'
+  ms="$(pg_sql "SELECT (extract(epoch FROM '$PG_STATEMENT_TIMEOUT'::interval) * 1000)::bigint")"
+  for _ in $(seq 1 30); do
+    [ "$(pg_sql "SELECT count(*) FROM pg_settings WHERE (name = 'statement_timeout' AND setting = '$ms') OR (name = 'client_min_messages' AND setting = '$PG_CLIENT_MIN_MESSAGES') OR (name = 'tcp_keepalives_idle' AND reset_val = '$PG_TCP_KEEPALIVES_IDLE')")" = 3 ] && break
+    sleep 2
+  done
+  [ "$(pg_sql "SELECT count(*) FROM pg_settings WHERE (name = 'statement_timeout' AND setting = '$ms') OR (name = 'client_min_messages' AND setting = '$PG_CLIENT_MIN_MESSAGES') OR (name = 'tcp_keepalives_idle' AND reset_val = '$PG_TCP_KEEPALIVES_IDLE')")" = 3 ] \
+    || die "the new values are not live after 60 s - 'patronictl list' and 'patronictl show-config' say why"
+  ok "parameters live on the leader (a reload - no restart); the standbys reload them from the DCS too"
+  # ---- 2. the role limits. Names never printed - counts only ----
+  n="$(pg_sql "SELECT count(*) FROM pg_roles WHERE NOT rolcanlogin AND rolconnlimit = -1 AND rolname !~ '^pg_'")"
+  sql='DO $$ DECLARE r record; BEGIN
+         FOR r IN SELECT rolname FROM pg_roles WHERE NOT rolcanlogin AND rolconnlimit = -1 AND rolname !~ '"'"'^pg_'"'"' LOOP
+           EXECUTE format('"'"'ALTER ROLE %I CONNECTION LIMIT 0'"'"', r.rolname);
+         END LOOP; END $$'
+  pg_sql "$sql"
+  pg_sql "ALTER ROLE postgres CONNECTION LIMIT $PG_SUPERUSER_CONN_LIMIT"
+  ok "$n NOLOGIN role(s) set to CONNECTION LIMIT 0 (they cannot log in; 0 says so); postgres = $PG_SUPERUSER_CONN_LIMIT - documented, NOT enforced for a superuser (its bound: superuser_reserved_connections $(pg_sql "SHOW superuser_reserved_connections") inside max_connections $(pg_sql "SHOW max_connections"))"
+  n="$(pg_sql "SELECT count(*) FROM pg_roles WHERE rolcanlogin AND NOT rolsuper AND rolconnlimit = -1")"
+  [ "$n" = 0 ] || warn "$n login role(s) still unlimited - their limit is the application's decision (B-07), not set here"
+  say "after:"; stig_settings_state
+}
+
 case "${1:-}" in
   etcd)       shift; cmd_etcd "$@" ;;
   etcd-check) cmd_etcd_check ;;
@@ -1597,6 +1666,7 @@ case "${1:-}" in
   backup-run)    shift; cmd_backup_run "$@" ;;
   backup-restore-test) cmd_backup_restore_test ;;
   extensions)    cmd_extensions ;;
+  stig-settings) cmd_stig_settings ;;
   app-restore)   shift; cmd_app_restore "$@" ;;
-  *) sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  *) sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

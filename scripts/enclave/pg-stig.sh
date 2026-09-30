@@ -560,7 +560,14 @@ probe_rule("V-261963", [("the denied SELECT", S_ + r"SELECT \* FROM stigprobe_%s
 probe_rule("V-261956", [("the probe's own connection, logged", r"connection authorized: user=postgres database=postgres")], [(on("log_connections"), "log_connections is off")])
 probe_rule("V-261960", [("its connection", r"connection authorized: user=postgres database=postgres"), ("its disconnection", r"disconnection: session time:")],
            [(on("log_connections"), "log_connections is off"), (on("log_disconnections"), "log_disconnections is off")])
-probe_rule("V-261922", [("a millisecond timestamp on every line (first line shown)", r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3} ")], [need("%m")])
+probe_rule("V-261922", [("a millisecond timestamp (first line shown)", r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3} ")], [need("%m")])
+# ...and on EVERY line of the probe's sessions, not just one - the label says every, so the check does.
+if T and R["V-261922"]["status"] == "not_a_finding":
+    nots = [l for l in PL if not re.match(r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3} ", l)]
+    R["V-261922"]["details"] += "\nlines of the probe's sessions without a millisecond timestamp: %d of %d" % (len(nots), len(PL))
+    if nots:
+        R["V-261922"]["status"] = "open"
+        R["V-261922"]["details"] += "\n\nFINDING: %d line(s) without a millisecond timestamp" % len(nots)
 
 # ---- everything else: said, not guessed ------------------------------------------------------
 LATER = {

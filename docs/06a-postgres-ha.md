@@ -1274,7 +1274,7 @@ written as a procedure (§16).
 | | what | where |
 |---|---|---|
 | ⬜ | **A crash under a write load** — slice 4 proved promotion and rejoin with no writes running; zero loss under load needs a write generator | B-06a |
-| ⬜ | **Slice 6:** the PostgreSQL 16 STIG scan (the XCCDF needs a CAC download), the org baseline, the Crunchy-vs-Ubuntu tailoring statement. The application's database is loaded (§10a); the empty-cluster scan needs it dropped and reloaded from the dump, which stays on the leader until then | B-06a, 6a.1, 6a.10, 6a.11 |
+| ⬜ | **Slice 6:** the PostgreSQL 16 STIG scan (the Crunchy Data Postgres 16 V1R3 STIG, 111 rules, in `docs/compliance/stigs` since 2026-09-17; Evaluate-STIG only covers 9.x, so the check is ours to build), the org baseline, the Crunchy-vs-Ubuntu tailoring statement. The application's database is loaded (§10a); the empty-cluster scan needs it dropped and reloaded from the dump, which stays on the leader until then | B-06a, 6a.1, 6a.10, 6a.11 |
 | ⬜ | **A written restore procedure** — replacing the cluster from a store after a disaster (slice 5 proved the backups restore; recovering the live cluster from them is a different operation), and a **scheduled** restore drill rather than a manual one | B-06a |
 | ⬜ | **host-3's store sizing** — 100 GB reserved on its images pool. Measured 2026-09-29: 344 MB of the application's database is 75.5 MB per full; size it alongside 2.8 | B-06a, 2.8 |
 | ⬜ | **Certificate renewal** — the pg nodes' and the stores' certificates expire **2027-09-28**, in three places per pg node. Watched since 2026-09-29 (`CertificateExpiringSoon`, 30 days ahead, backlog 3.45); renewal itself is still manual | B-06a |

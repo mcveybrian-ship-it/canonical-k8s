@@ -20,10 +20,20 @@ Generated 2026-09-18 20:28 UTC. Regenerate by re-running the `sha256sum` loop in
 | `U_GPOS_V3R3_SRG.zip` | 1.2M | `97026655bce18d91e12c9c0a9fd54288989f0b483d3b92ec615e2dc0544e6f24` | 2026-09-17 |
 | `U_Kubernetes_V2R5_STIG_SCAP_1-3_Benchmark.zip` | 32K | `049b63b6808c7433fbf2d1e6d9d6ed5ce8413d35dcd97963a27d07158f270584` | 2026-09-17 |
 | `U_Web_Server_V4R5_SRG.zip` | 1.2M | `e7936ed668282a5536b1be9713fc6d69d2be3338c7728e8c2e701c5e5f64d4bd` | 2026-09-17 |
+| `U_Kubernetes_V2R6_STIG.zip` | 2.9M | `2e66cc46e19889f337b40a7827745146c40c7b532529c03d826ba7462419876a` | 2026-09-18 |
+| `CAL_by_Port-20260901.pdf` | 22M | `d80605b51e67e77c7218ab56c16fb3ff594dfa2d1eb5052cb80abf034e78b857` | 2026-09-18 |
+| `CAL_by_Service-20260901.pdf` | 21M | `6cf01c5e322d803825ebfd039a0526ab103fefea4343540c5fcce7cf9562c5f4` | 2026-09-18 |
+| `CAL_Excel_format_20260901.xlsx` | 3.3M | `6b5795a5243f45eef32ef244482ea206f33cf31b5ad50563d17f3c49936cac44` | 2026-09-18 |
+| `CAL_Record_of_Changes_20260901.xlsx` | 564K | `ea9348e3d4685ff18fff4498f3deefc74fc05aadd1a5163a27e90fb71cd9325a` | 2026-09-18 |
+| `DoDIN APL Report_18-Sep-2026.pdf` | 256K | `2f371495d2c9e144147c32d57052961ef0fa9090653b73b0de7329ffc36f0dd2` | 2026-09-18 |
+| `DoDIN APL Report_18-Sep-2026.xls` | 88K | `eb7679917046d638309dffe3991d1fecd3fa268ca3902b411bfaa5038186e72d` | 2026-09-18 |
+| `unclass-certificates_pkcs7_DoD.zip` | 120K | `32595adbe752df5823cedd2c6a4f206c07fcc3c1520fb831015204e9fbb75711` | 2026-09-18 |
 
-## ⚠️ Still missing
+## ✅ Nothing on the list is missing (2026-09-30)
 
-- **`U_Kubernetes_V2R5_STIG.zip`** — the **Manual** XCCDF. We hold only
-  `U_Kubernetes_V2R5_STIG_SCAP_1-3_Benchmark.zip`, which is the *automatable subset*
-  (61 rules). **34 V-IDs in the observed range are absent.** Every Kubernetes coverage
-  figure and the Container Platform SRG overlap analysis remain FLOORS until it lands.
+- **`U_Kubernetes_V2R6_STIG.zip`** — the **Manual** XCCDF, obtained 2026-09-18. It supersedes the
+  V2R5 manual this section used to ask for (92 rules vs the SCAP benchmark's 61, which is still V2R5).
+- Rows added 2026-09-30 for the files that arrived after this manifest was first generated. The CAL
+  and the DoDIN APL report are CAC-only downloads, not public; they are listed for provenance only.
+- **Deliberately not listed:** two local documents in the folder that are not DISA downloads. This
+  file is tracked and `origin` is public.

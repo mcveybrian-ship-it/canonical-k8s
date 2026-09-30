@@ -1061,6 +1061,59 @@ no-leak checks can fail). Then everything it made is dropped and shredded.
 
 ---
 
+## 10b. Slice 6 — the Postgres 16 STIG, assessed by our own checker (in progress, 2026-09-30)
+
+### 10b.1 Why ours
+
+The STIG is DISA's **Crunchy Data Postgres 16 V1R3** — 111 rules, in `docs/compliance/stigs`
+since 2026-09-17. **Evaluate-STIG only covers PostgreSQL 9.x**, so the check is
+`scripts/enclave/pg-stig.sh`, built in pieces and each proven live before the next.
+
+### 10b.2 How it works
+
+| | |
+|---|---|
+| `scan` — on a pg node | one query as the superuser over the local socket: settings, `pg_hba_file_rules`, the role catalog, FIPS state. **Never a table's contents**; passwords are classified inside the query (none / SCRAM / other) and never returned. Writes `/srv/stig-evidence/<HOST>/Postgres16/pg16-results-<time>.json` |
+| `cklb` — on stage-01 | after `stig-tools.sh collect`: builds the checklist from the results and **DISA's own text in the zip**, beside Evaluate-STIG's in `<HOST>/Checklist/` where the CCI harvest already looks. The rule text never goes to the nodes |
+| not reviewed by default | a rule the current piece does not judge is `not_reviewed`, with the piece that will. A rule with two halves — a setting **and** "verify the event was logged" — stays `not_reviewed` until the log half is proven: a correct setting is not evidence that the log holds the record |
+| the application's names | roles and databases outside the platform's and the vendor's are written as "application role N" / "application database N", **masked separately** (one role shares its database's name). The map is root-only on the node. **A self-check re-reads every results file for the real names and deletes it if one got through** — proven both ways offline, with the masking broken on purpose |
+| `pending_restart` | a setting judged on its running value carries a warning when the configuration holds another one not yet applied (§9a.2a) |
+
+### 10b.3 Piece 6.1 — the settings rules, and the Postgres tidy-up
+
+The first scan (pg-03, 2026-09-30) judged 36 rules: **31 pass, 4 Open, 1 not applicable.** The four
+Opens were values the STIG leaves to the site; the acting AO decided them the same day, and
+`06a stig-settings` applied them — **a reload, no restart, no failover**:
+
+| rule | before | after |
+|---|---|---|
+| V-261857 connection limits | 5 of 8 roles unlimited (`-1`) | 0 — the 4 NOLOGIN roles `0`; `postgres` `10`, **documented, not enforced for a superuser** (its real bound: `superuser_reserved_connections` 3 inside `max_connections` 100) |
+| V-261899 dead sessions | keepalives 0 / 0 / 0, `statement_timeout` 0 | keepalives **300 s / 30 s / 3**, `statement_timeout` **60 min** |
+| V-261908/909 error detail | `client_min_messages` notice | **error** |
+
+**Result, identical on all three nodes: 33 pass · 0 Open · 1 N/A**, 77 still to judge. The values
+are in the bootstrap for a rebuild and go into the baseline (6a.10). `app-restore` now makes NOLOGIN
+roles with limit 0, and its load session keeps warnings visible and has no statement timeout.
+
+```bash
+### MACHINE: the leader ###
+sudo ./scripts/install/06a-postgres-ha.sh stig-settings   # the decided values; before and after
+### MACHINE: each pg node ###
+sudo ./scripts/enclave/pg-stig.sh scan                    # reads only; the summary is safe to paste
+### MACHINE: stage-01 ###
+./scripts/enclave/stig-tools.sh collect 10.2.20.165 10.2.20.166 10.2.20.167
+./scripts/enclave/pg-stig.sh cklb                         # the checklists
+```
+
+### 10b.4 Still to come
+
+**6.2** the audit probe (a throwaway role tries what the STIG forbids; each denial must be found in
+the log) and the file checks, with the STIG's RHEL paths mapped to Ubuntu and Patroni · **6.3** the
+org baseline (6a.10) · **6.4** the written answers · **6.5** the two scans — the empty cluster, then
+with the application.
+
+---
+
 ## 11. Who talks to whom, and how each proves who it is
 
 ### 11.1 The flows
@@ -1274,7 +1327,7 @@ written as a procedure (§16).
 | | what | where |
 |---|---|---|
 | ⬜ | **A crash under a write load** — slice 4 proved promotion and rejoin with no writes running; zero loss under load needs a write generator | B-06a |
-| ⬜ | **Slice 6:** the PostgreSQL 16 STIG scan (the Crunchy Data Postgres 16 V1R3 STIG, 111 rules, in `docs/compliance/stigs` since 2026-09-17; Evaluate-STIG only covers 9.x, so the check is ours to build), the org baseline, the Crunchy-vs-Ubuntu tailoring statement. The application's database is loaded (§10a); the empty-cluster scan needs it dropped and reloaded from the dump, which stays on the leader until then | B-06a, 6a.1, 6a.10, 6a.11 |
+| 🔄 | **Slice 6 — in progress, §10b:** the PostgreSQL 16 STIG scan (6.1 live: 33 pass, 0 Open on all three nodes), the org baseline, the Crunchy-vs-Ubuntu tailoring statement. The application's database is loaded (§10a); the empty-cluster scan needs it dropped and reloaded from the dump, which stays on the leader until then | B-06a, 6a.1, 6a.10, 6a.11 |
 | ⬜ | **A written restore procedure** — replacing the cluster from a store after a disaster (slice 5 proved the backups restore; recovering the live cluster from them is a different operation), and a **scheduled** restore drill rather than a manual one | B-06a |
 | ⬜ | **host-3's store sizing** — 100 GB reserved on its images pool. Measured 2026-09-29: 344 MB of the application's database is 75.5 MB per full; size it alongside 2.8 | B-06a, 2.8 |
 | ⬜ | **Certificate renewal** — the pg nodes' and the stores' certificates expire **2027-09-28**, in three places per pg node. Watched since 2026-09-29 (`CertificateExpiringSoon`, 30 days ahead, backlog 3.45); renewal itself is still manual | B-06a |
@@ -1285,4 +1338,4 @@ written as a procedure (§16).
 | 🔴 | **pgBackRest repository encryption** before any copy to the lab recovery store | 3.50 |
 | 🗳️ | Production sizing — the lab runs 2 vCPU / 4 GiB / 40 GB / 150 GB; `vm-specs.env`'s default of 8 GiB / 60 GB / 400 GB is explicitly not a production sizing | 2.8 |
 
-**Key:** ⬜ open · 🗳️ a decision owed · ❓ a question for someone else · 🔴 blocks something.
+**Key:** ⬜ open · 🔄 in progress · 🗳️ a decision owed · ❓ a question for someone else · 🔴 blocks something.

@@ -96,7 +96,7 @@ SELECT json_build_object(
   'databases', (SELECT json_agg(datname ORDER BY oid) FROM pg_database),
   'ident', (SELECT json_agg(json_build_object('map', map_name, 'sys', sys_name, 'pg', pg_username, 'error', error)) FROM pg_ident_file_mappings),
   'catalog_owner', (SELECT json_object_agg(nspname, pg_get_userbyid(nspowner)) FROM pg_namespace WHERE nspname IN ('pg_catalog', 'information_schema')),
-  'catalog_public_write', (SELECT count(*) FROM pg_class c JOIN pg_namespace s ON s.oid = c.relnamespace
+  'catalog_public_write', (SELECT json_agg(s.nspname || '.' || c.relname ORDER BY 1) FROM pg_class c JOIN pg_namespace s ON s.oid = c.relnamespace
       WHERE s.nspname IN ('pg_catalog', 'information_schema') AND c.relkind IN ('r','v','m','p')
         AND (has_table_privilege('public', c.oid, 'INSERT') OR has_table_privilege('public', c.oid, 'UPDATE') OR has_table_privilege('public', c.oid, 'DELETE'))),
   'db_acl', (SELECT json_agg(json_build_object('db', datname, 'owner', pg_get_userbyid(datdba),
@@ -847,9 +847,14 @@ arule("V-261915", "not_a_finding" if langs and not bad_l else ("open" if bad_l e
       "procedural languages installed, all databases: %s" % (", ".join(langs) or "unknown") + ("\n\nFINDING: unapproved languages: %s" % ", ".join(bad_l) if bad_l else ""),
       "Privileged functionality is the superuser's (postgres only) and the role attributes in the baseline. No untrusted procedural language (plpython, plperlu, plr) is installed.")
 co = F.get("catalog_owner") or {}
-cpw = F.get("catalog_public_write")
-arule("V-261902", "not_a_finding" if co and all(v == "postgres" for v in co.values()) and cpw == 0 else "open",
-      "owners: %s\ncatalog relations PUBLIC may write: %s" % (", ".join("%s=%s" % kv for kv in co.items()), cpw),
+cpw = F.get("catalog_public_write") or []
+# pg_settings is PostgreSQL's own grant: UPDATE on it is SET by another name - session-scoped, only for the
+# parameters the user may set anyway, never a write to a catalog. The first live run (2026-10-01) counted it.
+cpw_bad = [x for x in cpw if x != "pg_catalog.pg_settings"]
+arule("V-261902", "not_a_finding" if co and all(v == "postgres" for v in co.values()) and not cpw_bad else "open",
+      "owners: %s\ncatalog relations PUBLIC may write: %s%s" % (", ".join("%s=%s" % kv for kv in co.items()), ", ".join(cpw) or "none",
+      " (pg_settings: PostgreSQL's own UPDATE grant, which is SET for the session - not a catalog write)" if "pg_catalog.pg_settings" in cpw else "")
+      + ("\n\nFINDING: PUBLIC may write: %s" % ", ".join(cpw_bad) if cpw_bad else ""),
       "Security functions live in pg_catalog and information_schema, owned by postgres; the application's objects live in its own schemas.")
 for v in ("V-261901", "V-261930", "V-261931"):
     arule(v, "not_a_finding",

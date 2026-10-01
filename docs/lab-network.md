@@ -404,10 +404,14 @@ specifies a physical break with no routed path — this is the lab.)
 | host-1 | onboard 1 Gb (today) | USB 2.5 Gb adapter (RTL8156BG, `r8152`) — `enx00e04d00a591` |
 | host-2 | onboard 1 Gb (today) | USB 2.5 Gb adapter — `enx00e04d01420e` |
 | host-3 | onboard 1 Gb (today) | USB 2.5 Gb adapter — `enx00e04d00a257` |
-| host-4 | onboard 2.5 Gb (today) | USB 2.5 Gb adapter — `enx00e04d00a418`, in the **top-of-case USB 3 port** (the chipset controller); the back panel's four USB 3 ports share one controller with both backup drives |
+| host-4 | onboard 2.5 Gb (today) | USB 2.5 Gb adapter — `enx00e04d00a418`, in the **top-of-case USB 3 port** (the chipset controller); the back panel's four USB 3 ports share one controller with both backup drives → `10.2.30.158` (2026-10-01) |
 | NAS (lab only) | onboard port | SFP+ 1, **DAC cable**, 10 Gb |
 | Dell R7515 (lab only) | — (stays on FortiGate `internal3`) | SFP+ 2: a **10GBASE-T SFP+ module** + Cat6a to its RJ45 10 Gb card — **gap cable #2** |
 | FortiGate `dmz` | uplink (today) — **gap cable #1** | — |
+
+Storage addresses are `STORAGE_HOST_n` in `enclave-addresses.env` (.155–.158). The vault is .170
+and the NAS .171 — lab gear, so not in that file. host-4 has its address (2026-10-01,
+`03-host-services.sh storage`); host-1..3 not yet.
 
 Speeds that matter: 1 Gb ≈ 110 MB/s (the old USB backup drive's speed, rejected as unworkable);
 a host's 2.5 Gb adapter ≈ 280 MB/s; NAS ↔ Dell at 10 Gb ≈ 1 GB/s.
@@ -479,8 +483,15 @@ recovery store.
 `Cleanup-VM.ps1` deletes every disk attached to the VM, so `Build-Stage01.ps1` refuses to build over
 an existing VM. Block D is the deliberate way.
 
-**Not yet:** SSH — only the Hyper-V console reaches it until a host has a storage address, then
-SecureCRT through host-4 as a jump host; and the copies themselves (vm-backup's third copy — 3.50 applies).
+**SSH:** SecureCRT through host-4 (2026-10-01).
+
+- On the host-4 session: *Properties → Connection → Port Forwarding → Add*, local port `2222`,
+  remote `10.2.30.170` port `22`.
+- A `lab-vault` session to `127.0.0.1:2222`, user `encadmin`, the stage-01 key, and
+  **Firewall: None** — if it inherits the SOCKS firewall, stage-01 tries `127.0.0.1:2222` on itself.
+- A forward added to an open session starts only after a reconnect.
+
+**Not yet:** the copies themselves (vm-backup's third copy — 3.50 applies).
 
 **A. The password hash, then the build.** `openssl` asks twice and refuses a mismatch (`mkpasswd`
 asks once — that cost a rebuild). Copy the `$6$` line; the Dell block asks for it, so it never sits

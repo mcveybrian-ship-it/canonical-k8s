@@ -342,6 +342,32 @@ network costs nothing and leaves the option open.
 
 From here a VM joins the LAN with `--network bridge=br0` instead of `--network default`.
 
+## 3a. The storage network — a second NIC, its own address (backlog 3.16, added 2026-10-01)
+
+Each host's second NIC (a USB 2.5 GbE adapter in the lab) sits on the storage switch, which has
+no uplink. `storage` gives it `STORAGE_HOST_n` from `enclave-addresses.env` — `10.2.30.155`–`.158`,
+the same last octet as the management address. No gateway, no DNS.
+
+```bash
+### MACHINE: each host in turn (host-4 done 2026-10-01) ###
+cd ~/canonical-k8s && sudo ./scripts/install/03-host-services.sh storage
+```
+
+- **The NIC is discovered:** the one physical interface that is up, is not a bridge port, and has
+  no address outside the storage subnet. Two candidates and it refuses — set `STORAGE_NIC` in the
+  params file.
+- **netplan, like the bridge:** `/etc/netplan/75-enclave-storage.yaml`, matched by MAC,
+  `optional: true`. Boot waits only for `br0`, so a dead adapter costs speed, never a boot.
+- **The reload reconfigures `br0` too.** On systemd 255, `networkctl reload` reconfigured `br0`
+  and its port, not only the new interface — found on host-4's first run by the step's own check.
+  It cost nothing visible (the VMs answered, no scrape was missed), so the step **requires every
+  bridge to keep its address and every port** across the reload, or it fails.
+- **What it exposes:** host-4 has no ufw (by design), so its SSH answers on the storage network —
+  the other hosts, and in the lab the Dell vault and the NAS. host-4 does not route between the two
+  networks (`ip_forward = 0`). Hosts 1–3 have ufw, but their `22/tcp limit` from any source covers
+  the storage address too; whether that stays is decided with the Ceph split.
+- **Owed:** the address coming back after host-4's next reboot.
+
 ## 4. The data volumes — one, not one per service
 
 The step-02 autoinstall creates `vg-data` on top of `crypt-data` **with no logical volumes**,

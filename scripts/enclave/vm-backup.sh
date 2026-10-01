@@ -1546,7 +1546,14 @@ push_sets() {
     fi
   done
   local t1; t1="$(date +%s)"
-  [ "$dry" -eq 1 ] && { say "DRY RUN - nothing was transferred"; return 0; }
+  if [ "$dry" -eq 1 ]; then
+    say "DRY RUN - nothing was transferred"
+    # A DRY RUN THAT COULD NOT REACH THE FAR END IS A FAILED CHECK, NOT A PASSED ONE. Until
+    # 2026-10-01 this returned 0 regardless - the first `third-copy -n` printed three
+    # "Permission denied (publickey)" and still exited as a success.
+    [ "$rc" -eq 0 ] || die "$label dry run FAILED - see the errors above"
+    return 0
+  fi
 
   # State for the facts below: a second copy that silently stopped is the failure mode here.
   printf 'host=%s\nseconds=%s\nbytes=%s\ndomains=%s\nrc=%s\nduration=%s\n' \

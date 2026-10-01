@@ -14,6 +14,9 @@
 #     sudo ./vm-backup.sh second-copy            push completed sets to the host the placement
 #                                                map names - a copy that does not die with this
 #                                                machine (red flag 1.2). --setup makes the key
+#     sudo ./vm-backup.sh third-copy             the same, to a store the site names in
+#                                                BACKUP_THIRD_ADDR - the Dell vault in the lab;
+#                                                off (a no-op) when that is empty
 #     sudo ./vm-backup.sh restore-test <vm>      REHEARSE one: rebuild the chain into its own
 #                                                directory, boot it as restore-test-<vm> with
 #                                                no NIC, prove it, remove it. Touches nothing live
@@ -95,6 +98,12 @@ SECOND_STATE="${BACKUP_SECOND_STATE:-/var/lib/enclave-backup-second.state}"
 # and every byte of it is an apt mirror, rebuildable from the transfer bundle. Copying it a
 # second time costs the most and protects the least. --all overrides.
 SECOND_SKIP="${BACKUP_SECOND_SKIP:-svc-repo-01}"
+# THE THIRD COPY - lab only in this repo (the Dell vault); see cmd_third_copy. Empty address = off.
+THIRD_ADDR="${BACKUP_THIRD_ADDR:-}"
+THIRD_DIR="${BACKUP_THIRD_DIR:-/srv/cold/backup-copy}"
+THIRD_KEY="${BACKUP_THIRD_KEY:-/etc/enclave/backup-third.key}"
+THIRD_STATE="${BACKUP_THIRD_STATE:-/var/lib/enclave-backup-third.state}"
+THIRD_SKIP="${BACKUP_THIRD_SKIP:-$SECOND_SKIP}"
 ACCEPT_PLAIN=0
 ALLOW_NONMOUNT=0
 DETACH=0
@@ -337,6 +346,21 @@ cmd_status() {
   for d in $(domains); do
     local cps; cps="$(virsh checkpoint-list "$d" --name 2>/dev/null | sed '/^$/d' | tr '\n' ' ')"
     printf '     %-16s %s\n' "$d" "${cps:-none - next run must be a full}"
+  done
+  printf '\n  off-host copies, last run (from their state files):\n'
+  local which sf when
+  for which in second third; do
+    sf="$SECOND_STATE"; [ "$which" = third ] && sf="$THIRD_STATE"
+    if [ -r "$sf" ]; then
+      when="$(awk -F= '/^seconds=/{print $2}' "$sf")"
+      printf '     %-7s -> %-14s %s  rc=%s  %s\n' "$which" "$(awk -F= '/^host=/{print $2}' "$sf")" \
+        "$(date -d "@${when:-0}" '+%Y-%m-%d %H:%M %Z' 2>/dev/null)" "$(awk -F= '/^rc=/{print $2}' "$sf")" \
+        "$(human "$(awk -F= '/^bytes=/{print $2}' "$sf")")"
+    elif [ "$which" = third ] && [ -z "$THIRD_ADDR" ]; then
+      printf '     %-7s not configured (BACKUP_THIRD_ADDR empty - lab only)\n' "$which"
+    else
+      printf '     %-7s never run\n' "$which"
+    fi
   done
   printf '\n'
 }
@@ -1171,6 +1195,9 @@ ExecStart=${self} prune
 # night's backup look failed when the backup itself succeeded. It reports through
 # enclave_backup_second_* - an ageing timestamp there is the signal, not this unit's status.
 ExecStart=-${self} second-copy
+# A third copy where the site names one (BACKUP_THIRD_ADDR - the Dell vault in the lab). Also
+# non-fatal, and a no-op when the address is empty.
+ExecStart=-${self} third-copy
 EOF
 
   cat > "/etc/systemd/system/${SVC_NAME}.timer" <<EOF
@@ -1258,12 +1285,12 @@ EOF
   ok "scheduled: ${SVC_NAME}.timer at ${at} ${BACKUP_TZ} daily -> ${DEST}"
   ok "scheduled: ${VERIFY_SVC}.timer '${weekly_cal}' - deep verify, reads every byte"
   say ""
-  say "   nightly: incr + verify (changed sets only) + prune + second-copy   - minutes"
+  say "   nightly: incr + verify (changed sets only) + prune + second-copy + third-copy (if set)   - minutes"
   say "   weekly : verify --all                                - reads the whole volume"
   say ""
   systemctl list-timers "${SVC_NAME}.timer" "${VERIFY_SVC}.timer" --no-pager | sed 's/^/       /'
   printf '\n'
-  say "each run does: incr (falls back to full with no checkpoint), verify, prune, second-copy"
+  say "each run does: incr (falls back to full with no checkpoint), verify, prune, second-copy, third-copy"
   say "watch it with:   journalctl -u ${SVC_NAME}.service -n 50"
 
   # SAY THE REBOOT PROBLEM OUT LOUD, EVERY TIME, IF IT APPLIES.
@@ -1359,6 +1386,23 @@ PLAN
 # rsync to WRITE INTO one directory and nothing else - no shell, no reading back, no other
 # path. A compromise of this host can still overwrite what it has already sent; defending
 # against that needs media it cannot reach, which is the same answer as 1.3.
+copy_key() {   # <keyfile> <comment> - make an off-host copy's key once; say so if it exists
+  if [ -s "$1" ]; then
+    say "key already exists: $1"
+    return 0
+  fi
+  install -d -m 0700 "$(dirname "$1")"
+  # RSA, NOT ed25519. These hosts run FIPS and ssh-keygen refuses outright:
+  #   "ED25519 keys are not allowed in FIPS mode"   (measured on host-4, 2026-09-20)
+  # The FIPS-approved choices are RSA and ECDSA P-256/384; RSA 4096 is the least surprising
+  # and matches the keys the build already uses. BACKUP_SECOND_KEYTYPE overrides.
+  local kt="${BACKUP_SECOND_KEYTYPE:-rsa}" kb=()
+  [ "$kt" = rsa ] && kb=(-b 4096)
+  ssh-keygen -t "$kt" "${kb[@]}" -N '' -C "$2" -f "$1" >/dev/null \
+    || die "ssh-keygen failed for type $kt - on a FIPS host try rsa or ecdsa"
+  ok "created $1"
+}
+
 second_host() {   # the host the placement map sends this machine's copies to
   local want="${BACKUP_SECOND_HOST:-${PLACE_BACKUP_SECOND:-}}" me; me="$(hostname -s)"
   case "$want" in
@@ -1400,20 +1444,7 @@ cmd_second_copy() {
   [ -n "$addr" ] || die "$target has no address in enclave-addresses.env"
 
   if [ "$setup" -eq 1 ]; then
-    if [ -s "$SECOND_KEY" ]; then
-      say "key already exists: $SECOND_KEY"
-    else
-      install -d -m 0700 "$(dirname "$SECOND_KEY")"
-      # RSA, NOT ed25519. These hosts run FIPS and ssh-keygen refuses outright:
-      #   "ED25519 keys are not allowed in FIPS mode"   (measured on host-4, 2026-09-20)
-      # The FIPS-approved choices are RSA and ECDSA P-256/384; RSA 4096 is the least surprising
-      # and matches the keys the build already uses. BACKUP_SECOND_KEYTYPE overrides.
-      local kt="${BACKUP_SECOND_KEYTYPE:-rsa}" kb=()
-      [ "$kt" = rsa ] && kb=(-b 4096)
-      ssh-keygen -t "$kt" "${kb[@]}" -N '' -C "vm-backup second copy from $(hostname -s)" -f "$SECOND_KEY" >/dev/null \
-        || die "ssh-keygen failed for type $kt - on a FIPS host try rsa or ecdsa"
-      ok "created $SECOND_KEY"
-    fi
+    copy_key "$SECOND_KEY" "vm-backup second copy from $(hostname -s)"
     # THE ADDRESS THIS HOST WILL ACTUALLY CONNECT FROM - ask the kernel, do not guess (backlog
     # 3.31 #12). This took "the first non-loopback IPv4 listed", which depends on interface
     # order, not on routing. Measured 2026-09-25 on stage-01 (three addresses): that picked
@@ -1444,7 +1475,20 @@ cmd_second_copy() {
     return 0
   fi
 
-  [ -r "$SECOND_KEY" ] || die "no key at $SECOND_KEY - run: sudo $0 second-copy --setup"
+  push_sets "second copy" "$SECOND_KEY" "$target" "$addr" "$SECOND_DIR" "$SECOND_SKIP" "$SECOND_STATE" \
+            "${BACKUP_SECOND_DELETE:-1}" "$dry" "$all"
+}
+
+# ---------------------------------------------------------------- pushing sets off this host
+# push_sets - THE TRANSFER BOTH OFF-HOST COPIES USE: every domain directory holding a set, minus
+# a skip list, rsync'd over ssh to a far end whose authorized_keys confines this key to
+# `rrsync -wo <dir>`, then re-read with --checksum. Moved out of second-copy unchanged on
+# 2026-10-01 when the third copy arrived, so the two cannot drift apart.
+#
+#   push_sets <label> <key> <target> <addr> <remote dir> <skip list> <state file> <delete 0|1> <dry 0|1> <all 0|1>
+push_sets() {
+  local label="$1" key="$2" target="$3" addr="$4" rdir="$5" skip="$6" state="$7" del="$8" dry="$9" all="${10}"
+  [ -r "$key" ] || die "no key at $key - run: sudo $0 ${label// /-} --setup"
   check_dest
   local -a doms=() skipped=()
   local d
@@ -1453,13 +1497,14 @@ cmd_second_copy() {
     # one, and the first dry run duly offered to replicate it. A domain directory is one that
     # holds at least one backup SET, and a set is a directory with an INFO file in it.
     [ -n "$(find "$DEST/$d" -mindepth 2 -maxdepth 2 -name INFO -print -quit 2>/dev/null)" ] || continue
-    if [ "$all" -eq 0 ] && printf '%s\n' $SECOND_SKIP | grep -qx "$d"; then skipped+=("$d"); continue; fi
+    # shellcheck disable=SC2086  # the skip list is space-separated on purpose
+    if [ "$all" -eq 0 ] && printf '%s\n' $skip | grep -qx "$d"; then skipped+=("$d"); continue; fi
     doms+=("$d")
   done
-  [ "${#doms[@]}" -gt 0 ] || die "nothing to copy - every domain is excluded by BACKUP_SECOND_SKIP"
-  say "second copy: $(hostname -s) -> $target ($addr):$SECOND_DIR"
+  [ "${#doms[@]}" -gt 0 ] || die "nothing to copy - every domain is excluded by the skip list"
+  say "$label: $(hostname -s) -> $target ($addr):$rdir"
   say "domains    : ${doms[*]}"
-  [ "${#skipped[@]}" -eq 0 ] || say "excluded   : ${skipped[*]} (rebuildable - see BACKUP_SECOND_SKIP)"
+  [ "${#skipped[@]}" -eq 0 ] || say "excluded   : ${skipped[*]} (rebuildable - see the skip list)"
 
   # IdentitiesOnly=yes offers ONLY the key below. Without it ssh also offers root's default
   # identities and an agent's, and if one of those matched an unrestricted entry on the far end
@@ -1467,18 +1512,18 @@ cmd_second_copy() {
   # landing outside the one directory this key is confined to.
   # LogLevel=ERROR silences the login BANNER - which OpenSSH prints at INFO and which otherwise
   # repeats its full DoD text once per rsync - WITHOUT hiding errors, which are logged above it.
-  local SSH=(ssh -i "$SECOND_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o LogLevel=ERROR -o IdentitiesOnly=yes)
+  local SSH=(ssh -i "$key" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o LogLevel=ERROR -o IdentitiesOnly=yes)
   # --delete MIRRORS THE SOURCE, and without it the copy only ever grows. `prune` removes old
   # chains here, nothing removes them there, and each new full adds ~84 GB to a 196 GB volume -
   # so the far end fills and then silently stops being a copy at all. Measured on the first run,
   # 2026-09-20: 84 GB landed, 103 GB free. The trade is stated rather than hidden: a mistake on
   # THIS machine propagates to the copy, which is why the copy is not the only control - the
   # weekly deep verify and the restore test are what make it trustworthy. BACKUP_SECOND_DELETE=0
-  # keeps everything and accepts the growth.
+  # (BACKUP_THIRD_DELETE=0 for the third copy) keeps everything and accepts the growth.
   # -a keeps modes and mtimes, and rsync's size+mtime check is what lets last night's unchanged
   # sets be skipped; --partial lets an interrupted multi-GB file resume instead of restarting.
   local -a RS=(rsync -a --partial --human-readable -e "${SSH[*]}")
-  [ "${BACKUP_SECOND_DELETE:-1}" = 0 ] || RS+=(--delete)
+  [ "$del" = 0 ] || RS+=(--delete)
   [ "$dry" -eq 1 ] && RS+=(--dry-run --itemize-changes)
 
   local t0 bytes=0 rc=0; t0="$(date +%s)"
@@ -1505,10 +1550,66 @@ cmd_second_copy() {
 
   # State for the facts below: a second copy that silently stopped is the failure mode here.
   printf 'host=%s\nseconds=%s\nbytes=%s\ndomains=%s\nrc=%s\nduration=%s\n' \
-    "$target" "$(date +%s)" "$bytes" "${#doms[@]}" "$rc" "$((t1-t0))" > "$SECOND_STATE"
-  chmod 0644 "$SECOND_STATE"
-  [ "$rc" -eq 0 ] || die "second copy finished WITH ERRORS in $((t1-t0))s"
-  ok "second copy complete: ${#doms[@]} domain(s), $(numfmt --to=iec "$bytes" 2>/dev/null || echo "$bytes")B, $((t1-t0))s"
+    "$target" "$(date +%s)" "$bytes" "${#doms[@]}" "$rc" "$((t1-t0))" > "$state"
+  chmod 0644 "$state"
+  [ "$rc" -eq 0 ] || die "$label finished WITH ERRORS in $((t1-t0))s"
+  ok "$label complete: ${#doms[@]} domain(s), $(numfmt --to=iec "$bytes" 2>/dev/null || echo "$bytes")B, $((t1-t0))s"
+}
+
+# ---------------------------------------------------------------- third copy
+# A THIRD COPY, to a store the site names in BACKUP_THIRD_ADDR. In THIS repo that is the lab's
+# Dell vault (docs/lab-network.md 9.3), which holds copies so the lab can be rebuilt - LAB ONLY:
+# in any other environment the address is empty and this is a no-op. Where a site has a real
+# offsite store (backlog 3.29, CP-6), the same values point at it.
+#
+#     sudo ./vm-backup.sh third-copy --setup    make its OWN key, print what to authorise there
+#     sudo ./vm-backup.sh third-copy [-n] [--all]
+#
+# The same transfer as the second copy (push_sets): a write-only rrsync on the far end, verified
+# byte-for-byte. Its own key, so revoking one store never touches the other.
+#
+# WHAT GOES: only this script's sets - the guests on this host. Never pgBackRest's repositories:
+# they hold the application's real records with no encryption of their own (backlog 3.50).
+#
+# NOT MONITORED. It writes its state file and `status` shows it, but nothing alerts on a third
+# copy that stopped - lab-grade, and said so in lab-network.md 9.3.
+cmd_third_copy() {
+  local setup=0 dry=0 all=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --setup) setup=1; shift ;;
+      -n|--dry-run) dry=1; shift ;;
+      --all) all=1; shift ;;
+      *) die "third-copy: unknown argument $1" ;;
+    esac
+  done
+  need_root
+  if [ -z "$THIRD_ADDR" ]; then
+    say "third copy not configured (BACKUP_THIRD_ADDR is empty) - nothing to do"
+    return 0
+  fi
+
+  if [ "$setup" -eq 1 ]; then
+    copy_key "$THIRD_KEY" "vm-backup third copy from $(hostname -s)"
+    # The address this host connects FROM - asked of the kernel, as second-copy does. For the
+    # lab vault that is the storage NIC's address (3.16), and that is correct.
+    local myaddr
+    myaddr="$(ip -4 route get "$THIRD_ADDR" 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1)"
+    [ -n "$myaddr" ] || die "cannot tell which address $(hostname -s) uses to reach $THIRD_ADDR - check 'ip -4 route get $THIRD_ADDR'"
+    say "this host reaches $THIRD_ADDR from $myaddr"
+    printf '\n  ON THE THIRD-COPY STORE (%s), run this ONCE - it authorises a WRITE-ONLY rsync into one directory:\n\n' "$THIRD_ADDR"
+    printf '    ls -l /usr/bin/rsync /usr/bin/rrsync\n'
+    printf '    sudo install -d -m 0750 -o root -g root %s\n' "$THIRD_DIR"
+    printf '    sudo install -d -m 0700 /root/.ssh\n'
+    printf '    echo %s | sudo tee -a /root/.ssh/authorized_keys >/dev/null\n' \
+      "'from=\"$myaddr\",restrict,command=\"/usr/bin/rrsync -wo $THIRD_DIR\" $(cut -d" " -f1-2 "$THIRD_KEY.pub")'"
+    printf '    sudo chmod 600 /root/.ssh/authorized_keys\n\n'
+    say "then:  sudo $0 third-copy -n"
+    return 0
+  fi
+
+  push_sets "third copy" "$THIRD_KEY" "$THIRD_ADDR" "$THIRD_ADDR" "$THIRD_DIR" "$THIRD_SKIP" "$THIRD_STATE" \
+            "${BACKUP_THIRD_DELETE:-1}" "$dry" "$all"
 }
 
 # ---------------------------------------------------------------- restore TEST
@@ -1963,5 +2064,6 @@ case "${1:-status}" in
   restore-plan) shift || true; cmd_restore_plan "${1:-}" ;;
   restore-test) shift || true; cmd_restore_test "$@" ;;
   second-copy)  shift || true; cmd_second_copy "$@" ;;
-  *) printf 'usage: %s {status|facts|full [vm]|incr [vm]|progress|verify [--all]|prune [--dry-run]|keyfile|reattach|schedule [HH:MM]|unschedule|restore-plan <vm>|restore-test <vm> [--set S] [--keep] [-n]|second-copy [--setup] [-n] [--all]}\n' "$0" >&2; exit 2 ;;
+  third-copy)   shift || true; cmd_third_copy "$@" ;;
+  *) printf 'usage: %s {status|facts|full [vm]|incr [vm]|progress|verify [--all]|prune [--dry-run]|keyfile|reattach|schedule [HH:MM]|unschedule|restore-plan <vm>|restore-test <vm> [--set S] [--keep] [-n]|second-copy [--setup] [-n] [--all]|third-copy [--setup] [-n] [--all]}\n' "$0" >&2; exit 2 ;;
 esac

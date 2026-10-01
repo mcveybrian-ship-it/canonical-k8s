@@ -388,6 +388,13 @@ AL_FS_RESERVED_MOUNTS="${AL_FS_RESERVED_MOUNTS:-$( [ -r "$HERE/vm-specs.env" ] &
 AL_DATA_POOL_OTHER_BYTES="${AL_DATA_POOL_OTHER_BYTES:-5000000000}"  # 5 GB of non-disk data on it (measured baseline: 0)
 AL_DB_BACKUP_STALE="${AL_DB_BACKUP_STALE:-93600}"        # 26 h: a store missed its nightly database backup (B-06a slice 5)
 AL_DB_FULL_STALE="${AL_DB_FULL_STALE:-691200}"           # 8 d: the weekly full is overdue
+# Postgres 16 STIG, slice 6.4 (2026-10-01). V-261919: support staff warned when the volume holding
+# PostgreSQL's logs reaches 75 % used - the generic FilesystemFillingWarning fires at 80 %.
+AL_PG_VOLUME_MOUNT="${AL_PG_VOLUME_MOUNT:-/var/lib/postgresql}"
+AL_PG_VOLUME_WARN_PCT="${AL_PG_VOLUME_WARN_PCT:-75}"
+# V-261920: a real-time alert when audit records stop reaching the log - two facts runs (15 min each)
+# whose audited heartbeat read was not found in PostgreSQL's log.
+AL_PG_AUDIT_SILENT_FOR="${AL_PG_AUDIT_SILENT_FOR:-30m}"
 AL_FS_CRIT_PCT="${AL_FS_CRIT_PCT:-10}"    # free space critical
 AL_FS_WARN_FOR="${AL_FS_WARN_FOR:-15m}"
 AL_FS_CRIT_FOR="${AL_FS_CRIT_FOR:-5m}"
@@ -1585,6 +1592,33 @@ groups:
   # primary accept writes ASYNCHRONOUSLY and say nothing - this is what says something.
   - name: enclave-database
     rules:
+      # AUDIT, PROVEN END TO END (Postgres 16 STIG V-261920, slice 6.4, 2026-10-01). The facts job runs one
+      # audited read with a unique marker and looks for THAT read in PostgreSQL's log. Missing while the
+      # database is up = pgaudit, the logging collector or the log file is broken - audit records are lost.
+      - alert: DatabaseAuditNotWriting
+        expr: enclave_pg_audit_heartbeat_ok == 0 and on (machine) pg_up == 1
+        for: ${AL_PG_AUDIT_SILENT_FOR}
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ \$labels.machine }}: PostgreSQL is running and its audit records are NOT reaching the log"
+          description: "The facts job's audited heartbeat read was not found in PostgreSQL's log on two runs in a row. Every audited action on this node is now unrecorded (Postgres 16 STIG V-261920)."
+          action: >-
+            On {{ \$labels.machine }}: sudo ls -l /var/lib/postgresql/16/enclave-pg/log; then as postgres
+            'SHOW shared_preload_libraries', 'SHOW pgaudit.log', 'SHOW logging_collector'; 'patronictl list'.
+      - alert: DatabaseVolumeAt75
+        expr: >-
+          (1 - node_filesystem_avail_bytes{mountpoint="${AL_PG_VOLUME_MOUNT}"} / node_filesystem_size_bytes{mountpoint="${AL_PG_VOLUME_MOUNT}"}) * 100
+          >= ${AL_PG_VOLUME_WARN_PCT}
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ \$labels.machine }}: the database volume is {{ \$value | humanize }} % used"
+          description: "The volume holding PostgreSQL's data and its logs has reached ${AL_PG_VOLUME_WARN_PCT} % - the Postgres 16 STIG's warning point (V-261919). The generic disk warning fires only at 80 %."
+          action: >-
+            'df -h ${AL_PG_VOLUME_MOUNT}' and 'sudo du -sh /var/lib/postgresql/16/enclave-pg/{base,pg_wal,log}' on
+            {{ \$labels.machine }}. WAL piling up means archiving is failing (DatabaseArchivingFailing).
       - alert: PostgresSyncStandbyLost
         expr: >-
           (sum by (scope) (patroni_primary) >= 1)
@@ -2385,6 +2419,35 @@ if re.search(r"(?m)^repo[0-9]+-path=", conf):
             emit("enclave_pgbackrest_last_backup_seconds", ts, {"stanza": st, "repo": repo, "type": typ},
                  help="unix time the last pgBackRest backup of this type finished in this repository")
         SRC["pgbackrest"] = 1
+
+# ------------------------------------------------------------------ the database AUDIT HEARTBEAT
+# Postgres 16 STIG V-261920, slice 6.4 (2026-10-01). On a node running PostgreSQL: one audited read
+# carrying a unique marker, then look for THAT read in PostgreSQL's own log. Found = auditing works
+# end to end - pgaudit loaded, the logging collector writing, the file where it belongs. A correct
+# setting proves none of that; a record in the file does. Nothing but the marker is ever read back.
+PGDATA_HB = os.environ.get("PG_DATA") or "/var/lib/postgresql/16/enclave-pg"
+if os.path.exists(os.path.join(PGDATA_HB, "postmaster.pid")):
+    mark = "enclave-audit-heartbeat-%d" % int(time.time())
+    rc, o, e = run(["runuser", "-u", "postgres", "--", "psql", "-X", "-A", "-t", "-q", "-d", "postgres",
+                    "-c", "SELECT count(*) FROM pg_catalog.pg_class WHERE relname = '%s'" % mark])
+    hb = 0
+    if rc == 0:
+        time.sleep(3)   # the logging collector writes asynchronously
+        logs = sorted(glob.glob(os.path.join(PGDATA_HB, "log", "*.log")), key=lambda f: os.path.getmtime(f))
+        for f in logs[-2:]:
+            try:
+                with open(f, errors="replace") as fh:
+                    fh.seek(max(0, os.path.getsize(f) - 4000000))
+                    if mark in fh.read():
+                        hb = 1
+            except OSError:
+                pass
+    emit("enclave_pg_audit_heartbeat_ok", hb,
+         help="1 when the facts job's audited read was FOUND in PostgreSQL's log this run (Postgres 16 STIG V-261920)")
+    if hb:
+        emit("enclave_pg_audit_heartbeat_seconds", int(time.time()),
+             help="unix time an audited read was last found in PostgreSQL's log")
+    SRC["pg_audit"] = 1 if rc == 0 else 0
 
 # ------------------------------------------------------------------ data disks RESERVED
 # Backlog 3.42, found 2026-09-28. A database disk is created preallocated (falloc) so that a

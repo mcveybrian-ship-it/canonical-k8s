@@ -318,6 +318,12 @@ PG_CLIENT_MIN_MESSAGES="${PG_CLIENT_MIN_MESSAGES:-error}"       # V-261908/909; 
 # is superuser_reserved_connections inside max_connections. Set so the catalog carries a documented
 # value instead of -1, and the baseline says exactly that rather than pretend it limits anything.
 PG_SUPERUSER_CONN_LIMIT="${PG_SUPERUSER_CONN_LIMIT:-10}"
+# V-261874 (decided 2026-10-01): the local log files roll over a WEEK - one per weekday, each
+# overwritten seven days later (oldest first). Before this nothing removed them, and a busy audited
+# database would in time fill its own volume and stop. The long-term record is the syslog copy,
+# collected centrally (backlog 3.37). Size-driven rotation is off: it would append within the day.
+PG_LOG_FILENAME="${PG_LOG_FILENAME:-postgresql-%a.log}"
+PG_LOG_ROTATION_AGE="${PG_LOG_ROTATION_AGE:-1d}"
 # ---- slice 5: pgBackRest (decided 2026-09-28: TLS both ways; two live stores; LUKS underneath;
 # 2 weekly fulls + daily differentials). The stores and their repository paths, in repo order,
 # come from vm-specs.env - the planner reads the same line to reserve host-3's space.
@@ -424,6 +430,10 @@ bootstrap:
         tcp_keepalives_count: $PG_TCP_KEEPALIVES_COUNT
         statement_timeout: $PG_STATEMENT_TIMEOUT
         client_min_messages: $PG_CLIENT_MIN_MESSAGES
+        log_filename: "$PG_LOG_FILENAME"
+        log_truncate_on_rotation: "on"
+        log_rotation_age: $PG_LOG_ROTATION_AGE
+        log_rotation_size: 0
   initdb:
     - encoding: UTF8
     - data-checksums
@@ -1612,7 +1622,7 @@ cmd_app_restore() {
 # live: the DCS for the parameters (a reload - no restart, no outage) and the catalog for the role
 # limits. Safe to re-run. Prints every value before and after.
 stig_settings_state() {
-  pg_sql "SELECT string_agg(name || '=' || coalesce(nullif(reset_val, ''), setting) || coalesce(' ' || nullif(unit, ''), '') || CASE WHEN pending_restart THEN ' (PENDING RESTART)' ELSE '' END, '  ' ORDER BY name) FROM pg_settings WHERE name IN ('tcp_keepalives_idle','tcp_keepalives_interval','tcp_keepalives_count','statement_timeout','client_min_messages')" | sed 's/^/     /'
+  pg_sql "SELECT string_agg(name || '=' || coalesce(nullif(reset_val, ''), setting) || coalesce(' ' || nullif(unit, ''), '') || CASE WHEN pending_restart THEN ' (PENDING RESTART)' ELSE '' END, '  ' ORDER BY name) FROM pg_settings WHERE name IN ('tcp_keepalives_idle','tcp_keepalives_interval','tcp_keepalives_count','statement_timeout','client_min_messages','log_filename','log_truncate_on_rotation','log_rotation_age','log_rotation_size')" | sed 's/^/     /'
   pg_sql "SELECT 'unlimited (-1): ' || count(*) FILTER (WHERE rolconnlimit = -1) || ' of ' || count(*) || ' roles (pg_* excluded); postgres = ' || max(rolconnlimit) FILTER (WHERE rolname = 'postgres') FROM pg_roles WHERE rolname !~ '^pg_'" | sed 's/^/     /'
 }
 cmd_stig_settings() {
@@ -1629,13 +1639,17 @@ cmd_stig_settings() {
     -s "postgresql.parameters.tcp_keepalives_interval=$PG_TCP_KEEPALIVES_INTERVAL" \
     -s "postgresql.parameters.tcp_keepalives_count=$PG_TCP_KEEPALIVES_COUNT" \
     -s "postgresql.parameters.statement_timeout=$PG_STATEMENT_TIMEOUT" \
-    -s "postgresql.parameters.client_min_messages=$PG_CLIENT_MIN_MESSAGES" 2>&1 | sed 's/^/     /'
+    -s "postgresql.parameters.client_min_messages=$PG_CLIENT_MIN_MESSAGES" \
+    -s "postgresql.parameters.log_filename=$PG_LOG_FILENAME" \
+    -s "postgresql.parameters.log_truncate_on_rotation=on" \
+    -s "postgresql.parameters.log_rotation_age=$PG_LOG_ROTATION_AGE" \
+    -s "postgresql.parameters.log_rotation_size=0" 2>&1 | sed 's/^/     /'
   ms="$(pg_sql "SELECT (extract(epoch FROM '$PG_STATEMENT_TIMEOUT'::interval) * 1000)::bigint")"
   for _ in $(seq 1 30); do
-    [ "$(pg_sql "SELECT count(*) FROM pg_settings WHERE (name = 'statement_timeout' AND setting = '$ms') OR (name = 'client_min_messages' AND setting = '$PG_CLIENT_MIN_MESSAGES') OR (name = 'tcp_keepalives_idle' AND reset_val = '$PG_TCP_KEEPALIVES_IDLE')")" = 3 ] && break
+    [ "$(pg_sql "SELECT count(*) FROM pg_settings WHERE (name = 'statement_timeout' AND setting = '$ms') OR (name = 'client_min_messages' AND setting = '$PG_CLIENT_MIN_MESSAGES') OR (name = 'tcp_keepalives_idle' AND reset_val = '$PG_TCP_KEEPALIVES_IDLE') OR (name = 'log_filename' AND setting = '$PG_LOG_FILENAME') OR (name = 'log_truncate_on_rotation' AND setting = 'on')")" = 5 ] && break
     sleep 2
   done
-  [ "$(pg_sql "SELECT count(*) FROM pg_settings WHERE (name = 'statement_timeout' AND setting = '$ms') OR (name = 'client_min_messages' AND setting = '$PG_CLIENT_MIN_MESSAGES') OR (name = 'tcp_keepalives_idle' AND reset_val = '$PG_TCP_KEEPALIVES_IDLE')")" = 3 ] \
+  [ "$(pg_sql "SELECT count(*) FROM pg_settings WHERE (name = 'statement_timeout' AND setting = '$ms') OR (name = 'client_min_messages' AND setting = '$PG_CLIENT_MIN_MESSAGES') OR (name = 'tcp_keepalives_idle' AND reset_val = '$PG_TCP_KEEPALIVES_IDLE') OR (name = 'log_filename' AND setting = '$PG_LOG_FILENAME') OR (name = 'log_truncate_on_rotation' AND setting = 'on')")" = 5 ] \
     || die "the new values are not live after 60 s - 'patronictl list' and 'patronictl show-config' say why"
   ok "parameters live on the leader (a reload - no restart); the standbys reload them from the DCS too"
   # ---- 2. the role limits. Names never printed - counts only ----

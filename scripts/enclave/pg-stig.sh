@@ -54,7 +54,7 @@ PG_STIG_MASK_APP="${PG_STIG_MASK_APP:-1}"
 PG_STIG_MAP="${PG_STIG_MAP:-/var/lib/enclave-pg-stig/names.map}"
 PG_STIG_PLATFORM_ROLES="${PG_STIG_PLATFORM_ROLES:-postgres replicator rewinder pgmonitor}"
 PG_DATA="${PG_DATA:-/var/lib/postgresql/16/enclave-pg}"
-TOOL_VERSION="6.3"
+TOOL_VERSION="6.4"
 PG_STIG_BASELINE="${PG_STIG_BASELINE:-$SELF/pg-baseline.env}"   # the org-defined values (6a.10)
 
 say()  { printf '  %s\n' "$*"; }
@@ -79,7 +79,7 @@ SELECT json_build_object(
                  'tcp_keepalives_interval','tcp_keepalives_count','max_connections','port',
                  'listen_addresses','data_directory','hba_file','ident_file','config_file',
                  'log_min_messages','log_min_error_statement','log_error_verbosity','log_statement',
-                 'superuser_reserved_connections')),
+                 'superuser_reserved_connections','log_truncate_on_rotation','log_rotation_age','log_rotation_size')),
   'role_settings', (SELECT json_agg(json_build_object('role', coalesce(r.rolname, '*'), 'db', coalesce(d.datname, '*'),
                       'config', s.setconfig))
                     FROM pg_db_role_setting s LEFT JOIN pg_roles r ON r.oid = s.setrole
@@ -94,6 +94,11 @@ SELECT json_build_object(
                          WHEN rolpassword LIKE 'SCRAM-SHA-256$%' THEN 'scram' ELSE 'other' END) ORDER BY oid)
             FROM pg_authid),
   'databases', (SELECT json_agg(datname ORDER BY oid) FROM pg_database),
+  'ident', (SELECT json_agg(json_build_object('map', map_name, 'sys', sys_name, 'pg', pg_username, 'error', error)) FROM pg_ident_file_mappings),
+  'catalog_owner', (SELECT json_object_agg(nspname, pg_get_userbyid(nspowner)) FROM pg_namespace WHERE nspname IN ('pg_catalog', 'information_schema')),
+  'catalog_public_write', (SELECT count(*) FROM pg_class c JOIN pg_namespace s ON s.oid = c.relnamespace
+      WHERE s.nspname IN ('pg_catalog', 'information_schema') AND c.relkind IN ('r','v','m','p')
+        AND (has_table_privilege('public', c.oid, 'INSERT') OR has_table_privilege('public', c.oid, 'UPDATE') OR has_table_privilege('public', c.oid, 'DELETE'))),
   'db_acl', (SELECT json_agg(json_build_object('db', datname, 'owner', pg_get_userbyid(datdba),
                'public_create', has_database_privilege('public', datname, 'CREATE')) ORDER BY oid)
              FROM pg_database WHERE datallowconn),
@@ -225,7 +230,9 @@ SELECT json_build_object(
                               AND (has_table_privilege('public', c.oid, 'INSERT') OR has_table_privilege('public', c.oid, 'UPDATE')
                                    OR has_table_privilege('public', c.oid, 'DELETE') OR has_table_privilege('public', c.oid, 'TRUNCATE'))),
   'tables', (SELECT count(*) FROM pg_class c JOIN pg_namespace s ON s.oid = c.relnamespace
-               WHERE c.relkind IN ('r','p') AND s.nspname NOT IN ('pg_catalog', 'information_schema'))
+               WHERE c.relkind IN ('r','p') AND s.nspname NOT IN ('pg_catalog', 'information_schema')),
+  'languages', (SELECT json_agg(lanname ORDER BY lanname) FROM pg_language),
+  'triggers', (SELECT count(*) FROM pg_trigger WHERE NOT tgisinternal)
 )
 SQL
 )
@@ -267,9 +274,25 @@ cmd_scan() {
     printf 'openssl_version=%s\n' "$(openssl version 2>&1 | head -1)"
     printf 'mac=%s\n' "$(ip -o link show 2>/dev/null | grep -o 'link/ether [0-9a-f:]*' | head -1 | cut -d' ' -f2)"
     printf 'fqdn=%s\n' "$(hostname -f 2>/dev/null || hostname -s)"
+    printf 'sudo_members=%s\n' "$(getent group sudo | cut -d: -f4)"
+    printf 'admin_members=%s\n' "$(getent group admin 2>/dev/null | cut -d: -f4)"
+    printf 'nopasswd=%s\n' "$(grep -rhsE '^[^#]*NOPASSWD' /etc/sudoers /etc/sudoers.d/ | wc -l)"
+    printf 'data_source=%s\n' "$(findmnt -no SOURCE /var/lib/postgresql 2>/dev/null || echo unknown)"
+    printf 'pgcrypto_installed=%s\n' "$(ls /usr/share/postgresql/16/extension/pgcrypto.control >/dev/null 2>&1 && echo available || echo absent)"
   } > "$tmp/host.env"
   openssl list -providers > "$tmp/providers.txt" 2>&1 || true
   [ "$probe" = 1 ] && run_probe "$tmp"
+  # V-261920's evidence: one audited read with a marker, then that read FOUND in PostgreSQL's log -
+  # the same end-to-end proof the facts job runs every 15 min for the DatabaseAuditNotWriting alert.
+  local hbm hb=0 hlog lf
+  hbm="pg-stig-heartbeat-$(od -An -N4 -tx4 /dev/urandom | tr -d ' ')"
+  runuser -u postgres -- psql -X -A -t -q -d postgres -c "SELECT count(*) FROM pg_catalog.pg_class WHERE relname = '$hbm'" >/dev/null 2>&1 || true
+  sleep 3
+  hlog="$(runuser -u postgres -- psql -X -A -t -q -d postgres -c "SELECT current_setting('data_directory') || '/' || current_setting('log_directory')")"
+  if [ -d "$hlog" ]; then
+    while IFS= read -r lf; do grep -qsF "$hbm" "$lf" && { hb=1; break; }; done < <(ls -t "$hlog"/*.log 2>/dev/null | head -2)
+  fi
+  printf 'audit_heartbeat=%s\n' "$hb" >> "$tmp/host.env"
   # ---- per database (numbered files - a database's name never becomes a path) ----
   install -d -m 0700 "$tmp/dbs"
   local i=0 db
@@ -801,10 +824,84 @@ for v in ("V-261890", "V-261897"):
 res("V-261929", "open", "\n".join(show(n) for n in ("ssl_ca_file", "ssl_cert_file")) + "\nissuer: the enclave's own root CA (scripts/enclave/ca.sh) - not DoD PKI\n\nFINDING: not DoD PKI - left open by decision of the acting AO (2026-10-01), with the written justification in the comments",
     B.get("PGB_DOD_PKI_JUSTIFICATION", "No justification in the baseline."))
 
+
+# ---- E. the written answers (slice 6.4, decided 2026-10-01) - evidence gathered where it exists ------
+def arule(vid, status, ev, note):
+    res(vid, status, ev, note)
+mem = [m for m in (H.get("sudo_members", "") + "," + H.get("admin_members", "")).split(",") if m]
+nopw = int(H.get("nopasswd", "0") or 0)
+arule("V-261882", "not_a_finding" if nopw == 0 and mem else "open",
+      "members of sudo/admin: %s\nsudoers rules without a password (NOPASSWD): %d" % (", ".join(sorted(set(mem))) or "none", nopw)
+      + ("" if nopw == 0 and mem else "\n\nFINDING: a NOPASSWD rule, or no administrator group"),
+      "Installing or changing PostgreSQL needs root. Only the operator account(s) above can sudo, each with its own password (hardened: no NOPASSWD), and every sudo is audited by auditd.")
+idm = F.get("ident") or []
+cert_lines = [h for h in hba if (h["method"] or "") == "cert"]
+mapped = [h for h in cert_lines if any(str(o).startswith("map=") for o in (h["opts"] or []))]
+arule("V-261895", "not_a_finding" if idm and cert_lines and len(mapped) == len(cert_lines) else "open",
+      "certificate lines in pg_hba: %d, each with a user map: %d\npg_ident mappings:\n%s" % (len(cert_lines), len(mapped),
+      "\n".join("%s: %s -> %s%s" % (m["map"], m["sys"], MR(m["pg"]), (" [ERROR %s]" % m["error"]) if m.get("error") else "") for m in idm) or "none"),
+      "Each node's own certificate (its CN) is mapped to the replication roles; no other identity can use them.")
+langs = sorted({l for d in DBS for l in (d.get("languages") or [])})
+bad_l = [l for l in langs if l not in ("internal", "c", "sql", "plpgsql")]
+arule("V-261915", "not_a_finding" if langs and not bad_l else ("open" if bad_l else "not_reviewed"),
+      "procedural languages installed, all databases: %s" % (", ".join(langs) or "unknown") + ("\n\nFINDING: unapproved languages: %s" % ", ".join(bad_l) if bad_l else ""),
+      "Privileged functionality is the superuser's (postgres only) and the role attributes in the baseline. No untrusted procedural language (plpython, plperlu, plr) is installed.")
+co = F.get("catalog_owner") or {}
+cpw = F.get("catalog_public_write")
+arule("V-261902", "not_a_finding" if co and all(v == "postgres" for v in co.values()) and cpw == 0 else "open",
+      "owners: %s\ncatalog relations PUBLIC may write: %s" % (", ".join("%s=%s" % kv for kv in co.items()), cpw),
+      "Security functions live in pg_catalog and information_schema, owned by postgres; the application's objects live in its own schemas.")
+for v in ("V-261901", "V-261930", "V-261931"):
+    arule(v, "not_a_finding",
+          "the data volume: /var/lib/postgresql on %s (a virtual disk)\npgcrypto: %s" % (H.get("data_source", "?"), H.get("pgcrypto_installed", "?")),
+          "Data at rest - including PII - is encrypted underneath the database: every guest disk is a file on a LUKS2 volume (aes-xts-plain64, 512-bit) on its host, opened by the host's FIPS kernel (06a §1.3, verified on host-1..3). pgcrypto is deliberately NOT used: it is outside any FIPS 140-3 validation boundary, and its MD5/DES modes fail under FIPS.")
+arule("V-261918", "not_a_finding", "the data volume is in use since the build (2026-09-27); its alerts: DatabaseVolumeAt75, FilesystemFillingWarning/Critical",
+      "PostgreSQL has never run out of audit log space on this cluster.")
+arule("V-261927", "not_a_finding", "", "An administrator forces re-authentication with pg_terminate_backend - one user: SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = '<role>'; everyone: ... WHERE pid <> pg_backend_pid(). The procedure is in 06a §14.")
+arule("V-261903", "not_a_finding", "", "Production data reaches this cluster only through `06a app-restore` (06a §10a): it stays inside the gap, nothing of it is displayed, the load log is root-only, and the dump and logs are shredded when the work is done. Copies never leave protected locations.")
+pst = B.get("PGB_SESSION_TERMINATION")
+arule("V-261910", "not_a_finding" if pst else "not_reviewed", "\n".join(show(n) for n in ("statement_timeout", "tcp_keepalives_idle")),
+      ("The organization's definition (baseline PGB_SESSION_TERMINATION): " + pst) if pst else "No definition in the baseline.")
+for v in ("V-261911", "V-261912", "V-261913"):
+    arule(v, "not_a_finding" if B.get("PGB_SECURITY_LABELS") == "not required" else "not_reviewed", "",
+          "Security labelling is not required (baseline PGB_SECURITY_LABELS): one classification level (CUI), and no labelling requirement.")
+arule("V-261873", "not_applicable" if B.get("PGB_AUDIT_FAILURE") == "availability" else "not_reviewed", "",
+      "Availability takes precedence over a complete audit trail - a dispatch system must not stop because its audit store is full (baseline PGB_AUDIT_FAILURE; the STIG's own Not Applicable condition, an AO determination). Audit space is watched instead: DatabaseVolumeAt75, and the logs roll over a week.")
+lf = val("log_filename") or ""; ltr = on("log_truncate_on_rotation"); lra = val("log_rotation_age") or "0"
+cyclic = bool(re.search(r"%[aAdjuwHM]", lf)) and not re.search(r"%[YyGs]", lf)
+arule("V-261874", "not_a_finding" if cyclic and ltr and lra not in ("0", "") else "open",
+      "\n".join(show(n) for n in ("log_filename", "log_truncate_on_rotation", "log_rotation_age", "log_rotation_size"))
+      + ("" if cyclic and ltr and lra not in ("0", "") else "\n\nFINDING: the log files never roll over - oldest records are not overwritten, they pile up"),
+      "The local log files roll over a week, oldest overwritten first (06a stig-settings, 2026-10-01). The long-term record is the syslog copy, collected centrally (backlog 3.37).")
+arule("V-261919", "not_a_finding", "the alert DatabaseVolumeAt75 (scripts/enclave/monitoring.sh) on svc-obs-01: the database volume at 75 % used, for 15 min",
+      "Support staff are warned at 75 %, the STIG's point; the generic disk warning fires at 80 %. Promtool-tested both ways 2026-10-01.")
+hbv = H.get("audit_heartbeat", "0")
+arule("V-261920", "not_a_finding" if hbv == "1" else "open",
+      "this scan's audited heartbeat read was %s in PostgreSQL's log" % ("FOUND" if hbv == "1" else "NOT found")
+      + ("" if hbv == "1" else "\n\nFINDING: audit records are not reaching the log"),
+      "The facts job repeats this heartbeat every 15 minutes on every node; the alert DatabaseAuditNotWriting fires (critical) when it is missing twice while the database is up. Promtool-tested both ways 2026-10-01.")
+res("V-261858", "open", "pg_hba methods: %s" % ", ".join(sorted({h["method"] for h in hba if h["method"]})) + "\n\nFINDING: not every login is authenticated by an organization-level mechanism - open with the written justification in the comments",
+    B.get("PGB_ORG_AUTH_JUSTIFICATION", "No justification in the baseline."))
+hs = [h for h in hba if h["type"] == "hostssl"]
+res("V-261893", "open", show("ssl_crl_file") + "\nhostssl lines: %s" % "; ".join("line %s %s%s" % (h["line"], h["method"], (" " + " ".join(h["opts"])) if h["opts"] else "") for h in hs)
+    + "\n\nFINDING: no CRL configured - open with the written justification in the comments", B.get("PGB_CRL_JUSTIFICATION", "No justification in the baseline."))
+for v in ("V-261917", "V-261967"):
+    res(v, "open", show("log_destination") + "\n" + show("syslog_facility") + "\n\nFINDING: no central log store collects PostgreSQL's audit records yet (backlog 3.37)",
+        B.get("PGB_CENTRAL_AUDIT", ""))
+res("V-261859", "open", "\n\nFINDING: the application's permission model (who may do what, per role) is not documented yet",
+    "The application's owners document its access model; with parity, it is the Azure deployment's. Until then the access control itself cannot be judged (also V-261914 and V-261885).")
+fns = sum(r["n"] for d in DBS if d["db"] not in SYS for r in (d.get("owners") or []) if r["kind"] == "function" and (is_app_role(r["owner"]) or r["owner"] in bl("PGB_PARITY_ROLES")))
+trg = sum(d.get("triggers") or 0 for d in DBS if d["db"] not in SYS)
+for v in ("V-261905", "V-261906", "V-261907"):
+    res(v, "not_reviewed", "the application's database code: %d functions owned by its roles, %d triggers" % (fns, trg),
+        "A review of the application's own database code - input validation, dynamic SQL - by the application's owners.")
+for v, why in (("V-261914", "The object owners pass (above); the access control itself waits for the application's documented permission model (V-261859)."),
+               ("V-261885", "PGDATA and PUBLIC pass (above); each object's privileges wait for the application's documented permission model (V-261859).")):
+    if R.get(v, {}).get("status") == "not_reviewed":
+        R[v]["comments"] = why
+
 # ---- everything else: said, not guessed ------------------------------------------------------
-LATER = {
- "6.4 (written answers and evidence)": "V-261859 V-261858 V-261873 V-261874 V-261882 V-261893 V-261895 V-261901 V-261902 V-261903 V-261905 V-261906 V-261907 V-261910 V-261911 V-261912 V-261913 V-261915 V-261917 V-261918 V-261919 V-261920 V-261927 V-261930 V-261931 V-261967",
-}
+LATER = {}
 for piece, vids in LATER.items():
     for v in vids.split():
         if v not in R:

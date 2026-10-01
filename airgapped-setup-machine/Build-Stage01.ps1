@@ -132,10 +132,11 @@ if ($left) {
 }
 
 # --- escape for ExpandString, and PROVE it, before anything is built ----------------------------
-# Backticks first, then dollars, then double quotes: each step must not touch what an earlier one
-# added. Double quotes were never escaped while the only template was stage-01's, which has none;
-# the lab vault's embedded setup script is full of them (2026-10-01).
-$escaped = $raw.Replace('`', '``').Replace('$', '`$').Replace('"', '`"')
+# Backticks first, then dollars: the second step must not touch what the first added. Double quotes
+# are NOT escaped: ExpandString doubles every " itself before it scans (Parser.ScanString, the same
+# in Windows PowerShell 5.1), so a plain " comes back unchanged and an escaped one ends the string
+# early. Escaping them was tried on 2026-10-01 and the round trip below refused it.
+$escaped = $raw.Replace('`', '``').Replace('$', '`$')
 # The round trip: run the text through the same ExpandString the provisioning script uses, and require
 # the original back, byte for byte (-cne: PowerShell's -ne ignores case). A character the escaping
 # misses fails HERE, in the dry run too - not inside a half-built VM.

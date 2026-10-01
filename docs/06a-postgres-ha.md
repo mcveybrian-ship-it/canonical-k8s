@@ -1143,7 +1143,7 @@ never uses.
 Results 2026-10-01, before the parity roles were added to the baseline. **The platform has no Opens.**
 The five, identical on all three nodes: V-261884/914 (an Azure role owns a schema — parity, now in the
 baseline), V-261923/924 (PUBLIC may create in the application database's `public` schema, PostgreSQL
-14's default — backlog 3.52, fixed on both sides), V-261929 (not DoD PKI — open by the acting AO's
+14's default — backlog 3.52, now removed by every load), V-261929 (not DoD PKI — open by the acting AO's
 decision, with its justification).
 
 **The checker's own defects, caught on the way** — each would have reported a confident wrong answer:
@@ -1174,10 +1174,40 @@ The last 28 rules ask for judgments, not queries. Every site decision and every 
 **Result, 2026-10-01 — all 111 rules judged:** leader **96 pass · 8 Open · 2 N/A · 5 not reviewed**;
 standbys 77 · 8 · 2 · 24 (the probe's rules are the leader's). Every Open has an owner.
 
-### 10b.7 Still to come
+### 10b.7 Piece 6.5 — the two scans
 
-**6.5** the two scans — the empty cluster, then with the application — then
-3.52's fix on both sides.
+The plan of 2026-09-28: scan the platform alone, then with the application, so the findings each brings
+are told apart. `app-restore drop` took the application's database away, every node was scanned, the
+checklists were built; then it was reloaded (49 s) and scanned again; then 3.52 was fixed.
+
+| scan (pg-03, leader, with the probe) | pass | Open | N/A | not reviewed |
+|---|---|---|---|---|
+| **the empty cluster** — the platform alone | 104 | **5** | 2 | 0 |
+| **with the application** | 96 | **8** | 2 | 5 |
+| **after 3.52's fix** | 98 | **6** | 2 | 5 |
+
+The standbys show the same split (the probe's rules are the leader's). **The platform stands on its own
+with five Opens, each justified or tracked** — the three decisions (V-261858, V-261893, V-261929) and the
+central log store (V-261917/967, backlog 3.37). **The application brings three Opens and five reviews** —
+PUBLIC's right to create in its `public` schema (PostgreSQL 14's default, carried in by the dump; removed
+by `app-restore revoke-public`, 1 → 0, and now by every `app-restore load`), its undocumented permission
+model (V-261859), and a review of its own database code and access model (V-261905–907, 914, 885). The
+Opens are POA&M ENG-69 to ENG-73. Checklists for each scan are on stage-01 in
+`/srv/stig-evidence/PG-0N/Checklist/`.
+
+**The dump was shredded on 2026-10-01.** The two load logs are kept: both loads had 0 errors, so they
+hold no rows, and they are the marker `drop` and `revoke-public` check before touching a database.
+
+**The tailoring statement (backlog 6a.11).** The STIG is DISA's for **Crunchy Data's** PostgreSQL 16
+distribution. pg-01..03 run **Ubuntu's `postgresql-16`** — 16.15-0ubuntu0.24.04.1, from Ubuntu 24.04's
+main archive (noble-updates and noble-security), maintained by Ubuntu's developers from the Debian
+PostgreSQL packaging. The rules check the PostgreSQL engine's configuration, roles, logging and files —
+the same engine — so they **apply unchanged**, with two tailorings: (1) the STIG's RHEL/Crunchy paths and
+commands are mapped to Ubuntu's (`rpm` → `dpkg`; `/usr/pgsql-16` → `/usr/lib/postgresql/16` and
+`/usr/share/postgresql/16`; `fips-mode-setup` → `/proc/sys/crypto/fips_enabled`); (2) **"the vendor"**
+(V-283674, V-261936) is Canonical for this build, and "the latest version" is the newest `postgresql-16`
+in the enclave mirror, under the patching decision of 2026-09-23. It is assessed with `pg-stig.sh`, since
+Evaluate-STIG covers only 9.x.
 
 ---
 
@@ -1402,7 +1432,7 @@ sudo -u postgres psql -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity
 | | what | where |
 |---|---|---|
 | ⬜ | **A crash under a write load** — slice 4 proved promotion and rejoin with no writes running; zero loss under load needs a write generator | B-06a |
-| 🔄 | **Slice 6 — in progress, §10b:** the PostgreSQL 16 STIG scan (6.1 live: 33 pass, 0 Open on all three nodes), the org baseline, the Crunchy-vs-Ubuntu tailoring statement. The application's database is loaded (§10a); the empty-cluster scan needs it dropped and reloaded from the dump, which stays on the leader until then | B-06a, 6a.1, 6a.10, 6a.11 |
+| ✅ | **Slice 6 — PASSED 2026-10-01, §10b:** all 111 rules judged by `pg-stig.sh`; the platform alone has 5 Opens, each justified or tracked; with the application, 6 after 3.52's fix — POA&M ENG-69 to ENG-73. Owed by others: the application's permission model and a review of its database code (its owners) | B-06a, 6a.10, 6a.11 |
 | ⬜ | **A written restore procedure** — replacing the cluster from a store after a disaster (slice 5 proved the backups restore; recovering the live cluster from them is a different operation), and a **scheduled** restore drill rather than a manual one | B-06a |
 | ⬜ | **host-3's store sizing** — 100 GB reserved on its images pool. Measured 2026-09-29: 344 MB of the application's database is 75.5 MB per full; size it alongside 2.8 | B-06a, 2.8 |
 | ⬜ | **Certificate renewal** — the pg nodes' and the stores' certificates expire **2027-09-28**, in three places per pg node. Watched since 2026-09-29 (`CertificateExpiringSoon`, 30 days ahead, backlog 3.45); renewal itself is still manual | B-06a |

@@ -54,7 +54,8 @@ PG_STIG_MASK_APP="${PG_STIG_MASK_APP:-1}"
 PG_STIG_MAP="${PG_STIG_MAP:-/var/lib/enclave-pg-stig/names.map}"
 PG_STIG_PLATFORM_ROLES="${PG_STIG_PLATFORM_ROLES:-postgres replicator rewinder pgmonitor}"
 PG_DATA="${PG_DATA:-/var/lib/postgresql/16/enclave-pg}"
-TOOL_VERSION="6.2"
+TOOL_VERSION="6.3"
+PG_STIG_BASELINE="${PG_STIG_BASELINE:-$SELF/pg-baseline.env}"   # the org-defined values (6a.10)
 
 say()  { printf '  %s\n' "$*"; }
 ok()   { printf '  [ok] %s\n' "$*"; }
@@ -77,7 +78,8 @@ SELECT json_build_object(
                  'ssl_ciphers','client_min_messages','statement_timeout','tcp_keepalives_idle',
                  'tcp_keepalives_interval','tcp_keepalives_count','max_connections','port',
                  'listen_addresses','data_directory','hba_file','ident_file','config_file',
-                 'log_min_messages','log_min_error_statement','log_error_verbosity','log_statement')),
+                 'log_min_messages','log_min_error_statement','log_error_verbosity','log_statement',
+                 'superuser_reserved_connections')),
   'role_settings', (SELECT json_agg(json_build_object('role', coalesce(r.rolname, '*'), 'db', coalesce(d.datname, '*'),
                       'config', s.setconfig))
                     FROM pg_db_role_setting s LEFT JOIN pg_roles r ON r.oid = s.setrole
@@ -92,6 +94,9 @@ SELECT json_build_object(
                          WHEN rolpassword LIKE 'SCRAM-SHA-256$%' THEN 'scram' ELSE 'other' END) ORDER BY oid)
             FROM pg_authid),
   'databases', (SELECT json_agg(datname ORDER BY oid) FROM pg_database),
+  'db_acl', (SELECT json_agg(json_build_object('db', datname, 'owner', pg_get_userbyid(datdba),
+               'public_create', has_database_privilege('public', datname, 'CREATE')) ORDER BY oid)
+             FROM pg_database WHERE datallowconn),
   'version', version(),
   'server_version_num', current_setting('server_version_num'),
   'in_recovery', pg_is_in_recovery()
@@ -190,6 +195,41 @@ for l in lines:
   say "probe: $(wc -l < "$tmp/probe.log") log line(s) from its own sessions"
 }
 
+# Per database (each that allows connections): extensions, object owners by kind (counts), SECURITY
+# DEFINER functions (counts - extension members apart), and what PUBLIC may create or write. Counts
+# and owner names only; no object names, nothing from a table.
+DB_SQL=$(cat <<'SQL'
+SELECT json_build_object(
+  'db', current_database(),
+  'extensions', (SELECT json_agg(extname ORDER BY extname) FROM pg_extension),
+  'owners', (SELECT json_agg(json_build_object('owner', o, 'kind', k, 'n', n)) FROM (
+      SELECT pg_get_userbyid(c.relowner) AS o, CASE c.relkind WHEN 'r' THEN 'table' WHEN 'p' THEN 'table' WHEN 'v' THEN 'view'
+             WHEN 'm' THEN 'view' WHEN 'S' THEN 'sequence' WHEN 'f' THEN 'foreign table' END AS k, count(*) AS n
+        FROM pg_class c JOIN pg_namespace s ON s.oid = c.relnamespace
+       WHERE s.nspname NOT IN ('pg_catalog', 'information_schema') AND s.nspname !~ '^pg_toast' AND c.relkind IN ('r','p','v','m','S','f')
+       GROUP BY 1, 2
+      UNION ALL
+      SELECT pg_get_userbyid(nspowner), 'schema', count(*) FROM pg_namespace
+       WHERE nspname NOT IN ('pg_catalog', 'information_schema') AND nspname !~ '^pg_(toast|temp)' GROUP BY 1
+      UNION ALL
+      SELECT pg_get_userbyid(p.proowner), 'function', count(*) FROM pg_proc p JOIN pg_namespace s ON s.oid = p.pronamespace
+       WHERE s.nspname NOT IN ('pg_catalog', 'information_schema') GROUP BY 1) x),
+  'secdef', (SELECT json_build_object('total', count(*), 'extension', count(*) FILTER (WHERE EXISTS (
+                SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_proc'::regclass AND d.objid = p.oid AND d.deptype = 'e')))
+             FROM pg_proc p JOIN pg_namespace s ON s.oid = p.pronamespace
+             WHERE p.prosecdef AND s.nspname NOT IN ('pg_catalog', 'information_schema')),
+  'public_create_schemas', (SELECT count(*) FROM pg_namespace WHERE nspname !~ '^pg_' AND nspname <> 'information_schema'
+                              AND has_schema_privilege('public', oid, 'CREATE')),
+  'public_write_tables', (SELECT count(*) FROM pg_class c JOIN pg_namespace s ON s.oid = c.relnamespace
+                            WHERE c.relkind IN ('r','p') AND s.nspname NOT IN ('pg_catalog', 'information_schema')
+                              AND (has_table_privilege('public', c.oid, 'INSERT') OR has_table_privilege('public', c.oid, 'UPDATE')
+                                   OR has_table_privilege('public', c.oid, 'DELETE') OR has_table_privilege('public', c.oid, 'TRUNCATE'))),
+  'tables', (SELECT count(*) FROM pg_class c JOIN pg_namespace s ON s.oid = c.relnamespace
+               WHERE c.relkind IN ('r','p') AND s.nspname NOT IN ('pg_catalog', 'information_schema'))
+)
+SQL
+)
+
 whoami_pg() {
   [ -r "$ADDRS" ] || die "no address file at $ADDRS"
   local mine k a
@@ -230,10 +270,24 @@ cmd_scan() {
   } > "$tmp/host.env"
   openssl list -providers > "$tmp/providers.txt" 2>&1 || true
   [ "$probe" = 1 ] && run_probe "$tmp"
+  # ---- per database (numbered files - a database's name never becomes a path) ----
+  install -d -m 0700 "$tmp/dbs"
+  local i=0 db
+  while IFS= read -r db; do
+    [ -n "$db" ] || continue
+    i=$((i + 1))
+    runuser -u postgres -- psql -X -A -t -q -v ON_ERROR_STOP=1 -d "$db" -c "$DB_SQL" > "$tmp/dbs/$i.json" 2> "$tmp/dbs/$i.err" \
+      || { warn "the per-database query failed in database #$i:"; sed 's/^/       /' "$tmp/dbs/$i.err" >&2; rm -f "$tmp/dbs/$i.json"; }
+  done < <(runuser -u postgres -- psql -X -A -t -q -d postgres -c "SELECT datname FROM pg_database WHERE datallowconn ORDER BY oid")
+  # ---- the software, from dpkg and the mirror's candidate ----
+  dpkg-query -W -f='${Package}\t${Version}\t${db:Status-Abbrev}\n' > "$tmp/packages.tsv" 2>/dev/null || true
+  apt-cache policy postgresql-16 > "$tmp/policy.txt" 2>&1 || true
+  awk -F'\t' '$1 ~ /postgres/ && $3 ~ /^ii/ {print $1}' "$tmp/packages.tsv" | while read -r pkg; do dpkg-query -L "$pkg"; done > "$tmp/pgfiles.txt" 2>/dev/null || true
+  cp "$PG_STIG_BASELINE" "$tmp/baseline.env" 2>/dev/null || warn "no baseline at $PG_STIG_BASELINE - the baseline rules stay not_reviewed"
   python3 - "$tmp" "$out" "$host" "$ME_ADDR" "$PG_STIG_MASK_APP" "$PG_STIG_MAP" "$PG_STIG_PLATFORM_ROLES" "$TOOL_VERSION" "$owner" "$PROBE_TAG" <<'SCANPY' || rc=$?
 import json, os, re, sys, time, pwd
 tmp, out, host, addr, mask, mapfile, platform, toolver, owner, ptag = sys.argv[1:11]
-import stat, grp
+import stat, grp, glob
 F = json.load(open(os.path.join(tmp, "facts.json")))
 H = dict(l.rstrip("\n").split("=", 1) for l in open(os.path.join(tmp, "host.env")) if "=" in l)
 providers = open(os.path.join(tmp, "providers.txt")).read()
@@ -569,10 +623,178 @@ if T and R["V-261922"]["status"] == "not_a_finding":
         R["V-261922"]["status"] = "open"
         R["V-261922"]["details"] += "\n\nFINDING: %d line(s) without a millisecond timestamp" % len(nots)
 
+
+# ---- C. the org baseline (6a.10, scripts/enclave/pg-baseline.env) --------------------------------
+B = {}
+bp = os.path.join(tmp, "baseline.env")
+if os.path.exists(bp):
+    for l in open(bp):
+        m = re.match(r"^\s*(PGB_\w+)='(.*)'\s*$", l)
+        if m: B[m.group(1)] = m.group(2)
+def bl(k): return (B.get(k) or "").split()
+DBS = []
+for f in sorted(glob.glob(os.path.join(tmp, "dbs", "*.json")), key=lambda x: int(os.path.basename(x).split(".")[0])):
+    try: DBS.append(json.load(open(f)))
+    except Exception: pass
+SYS = {"postgres", "template1", "template0"}
+def is_app_role(n): return n in rnames
+def is_vendor(n): return n.startswith("azure")
+pk = {}
+for l in open(os.path.join(tmp, "packages.tsv"), errors="replace"):
+    c = l.rstrip("\n").split("\t")
+    if len(c) == 3 and c[2].startswith("ii"): pk[c[0]] = c[1]
+pol = open(os.path.join(tmp, "policy.txt"), errors="replace").read()
+inst = (re.search(r"Installed:\s*(\S+)", pol) or [None, ""])[1]
+cand = (re.search(r"Candidate:\s*(\S+)", pol) or [None, ""])[1]
+pgfiles = set(l.strip() for l in open(os.path.join(tmp, "pgfiles.txt"), errors="replace")) if os.path.exists(os.path.join(tmp, "pgfiles.txt")) else set()
+BREF = "pg-baseline.env (backlog 6a.10)"
+
+def brule(vid, checks, ev, half=None, note="", facts=()):
+    if not B:
+        res(vid, "not_reviewed", ev, "No baseline file was found - this rule compares against it (6a.10)."); return
+    # MISSING FACTS ARE NOT A PASS: an empty list of extensions, packages or files would make
+    # "nothing unapproved" vacuously true. Found by the planted-problem test, 2026-10-01.
+    gone = [n for n, have in facts if not have]
+    if gone:
+        res(vid, "not_reviewed", ev, "Not judged - facts missing: %s." % ", ".join(gone)); return
+    fails = [t for ok, t in checks if not ok]
+    if fails: res(vid, "open", ev + "\n\nFINDING: " + "; ".join(fails), note)
+    elif half: res(vid, "not_reviewed", ev + "\n\nThe baseline half passes. " + half, note)
+    else: res(vid, "not_a_finding", ev, note)
+
+supers = [r["name"] for r in roles if r["super"]]
+bad_supers = [x for x in supers if x not in bl("PGB_SUPERUSERS")]
+admin_attr = [r for r in roles if not r["super"] and not r["name"].startswith("pg_")
+              and (r["createrole"] or r["createdb"] or r["bypassrls"]) and r["name"] not in bl("PGB_ADMIN_ATTR_ROLES")]
+ev_su = "superusers: %s (baseline: %s)\nnon-superusers with CREATEROLE, CREATEDB or BYPASSRLS: %s (baseline: %s)" % (
+    ", ".join(MR(x) for x in supers) or "none", ", ".join(bl("PGB_SUPERUSERS")) or "none",
+    ", ".join(MR(r["name"]) for r in admin_attr) or "none", ", ".join(bl("PGB_ADMIN_ATTR_ROLES")) or "none")
+su_checks = [(not bad_supers, "superusers outside the baseline: %s" % ", ".join(MR(x) for x in bad_supers)),
+             (not admin_attr, "admin attributes outside the baseline: %s" % ", ".join(MR(r["name"]) for r in admin_attr))]
+
+# extensions, across every database
+ext_bad, ext_ev = [], []
+for d in DBS:
+    exts = d.get("extensions") or []
+    bad = [e for e in exts if e not in bl("PGB_EXTENSIONS")]
+    ext_bad += ["%s in %s" % (e, MD(d["db"])) for e in bad]
+    ext_ev.append("%s: %s" % (MD(d["db"]), ", ".join(exts) or "none"))
+ext_ev = "installed extensions, per database:\n" + "\n".join(ext_ev) + "\napproved (%s): %s" % (BREF, " ".join(bl("PGB_EXTENSIONS")))
+
+# PUBLIC
+dbacl = F.get("db_acl") or []
+pub_db = [MD(x["db"]) for x in dbacl if x.get("public_create")]
+pub_schema = sum(d.get("public_create_schemas") or 0 for d in DBS)
+pub_write = sum(d.get("public_write_tables") or 0 for d in DBS)
+ev_pub = "databases where PUBLIC may CREATE: %s\nschemas where PUBLIC may CREATE: %d (in %d databases)\ntables PUBLIC may INSERT/UPDATE/DELETE/TRUNCATE: %d of %d" % (
+    ", ".join(pub_db) or "none", pub_schema, len(DBS), pub_write, sum(d.get("tables") or 0 for d in DBS))
+
+# owners
+own_bad, own_ev = [], []
+for d in DBS:
+    allowed_sys = set(bl("PGB_OWNERS_SYSTEM"))
+    rows = d.get("owners") or []
+    by = {}
+    for r in rows:
+        by.setdefault(r["owner"], {}).setdefault(r["kind"], 0)
+        by[r["owner"]][r["kind"]] += r["n"]
+    for o, kinds in sorted(by.items()):
+        sysdb = d["db"] in SYS
+        ok = (o in allowed_sys) if sysdb else (o in bl("PGB_OWNERS_APPLICATION") or ("application" in bl("PGB_OWNERS_APPLICATION") and is_app_role(o)))
+        tag = "" if ok else ("  <- a VENDOR role from the source platform" if is_vendor(o) else "  <- not an authorised owner")
+        own_ev.append("%s: %s owns %s%s" % (MD(d["db"]), MR(o), ", ".join("%d %s" % (n, k) for k, n in sorted(kinds.items())), tag))
+        if not ok: own_bad.append("%s in %s" % (MR(o), MD(d["db"])))
+dbo = ["%s owned by %s" % (MD(x["db"]), MR(x["owner"])) for x in dbacl]
+own_ev = "object owners (counts by kind, all schemas but pg_catalog/information_schema):\n" + "\n".join(own_ev) + "\ndatabases: " + "; ".join(dbo)
+own_ok_db = all((x["db"] in SYS and x["owner"] in bl("PGB_OWNERS_SYSTEM")) or (x["db"] not in SYS and (x["owner"] == "postgres" or is_app_role(x["owner"]))) for x in dbacl)
+
+# SECURITY DEFINER
+sd_tot = sum((d.get("secdef") or {}).get("total", 0) for d in DBS)
+sd_ext = sum((d.get("secdef") or {}).get("extension", 0) for d in DBS)
+ev_sd = "SECURITY DEFINER functions outside pg_catalog: %d - %d belong to approved extensions, %d do not\nper database: %s" % (
+    sd_tot, sd_ext, sd_tot - sd_ext, "; ".join("%s %d/%d" % (MD(d["db"]), (d.get("secdef") or {}).get("total", 0), (d.get("secdef") or {}).get("extension", 0)) for d in DBS))
+
+# connection limits against the baseline
+cl = dict(x.split("=", 1) for x in bl("PGB_CONN_LIMITS") if "=" in x)
+cl_bad, cl_ev = [], []
+for r in listed:
+    want = cl.get(r["name"]) if r["name"] in cl else (cl.get("NOLOGIN") if not r["login"] else None)
+    if want is None:
+        cl_bad.append("%s (LOGIN, no limit in the baseline)" % MR(r["name"])); mark = "  <- no baseline value"
+    elif str(r["connlimit"]) != str(want):
+        cl_bad.append("%s is %s, baseline %s" % (MR(r["name"]), r["connlimit"], want)); mark = "  <- baseline %s" % want
+    else: mark = ""
+    cl_ev.append("%s: %s%s%s" % (MR(r["name"]), r["connlimit"], "" if r["login"] else " (NOLOGIN)", mark))
+mc_ok = str(val("max_connections")) == B.get("PGB_MAX_CONNECTIONS", "")
+
+# packages
+pgpk = {n: v for n, v in pk.items() if "postgres" in n or n in ("patroni", "pgbackrest")}
+pk_bad = [n for n in pgpk if n not in bl("PGB_PACKAGES")]
+other_major = [n for n in pk if re.match(r"postgresql(-client)?-(\d+)$", n) and re.match(r"postgresql(-client)?-(\d+)$", n).group(2) != B.get("PGB_MAJOR", "16")]
+ev_pk = "PostgreSQL-related packages installed:\n" + "\n".join("%s %s" % (n, v) for n, v in sorted(pgpk.items())) + "\napproved (%s): %s" % (BREF, " ".join(bl("PGB_PACKAGES")))
+
+# software directory: every file under /usr/lib/postgresql/<major> belongs to a PostgreSQL package
+libroot = "/usr/lib/postgresql/%s" % B.get("PGB_MAJOR", "16")
+stray = [p for p in walk(libroot) if os.path.isfile(p) and p not in pgfiles] if os.path.isdir(libroot) and pgfiles else []
+nfiles = sum(1 for p in walk(libroot) if os.path.isfile(p)) if os.path.isdir(libroot) else 0
+
+# ---- the rules ----
+brule("V-261857", [(mc_ok, "max_connections is %s, baseline %s" % (val("max_connections"), B.get("PGB_MAX_CONNECTIONS"))), (not cl_bad, "; ".join(cl_bad))],
+      show("max_connections") + " (baseline %s)\n" % B.get("PGB_MAX_CONNECTIONS", "?") + "\n".join(cl_ev),
+      note="postgres's limit is documented, not enforced: PostgreSQL exempts superusers from role limits; its real bound is superuser_reserved_connections (%s) inside max_connections." % (val("superuser_reserved_connections") or "3"))
+brule("V-261862", [(data_ok_owner, "PGDATA is not wholly postgres-owned")] + su_checks[:1], ev_data + "\n" + ev_su)
+brule("V-261878", [(logdir_ok, "the log directory is not postgres-owned"), (data_ok_owner, "PGDATA is not wholly postgres-owned"),
+                   (not pga_bad, "pgaudit files not root-owned")] + su_checks, ev_su + "\n" + ev_data + "\npgaudit's files: " + "; ".join(desc(f) for f in pga_files))
+brule("V-261888", su_checks[:1] + [(not ext_bad, "unapproved extensions: %s" % ", ".join(ext_bad))], ev_su + "\n" + ext_ev,
+      note="COPY TO/FROM a program or file is superuser-only; the only superuser is postgres.", facts=[("the per-database facts", bool(DBS))])
+brule("V-261886", [(not ext_bad, "unapproved extensions: %s" % ", ".join(ext_bad))], ext_ev, note="PostGIS is approved while backlog 3.49 asks whether the application needs it.", facts=[("the per-database facts", bool(DBS))])
+brule("V-261898", su_checks[1:], ev_su)
+brule("V-261924", su_checks[:1] + [(not pub_db, "PUBLIC may CREATE in: %s" % ", ".join(pub_db)), (pub_schema == 0, "PUBLIC may CREATE in %d schema(s)" % pub_schema)], ev_su + "\n" + ev_pub, facts=[("the per-database facts", bool(DBS)), ("the database privileges", bool(dbacl))])
+brule("V-261923", [(pub_schema == 0, "PUBLIC may CREATE in %d schema(s)" % pub_schema), (not pub_db, "PUBLIC may CREATE in: %s" % ", ".join(pub_db))], ev_pub,
+      note="The application's roles own the application's schemas by design (baseline: owners); PUBLIC may create nowhere.", facts=[("the per-database facts", bool(DBS)), ("the database privileges", bool(dbacl))])
+brule("V-261884", [(not own_bad, "objects owned outside the baseline: %s" % ", ".join(own_bad)), (own_ok_db, "a database is owned outside the baseline")], own_ev, facts=[("the per-database facts", bool(DBS)), ("the database owners", bool(dbacl))])
+brule("V-261914", [(not own_bad, "objects owned outside the baseline: %s" % ", ".join(own_bad))], own_ev,
+      half="The discretionary access control itself is judged against the application's documented DAC model (slice 6.4).", facts=[("the per-database facts", bool(DBS))])
+brule("V-261885", [(data_ok_mode, "PGDATA grants access beyond its owner"), (pub_write == 0, "PUBLIC may write to %d table(s)" % pub_write)], ev_data + "\n" + ev_pub,
+      half="Each object's privileges are judged against the application's documented DAC model (slice 6.4).", facts=[("the per-database facts", bool(DBS))])
+brule("V-261916", [(sd_tot - sd_ext == 0, "%d SECURITY DEFINER function(s) outside approved extensions, not documented - the application's; ask its owners (with backlog 3.49)" % (sd_tot - sd_ext))], ev_sd,
+      note="SECURITY DEFINER functions belonging to approved extensions (PostGIS) are documented by the extension's approval in the baseline.", facts=[("the per-database facts", bool(DBS))])
+brule("V-261887", [(not pk_bad, "unapproved packages: %s" % ", ".join(pk_bad))], ev_pk, facts=[("the package list", bool(pk))])
+brule("V-261935", [(not other_major, "other PostgreSQL versions installed: %s" % ", ".join(other_major))], ev_pk,
+      note="The STIG's check is rpm -qa; on Ubuntu, dpkg.")
+ver_ok = bool(inst) and inst == cand and B.get("PGB_VERSION_SOURCE") == "mirror"
+for v in ("V-261936", "V-283674"):
+    brule(v, [(ver_ok, "postgresql-16 installed %s, the mirror offers %s" % (inst or "?", cand or "?"))],
+          "postgresql-16: installed %s, newest in the enclave mirror %s\n%s" % (inst or "?", cand or "?", F.get("version", "")),
+          note="'Latest' is the newest postgresql-16 the enclave mirror offers, under the patching decision of 2026-09-23 (baseline PGB_VERSION_SOURCE). Ubuntu ships PostgreSQL 16 in its main archive; the Crunchy-vs-Ubuntu tailoring statement is backlog 6a.11.", facts=[("the package list", bool(pk))])
+brule("V-261883", [(not stray, "%d file(s) under %s belong to no PostgreSQL package: %s" % (len(stray), libroot, ", ".join(stray[:5])))],
+      "%s: %d files, %d belonging to no installed PostgreSQL package (dpkg -L)" % (libroot, nfiles, len(stray)), facts=[("the package file lists (dpkg -L)", bool(pgfiles)), ("the software directory", os.path.isdir(libroot))])
+port_ok = str(val("port")) == B.get("PGB_PORT", "")
+la = [x.strip() for x in (val("listen_addresses") or "").split(",") if x.strip()]
+listen_ok = B.get("PGB_LISTEN") == "node" and la == [addr]
+ev_net = show("port") + " (baseline %s)\n" % B.get("PGB_PORT", "?") + show("listen_addresses") + " (baseline: this node's own address, %s)" % addr
+brule("V-261889", [(port_ok, "port is not the baseline's"), (listen_ok, "listen_addresses is not exactly this node's address")], ev_net)
+brule("V-261926", [(port_ok, "port is not the baseline's")], ev_net)
+brule("V-261872", [(B.get("PGB_AUDIT_EXTRA") == "none", "the baseline defines additional audit content - not judged automatically")],
+      show("log_line_prefix") + "\n" + show("pgaudit.log"),
+      note="The organization defines no audit information beyond the log_line_prefix fields and pgaudit's statement text (baseline PGB_AUDIT_EXTRA).")
+login = [r for r in roles if r["login"]]
+app_login = [r for r in login if is_app_role(r["name"]) or is_vendor(r["name"])]
+weak = [h for h in hba if (h["method"] or "") in ("trust", "password", "md5", "ident")]
+ev_id = "LOGIN roles: %s\npg_hba methods in use: %s" % (", ".join(MR(r["name"]) for r in login), ", ".join(sorted({h["method"] for h in hba if h["method"]})))
+for v in ("V-261890", "V-261897"):
+    if app_login:
+        brule(v, [(not weak, "pg_hba uses %s" % ", ".join(sorted({h["method"] for h in weak})))], ev_id,
+              half="Application LOGIN roles exist - their individual identification is the application's (B-07, slice 6.4).")
+    else:
+        brule(v, [(not weak, "pg_hba uses %s" % ", ".join(sorted({h["method"] for h in weak})))], ev_id,
+              note="No person has a database account. The LOGIN roles are the platform's: postgres, reached only by peer on the local socket after an administrator authenticates individually to the OS (their own account, sudo with a password); replicator and rewinder, authenticated per node by certificate (each node's own CN, mapped in pg_ident); pgmonitor, peer on the local socket.")
+res("V-261929", "open", "\n".join(show(n) for n in ("ssl_ca_file", "ssl_cert_file")) + "\nissuer: the enclave's own root CA (scripts/enclave/ca.sh) - not DoD PKI\n\nFINDING: not DoD PKI - left open by decision of the acting AO (2026-10-01), with the written justification in the comments",
+    B.get("PGB_DOD_PKI_JUSTIFICATION", "No justification in the baseline."))
+
 # ---- everything else: said, not guessed ------------------------------------------------------
 LATER = {
- "6.3 (the org baseline, 6a.10)": "V-261859 V-261872 V-261884 V-261886 V-261887 V-261888 V-261889 V-261890 V-261897 V-261898 V-261914 V-261916 V-261923 V-261924 V-261926 V-261929 V-261935 V-261936 V-283674 V-261883",
- "6.4 (written answers and evidence)": "V-261858 V-261873 V-261874 V-261882 V-261893 V-261895 V-261901 V-261902 V-261903 V-261905 V-261906 V-261907 V-261910 V-261911 V-261912 V-261913 V-261915 V-261917 V-261918 V-261919 V-261920 V-261927 V-261930 V-261931 V-261967",
+ "6.4 (written answers and evidence)": "V-261859 V-261858 V-261873 V-261874 V-261882 V-261893 V-261895 V-261901 V-261902 V-261903 V-261905 V-261906 V-261907 V-261910 V-261911 V-261912 V-261913 V-261915 V-261917 V-261918 V-261919 V-261920 V-261927 V-261930 V-261931 V-261967",
 }
 for piece, vids in LATER.items():
     for v in vids.split():

@@ -53,6 +53,10 @@
   Where the VM definition and the VHDX land. One path controls both: the definition goes here,
   the disk goes to <StoragePath>\<VMName>\Virtual Hard Disks\. Defaults to G:\Hyper-V.
 
+.PARAMETER UserDataTemplate
+  Optional. The cloud-init user-data template to render. Defaults to stage-01-userdata.yaml beside
+  this script. The LAB's cold-store VM uses scripts/lab/lab-vault-userdata.yaml (docs/lab-network.md
+  section 9.3) - same placeholders, its own hostname, no packages. Lab only, not part of the product.
 .PARAMETER DryRun
   Print the resolved command and exit without provisioning.
 
@@ -76,6 +80,7 @@ param(
     [int]    $VMProcessorCount  = 8,
     [uint64] $VMMemoryBytes     = 16GB,
     [string] $StoragePath       = "G:\Hyper-V",
+    [string] $UserDataTemplate  = "",
     [switch] $DryRun
 )
 
@@ -83,7 +88,7 @@ $ErrorActionPreference = "Stop"
 function Die { param($m) Write-Host "[x] $m" -ForegroundColor Red; exit 1 }
 
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
-$template = Join-Path $here "stage-01-userdata.yaml"
+if ($UserDataTemplate) { $template = $UserDataTemplate } else { $template = Join-Path $here "stage-01-userdata.yaml" }
 
 if (-not (Test-Path $template))           { Die "template not found: $template" }
 if (-not (Test-Path $ProvisioningScript)) { Die "provisioning script not found: $ProvisioningScript" }
@@ -133,7 +138,7 @@ Write-Host ("  vm name    {0}" -f $VMName)
 Write-Host ("  image      24.04  (NOT -azure: needs Win11 22000+, this host is Server 2022)")
 Write-Host ("  cpu / ram  {0} vCPU / {1} GB" -f $VMProcessorCount, ($VMMemoryBytes/1GB))
 Write-Host ("  disk       {0} GB" -f ($VHDSizeBytes/1GB))
-Write-Host ("  network    {0}" -f $(if ($NetAddress) { "$NetAddress gw $NetGateway" } else { "DHCP" }))
+Write-Host ("  network    {0}" -f $(if ($NetAddress) { if ($NetGateway) { "$NetAddress gw $NetGateway" } else { "$NetAddress, no gateway" } } else { "DHCP" }))
 Write-Host ("  switch     {0}" -f $(if ($SwitchName) { $SwitchName } else { "auto-detect" }))
 Write-Host ("  netconfig  {0}" -f $(if ($NetConfigType) { $NetConfigType } else { "v2 (script default for static)" }))
 Write-Host ("  ssh key    {0}" -f ($key -split " ")[0])
@@ -162,7 +167,7 @@ Write-Host ("  escaped    {0} literal '$' for ExpandString" -f $dollars)
 Write-Host ""
 
 # Temp file holds the password hash - remove it whatever happens.
-$tmp = Join-Path $env:TEMP ("stage-01-userdata-{0}.yaml" -f (Get-Random))
+$tmp = Join-Path $env:TEMP ("{0}-userdata-{1}.yaml" -f $VMName, (Get-Random))
 $enc = New-Object System.Text.UTF8Encoding($false)
 [System.IO.File]::WriteAllText($tmp, ($escaped -replace "`r`n", "`n"), $enc)
 
@@ -184,7 +189,8 @@ try {
     if ($NetAddress) {
         $args["NetAddress"] = $NetAddress
         $args["NetNetmask"] = $NetNetmask
-        $args["NetGateway"] = $NetGateway
+        # no gateway on an isolated switch (the lab vault): pass none rather than an empty one
+        if ($NetGateway) { $args["NetGateway"] = $NetGateway }
     }
 
     & $ProvisioningScript @args

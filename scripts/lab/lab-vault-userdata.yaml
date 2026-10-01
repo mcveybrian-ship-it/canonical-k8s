@@ -1,0 +1,42 @@
+#cloud-config
+#
+# lab-vault cloud-init user-data - the LAB's cold store (docs/lab-network.md section 9.3).
+# LAB ONLY: not part of the product, not inside the enclave's boundary, no STIG.
+#
+# Rendered by airgapped-setup-machine/Build-Stage01.ps1 -UserDataTemplate <this file>: it
+# substitutes @@SSH_KEY@@ and @@PASSWORD_HASH@@ and writes a temporary copy - this file is a
+# template and is never used directly.
+#
+# The VM sits ONLY on the Dell's "Storage" vSwitch (the GigaPlus, no uplink): no internet, so
+# nothing is installed at first boot. What it needs comes with the Ubuntu 24.04 cloud image -
+# rsync (with /usr/bin/rrsync, the write-only receiver vm-backup's copies use) and cryptsetup
+# (for the LUKS data disk) - checked 2026-10-01 on stage-01, built from the same image.
+
+hostname: lab-vault
+fqdn: lab-vault.lab.local
+prefer_fqdn_over_hostname: false
+timezone: Etc/UTC
+locale: en_US.UTF-8
+
+users:
+  - name: encadmin
+    gecos: Lab vault admin
+    groups: [adm, sudo]
+    shell: /bin/bash
+    lock_passwd: false
+    passwd: '@@PASSWORD_HASH@@'
+    sudo: ALL=(ALL) ALL
+    ssh_authorized_keys:
+      - '@@SSH_KEY@@'
+
+ssh_pwauth: false          # key only over the network; the Hyper-V console takes the password
+
+growpart:
+  mode: auto
+  devices: ['/']
+  ignore_growroot_disabled: false
+resize_rootfs: true
+
+# no internet on the storage switch - nothing to update or install
+package_update: false
+package_upgrade: false

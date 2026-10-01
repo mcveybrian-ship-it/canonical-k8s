@@ -706,13 +706,16 @@ for d in DBS:
         by[o][r["kind"]] += r["n"]
     for o, kinds in sorted(by.items()):
         sysdb = d["db"] in SYS
-        ok = (o in allowed_sys) if sysdb else (o in bl("PGB_OWNERS_APPLICATION") or ("application" in bl("PGB_OWNERS_APPLICATION") and is_app_role(o)))
-        tag = "" if ok else ("  <- a VENDOR role from the source platform" if is_vendor(o) else "  <- not an authorised owner")
+        allowed_app = bl("PGB_OWNERS_APPLICATION")
+        ok = (o in allowed_sys) if sysdb else (o in allowed_app or ("application" in allowed_app and is_app_role(o))
+                                               or ("parity" in allowed_app and o in bl("PGB_PARITY_ROLES")))
+        if ok and o in bl("PGB_PARITY_ROLES"): tag = "  (a parity role - mirrors the application's Azure deployment, baseline PGB_PARITY_ROLES)"
+        else: tag = "" if ok else ("  <- a VENDOR role from the source platform, not in PGB_PARITY_ROLES" if is_vendor(o) else "  <- not an authorised owner")
         own_ev.append("%s: %s owns %s%s" % (MD(d["db"]), MR(o), ", ".join("%d %s" % (n, k) for k, n in sorted(kinds.items())), tag))
         if not ok: own_bad.append("%s in %s" % (MR(o), MD(d["db"])))
 dbo = ["%s owned by %s" % (MD(x["db"]), MR(x["owner"])) for x in dbacl]
 own_ev = "object owners (counts by kind, all schemas but pg_catalog/information_schema):\n" + "\n".join(own_ev) + "\ndatabases: " + "; ".join(dbo)
-own_ok_db = all((x["db"] in SYS and x["owner"] in bl("PGB_OWNERS_SYSTEM")) or (x["db"] not in SYS and (x["owner"] == "postgres" or is_app_role(x["owner"]))) for x in dbacl)
+own_ok_db = all((x["db"] in SYS and x["owner"] in bl("PGB_OWNERS_SYSTEM")) or (x["db"] not in SYS and (x["owner"] == "postgres" or is_app_role(x["owner"]) or x["owner"] in bl("PGB_PARITY_ROLES"))) for x in dbacl)
 
 # SECURITY DEFINER
 sd_tot = sum((d.get("secdef") or {}).get("total", 0) for d in DBS)

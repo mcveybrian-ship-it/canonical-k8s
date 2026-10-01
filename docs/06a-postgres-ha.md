@@ -1105,12 +1105,61 @@ sudo ./scripts/enclave/pg-stig.sh scan                    # reads only; the summ
 ./scripts/enclave/pg-stig.sh cklb                         # the checklists
 ```
 
-### 10b.4 Still to come
+### 10b.4 Piece 6.2 — the audit probe and the file checks
 
-**6.2** the audit probe (a throwaway role tries what the STIG forbids; each denial must be found in
-the log) and the file checks, with the STIG's RHEL paths mapped to Ubuntu and Patroni · **6.3** the
-org baseline (6a.10) · **6.4** the written answers · **6.5** the two scans — the empty cluster, then
-with the application.
+Sixteen rules say "do X as an unprivileged role, then find the denial in the log" — a correct setting
+proves none of them. `scan --probe`, **on the leader only** (it writes), creates a throwaway role
+`stigprobe_<tag>` (NOLOGIN, no privileges) and schema, does the audited things, then `SET ROLE`s to it
+and tries each forbidden thing — read `pg_authid`, write the table, set a superuser parameter, grant
+itself rights, make itself superuser, alter the probe's **own** second role, create a superuser — makes
+one logon as a role that does not exist, and **drops everything**, checking nothing is left. Every target
+is a probe object: never `postgres`, never an application role. The evidence kept is **only the probe
+sessions' own log lines**, found by their session ID (`%c`), so no other session's line can reach the
+results. Every pass was traced on the first run to the probe's own logged denial — `STATEMENT: SELECT *
+FROM pg_authid …` followed by `ERROR: permission denied for table pg_authid`, pgaudit's `ROLE,GRANT`
+lines, the `FATAL` for the non-existent role.
+
+The file checks map the STIG's RHEL paths to Ubuntu and Patroni (§9a.2a trap 4): PGDATA `0700
+postgres` with **no entry granting group or other anything**; logs `0600`; syslog `0640 syslog:adm`;
+`postgresql.conf` `0600`; the software and pgaudit root-owned; the TLS key `0640 root:postgres` in a
+`0750` directory. A standby cannot run the probe; its checklist leaves those rules to the leader's.
+
+### 10b.5 Piece 6.3 — the org baseline
+
+`scripts/enclave/pg-baseline.env` is the organization's answer to every "compare against what the
+organization documented" rule (backlog 6a.10, closed): superusers, admin attributes, connection
+limits, port and listen address, approved extensions and packages, "latest version" (= the newest
+`postgresql-16` in the enclave mirror), object owners, PUBLIC's rights, audit content, and V-261929's
+justification. It names no application role. **Azure's roles are in it as parity roles**: the enclave
+mirrors the application's Azure role structure on purpose, so there is one database setup, not two —
+the one deliberate difference is `postgres`, a superuser in the enclave only, which the application
+never uses.
+
+| node | pass | Open | N/A | still to judge |
+|---|---|---|---|---|
+| pg-03 (leader, with the probe) | 78 | 5 | 1 | 27 |
+| pg-01, pg-02 (standbys) | 59 | 5 | 1 | 46 |
+
+Results 2026-10-01, before the parity roles were added to the baseline. **The platform has no Opens.**
+The five, identical on all three nodes: V-261884/914 (an Azure role owns a schema — parity, now in the
+baseline), V-261923/924 (PUBLIC may create in the application database's `public` schema, PostgreSQL
+14's default — backlog 3.52, fixed on both sides), V-261929 (not DoD PKI — open by the acting AO's
+decision, with its justification).
+
+**The checker's own defects, caught on the way** — each would have reported a confident wrong answer:
+
+| | what | fixed by |
+|---|---|---|
+| 1 | a role sharing its database's name was masked as the database | separate masks for roles and databases; the self-check |
+| 2 | V-261883 would pass with an empty package file list ("no stray files" is vacuously true), and the extension, owner and PUBLIC rules with no per-database facts | missing facts mean `not_reviewed`, never a pass — found by planting a problem in every area |
+| 3 | `pg_database_owner` (PostgreSQL 15+, owner of every `public` schema) flagged as unauthorised in `template1` and `postgres` | judged as the database's own owner |
+| 4 | V-261922 said "every line" and checked one | it counts every line of the probe's sessions |
+
+### 10b.6 Still to come
+
+**6.4** the written answers (27 rules — LUKS, FIPS, the alerts, the backups and the audit offload are the
+evidence for most) · **6.5** the two scans — the empty cluster, then with the application — then
+3.52's fix on both sides.
 
 ---
 

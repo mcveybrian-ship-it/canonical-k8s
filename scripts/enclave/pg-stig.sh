@@ -686,8 +686,9 @@ dbacl = F.get("db_acl") or []
 pub_db = [MD(x["db"]) for x in dbacl if x.get("public_create")]
 pub_schema = sum(d.get("public_create_schemas") or 0 for d in DBS)
 pub_write = sum(d.get("public_write_tables") or 0 for d in DBS)
-ev_pub = "databases where PUBLIC may CREATE: %s\nschemas where PUBLIC may CREATE: %d (in %d databases)\ntables PUBLIC may INSERT/UPDATE/DELETE/TRUNCATE: %d of %d" % (
-    ", ".join(pub_db) or "none", pub_schema, len(DBS), pub_write, sum(d.get("tables") or 0 for d in DBS))
+ev_pub = "databases where PUBLIC may CREATE: %s\nschemas where PUBLIC may CREATE: %d - per database: %s\ntables PUBLIC may INSERT/UPDATE/DELETE/TRUNCATE: %d of %d" % (
+    ", ".join(pub_db) or "none", pub_schema, "; ".join("%s %d" % (MD(d["db"]), d.get("public_create_schemas") or 0) for d in DBS),
+    pub_write, sum(d.get("tables") or 0 for d in DBS))
 
 # owners
 own_bad, own_ev = [], []
@@ -695,9 +696,14 @@ for d in DBS:
     allowed_sys = set(bl("PGB_OWNERS_SYSTEM"))
     rows = d.get("owners") or []
     by = {}
+    # pg_database_owner (PostgreSQL 15+) owns each database's public schema and MEANS "this database's
+    # owner" - judged as that owner. The first live run (2026-10-01) wrongly flagged it in template1/postgres.
+    dbowner = next((x["owner"] for x in (F.get("db_acl") or []) if x["db"] == d["db"]), None)
     for r in rows:
-        by.setdefault(r["owner"], {}).setdefault(r["kind"], 0)
-        by[r["owner"]][r["kind"]] += r["n"]
+        o = r["owner"]
+        if o == "pg_database_owner" and dbowner: o = dbowner
+        by.setdefault(o, {}).setdefault(r["kind"], 0)
+        by[o][r["kind"]] += r["n"]
     for o, kinds in sorted(by.items()):
         sysdb = d["db"] in SYS
         ok = (o in allowed_sys) if sysdb else (o in bl("PGB_OWNERS_APPLICATION") or ("application" in bl("PGB_OWNERS_APPLICATION") and is_app_role(o)))

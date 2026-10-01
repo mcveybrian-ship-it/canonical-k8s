@@ -31,6 +31,7 @@
 #     sudo ./06a-postgres-ha.sh app-restore load <file> <db>  on the LEADER, into a NEW database
 #     sudo ./06a-postgres-ha.sh app-restore summary [log]     reprint a load's summary from its log
 #     sudo ./06a-postgres-ha.sh app-restore drop <db>         for a reload: only one app-restore made
+#     sudo ./06a-postgres-ha.sh app-restore revoke-public <db> 3.52: PUBLIC may no longer create in public
 #     sudo ./06a-postgres-ha.sh app-restore shred <file>...   the dump and the load log, when done
 #
 # SLICE 2 - THE DATABASE'S OWN etcd, WITH MUTUAL TLS
@@ -1526,6 +1527,31 @@ cmd_app_drop() {
   pg_sql "DROP DATABASE $db" && ok "$db dropped - the roles it made stay (NOLOGIN), a reload reuses them"
 }
 
+# 3.52 (2026-10-01): PostgreSQL 14's default let PUBLIC create in the public schema; a dump from 14 carries
+# the grant over (V-261923/924). The fix is PostgreSQL 15's own default - REVOKE CREATE ON SCHEMA public FROM
+# PUBLIC - applied on BOTH sides, the Azure deployment too, so the two setups stay one. Leader only; only a
+# database app-restore loaded; safe to re-run. In Azure, where the application RUNS, grant CREATE on public to
+# the application's own role first if it creates objects there - in the lab nothing runs yet (B-07).
+cmd_app_revoke_public() {
+  need_root; whoami_pg
+  local db="${1:-}" j v leader n0 n1 q
+  [ -n "$db" ] || die "usage: sudo $0 app-restore revoke-public <database>"
+  printf '%s' "$db" | grep -qxE '[a-z_][a-z0-9_]{0,62}' || die "database name '$db': lower-case letters, digits and _ only"
+  j="$(cluster_json)"; v="$(cluster_verdict "$j")"
+  case "$v" in ok*) ;; *) die "the cluster is not healthy (${v#bad }) - fix that first" ;; esac
+  read -r _ leader _ <<<"$v"
+  [ "$leader" = "$ME" ] || die "run this on the leader - $leader leads"
+  [ "$(pg_sql "SELECT count(*) FROM pg_database WHERE datname='$db'")" = 1 ] || die "there is no database $db"
+  ls "$APP_LOG_DIR/$db"-*.log >/dev/null 2>&1 || die "$db was not loaded by app-restore (no $APP_LOG_DIR/$db-*.log) - refusing"
+  q="SELECT count(*) FROM pg_namespace WHERE nspname !~ '^pg_' AND nspname <> 'information_schema' AND has_schema_privilege('public', oid, 'CREATE')"
+  n0="$(runuser -u postgres -- psql -X -A -t -q -d "$db" -c "$q")"
+  runuser -u postgres -- psql -X -q -v ON_ERROR_STOP=1 -d "$db" -c "REVOKE CREATE ON SCHEMA public FROM PUBLIC" \
+    || die "the REVOKE failed - psql's reason is above"
+  n1="$(runuser -u postgres -- psql -X -A -t -q -d "$db" -c "$q")"
+  ok "schemas PUBLIC may create in, in $db: $n0 -> $n1"
+  [ "$n1" = 0 ] || warn "PUBLIC may still create in $n1 schema(s) - the grant is not on public alone; look before going further"
+}
+
 cmd_app_shred() {
   need_root
   [ "$#" -gt 0 ] || die "usage: sudo $0 app-restore shred <file>..."
@@ -1612,8 +1638,9 @@ cmd_app_restore() {
     rehearse) cmd_app_rehearse ;;
     summary)  cmd_app_summary "$@" ;;
     drop)     cmd_app_drop "$@" ;;
+    revoke-public) cmd_app_revoke_public "$@" ;;
     shred)    cmd_app_shred "$@" ;;
-    *) die "usage: sudo $0 app-restore rehearse | census <file> | load <file> <database> | summary [log] | drop <database> | shred <file>..." ;;
+    *) die "usage: sudo $0 app-restore rehearse | census <file> | load <file> <database> | summary [log] | drop <database> | revoke-public <database> | shred <file>..." ;;
   esac
 }
 
@@ -1682,5 +1709,5 @@ case "${1:-}" in
   extensions)    cmd_extensions ;;
   stig-settings) cmd_stig_settings ;;
   app-restore)   shift; cmd_app_restore "$@" ;;
-  *) sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  *) sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

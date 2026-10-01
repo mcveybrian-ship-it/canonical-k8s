@@ -40,3 +40,47 @@ resize_rootfs: true
 # no internet on the storage switch - nothing to update or install
 package_update: false
 package_upgrade: false
+
+# The vault's one-time setup, run from the Hyper-V console after the data disk is attached
+# (docs/lab-network.md section 9.3): sudo lab-vault-setup. Written here so the vault needs no
+# network to be set up - this file is the vault's whole definition.
+write_files:
+  - path: /usr/local/sbin/lab-vault-setup
+    owner: root:root
+    permissions: '0750'
+    content: |
+      #!/usr/bin/env bash
+      # lab-vault-setup - ONE TIME, on lab-vault, after the data disk is attached.
+      # Finds the one data disk (never the system disk), LUKS2 with a key file on the OS disk,
+      # ext4, mounted at /srv/cold, opened at every boot. Safe to re-run: an existing LUKS disk is
+      # opened, never re-formatted.
+      set -euo pipefail
+      MNT=/srv/cold; KEY=/etc/luks/cold.key; NAME=cold
+      die() { echo "  [x] $*" >&2; exit 1; }
+      [ "$(id -u)" = 0 ] || die "run with sudo"
+      [ "$(hostname -s)" = lab-vault ] || die "this is $(hostname -s), not lab-vault"
+      root="$(lsblk -no PKNAME "$(findmnt -no SOURCE /)" | head -1)"
+      cands="$(lsblk -dno NAME,TYPE | awk '$2=="disk"{print $1}' | grep -vx "$root" | grep -v '^sr' || true)"
+      [ "$(printf '%s\n' "$cands" | grep -c .)" = 1 ] || die "expected exactly ONE data disk besides the system disk ($root); found: ${cands:-none}"
+      dev="/dev/$cands"
+      echo "  data disk: $dev ($(lsblk -dno SIZE "$dev")) - the system disk is $root"
+      if cryptsetup isLuks "$dev"; then
+        echo "  already LUKS - opening it, NOT formatting"
+      else
+        [ -z "$(lsblk -no NAME "$dev" | tail -n +2)" ] || die "$dev has partitions - refusing"
+        if blkid -p "$dev" >/dev/null 2>&1; then die "$dev carries a filesystem or other signature - refusing"; fi
+        install -d -m 0700 /etc/luks
+        [ -f "$KEY" ] || { head -c 4096 /dev/urandom > "$KEY"; chmod 0400 "$KEY"; }
+        cryptsetup luksFormat --type luks2 --batch-mode --key-file "$KEY" "$dev"
+        echo "  [ok] LUKS2 on $dev, key file $KEY"
+      fi
+      [ -e "/dev/mapper/$NAME" ] || cryptsetup open --key-file "$KEY" "$dev" "$NAME"
+      blkid "/dev/mapper/$NAME" >/dev/null 2>&1 || mkfs.ext4 -q -L cold "/dev/mapper/$NAME"
+      uuid="$(cryptsetup luksUUID "$dev")"
+      grep -q "^$NAME " /etc/crypttab 2>/dev/null || echo "$NAME UUID=$uuid $KEY luks,nofail" >> /etc/crypttab
+      grep -q " $MNT " /etc/fstab || echo "/dev/mapper/$NAME $MNT ext4 defaults,nofail 0 2" >> /etc/fstab
+      install -d -m 0755 "$MNT"
+      mountpoint -q "$MNT" || mount "$MNT"
+      install -d -m 0755 "$MNT/backup-copy"
+      df -h "$MNT"
+      echo "  [ok] $MNT ready: encrypted (LUKS2), opens at every boot, $MNT/backup-copy receives the copies"

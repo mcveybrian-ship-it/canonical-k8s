@@ -131,9 +131,20 @@ if ($left) {
     exit 1
 }
 
+# --- escape for ExpandString, and PROVE it, before anything is built ----------------------------
+# Backticks first, then dollars, then double quotes: each step must not touch what an earlier one
+# added. Double quotes were never escaped while the only template was stage-01's, which has none;
+# the lab vault's embedded setup script is full of them (2026-10-01).
+$escaped = $raw.Replace('`', '``').Replace('$', '`$').Replace('"', '`"')
+# The round trip: run the text through the same ExpandString the provisioning script uses, and require
+# the original back, byte for byte (-cne: PowerShell's -ne ignores case). A character the escaping
+# misses fails HERE, in the dry run too - not inside a half-built VM.
+$roundtrip = $ExecutionContext.InvokeCommand.ExpandString($escaped)
+if ($roundtrip -cne $raw) { Die "the escaped user-data does not expand back to the template - a character the escaping misses" }
+
 Write-Host ""
-Write-Host "  STAGE-01 build"
-Write-Host "  --------------"
+Write-Host ("  {0} build (Hyper-V cloud image)" -f $VMName)
+Write-Host "  ------------------------------"
 Write-Host ("  vm name    {0}" -f $VMName)
 Write-Host ("  image      24.04  (NOT -azure: needs Win11 22000+, this host is Server 2022)")
 Write-Host ("  cpu / ram  {0} vCPU / {1} GB" -f $VMProcessorCount, ($VMMemoryBytes/1GB))
@@ -148,6 +159,7 @@ Write-Host ("  storage    {0}" -f $StoragePath)
 Write-Host ("             VHDX -> {0}\{1}\Virtual Hard Disks\{1}.vhdx" -f $StoragePath, $VMName)
 Write-Host ""
 
+Write-Host "  user-data  escaping verified: it expands back to the template exactly"
 if ($DryRun) { Write-Host "Dry run - nothing provisioned."; exit 0 }
 
 # --- escape for the provisioning script's ExpandString() -------------------------------------
@@ -158,9 +170,7 @@ if ($DryRun) { Write-Host "Dry run - nothing provisioned."; exit 0 }
 # password is silently destroyed and the account becomes unusable. Same for cloud-init tokens
 # such as $UPTIME.
 #
-# Escape backticks first, then dollars. Order matters: doing dollars first would double-escape
-# the backticks this step introduces.
-$escaped = $raw.Replace('`', '``').Replace('$', '`$')
+# (escaped above, before the summary - see 'escape for the provisioning script's ExpandString')
 
 $dollars = ([regex]::Matches($raw, '\$')).Count
 Write-Host ("  escaped    {0} literal '$' for ExpandString" -f $dollars)

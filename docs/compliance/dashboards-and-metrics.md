@@ -501,6 +501,8 @@ all generated from the address file by `monitoring.sh scrape`.
 | `enclave_pgbackrest_status` | `stanza`, `repo` | `pgbackrest info` as postgres, on each **backup store** | pgBackRest's verdict on its repository: 0 ok; **99 = info unreadable** (never a missing number) |
 | `enclave_pgbackrest_last_backup_seconds` | `stanza`, `repo`, `type` | same | when the last `full` / `diff` finished in that repository |
 | `enclave_vm_data_pool_other_bytes` | `pool` | `statvfs` of `VM_POOL_DATA` minus its reserved data disks — hypervisors, real mount only | bytes on the database volume that are NOT a data disk. Baseline 28 KB (`lost+found`) |
+| `enclave_pg_audit_heartbeat_ok` | — | the facts job on each **pg node**, 2026-10-01 | 1 when its audited read (a unique marker) was **found in PostgreSQL's own log** this run — auditing proven end to end, not inferred from settings (Postgres 16 STIG V-261920) |
+| `enclave_pg_audit_heartbeat_seconds` | — | same | unix time the heartbeat was last found; absent until the first success |
 
 ### Patch posture — every in-gap machine
 
@@ -640,6 +642,8 @@ pager that trains people to ignore it.
 | `DataVolumeForeignData` | > 5 GB on the database volume that is not a reserved data disk — 2026-09-27's failure | 15m | warning |
 | **database** (B-06a slice 4) | | | |
 | `PostgresSyncStandbyLost` | a primary with no synchronous standby — commits unprotected; **proven live 2026-09-28** | 5m | critical |
+| `DatabaseAuditNotWriting` | a pg node whose database is up (`pg_up`) and whose audited heartbeat read was not found in its log — audit records are being lost (V-261920). Promtool-tested both ways 2026-10-01 | 30m | critical |
+| `DatabaseVolumeAt75` | the volume holding PostgreSQL's data and logs (`/var/lib/postgresql`) at 75 % used — the STIG's point (V-261919); the generic warning fires at 80 % | 15m | warning |
 | `PostgresNoPrimary` | no leader, longer than a failover | 1m | critical |
 | `PostgresMultiplePrimaries` | split brain | 1m | critical |
 | `PostgresReplicaNotStreaming` | a replica not streaming | 5m | warning |

@@ -1154,11 +1154,29 @@ decision, with its justification).
 | 2 | V-261883 would pass with an empty package file list ("no stray files" is vacuously true), and the extension, owner and PUBLIC rules with no per-database facts | missing facts mean `not_reviewed`, never a pass — found by planting a problem in every area |
 | 3 | `pg_database_owner` (PostgreSQL 15+, owner of every `public` schema) flagged as unauthorised in `template1` and `postgres` | judged as the database's own owner |
 | 4 | V-261922 said "every line" and checked one | it counts every line of the probe's sessions |
+| 5 | V-261902 counted `pg_settings` as a catalog PUBLIC may write — PostgreSQL's own `UPDATE` grant, which is `SET` by another name | the relation is named in the evidence; `pg_settings` is allowed with that reason, anything else is a finding |
 
-### 10b.6 Still to come
+### 10b.6 Piece 6.4 — the written answers
 
-**6.4** the written answers (27 rules — LUKS, FIPS, the alerts, the backups and the audit offload are the
-evidence for most) · **6.5** the two scans — the empty cluster, then with the application — then
+The last 28 rules ask for judgments, not queries. Every site decision and every justification lives in
+`pg-baseline.env`; the scan gathers the evidence where it exists:
+
+| outcome | rules |
+|---|---|
+| **pass, with evidence the scan gathers** | the installation account (only the operator's account can sudo, with a password); certificate identities mapped in `pg_ident`; only `plpgsql` among procedural languages; the catalogs owned by `postgres`, PUBLIC unable to write them (`pg_settings` excepted — see below); data at rest (LUKS2 on every host volume under the guest disks — pgcrypto deliberately not used, it is outside any FIPS boundary); audit space never exhausted; forced re-authentication (§14); production data only through §10a's procedure |
+| **pass by the site's definition** | session termination (the 60-minute statement timeout and keepalives; no idle limit — the application pools); security labelling not required (one classification level, CUI) |
+| **not applicable** | shutting down on audit failure — availability takes precedence for a dispatch system, the STIG's own N/A condition |
+| **three real fixes, then pass** | **the logs roll over a week** (`postgresql-<Day>.log`, oldest overwritten first) — before this, nothing ever removed them, and a busy audited database would in time fill its own volume and stop; **`DatabaseVolumeAt75`** — the STIG's 75 % warning (the generic one fires at 80 %); **an end-to-end audit heartbeat** — every 15 minutes the facts job runs one audited read and looks for that exact read in the log, and `DatabaseAuditNotWriting` fires (critical) after two misses while the database is up. Proven live on all three nodes; both alerts promtool-tested both ways with three must-fail controls |
+| **open, with a written justification** | organization-level authentication (CAC/PIV, 6a.23); no CRL (a lapsed CRL would cut replication); not DoD PKI |
+| **open, a backlog item** | the central log store (3.37); PUBLIC may create in the application database's `public` schema (3.52) |
+| **the application's owners** | the permission model, undocumented (open); a review of the application's own database code — 29 functions, 38 triggers (not reviewed) |
+
+**Result, 2026-10-01 — all 111 rules judged:** leader **96 pass · 8 Open · 2 N/A · 5 not reviewed**;
+standbys 77 · 8 · 2 · 24 (the probe's rules are the leader's). Every Open has an owner.
+
+### 10b.7 Still to come
+
+**6.5** the two scans — the empty cluster, then with the application — then
 3.52's fix on both sides.
 
 ---
@@ -1331,6 +1349,14 @@ sudo -u postgres pgbackrest --stanza=enclave-pg check     # on the PRIMARY: a WA
 A backup now: `06a backup-run full|diff` on a store. A restore drill: `06a backup-restore-test` on
 the primary. A real restore is a different operation — it replaces a cluster — and is not yet
 written as a procedure (§16).
+
+**Force a user to log in again** (V-261927) — on the leader, as `postgres`:
+
+```bash
+### MACHINE: the leader ###
+sudo -u postgres psql -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = '<role>'"   # one role
+sudo -u postgres psql -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND backend_type = 'client backend'"   # every client
+```
 
 **Do not:**
 

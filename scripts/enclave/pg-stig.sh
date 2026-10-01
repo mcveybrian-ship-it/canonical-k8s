@@ -893,17 +893,32 @@ res("V-261893", "open", show("ssl_crl_file") + "\nhostssl lines: %s" % "; ".join
 for v in ("V-261917", "V-261967"):
     res(v, "open", show("log_destination") + "\n" + show("syslog_facility") + "\n\nFINDING: no central log store collects PostgreSQL's audit records yet (backlog 3.37)",
         B.get("PGB_CENTRAL_AUDIT", ""))
-res("V-261859", "open", "\n\nFINDING: the application's permission model (who may do what, per role) is not documented yet",
-    "The application's owners document its access model; with parity, it is the Azure deployment's. Until then the access control itself cannot be judged (also V-261914 and V-261885).")
+# WITH NO APPLICATION LOADED (6.5's first scan) only the platform is here, and its permission model IS
+# documented - 06a §11 (pg_hba, pg_ident) and the baseline. So these rules are judged for what is present.
+app_present = bool(rnames) or any(d["db"] not in SYS for d in DBS)
+if app_present:
+    res("V-261859", "open", "\n\nFINDING: the application's permission model (who may do what, per role) is not documented yet",
+        "The application's owners document its access model; with parity, it is the Azure deployment's. Until then the access control itself cannot be judged (also V-261914 and V-261885).")
+else:
+    res("V-261859", "not_a_finding", "no application roles or databases are present",
+        "Only the platform is here, and its permissions are documented: who may connect and how in 06a §11 (pg_hba, pg_ident), roles and their attributes in the baseline (pg-baseline.env).")
 fns = sum(r["n"] for d in DBS if d["db"] not in SYS for r in (d.get("owners") or []) if r["kind"] == "function" and (is_app_role(r["owner"]) or r["owner"] in bl("PGB_PARITY_ROLES")))
 trg = sum(d.get("triggers") or 0 for d in DBS if d["db"] not in SYS)
 for v in ("V-261905", "V-261906", "V-261907"):
-    res(v, "not_reviewed", "the application's database code: %d functions owned by its roles, %d triggers" % (fns, trg),
-        "A review of the application's own database code - input validation, dynamic SQL - by the application's owners.")
+    if app_present:
+        res(v, "not_reviewed", "the application's database code: %d functions owned by its roles, %d triggers" % (fns, trg),
+            "A review of the application's own database code - input validation, dynamic SQL - by the application's owners.")
+    else:
+        res(v, "not_a_finding", "no application database code: %d functions, %d triggers outside PostgreSQL's own" % (fns, trg),
+            "Only PostgreSQL's own code is present; the platform writes no stored procedures or triggers.")
 for v, why in (("V-261914", "The object owners pass (above); the access control itself waits for the application's documented permission model (V-261859)."),
                ("V-261885", "PGDATA and PUBLIC pass (above); each object's privileges wait for the application's documented permission model (V-261859).")):
     if R.get(v, {}).get("status") == "not_reviewed":
-        R[v]["comments"] = why
+        if app_present:
+            R[v]["comments"] = why
+        else:   # the half that waited on the application's model has nothing to wait for
+            R[v]["status"] = "not_a_finding"
+            R[v]["comments"] = "No application is present; the platform's own objects and privileges are documented (06a §11, the baseline)."
 
 # ---- everything else: said, not guessed ------------------------------------------------------
 LATER = {}

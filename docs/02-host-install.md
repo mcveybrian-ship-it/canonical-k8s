@@ -103,18 +103,14 @@ Done once. Reused for all three hosts. If you already did this during the pathfi
 
 ### 4.1 Password hash
 
-**Linux or WSL:**
-
 ```bash
-sudo apt install -y whois
-mkpasswd --method=SHA-512 --rounds=4096
-```
-
-**Windows**, using the OpenSSL that ships with Git Bash:
-
-```bash
+### MACHINE: stage-01, or Git Bash on the Windows desktop ###
 openssl passwd -6
 ```
+
+It asks twice and refuses a mismatch. **Not `mkpasswd`** — it asks once, so a typo goes unnoticed
+until the console refuses the password, and on a hardened host that is a lockout (a LAB-VAULT
+rebuild, 2026-10-01).
 
 Starts `$6$`. **Not optional** — the DISA profile requires a password on the administrative
 account and will lock you out of the host without one. MAAS-style key-only builds routinely
@@ -814,7 +810,7 @@ Same category as the consumer-M.2 note in runbook §1.5.
 
 ### The trap that cost the most time — `PASSWORD_HASH` quoting
 
-`mkpasswd -m sha-512` output **must** be wrapped in single quotes:
+The `$6$` hash **must** be wrapped in single quotes:
 
 ```
 PASSWORD_HASH='$6$....'      # correct

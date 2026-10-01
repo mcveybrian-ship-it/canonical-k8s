@@ -73,18 +73,14 @@ production hosts.
 
 Do this **once**. It goes in `host-params.env` and is shared by all three hosts.
 
-**On any Linux box** (or WSL):
-
 ```bash
-sudo apt install -y whois
-mkpasswd --method=SHA-512 --rounds=4096
-```
-
-**On Windows**, Git Bash ships OpenSSL:
-
-```bash
+### MACHINE: stage-01, or Git Bash on the Windows desktop ###
 openssl passwd -6
 ```
+
+It asks twice and refuses a mismatch. **Not `mkpasswd`** — it asks once, so a typo goes unnoticed
+until the console refuses the password, and on a hardened host that is a lockout (a LAB-VAULT
+rebuild, 2026-10-01).
 
 Output starts `$6$`. **Not optional** — the DISA profile requires a password on the admin
 account and locks you out without one. Record the plaintext in your credential store.

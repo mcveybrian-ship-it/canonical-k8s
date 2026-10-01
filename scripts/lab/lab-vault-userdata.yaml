@@ -79,6 +79,7 @@ write_files:
       uuid="$(cryptsetup luksUUID "$dev")"
       grep -q "^$NAME " /etc/crypttab 2>/dev/null || echo "$NAME UUID=$uuid $KEY luks,nofail" >> /etc/crypttab
       grep -q " $MNT " /etc/fstab || echo "/dev/mapper/$NAME $MNT ext4 defaults,nofail 0 2" >> /etc/fstab
+      systemctl daemon-reload   # systemd builds its mount and unlock units from fstab/crypttab
       install -d -m 0755 "$MNT"
       mountpoint -q "$MNT" || mount "$MNT"
       install -d -m 0755 "$MNT/backup-copy"

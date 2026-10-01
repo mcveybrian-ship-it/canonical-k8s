@@ -33,8 +33,9 @@
 
 .PARAMETER PasswordHash
   SHA-512 crypt hash for the console fallback account. Generate with:
-      mkpasswd --method=SHA-512 --rounds=4096      (Linux, whois package)
-      openssl passwd -6                            (Git Bash on Windows)
+      openssl passwd -6        (Linux, or Git Bash on Windows)
+  It asks for the password twice and refuses a mismatch. mkpasswd asks ONCE: a typo goes
+  unnoticed until the console refuses the password (LAB-VAULT, 2026-10-01).
 
 .PARAMETER NetAddress
   Static IPv4 for STAGE-01, in CIDR form: 10.0.20.160/24. If you pass a bare address the
@@ -93,6 +94,15 @@ if ($UserDataTemplate) { $template = $UserDataTemplate } else { $template = Join
 if (-not (Test-Path $template))           { Die "template not found: $template" }
 if (-not (Test-Path $ProvisioningScript)) { Die "provisioning script not found: $ProvisioningScript" }
 if (-not (Test-Path $SshPubKeyFile))      { Die "ssh public key not found: $SshPubKeyFile" }
+
+# --- never build over an existing VM ------------------------------------------------------------
+# The provisioning script does not stop on an existing VM of the same name: it runs Cleanup-VM.ps1,
+# which deletes the VM and EVERY disk file attached to it - a data disk included - after one
+# "Are you sure?" prompt (found 2026-10-01 building LAB-VAULT). A rebuild is a deliberate step:
+# detach any data disk, then remove the VM (docs/lab-network.md section 9.3 has the block).
+if (Get-VM -Name $VMName -ErrorAction SilentlyContinue) {
+    Die "a VM named $VMName already exists - not building over it (the provisioning script would delete every disk attached to it)"
+}
 
 $key = (Get-Content $SshPubKeyFile -Raw).Trim()
 if ($key.StartsWith("ssh-ed25519")) {
@@ -211,6 +221,10 @@ finally {
 }
 
 Write-Host ""
+if ($UserDataTemplate) {
+    # another VM's template: its next steps are its own, named in the template's header
+    Write-Host ("Next: {0} is built - the steps that follow are named at the top of {1}" -f $VMName, $template)
+} else {
 Write-Host @'
 Next:
   1. ssh encadmin@<address>
@@ -218,3 +232,4 @@ Next:
   3. git clone this repo, run the scripts natively
   4. Attach the PAID Pro token, then airgap-update-lab.md section 5
 '@
+}

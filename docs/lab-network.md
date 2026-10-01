@@ -359,7 +359,7 @@ answers, the deny is working.
 
 ## 9. PLANNED — storage network, USB adapters and the lab recovery store (2026-09-28)
 
-> **The GigaPlus and the four adapters are cabled (2026-09-29); the NAS and the Dell are not.** It is the agreed target. The management side (§1–§8)
+> **The GigaPlus and the four adapters are cabled (2026-09-29); the Dell is cabled and its vault built (2026-10-01); the NAS is not.** It is the agreed target. The management side (§1–§8)
 > does not change. Backlog 3.16 tracks progress; 3.48 is a related drive decision on host-4.
 
 ### 9.1 The target picture
@@ -463,8 +463,120 @@ running enclave; that is `vm-backup.sh` and pgBackRest.
    once a week. The first access after sleep takes ~10–15 s.
 8. **Network:** SFP+ card → GigaPlus SFP+ 1 (DAC); onboard port → management switch.
 
-**The Dell R7515:** its RAID 10 is the second recovery store, reached NAS ↔ Dell at 10 Gb through
-the module in SFP+ 2.
+**The Dell R7515 — `lab-vault`, built 2026-10-01.** Its RAID 10 (`D:`, 7.4 TB) is the second
+recovery store.
+
+| | |
+|---|---|
+| switch | Hyper-V `Storage` on `SLOT 2 Port 1`, 10 Gb into GigaPlus SFP+ 2. **The Dell's own OS is not on it** (`AllowManagementOS` off) |
+| VM | `LAB-VAULT`: 2 vCPU / 4 GB, 40 GB system disk on `G:`, Ubuntu 24.04 cloud image |
+| address | `10.2.30.170/24`, **no gateway** — only the storage network reaches it |
+| data | `D:\Hyper-V\LAB-VAULT\LAB-VAULT-data.vhdx`, 3 TB dynamic → LUKS2 (key file on the system disk) → ext4 at `/srv/cold`, opened and mounted at every boot — reboot-tested |
+| time | Hyper-V time sync; no NTP server on the storage network |
+| definition | `scripts/lab/lab-vault-userdata.yaml` — the whole VM, including its one-time `sudo lab-vault-setup` |
+
+**A rebuild deletes attached disks unless they are detached first.** The provisioning script's
+`Cleanup-VM.ps1` deletes every disk attached to the VM, so `Build-Stage01.ps1` refuses to build over
+an existing VM. Block D is the deliberate way.
+
+**Not yet:** SSH — only the Hyper-V console reaches it until a host has a storage address, then
+SecureCRT through host-4 as a jump host; and the copies themselves (vm-backup's third copy — 3.50 applies).
+
+**A. The password hash, then the build.** `openssl` asks twice and refuses a mismatch (`mkpasswd`
+asks once — that cost a rebuild). Copy the `$6$` line; the Dell block asks for it, so it never sits
+on a command line. The block re-attaches the data disk if it already exists (a rebuild).
+
+```bash
+### MACHINE: stage-01 (10.0.20.160) ###
+openssl passwd -6
+```
+
+```powershell
+### MACHINE: Dell R7515 (the Hyper-V host) - PowerShell as Administrator ###
+$tools = 'G:\tools'; $vm = 'LAB-VAULT'; $dataVhd = 'D:\Hyper-V\LAB-VAULT\LAB-VAULT-data.vhdx'
+if (-not (Test-Path "$tools\airgapped-setup-machine\Build-Stage01.ps1")) { Write-Host "WRONG MACHINE: $env:COMPUTERNAME - no $tools\airgapped-setup-machine" } else {
+  if (Get-VM -Name $vm -ErrorAction SilentlyContinue) { Write-Host "$vm already exists - not building over it (a rebuild would delete its disks)" } else {
+    $hash = Read-Host 'Paste the $6$ hash from stage-01'
+    if ($hash -notmatch '^\$6\$') { Write-Host "that is not a SHA-512 crypt hash - nothing built" } else {
+      & "$tools\airgapped-setup-machine\Build-Stage01.ps1" -ProvisioningScript "$tools\hyperv-vm-provisioning\New-HyperVCloudImageVM.ps1" `
+             -SshPubKeyFile "$env:USERPROFILE\.ssh\enclave_admin.pub" -PasswordHash $hash `
+             -UserDataTemplate "$tools\lab\lab-vault-userdata.yaml" `
+             -VMName $vm -NetAddress 10.2.30.170/24 -SwitchName Storage `
+             -VHDSizeBytes 40GB -VMProcessorCount 2 -VMMemoryBytes 4GB
+    }
+    Remove-Variable hash
+  }
+  if ((Get-VM -Name $vm -ErrorAction SilentlyContinue) -and (Test-Path $dataVhd) -and -not (Get-VMHardDiskDrive -VMName $vm | Where-Object Path -eq $dataVhd)) { Add-VMHardDiskDrive -VMName $vm -ControllerType SCSI -Path $dataVhd }
+  if (Get-VM -Name $vm -ErrorAction SilentlyContinue) { Get-VMHardDiskDrive -VMName $vm | Format-Table ControllerType, ControllerLocation, Path -AutoSize }
+}
+```
+
+**B. The data disk — first build only.** Dynamic: it takes space on `D:` only as copies land. It
+attaches to the running VM (Gen 2, SCSI). Safe to re-run.
+
+```powershell
+### MACHINE: Dell R7515 (the Hyper-V host) - PowerShell as Administrator ###
+$vm = 'LAB-VAULT'; $dataDir = 'D:\Hyper-V\LAB-VAULT'; $dataVhd = "$dataDir\LAB-VAULT-data.vhdx"; $dataSize = 3TB
+if (-not (Get-VM -Name $vm -ErrorAction SilentlyContinue)) { Write-Host "WRONG MACHINE or no VM: $env:COMPUTERNAME has no $vm" } else {
+  Get-VM $vm | Format-Table Name, State, Uptime, Heartbeat, Generation -AutoSize
+  if (Test-Path $dataVhd) { Write-Host "$dataVhd already exists - not creating it again" } else {
+    $free = (Get-Volume -DriveLetter D).SizeRemaining
+    if ($free -lt $dataSize) { Write-Host ("D: has {0:N0} GB free, less than the {1:N0} GB disk - nothing created" -f ($free/1GB), ($dataSize/1GB)) } else {
+      New-Item -ItemType Directory -Force $dataDir | Out-Null
+      New-VHD -Path $dataVhd -SizeBytes $dataSize -Dynamic | Format-Table Path, VhdFormat, VhdType, @{n='SizeGB';e={$_.Size/1GB}} -AutoSize
+    }
+  }
+  if ((Test-Path $dataVhd) -and -not (Get-VMHardDiskDrive -VMName $vm | Where-Object Path -eq $dataVhd)) { Add-VMHardDiskDrive -VMName $vm -ControllerType SCSI -Path $dataVhd }
+  Get-VMHardDiskDrive -VMName $vm | Format-Table ControllerType, ControllerNumber, ControllerLocation, Path -AutoSize
+}
+```
+
+**C. Set up the data disk — in the Hyper-V console** (`vmconnect.exe localhost LAB-VAULT`; log in as
+`encadmin`). `lab-vault-setup` checks its own hostname, refuses anything but exactly one blank data
+disk, and never re-formats an existing LUKS disk. Then reboot, and check that `/srv/cold` came back
+by itself.
+
+```bash
+### MACHINE: lab-vault (10.2.30.170) - the Hyper-V console ###
+cloud-init status --long
+ip -br addr
+lsblk -d -o NAME,SIZE,TYPE,MODEL
+sudo lab-vault-setup
+```
+
+```bash
+### MACHINE: lab-vault (10.2.30.170) - the Hyper-V console ###
+if [ "$(hostname -s)" != lab-vault ]; then echo "WRONG MACHINE: $(hostname -s)"; else
+  sudo reboot
+fi
+```
+
+```bash
+### MACHINE: lab-vault (10.2.30.170) - the Hyper-V console - after the reboot ###
+findmnt /srv/cold
+lsblk -o NAME,TYPE,FSTYPE,SIZE,MOUNTPOINT /dev/sdb
+date -u
+```
+
+**D. Remove the VM, keeping the data disk.** Detaches the data disk first, refuses while any `D:`
+disk is still attached, then lets the provisioning repo's own `Cleanup-VM.ps1` remove the VM, its
+system disk and its seed ISO. Then block A rebuilds and re-attaches.
+
+```powershell
+### MACHINE: Dell R7515 (the Hyper-V host) - PowerShell as Administrator ###
+$vm = 'LAB-VAULT'; $dataVhd = 'D:\Hyper-V\LAB-VAULT\LAB-VAULT-data.vhdx'; $cleanup = 'G:\tools\hyperv-vm-provisioning\Cleanup-VM.ps1'
+if (-not (Test-Path $cleanup)) { Write-Host "WRONG MACHINE: $env:COMPUTERNAME - no $cleanup" } else {
+  if (-not (Get-VM -Name $vm -ErrorAction SilentlyContinue)) { Write-Host "$vm is already gone - nothing to remove" } else {
+    Get-VMHardDiskDrive -VMName $vm | Where-Object Path -eq $dataVhd | Remove-VMHardDiskDrive
+    Get-VMHardDiskDrive -VMName $vm | Format-Table ControllerType, Path -AutoSize
+    if (Get-VMHardDiskDrive -VMName $vm | Where-Object Path -like 'D:\*') { Write-Host "a D: disk is still attached - NOT removing the VM" } else {
+      & $cleanup -VMNames $vm -Force
+    }
+  }
+  Get-VM | Format-Table Name, State -AutoSize
+  Get-Item $dataVhd -ErrorAction SilentlyContinue | Format-Table FullName, @{n='MB';e={[int]($_.Length/1MB)}} -AutoSize
+}
+```
 
 ### 9.4 Order of work
 

@@ -16,12 +16,14 @@
 #     ./03-host-services.sh cryptdisk  encrypt, format and mount a whole EXTRA disk (CRYPT_DISKS)
 #                                      - host-4's spare NVMe, the database backup store (B-06a)
 #     ./03-host-services.sh bridge     replace the NIC with a bridge   <-- can cut you off
+#     ./03-host-services.sh storage    the storage network's address on the second NIC (3.16)
 #     ./03-host-services.sh pool       define the libvirt storage pool
 #     ./03-host-services.sh tmux       tmux + the shared /etc/tmux.conf
 #     ./03-host-services.sh keyonly    disable password SSH  <-- do this LAST
 #     ./03-host-services.sh verify     prove all of the above, change nothing
 #     ./03-host-services.sh all        hosts, trustca, apt, libvirt, datavg, pool, tmux, verify
-#                                      (NOT bridge)
+#                                      (NOT bridge, NOT storage - a host without the second NIC
+#                                      is not broken; 3.16 decides the split for the product)
 #
 # "all" deliberately excludes "bridge". Every other step is reversible from an ssh session;
 # the bridge step is the one that can leave an air-gapped host needing a physical console.
@@ -105,6 +107,22 @@ die()  { printf '\n  [x] %s\n\n' "$*" >&2; exit 1; }
 
 need_root() { [ "$(id -u)" -eq 0 ] || die "run this with sudo: sudo $0 $*"; }
 
+# _in_subnet ADDRESS NET/LEN - true when the IPv4 address is inside the network.
+_ip2int() { local IFS=. a b c d; read -r a b c d <<< "$1"; printf '%s' $(( (a<<24) + (b<<16) + (c<<8) + d )); }
+_in_subnet() {
+  local net="${2%/*}" len="${2#*/}" mask
+  mask=$(( len == 0 ? 0 : (0xFFFFFFFF << (32 - len)) & 0xFFFFFFFF ))
+  [ $(( $(_ip2int "$1") & mask )) -eq $(( $(_ip2int "$net") & mask )) ]
+}
+
+# STORAGE_SUBNET from the address file, or empty. Read as text, like the guards above.
+_storage_subnet() {
+  local STORAGE_SUBNET=""
+  # shellcheck disable=SC1090
+  eval "$(awk -F= '/^STORAGE_SUBNET=/{print $1"="$2}' "$SELF/../enclave/enclave-addresses.env" 2>/dev/null)"
+  printf '%s' "$STORAGE_SUBNET"
+}
+
 # -----------------------------------------------------------------------------------------
 # Params. Validate quoting BEFORE sourcing - an unbalanced quote in a params file swallows
 # the rest of it and produces an error that points at the wrong line. This cost an hour in
@@ -184,9 +202,13 @@ load_params() {
   # still be told. Empty or unset means discover. Ambiguity is REFUSED rather than guessed -
   # two candidate NICs is a question for a person, not a coin toss.
   if [ -z "${BRIDGE_NIC:-}" ] || [ -z "${BRIDGE_ADDRESS:-}" ]; then
-    local _cand _n _found_nic="" _found_addr="" _count=0
+    local _cand _n _found_nic="" _found_addr="" _count=0 _ssub
+    _ssub="$(_storage_subnet)"
     while read -r _n _cand; do
       [ "$_n" = lo ] && continue
+      # The storage network's address is never the bridge's (3.16). Without this skip, a host
+      # with both addresses looks ambiguous and every subcommand here refuses.
+      [ -n "$_ssub" ] && _in_subnet "${_cand%/*}" "$_ssub" && continue
       _count=$((_count + 1)); _found_nic="$_n"; _found_addr="$_cand"
     done < <(ip -4 -o addr show scope global 2>/dev/null | awk '{print $2, $4}')
 
@@ -573,6 +595,135 @@ YAML
 }
 
 # =========================================================================================
+# storage - this host's address on the STORAGE network (backlog 3.16): the second NIC, on its
+# own switch with no uplink. Ceph replication later; today the lab recovery store. The
+# management address, br0 and every VM on it are NOT touched - and the step proves that.
+#
+# A systemd-networkd file of its own, NOT netplan, and that is the load-bearing choice.
+# `netplan generate` rewrites every file it owns, and `networkctl reload` reconfigures every
+# interface whose file changed (networkctl(1): "If a new, modified or removed .network file is
+# found, then all interfaces which match the file are reconfigured") - br0 and its port
+# included, under running VMs. One NEW file that matches only the storage NIC means the reload
+# touches only that NIC. After the reload the step reads networkd's journal and names every
+# interface it reconfigured, so the claim is checked on every run rather than trusted.
+#
+# Values, none typed per host: the address is STORAGE_HOST_n from enclave-addresses.env, n
+# being whichever HOST_n this machine is; the NIC is DISCOVERED - the one physical interface
+# that is up, is not a bridge port, and carries no IPv4 address outside the storage subnet - or
+# STORAGE_NIC in the params file. Ambiguity is refused. No gateway, no DNS: the storage network
+# routes nowhere. RequiredForOnline=no: a dead USB adapter costs speed, never a boot.
+# Safe to re-run: an identical file is left alone; a different one is kept aside first.
+cmd_storage() {
+  need_root storage
+  local af="$SELF/../enclave/enclave-addresses.env" f=/etc/systemd/network/20-enclave-storage.network
+  local HOST_1="" HOST_2="" HOST_3="" HOST_4="" STORAGE_SUBNET=""
+  # shellcheck disable=SC2034  # read through ${!v} below
+  local STORAGE_HOST_1="" STORAGE_HOST_2="" STORAGE_HOST_3="" STORAGE_HOST_4=""
+  # shellcheck disable=SC1090
+  eval "$(awk -F= '/^(HOST_[0-9]|STORAGE_HOST_[0-9]|STORAGE_SUBNET)=/{print $1"="$2}' "$af")"
+  [ -n "$STORAGE_SUBNET" ] || die "STORAGE_SUBNET is not set in $af"
+  local len="${STORAGE_SUBNET#*/}"
+  case "$len" in ''|*[!0-9]*) die "STORAGE_SUBNET='$STORAGE_SUBNET' is not in CIDR form" ;; esac
+
+  # Which HOST_n is this machine - by its management address, as the guard decided.
+  local mine n="" i v
+  mine=" $(ip -4 -o addr show scope global | awk '{split($4,a,"/"); print a[1]}' | tr '\n' ' ')"
+  for i in 1 2 3 4; do v="HOST_$i"; case "$mine" in *" ${!v:-none} "*) n="$i" ;; esac; done
+  [ -n "$n" ] || die "this machine holds none of HOST_1..4's addresses"
+  v="STORAGE_HOST_$n"; local addr="${!v}"
+  [ -n "$addr" ] || die "$v is not set in $af - no storage address for $(hostname -s)"
+  _in_subnet "$addr" "$STORAGE_SUBNET" || die "$v=$addr is not inside STORAGE_SUBNET=$STORAGE_SUBNET"
+
+  # The NIC: STORAGE_NIC from the params file if set, otherwise discovered.
+  local nic="" d cands="" a other
+  if [ -r "$PARAMS" ]; then
+    # shellcheck disable=SC1090
+    eval "$(awk -F= '/^STORAGE_NIC=/{print "nic="$2}' "$PARAMS")"
+  fi
+  if [ -n "$nic" ]; then
+    [ -e "/sys/class/net/$nic" ] || die "STORAGE_NIC='$nic' (from $PARAMS) does not exist here"
+    ok "STORAGE_NIC=$nic (from $PARAMS)"
+  else
+    for d in /sys/class/net/*; do
+      i="${d##*/}"
+      [ -e "$d/device" ] || continue                      # physical only: not lo, br0, vnet*, virbr*
+      [ -e "$d/master" ] && continue                      # a bridge port - the management NIC under br0
+      [ "$(cat "$d/operstate" 2>/dev/null)" = up ] || continue
+      other=0
+      while read -r a; do
+        [ -n "$a" ] || continue
+        _in_subnet "${a%/*}" "$STORAGE_SUBNET" || other=1
+      done < <(ip -4 -o addr show dev "$i" scope global | awk '{print $4}')
+      [ "$other" -eq 0 ] && cands="$cands $i"
+    done
+    cands="${cands# }"
+    case "$cands" in
+      "")    die "no candidate storage NIC: none is physical, up, outside the bridge and without
+       another address. Is the adapter plugged in and linked?  ip -br link" ;;
+      *" "*) die "more than one candidate storage NIC: $cands
+       This is a question for a person. Set STORAGE_NIC in $PARAMS." ;;
+    esac
+    nic="$cands"
+    ok "discovered STORAGE_NIC=$nic ($(basename "$(readlink -f "/sys/class/net/$nic/device/driver" 2>/dev/null)" 2>/dev/null), $(cat "/sys/class/net/$nic/speed" 2>/dev/null) Mb/s)"
+  fi
+  local mac; mac="$(cat "/sys/class/net/$nic/address")"
+
+  local want
+  want="# Written by 03-host-services.sh storage (backlog 3.16). Do not edit by hand: change
+# STORAGE_HOST_n / STORAGE_SUBNET in enclave-addresses.env and re-run the step.
+# The STORAGE network - no gateway, no DNS. A networkd file, not netplan: see the script.
+[Match]
+MACAddress=$mac
+
+[Link]
+RequiredForOnline=no
+
+[Network]
+Address=$addr/$len
+IPv6AcceptRA=no
+"
+  if [ -f "$f" ] && [ "$(cat "$f")" = "${want%$'\n'}" ]; then
+    skip "$f already says $nic ($mac) = $addr/$len"
+  else
+    if [ -f "$f" ]; then
+      local bk; bk="/root/networkd.pre-storage-$(date +%Y%m%d%H%M%S)"
+      mkdir -p "$bk" && cp -p "$f" "$bk/" && warn "$f differed - kept aside in $bk/"
+    fi
+    printf '%s' "$want" > "$f"; chmod 0644 "$f"
+    ok "wrote $f: $nic ($mac) = $addr/$len"
+  fi
+
+  local since; since="$(date '+%Y-%m-%d %H:%M:%S')"
+  networkctl reload || die "networkctl reload failed"
+  for i in $(seq 1 20); do
+    ip -4 -o addr show dev "$nic" | grep -q " $addr/$len " && break
+    sleep 1
+  done
+  ip -4 -o addr show dev "$nic" | grep -q " $addr/$len " \
+    || die "$nic did not take $addr/$len within 20 s. networkd says:
+$(journalctl -u systemd-networkd --since "$since" -o cat --no-pager 2>&1 | sed 's/^/       /')"
+  ok "$nic is up with $addr/$len"
+
+  # THE PROOF: which interfaces did networkd reconfigure? Only the storage NIC may appear.
+  local log touched=""
+  sleep 2
+  log="$(journalctl -u systemd-networkd --since "$since" -o cat --no-pager 2>&1)"
+  for d in /sys/class/net/*; do
+    i="${d##*/}"; [ "$i" = "$nic" ] && continue
+    printf '%s\n' "$log" | grep -q "^$i: " && touched="$touched $i"
+  done
+  say "networkd since the reload:"
+  printf '%s\n' "$log" | sed 's/^/      /'
+  if [ -n "$touched" ]; then
+    warn "networkd ALSO touched:$touched - check the VMs on the bridge are still reachable"
+  else
+    ok "networkd touched $nic only - br0, its port and the VMs were left alone"
+  fi
+  say "routes on $nic (expect only the subnet, no default):"
+  ip -4 route show dev "$nic" | sed 's/^/      /'
+}
+
+# =========================================================================================
 # pool - a libvirt 'dir' storage pool at POOL_PATH (the datavg volume), started and set to
 # autostart. 03-compose-vm.sh writes every guest disk into it.
 cmd_pool() {
@@ -798,6 +949,19 @@ cmd_verify() {
     && ok "crypt-data unlocks by keyfile with nofail" \
     || warn "crypt-data is not on the keyfile - boot will prompt twice"
 
+  # The storage network (3.16) is optional: a host without it is not split yet, not broken.
+  local sf=/etc/systemd/network/20-enclave-storage.network sa
+  if [ -r "$sf" ]; then
+    sa="$(awk -F= '/^Address=/{print $2}' "$sf")"
+    if ip -4 -o addr show scope global | grep -q " $sa "; then
+      ok "storage network: $sa ($(ip -4 -o addr show scope global | awk -v a="$sa" '$4==a{print $2}'))"
+    else
+      warn "storage network: $sf says $sa, but no interface has it"; fail=1
+    fi
+  else
+    skip "storage network not configured (3.16) - sudo ./03-host-services.sh storage"
+  fi
+
   echo
   [ "$fail" -eq 0 ] && ok "step 03 complete" || warn "step 03 INCOMPLETE - see above"
   return "$fail"
@@ -812,12 +976,13 @@ case "${1:-}" in
   datavg)  _assert_enclave_host; cmd_datavg ;;
   cryptdisk) _assert_enclave_host; cmd_cryptdisk ;;
   bridge)  _assert_enclave_host; cmd_bridge ;;
-  pool)    _assert_enclave_host; cmd_pool ;;
+  storage) _assert_enclave_host; cmd_storage ;;
+  pool)   _assert_enclave_host; cmd_pool ;;
   tmux)    cmd_tmux ;;
   hosts)   _assert_enclave_host; cmd_hosts ;;
   trustca) _assert_enclave_host; cmd_trustca ;;
   keyonly) _assert_keyonly_host; cmd_keyonly ;;
   verify)  cmd_verify ;;
   all)     _assert_enclave_host; cmd_hosts; cmd_trustca; cmd_apt; cmd_libvirt; cmd_datavg; cmd_pool; cmd_tmux; cmd_verify ;;
-  *)       sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  *)       sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

@@ -115,6 +115,19 @@ _in_subnet() {
   [ $(( $(_ip2int "$1") & mask )) -eq $(( $(_ip2int "$net") & mask )) ]
 }
 
+# _bridges_state - one line per bridge: its IPv4 addresses and its ports (the NIC and each VM's
+# vnet). What a network reload on this host must not lose; `storage` compares it before and after.
+_bridges_state() {
+  local d b
+  for d in /sys/class/net/*/bridge; do
+    [ -e "$d" ] || continue
+    b="$(basename "$(dirname "$d")")"
+    printf '%s addr=%s ports=%s\n' "$b" \
+      "$(ip -4 -o addr show dev "$b" scope global | awk '{print $4}' | sort | tr '\n' ',')" \
+      "$(find "/sys/class/net/$b/brif" -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null | sort | tr '\n' ',')"
+  done
+}
+
 # STORAGE_SUBNET from the address file, or empty. Read as text, like the guards above.
 _storage_subnet() {
   local STORAGE_SUBNET=""
@@ -596,26 +609,29 @@ YAML
 
 # =========================================================================================
 # storage - this host's address on the STORAGE network (backlog 3.16): the second NIC, on its
-# own switch with no uplink. Ceph replication later; today the lab recovery store. The
-# management address, br0 and every VM on it are NOT touched - and the step proves that.
+# own switch with no uplink. Ceph replication later; today the lab recovery store.
 #
-# A systemd-networkd file of its own, NOT netplan, and that is the load-bearing choice.
-# `netplan generate` rewrites every file it owns, and `networkctl reload` reconfigures every
-# interface whose file changed (networkctl(1): "If a new, modified or removed .network file is
-# found, then all interfaces which match the file are reconfigured") - br0 and its port
-# included, under running VMs. One NEW file that matches only the storage NIC means the reload
-# touches only that NIC. After the reload the step reads networkd's journal and names every
-# interface it reconfigured, so the claim is checked on every run rather than trusted.
+# NETPLAN, like the bridge: /etc/netplan/75-enclave-storage.yaml, then `netplan generate` and
+# `networkctl reload`. Not `netplan apply`, which also unbinds and rebinds every NIC that is down.
+#
+# THE RELOAD IS NOT NARROW, and the first version of this step assumed it was. networkctl(1)
+# says a reload reconfigures "all interfaces which match the file"; on systemd 255 it
+# reconfigured br0 and its port as well - measured on host-4 2026-10-01, the first run, by this
+# step's own check. It cost nothing visible (every VM answered, no monitoring target missed a
+# scrape), but it decides what the step must prove: every bridge keeps its address and every
+# port - its NIC and each VM's vnet - across the reload. If one does not, the step fails loudly.
 #
 # Values, none typed per host: the address is STORAGE_HOST_n from enclave-addresses.env, n
 # being whichever HOST_n this machine is; the NIC is DISCOVERED - the one physical interface
 # that is up, is not a bridge port, and carries no IPv4 address outside the storage subnet - or
-# STORAGE_NIC in the params file. Ambiguity is refused. No gateway, no DNS: the storage network
-# routes nowhere. RequiredForOnline=no: a dead USB adapter costs speed, never a boot.
-# Safe to re-run: an identical file is left alone; a different one is kept aside first.
+# STORAGE_NIC in the params file. Ambiguity is refused. Matched by MAC. No gateway, no DNS: the
+# storage network routes nowhere. `optional: true`, and boot waits only for the bridge anyway
+# (netplan's wait-online override names br0 alone - rendered and checked 2026-10-01), so a dead
+# USB adapter costs speed, never a boot. Safe to re-run: an identical file is left alone.
 cmd_storage() {
   need_root storage
-  local af="$SELF/../enclave/enclave-addresses.env" f=/etc/systemd/network/20-enclave-storage.network
+  local af="$SELF/../enclave/enclave-addresses.env" f=/etc/netplan/75-enclave-storage.yaml
+  local old=/etc/systemd/network/20-enclave-storage.network
   local HOST_1="" HOST_2="" HOST_3="" HOST_4="" STORAGE_SUBNET=""
   # shellcheck disable=SC2034  # read through ${!v} below
   local STORAGE_HOST_1="" STORAGE_HOST_2="" STORAGE_HOST_3="" STORAGE_HOST_4=""
@@ -671,29 +687,36 @@ cmd_storage() {
   local want
   want="# Written by 03-host-services.sh storage (backlog 3.16). Do not edit by hand: change
 # STORAGE_HOST_n / STORAGE_SUBNET in enclave-addresses.env and re-run the step.
-# The STORAGE network - no gateway, no DNS. A networkd file, not netplan: see the script.
-[Match]
-MACAddress=$mac
-
-[Link]
-RequiredForOnline=no
-
-[Network]
-Address=$addr/$len
-IPv6AcceptRA=no
+# The STORAGE network: no gateway, no DNS - it routes nowhere.
+network:
+  version: 2
+  ethernets:
+    storage:
+      match:
+        macaddress: \"$mac\"
+      addresses: [\"$addr/$len\"]
+      accept-ra: false
+      optional: true
 "
+  local bk; bk="/root/netplan.pre-storage-$(date +%Y%m%d%H%M%S)"
+  # This step's first version (2026-10-01, host-4 only) wrote a networkd file instead.
+  if [ -f "$old" ]; then
+    mkdir -p "$bk" && mv "$old" "$bk/" && warn "moved the first version's $old -> $bk/"
+  fi
   if [ -f "$f" ] && [ "$(cat "$f")" = "${want%$'\n'}" ]; then
     skip "$f already says $nic ($mac) = $addr/$len"
   else
-    if [ -f "$f" ]; then
-      local bk; bk="/root/networkd.pre-storage-$(date +%Y%m%d%H%M%S)"
-      mkdir -p "$bk" && cp -p "$f" "$bk/" && warn "$f differed - kept aside in $bk/"
-    fi
-    printf '%s' "$want" > "$f"; chmod 0644 "$f"
+    if [ -f "$f" ]; then mkdir -p "$bk" && cp -p "$f" "$bk/" && warn "$f differed - kept aside in $bk/"; fi
+    printf '%s' "$want" > "$f"; chmod 600 "$f"     # netplan warns about a file others can read
     ok "wrote $f: $nic ($mac) = $addr/$len"
   fi
 
-  local since; since="$(date '+%Y-%m-%d %H:%M:%S')"
+  local before after since out
+  before="$(_bridges_state)"
+  since="$(date '+%Y-%m-%d %H:%M:%S')"
+  out="$(netplan generate 2>&1)" || die "netplan generate failed - nothing applied:
+$out"
+  [ -z "$out" ] || printf '%s\n' "$out" | sed 's/^/      /'
   networkctl reload || die "networkctl reload failed"
   for i in $(seq 1 20); do
     ip -4 -o addr show dev "$nic" | grep -q " $addr/$len " && break
@@ -704,9 +727,12 @@ IPv6AcceptRA=no
 $(journalctl -u systemd-networkd --since "$since" -o cat --no-pager 2>&1 | sed 's/^/       /')"
   ok "$nic is up with $addr/$len"
 
-  # THE PROOF: which interfaces did networkd reconfigure? Only the storage NIC may appear.
+  # THE PROOF THAT MATTERS: every bridge keeps its address and every port across the reload.
+  for i in $(seq 1 30); do
+    after="$(_bridges_state)"; [ "$after" = "$before" ] && break
+    sleep 1
+  done
   local log touched=""
-  sleep 2
   log="$(journalctl -u systemd-networkd --since "$since" -o cat --no-pager 2>&1)"
   for d in /sys/class/net/*; do
     i="${d##*/}"; [ "$i" = "$nic" ] && continue
@@ -714,10 +740,16 @@ $(journalctl -u systemd-networkd --since "$since" -o cat --no-pager 2>&1 | sed '
   done
   say "networkd since the reload:"
   printf '%s\n' "$log" | sed 's/^/      /'
-  if [ -n "$touched" ]; then
-    warn "networkd ALSO touched:$touched - check the VMs on the bridge are still reachable"
+  [ -z "$touched" ] || say "networkd also reconfigured:$touched - expected on systemd 255 (see the comment above)"
+  if [ -z "$before" ]; then
+    ok "no bridge on this host - nothing else to check"
+  elif [ "$after" = "$before" ]; then
+    ok "every bridge kept its address and every port:"
+    printf '%s\n' "$after" | sed 's/^/      /'
   else
-    ok "networkd touched $nic only - br0, its port and the VMs were left alone"
+    warn "a bridge CHANGED across the reload - check the VMs NOW:"
+    diff <(printf '%s\n' "$before") <(printf '%s\n' "$after") | sed 's/^/      /' || true
+    exit 1
   fi
   say "routes on $nic (expect only the subnet, no default):"
   ip -4 route show dev "$nic" | sed 's/^/      /'
@@ -950,14 +982,16 @@ cmd_verify() {
     || warn "crypt-data is not on the keyfile - boot will prompt twice"
 
   # The storage network (3.16) is optional: a host without it is not split yet, not broken.
-  local sf=/etc/systemd/network/20-enclave-storage.network sa
+  local sf=/etc/netplan/75-enclave-storage.yaml sa
   if [ -r "$sf" ]; then
-    sa="$(awk -F= '/^Address=/{print $2}' "$sf")"
-    if ip -4 -o addr show scope global | grep -q " $sa "; then
+    sa="$(grep -o '"[0-9.]*/[0-9]*"' "$sf" | tr -d '"' | head -1)"
+    if [ -n "$sa" ] && ip -4 -o addr show scope global | grep -q " $sa "; then
       ok "storage network: $sa ($(ip -4 -o addr show scope global | awk -v a="$sa" '$4==a{print $2}'))"
     else
-      warn "storage network: $sf says $sa, but no interface has it"; fail=1
+      warn "storage network: $sf says ${sa:-no address}, but no interface has it"; fail=1
     fi
+  elif [ -e "$sf" ]; then
+    skip "storage network configured - run verify with sudo to check its address"
   else
     skip "storage network not configured (3.16) - sudo ./03-host-services.sh storage"
   fi

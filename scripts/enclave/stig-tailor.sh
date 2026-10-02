@@ -14,6 +14,7 @@
 #     sudo ./stig-tailor.sh luksenroll        # TPM unlock via clevis (proven; runbook 6.3i.1)
 #     sudo ./stig-tailor.sh radio status      # what radios this machine has
 #     sudo ./stig-tailor.sh radio disable     # ... and block them
+#     sudo ./stig-tailor.sh ra off            # ignore IPv6 router advertisements (3.55)
 #
 # EVERY SUBCOMMAND, IN THE ORDER A REBUILD RUNS THEM. The numbers are runbook section 6.0's
 # hardening table. scripts/install/05-harden-host.sh runs 8b-12d in this same order under its
@@ -2470,6 +2471,118 @@ cmd_radio() {
       ;;
 
     *) die "usage: $0 radio {status|disable|enable}" ;;
+  esac
+}
+
+# ----------------------------------------------------------------------------------- ra
+# IPv6 ROUTER ADVERTISEMENTS - backlog 3.55. systemd-networkd LISTENS for router advertisements on
+# any link with IPv6 link-local and forwarding off - its default (v255 network_adjust_ipv6_accept_ra)
+# - whatever the kernel's accept_ra says. No router exists on the enclave LAN (3.54, measured
+# 2026-10-02), but if one ever appeared - a device on the enclave switch, or IPv6 switched on at the
+# FortiGate's dmz port in State A - every machine would take a default route and addresses from it:
+# an IPv6 path across the gap. The DISA STIG profile does not select the accept_ra rules (only the
+# CIS profiles do - host-4's benchmark, 2026-10-02), so this is hardening, not a finding.
+#
+# IPv6 STAYS ON. Link-local and static IPv6 addresses are untouched: the cluster needs dual-stack
+# (Brian, 2026-10-02), and its nodes get static IPv6 because nothing here hands IPv6 out.
+#
+# HOW: one add-on file, /etc/netplan/72-enclave-no-ra.yaml, setting accept-ra: false on every
+# interface netplan already defines, UNDER THE SAME NAMES so netplan merges it into each definition
+# (rendered 2026-10-02 for a host's br0 and its port, and a guest's MAC-matched NIC: same files,
+# IPv6AcceptRA=no added, nothing else changed). Deleting the file undoes it. Applied with netplan
+# generate + networkctl reload, which on systemd 255 reconfigures every managed link (measured
+# 2026-10-01) - so it does not call the job done unless every bridge keeps its address and its ports
+# and this machine keeps every IPv4 address it had.
+#
+#     sudo ./stig-tailor.sh ra status     which interfaces still listen
+#     sudo ./stig-tailor.sh ra off        write the file, apply it, prove nothing else moved
+ra_defs() {   # "<type> <id>" for every interface netplan defines, from the merged configuration
+  netplan get 2>/dev/null | python3 -c '
+import sys, yaml
+d = (yaml.safe_load(sys.stdin) or {}).get("network") or {}
+for t in ("ethernets", "bridges", "bonds", "vlans"):
+    for i in (d.get(t) or {}):
+        print(t, i)
+'
+}
+ra_state() {  # what networkd will do with RAs on one netplan id, from the file netplan generated
+  local nf="/run/systemd/network/10-netplan-$1.network"
+  if [ ! -r "$nf" ]; then printf 'no generated file'
+  elif grep -qx 'IPv6AcceptRA=no' "$nf"; then printf 'ignores router advertisements'
+  elif grep -qx 'LinkLocalAddressing=no' "$nf"; then printf 'no IPv6 on this link (bridge port)'
+  else printf 'LISTENS for router advertisements'; fi
+}
+ra_snapshot() {  # every bridge's address and ports, and every global IPv4 address
+  local d b
+  for d in /sys/class/net/*/bridge; do
+    [ -e "$d" ] || continue
+    b="$(basename "$(dirname "$d")")"
+    printf 'bridge %s addr=%s ports=%s\n' "$b" \
+      "$(ip -4 -o addr show dev "$b" scope global | awk '{print $4}' | sort | tr '\n' ',')" \
+      "$(find "/sys/class/net/$b/brif" -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null | sort | tr '\n' ',')"
+  done
+  ip -4 -o addr show scope global | awk '{print "ipv4", $2, $4}' | sort
+}
+cmd_ra() {
+  local action="${1:-status}" f=/etc/netplan/72-enclave-no-ra.yaml defs t i
+  need_root
+  command -v netplan >/dev/null || die "no netplan on this machine"
+  defs="$(ra_defs)" || true
+  [ -n "$defs" ] || die "netplan defines no interfaces here (or 'netplan get' failed) - nothing to set"
+
+  case "$action" in
+    status)
+      printf '\n  IPv6 router advertisements on %s (backlog 3.55)\n\n' "$(hostname -s)"
+      while read -r t i; do say "  $t $i: $(ra_state "$i")"; done <<< "$defs"
+      [ -f "$f" ] && say "  $f present" || say "  $f absent"
+      ;;
+    off)
+      local want
+      want="# Written by stig-tailor.sh ra off (backlog 3.55). Re-run it rather than editing; delete
+# this file (then netplan generate && networkctl reload) to undo. IPv6 stays on - only router
+# advertisements are ignored, on every interface netplan defines here.
+network:
+  version: 2
+$(for t in ethernets bridges bonds vlans; do
+    ids="$(awk -v t="$t" '$1==t{print $2}' <<< "$defs")"
+    [ -n "$ids" ] || continue
+    printf '  %s:\n' "$t"
+    for i in $ids; do printf '    %s:\n      accept-ra: false\n' "$i"; done
+  done)
+"
+      if [ -f "$f" ] && [ "$(cat "$f")" = "${want%$'\n'}" ]; then
+        ok "$f already sets accept-ra: false on every interface netplan defines"
+      else
+        local before after out
+        before="$(ra_snapshot)"
+        printf '%s' "$want" > "$f"; chmod 600 "$f"
+        if ! out="$(netplan generate 2>&1)"; then
+          rm -f "$f"
+          die "netplan generate failed - $f removed, nothing applied:
+$out"
+        fi
+        ok "wrote $f"
+        networkctl reload || die "networkctl reload failed - $f is in place; run it again by hand"
+        for i in $(seq 1 30); do
+          after="$(ra_snapshot)"; [ "$after" = "$before" ] && break
+          sleep 1
+        done
+        if [ "$after" != "$before" ]; then
+          warn "the network CHANGED across the reload - check this machine and its VMs NOW:"
+          diff <(printf '%s\n' "$before") <(printf '%s\n' "$after") | sed 's/^/      /' || true
+          say  "  to undo:  rm $f && netplan generate && networkctl reload"
+          exit 1
+        fi
+        ok "every bridge kept its address and ports, and every IPv4 address is still here:"
+        printf '%s\n' "$after" | sed 's/^/      /'
+      fi
+      while read -r t i; do say "  $t $i: $(ra_state "$i")"; done <<< "$defs"
+      if grep -q '^LISTENS' <(while read -r t i; do ra_state "$i"; echo; done <<< "$defs"); then
+        die "an interface still listens for router advertisements - see above"
+      fi
+      ok "no interface listens for IPv6 router advertisements"
+      ;;
+    *) die "usage: $0 ra {status|off}" ;;
   esac
 }
 
@@ -4941,6 +5054,7 @@ case "${1:-}" in
   preflight) shift; cmd_preflight "$@" ;;
   usb)      shift; cmd_usb "$@" ;;
   radio)    shift; cmd_radio "$@" ;;
+  ra)       shift; cmd_ra "$@" ;;
   ufw)      shift; cmd_ufw "$@" ;;
   aide)     shift; cmd_aide "$@" ;;
   v1r6)     shift; cmd_v1r6 "$@" ;;

@@ -645,6 +645,18 @@ step_radio() {
   mark_step radio
 }
 
+# Backlog 3.55: ignore IPv6 router advertisements on every interface netplan defines. NOT a STIG
+# rule (only the CIS profiles select accept_ra) - hardening: a router appearing on the enclave LAN
+# would otherwise hand every machine a default route out of it. IPv6 itself stays on (the cluster
+# is dual-stack). The live fleet got it with `stig-tailor.sh ra off` on 2026-10-02, not through
+# here: most of it predates this script's state file, and `run` would have redone other steps.
+step_ra() {
+  done_step ra && return 0
+  hdr "8b. IPv6 router advertisements - ignored (backlog 3.55)"
+  "$ENC/stig-tailor.sh" ra off || die "ra off failed - see above; the machine's network is as it was unless it says otherwise"
+  mark_step ra
+}
+
 # runbook 6.0 step 12c (6.3i): GRUB password, V-270675. prep FIRST, or GRUB demands the
 # password to boot (ssp-inputs.md 4.4).
 step_grub() {
@@ -832,7 +844,7 @@ step_done() {
 # copies drifted: step_radio sat on the status board as "[ ] radio" and was never dispatched
 # (host-3 rebuild, 2026-09-21). One list means a step is either shown AND run, or neither.
 # Order matters: accounts before v1r6 (its reboot loads the emergency audit rule).
-STEPS=(preflight hostprep pro fips patch usg baseline prechecks usgfix tailor radio grub
+STEPS=(preflight hostprep pro fips patch usg baseline prechecks usgfix tailor radio ra grub
        accounts v1r6 verify auditvolume auditoffload final_audit evalstig)
 
 cmd_status() {

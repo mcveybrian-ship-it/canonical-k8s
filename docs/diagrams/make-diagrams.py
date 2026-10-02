@@ -2,7 +2,16 @@
 """
 make-diagrams.py - draw the enclave as draw.io files, from the files that define it.
 
-    python3 docs/diagrams/make-diagrams.py        # writes docs/diagrams/*.drawio
+    python3 docs/diagrams/make-diagrams.py          # writes docs/diagrams/*.drawio
+    python3 docs/diagrams/make-diagrams.py --check  # exit 1, naming the files, if any is stale
+
+KEEPING THEM CURRENT (2026-10-02). Two kinds of drift, two answers:
+  - the source files change (an address, a placement, a size): re-run this. The pre-push hook
+    (.githooks/pre-push) runs --check against the commit being pushed and refuses a push whose
+    diagrams do not match that commit's enclave-addresses.env and vm-specs.env.
+  - something gets BUILT: the source files cannot say so. Edit the STATUS block below in the same
+    commit as the milestone, and re-run. Solid instead of dashed, "built" instead of "planned",
+    follow from it.
 
 Addresses come from scripts/enclave/enclave-addresses.env and placement and sizes from
 scripts/enclave/vm-specs.env - the same files every script reads - so a renumbered machine or a
@@ -66,6 +75,24 @@ A = read_env(ADDR)
 PROD, LABO = read_specs(SPECS)
 LAB = dict(PROD, **LABO)
 
+# ------------------------------------------------------------------------ STATUS - what is BUILT
+# The ONLY place the drawing learns what exists. Date a line when the thing is built, in the same
+# commit as the milestone; empty means planned. Everything that is not here comes from the env files.
+STATUS = {
+    "kubernetes": "",                               # B-07: date the cluster was bootstrapped
+    "ceph": "",                                     # B-08: date Ceph served its first volume
+    "witness": "",                                  # 2.8: an OPTION until decided
+    "storage_address": {"host-4": "2026-10-01"},    # 3.16: `03-host-services.sh storage`, per host
+}
+
+
+def built(key):
+    return bool(STATUS.get(key))
+
+
+def state(key, row):
+    return ("built %s" % STATUS[key]) if built(key) else ("planned, %s" % row)
+
 
 def addr(key):
     return A.get(key, "?")
@@ -94,8 +121,9 @@ ST = {
     "host": BASE + "fillColor=#ffffff;strokeColor=#333333;strokeWidth=2;verticalAlign=top;align=left;spacingLeft=8;spacingTop=4;",
     "svc": BASE + "fillColor=#fff2cc;strokeColor=#d6b656;",
     "pg": BASE + "fillColor=#d5e8d4;strokeColor=#82b366;",
-    "k8s": BASE + "fillColor=#e1d5e7;strokeColor=#9673a6;dashed=1;",
-    "ceph": BASE + "fillColor=#ffe6cc;strokeColor=#d79b00;dashed=1;",
+    "k8s": BASE + "fillColor=#e1d5e7;strokeColor=#9673a6;" + ("" if built("kubernetes") else "dashed=1;"),
+    "k8s_item": BASE + "fillColor=#ffffff;strokeColor=#9673a6;" + ("" if built("kubernetes") else "dashed=1;"),
+    "ceph": BASE + "fillColor=#ffe6cc;strokeColor=#d79b00;" + ("" if built("ceph") else "dashed=1;"),
     "mgmt": BASE + "fillColor=#dae8fc;strokeColor=#6c8ebf;",
     "stor": BASE + "fillColor=#ffe6cc;strokeColor=#d79b00;",
     "lab": BASE + "fillColor=#f8cecc;strokeColor=#b85450;dashed=1;dashPattern=1 3;strokeWidth=2;",
@@ -163,11 +191,15 @@ class Page:
                    self.w, self.h, "".join(self.cells)))
 
 
+def render(pages):
+    return ('<mxfile host="make-diagrams.py" agent="make-diagrams.py" version="24.0.0">%s</mxfile>\n'
+            % "".join(p.xml() for p in pages))
+
+
 def write(fname, pages):
     path = os.path.join(HERE, fname)
     with open(path, "w") as f:
-        f.write('<mxfile host="make-diagrams.py" agent="make-diagrams.py" version="24.0.0">%s</mxfile>\n'
-                % "".join(p.xml() for p in pages))
+        f.write(render(pages))
     return path
 
 
@@ -232,7 +264,7 @@ def page_hosts():
                   "<b>Lab differences (vm-specs.env, profile lab):</b> the four service VMs stay on host-4 - the only "
                   "machine with the memory (125 GiB against 30 on host-1..3) - and k8s-wk-04 is <b>not composed</b> "
                   "in the lab, so the lab's Ceph would have three OSD nodes, the no-self-heal case the fourth exists to fix "
-                  "(open: K4 / backlog 3.48). Kubernetes guests are planned only - none is composed yet (B-07).",
+                  "(open: K4 / backlog 3.48)." + ("" if built("kubernetes") else " Kubernetes guests are planned only - none is composed yet (B-07)."),
                   "note")
     return p
 
@@ -268,7 +300,8 @@ def page_networks():
         hb = p.box(x, 500, 360, 120,
                    "<b>%s</b><br>br0 = %s (onboard NIC)<br>storage NIC = %s%s"
                    % (h, addr("HOST_" + n), addr("STORAGE_HOST_" + n),
-                      "  <b>(configured 2026-10-01)</b>" if n == "4" else "  (planned)"), "host", 12)
+                      ("  <b>(configured %s)</b>" % STATUS["storage_address"][h]) if h in STATUS["storage_address"]
+                      else "  (planned)"), "host", 12)
         p.edge(hb, mg, "br0", EDGE)
         p.edge(hb, sg, "2.5 G USB adapter", EDGE_ST)
     # address plan
@@ -304,7 +337,7 @@ def page_networks():
 # ======================================================================== 3. the Kubernetes cluster
 def page_k8s():
     p = Page("3 - Kubernetes cluster", 1990, 1200)
-    p.title("Kubernetes cluster - Canonical Kubernetes 1.36.4 (planned, B-07)",
+    p.title("Kubernetes cluster - Canonical Kubernetes 1.36.4 (%s)" % state("kubernetes", "B-07"),
             "Embedded etcd on three control planes · Cilium · Gateway API via the built-in ck-gateway · "
             "images only from Harbor · database outside the cluster on Patroni.")
     p.legend()
@@ -344,7 +377,7 @@ def page_k8s():
                 "Ceph MDS active" if i == 0 else None]
         y = 292
         for pod in [q for q in pods if q]:
-            st = "ceph" if pod.startswith("Ceph") or pod.startswith("ceph") else "planned"
+            st = "ceph" if pod.startswith("Ceph") or pod.startswith("ceph") else "k8s_item"
             p.box(x + 10, y, 200, 44, pod, st, 10)
             y += 50
     p.edge(gw, wks[1], "routes to app pods", FLOW_DASH)
@@ -380,7 +413,7 @@ def page_k8s():
 # ======================================================================== 4. storage
 def page_storage():
     p = Page("4 - Storage (Ceph)", 1990, 1150)
-    p.title("Storage - Ceph from Ubuntu debs on the workers (planned, B-08)",
+    p.title("Storage - Ceph from Ubuntu debs on the workers (%s)" % state("ceph", "B-08"),
             "Not MicroCeph (runbook 2.5). Ceph 19.2.3 from the enclave mirror; ceph-mds is there too (checked 2026-10-02).")
     p.legend()
     p.box(30, 100, 1620, 330, "<b>CEPH CLUSTER</b> - one OSD per worker · replica 3 · OSDs encrypted (--dmcrypt, decided 2026-09-23)", "zone", 12)
@@ -544,7 +577,7 @@ def page_overview():
         p.edge(hb, sg, "", EDGE_ST)
         for j, vm in enumerate(vms):
             p.box(x + 15, 405 + 70 * j, 360, 62, vm_label(vm, PROD, with_size=False), vm_style(vm), 10)
-    p.box(30, 720, 520, 130, "<b>Kubernetes (planned, B-07)</b><br>3 control planes (etcd, API VIP %s) · 4 workers<br>"
+    p.box(30, 720, 520, 130, "<b>Kubernetes (" + state("kubernetes", "B-07") + ")</b><br>3 control planes (etcd, API VIP %s) · 4 workers<br>"
           "Gateway API (ck-gateway) on a LoadBalancer VIP · *.apps<br>Ceph on the workers: CephFS RWX + RBD"
           % addr("K8S_API_VIP"), "k8s", 11)
     p.box(570, 720, 520, 130, "<b>PostgreSQL HA (built)</b><br>pg-01..03, Patroni + its own etcd, synchronous<br>"
@@ -570,8 +603,24 @@ PAGES = [
 ]
 
 if __name__ == "__main__":
-    built = [(f, fn()) for f, fn in PAGES]
-    for f, page in built:
-        print("wrote", os.path.relpath(write(f, [page]), REPO))
-    print("wrote", os.path.relpath(write("enclave-all-pages.drawio", [pg for _, pg in built]), REPO),
-          "(every page in one file)")
+    import sys
+    pages = [(f, fn()) for f, fn in PAGES]
+    wanted = [(f, render([pg])) for f, pg in pages] + [("enclave-all-pages.drawio", render([pg for _, pg in pages]))]
+    if "--check" in sys.argv[1:]:
+        stale = []
+        for f, content in wanted:
+            path = os.path.join(HERE, f)
+            if not os.path.exists(path) or open(path).read() != content:
+                stale.append(f)
+        if stale:
+            print("diagrams STALE - they do not match enclave-addresses.env / vm-specs.env / the STATUS block:")
+            for f in stale:
+                print("   docs/diagrams/" + f)
+            print("fix:  python3 docs/diagrams/make-diagrams.py   then commit docs/diagrams/")
+            sys.exit(1)
+        print("diagrams current: %d files match the generator" % len(wanted))
+        sys.exit(0)
+    for f, content in wanted:
+        with open(os.path.join(HERE, f), "w") as fh:
+            fh.write(content)
+        print("wrote", "docs/diagrams/" + f)

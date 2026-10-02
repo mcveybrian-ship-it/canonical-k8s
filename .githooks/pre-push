@@ -27,6 +27,26 @@ PROTECTED_BRANCH='refs/heads/prehistory'
 
 ZERO='0000000000000000000000000000000000000000'
 fail=0
+dfail=0
+
+# ---- DIAGRAMS MUST MATCH THE FILES THEY ARE DRAWN FROM (added 2026-10-02) --------------------
+# docs/diagrams/*.drawio are generated from enclave-addresses.env, vm-specs.env and the STATUS
+# block in make-diagrams.py. Checked against the commit being PUSHED, not the working tree: those
+# files are taken from that commit with git archive and the generator's --check runs on them.
+# Override for a deliberate exception, awkward on purpose:
+#   ALLOW_STALE_DIAGRAMS=i-have-checked git push ...
+check_diagrams() {   # <sha>
+    git cat-file -e "$1:docs/diagrams/make-diagrams.py" 2>/dev/null || return 0   # before the diagrams existed
+    command -v python3 >/dev/null 2>&1 || { echo "pre-push: python3 not found - diagrams NOT checked" >&2; return 0; }
+    d=$(mktemp -d) || return 0
+    git archive "$1" docs/diagrams scripts/enclave/enclave-addresses.env scripts/enclave/vm-specs.env | tar -x -C "$d"
+    out=$(python3 "$d/docs/diagrams/make-diagrams.py" --check 2>&1); rc=$?
+    rm -rf "$d"
+    [ "$rc" -eq 0 ] && return 0
+    echo "pre-push: REFUSING - commit $(git log -1 --format='%h' "$1") has stale diagrams:" >&2
+    echo "$out" | sed 's/^/  /' >&2
+    return 1
+}
 
 while read -r local_ref local_sha remote_ref remote_sha; do
 
@@ -61,7 +81,20 @@ while read -r local_ref local_sha remote_ref remote_sha; do
             break
         fi
     done
+
+    check_diagrams "$local_sha" || dfail=1
 done
+
+if [ "$dfail" -ne 0 ]; then
+    if [ "${ALLOW_STALE_DIAGRAMS:-}" = "i-have-checked" ]; then
+        echo "pre-push: ALLOW_STALE_DIAGRAMS set - pushing stale diagrams anyway." >&2
+    else
+        echo >&2
+        echo "  Nothing was pushed. Regenerate and commit:  python3 docs/diagrams/make-diagrams.py" >&2
+        echo "  A deliberate exception:  ALLOW_STALE_DIAGRAMS=i-have-checked git push ..." >&2
+        exit 1
+    fi
+fi
 
 if [ "$fail" -ne 0 ]; then
     if [ "${ALLOW_PRIVATE_PUSH:-}" = "i-have-checked" ]; then

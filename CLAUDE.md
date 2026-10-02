@@ -52,6 +52,13 @@ after getting it wrong first. Read them as constraints, not suggestions.
 `01-*.md` and two `02-*.md`. His words: *"are we just adding files"*. One document per step,
 updated in place. A new file only when there is genuinely a new step or a new mechanism.
 
+**The diagrams in `docs/diagrams/` are generated — keep them current.** `python3 docs/diagrams/make-diagrams.py`
+draws them from `enclave-addresses.env`, `vm-specs.env` and the STATUS block at the top of the
+script; never hand-edit a `.drawio`. When an address, a placement or a size changes, re-run it and
+commit the diagrams with the change — the pre-push hook refuses a push whose diagrams don't match.
+When something is **built**, date its line in STATUS in the same commit as the milestone: the
+source files cannot know it, so nothing else will.
+
 **Never give a single-platform answer.** He works from Windows/PowerShell and builds Ubuntu.
 Either cover both, or state plainly why only one applies — `01-*.sh` runs on the Ubuntu
 target, so bash-only is correct there and saying so is the answer. Audit the scripts rather

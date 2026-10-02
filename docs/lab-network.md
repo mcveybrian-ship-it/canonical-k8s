@@ -473,7 +473,7 @@ recovery store.
 | | |
 |---|---|
 | switch | Hyper-V `Storage` on `SLOT 2 Port 1`, 10 Gb into GigaPlus SFP+ 2. **The Dell's own OS is not on it** (`AllowManagementOS` off) |
-| VM | `LAB-VAULT`: 2 vCPU / 4 GB, 40 GB system disk on `G:`, Ubuntu 24.04 cloud image |
+| VM | `LAB-VAULT`: 6 vCPU / 4 GB (raised from 2 on 2026-10-01 — see the copy's speeds below), 40 GB system disk on `G:`, Ubuntu 24.04 cloud image |
 | address | `10.2.30.170/24`, **no gateway** — only the storage network reaches it |
 | data | `D:\Hyper-V\LAB-VAULT\LAB-VAULT-data.vhdx`, 3 TB dynamic → LUKS2 (key file on the system disk) → ext4 at `/srv/cold`, opened and mounted at every boot — reboot-tested |
 | time | Hyper-V time sync; no NTP server on the storage network |
@@ -491,7 +491,23 @@ an existing VM. Block D is the deliberate way.
   **Firewall: None** — if it inherits the SOCKS firewall, stage-01 tries `127.0.0.1:2222` on itself.
 - A forward added to an open session starts only after a reconnect.
 
-**Not yet:** the copies themselves (vm-backup's third copy — 3.50 applies).
+**The third copy (2026-10-01).** `vm-backup.sh third-copy` pushes host-4's service-VM backup sets
+into `/srv/cold/backup-copy` over the storage network — never pgBackRest's (3.50). Its own key, a
+write-only `rrsync` on the vault, accepted only from `10.2.30.158`. Set by `BACKUP_THIRD_ADDR` in
+`vm-specs.env` (lab only; empty elsewhere). Nightly after the second copy, non-fatal. One-time
+setup: `third-copy --setup` on host-4 prints the lines to authorise on the vault.
+
+| measured 2026-10-01 | |
+|---|---|
+| first copy | 182.4 GB (170 GiB: svc-harbor-01 35, svc-mgmt-01 93, svc-obs-01 44), 38.6 min, every file verified |
+| network | raw TCP host-4 → vault **274 MB/s** — the 2.5 Gb link ~93% used; the Dell's port at 10 Gbps |
+| the copy | rsync over ssh, one stream: **163–174 MB/s**. Limited by the vault's rsync receiver at ~85–95% of one core; the cipher (AES-256/128-GCM) and I/O priority make no difference |
+| the first copy | ~116 MB/s with **2 vCPUs** — rsync, sshd, LUKS and network interrupts needed more than two cores. Raised to 6 |
+| vault disk | write 430 MB/s; read-back during verify ~250–390 MB/s |
+| each night | only files not verified before are re-read (a ledger on host-4); the weekly verify re-reads both copies in full (`--verify-all`) |
+
+**Not monitored:** it writes `/var/lib/enclave-backup-third.state` and `vm-backup.sh status` shows
+the last run, but nothing alerts. **A difference found by `--verify-all` is reported, not repaired.**
 
 **A. The password hash, then the build.** `openssl` asks twice and refuses a mismatch (`mkpasswd`
 asks once — that cost a rebuild). Copy the `$6$` line; the Dell block asks for it, so it never sits
@@ -513,7 +529,7 @@ if (-not (Test-Path "$tools\airgapped-setup-machine\Build-Stage01.ps1")) { Write
              -SshPubKeyFile "$env:USERPROFILE\.ssh\enclave_admin.pub" -PasswordHash $hash `
              -UserDataTemplate "$tools\lab\lab-vault-userdata.yaml" `
              -VMName $vm -NetAddress 10.2.30.170/24 -SwitchName Storage `
-             -VHDSizeBytes 40GB -VMProcessorCount 2 -VMMemoryBytes 4GB
+             -VHDSizeBytes 40GB -VMProcessorCount 6 -VMMemoryBytes 4GB
     }
     Remove-Variable hash
   }

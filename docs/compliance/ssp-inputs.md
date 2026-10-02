@@ -409,7 +409,7 @@ the three guests holding state nothing can regenerate (`svc-mgmt-01`'s issuing C
 — 332 GB that took **1 h 11 m** to restore and is rebuildable from the transfer bundle
 (`contingency-plan.md` §9.2). The receiving key is restricted to a write-only `rsync` into one
 directory, and the copy is verified by re-reading the far end rather than by trusting an exit
-status.
+status — each new file the night it lands, and every file weekly (since 2026-10-01).
 
 ~~**What remains true.** The WAL archive is still unbuilt and still destined for `host-4`
 (`poam.md` ENG-04), so the *roll-forward* half of this finding is untouched.~~

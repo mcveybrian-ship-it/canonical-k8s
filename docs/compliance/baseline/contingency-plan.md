@@ -329,8 +329,8 @@ So: `qemu-img info` on everything, which parses the header without opening the c
 
 | Unit | When | What it does |
 |---|---|---|
-| `enclave-vm-backup.timer` | Daily at 02:00 in `BACKUP_TZ` | `incr`, then `verify` on changed sets only, then `prune` |
-| `enclave-vm-verify.timer` | `BACKUP_VERIFY_ONCALENDAR`, default Sunday 04:00 in `BACKUP_TZ` | `verify --all`, re-reading every byte |
+| `enclave-vm-backup.timer` | Daily at 02:00 in `BACKUP_TZ` | `incr`, `verify` on changed sets only, `prune`, then `second-copy` (non-fatal; at the far end it verifies only files not verified there before), and `third-copy` where the site names one (`BACKUP_THIRD_ADDR`, empty by default) |
+| `enclave-vm-verify.timer` | `BACKUP_VERIFY_ONCALENDAR`, default Sunday 04:00 in `BACKUP_TZ` | `verify --all`, re-reading every byte, then `second-copy --verify-all` (and `third-copy --verify-all`), re-reading each copy in full |
 
 Five properties of the units are deliberate:
 

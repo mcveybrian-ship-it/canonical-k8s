@@ -367,12 +367,13 @@ the gap. Q6 — the container-image bundle size — still gates Harbor's disk si
 | `stage-01` | **`10.2.10.160`** | online | Hyper-V VM. Pro token, the mirror, the repo. Also holds a **temporary** `10.2.20.160` in the enclave subnet, removed at cutover |
 | `build-01` | **`10.2.10.124`** | online | Physical, 32 GB. Writes the transfer SSD; holds the `private-sync.sh` backup |
 | Hyper-V host (R7515) | — | online | Windows Server 2022. Runs `stage-01`; seed-stick writer |
-| `host-4` | **`10.2.20.158`** | **air-gapped** | **BUILT 2026-09-01/02.** Services host. LUKS on 2 of 3 NVMe, 125 GB RAM. **Step 03 host prep DONE** - mirror apt, br0, 1.8T LUKS-backed image pool, verified after a cold boot. **Step 03 DONE.** Installs from `svc-repo-01` |
+| `host-4` | **`10.2.20.158`** | **air-gapped** | **BUILT 2026-09-01/02.** Services host. LUKS on 2 of 3 NVMe, 125 GB RAM. **Step 03 host prep DONE** - mirror apt, br0, 1.8T LUKS-backed image pool, verified after a cold boot. **Step 03 DONE.** Installs from `svc-repo-01`. Storage network `10.2.30.158` (2026-10-01) |
 | `host-1..3` | `10.2.20.155-157` | **air-gapped** | ✅ **BUILT 2026-09-17** from seed sticks (§4a: the stick builds them, MAAS redeploys them — except MAAS cannot, see runbook §9b). Verified: STIG LV layout, 500 GB encrypted data volume, remainder raw for Ceph, one console passphrase, no default route, KVM live, TPM 2.0 (AMD fTPM). ✅ **HARDENED 2026-09-17/18 by `05-harden-host.sh`** — Pro attached, FIPS `6.8.0-138-fips`, USG **213/3**, V1R6 **171/9/9/5**, byte-identical across all three. ✅ **VM-READY** (§6.5): libvirt, `br0`, `images` pool on 300 GB, `images-data` on 200 GB. ⏸️ **Nothing composed — Kubernetes paused by decision 2026-09-18, not blocked.** **No BMC on any of them**, which is why the bridge step and every module blacklist refuse rather than guess |
 | `svc-mgmt-01` | `10.2.20.161` | **air-gapped** | **CONTRACTS SERVER RUNNING 2026-09-04.** Attached to its own contracts server; esm-infra/esm-apps/fips-updates/usg all entitled. MAAS still to come |
 | `svc-repo-01` | `10.2.20.162` | **air-gapped** | **SERVING 2026-09-03.** 318 GB mirror over nginx, 9/9 suites verified, keys at `/keys/`, the 3 PPA debs at `/debs/`. host-4 installs from it |
 | `svc-harbor-01` | `10.2.20.163` | **air-gapped** | On `host-4`. Harbor registry; hardened 2026-09-14 (the portability test, above) |
 | `svc-obs-01` | `10.2.20.164` | **air-gapped** | On `host-4`. Prometheus/Alertmanager/Grafana, and the audit-offload collector (`rrsync -wo /srv/audit-offload`) |
+| `lab-vault` | `10.2.30.170` | **lab only** — the storage network, on the Dell | Built 2026-10-01. The lab's cold store: LUKS2 `/srv/cold` on the Dell's RAID 10; receives vm-backup's third copy (write-only `rrsync`). Hyper-V console, or SecureCRT through a host-4 port forward. `docs/lab-network.md` §9.3 |
 | `pg-01..03` | `10.2.20.165-167` | **air-gapped** | **One per `host-1..3`.** ✅ **COMPOSED `--harden` 2026-09-27**, hardened themselves unattended (211/4, Evaluate-STIG Open 4). PostgreSQL 16 under Patroni with its own etcd — `06a-postgres-ha.sh`, **slices 1–5 passed 2026-09-28**: monitored, failover proven by a power cut, backed up live to host-4 and host-3 with a point-in-time restore proven from each (`docs/06a-postgres-ha.md`). **The leader moves** — pg-01, pg-02 and pg-03 have each led on 2026-09-28; ask `patronictl list`, never assume |
 
 **THE MIRROR — 320 GB, seven archives.** Landscape added 2026-09-04 (Track B item 1).
@@ -878,6 +879,10 @@ a temp file and removed in a `finally` block.
 
 The wrapper refuses an Ed25519 key and a malformed password hash before it touches Hyper-V -
 same guards as the enclave seed builder, for the same reason.
+
+It also refuses to build over an existing VM: the provisioning script would delete every disk
+attached to it (found 2026-10-01). `-UserDataTemplate` builds another VM with the same wrapper - the
+lab vault, `docs/lab-network.md` §9.3.
 
 ## 6. Build sequence — status 2026-08-30
 

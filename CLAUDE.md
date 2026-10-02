@@ -64,7 +64,7 @@ are options."* Disk serials, addresses, LV sizes, usernames, NIC names all belon
 **Every command block names the machine it runs on. No exceptions.** There are now six
 machines in play — `stage-01`, `build-01`, the Hyper-V host, `host-1..4`, and the in-gap VMs
 `svc-mgmt-01`, `svc-repo-01`, `svc-harbor-01` and `svc-obs-01` on `host-4`, plus `pg-01..03` on
-`host-1..3`. A command without a machine is a command that gets run on the wrong
+`host-1..3`, and, lab only, `lab-vault` (10.2.30.170) on the Dell. A command without a machine is a command that gets run on the wrong
 one. Label it on the line above the block:
 
 ```bash

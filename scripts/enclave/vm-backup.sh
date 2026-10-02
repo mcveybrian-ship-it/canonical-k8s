@@ -1232,6 +1232,10 @@ IOSchedulingClass=idle
 TimeoutStartSec=6h
 ExecStartPre=${self} reattach
 ExecStart=${self} verify --all
+# The off-host copies, re-read in full once a week (nightly runs check only files not verified
+# before): rot on the far end's disk is caught within a week. Non-fatal, like the nightly copies.
+ExecStart=-${self} second-copy --verify-all
+ExecStart=-${self} third-copy --verify-all
 EOF
 
   cat > "/etc/systemd/system/${VERIFY_SVC}.timer" <<EOF
@@ -1286,7 +1290,7 @@ EOF
   ok "scheduled: ${VERIFY_SVC}.timer '${weekly_cal}' - deep verify, reads every byte"
   say ""
   say "   nightly: incr + verify (changed sets only) + prune + second-copy + third-copy (if set)   - minutes"
-  say "   weekly : verify --all                                - reads the whole volume"
+  say "   weekly : verify --all, then both copies --verify-all  - reads the whole volume"
   say ""
   systemctl list-timers "${SVC_NAME}.timer" "${VERIFY_SVC}.timer" --no-pager | sed 's/^/       /'
   printf '\n'
@@ -1372,7 +1376,7 @@ PLAN
 # A COPY THAT DOES NOT DIE WITH THIS MACHINE - red flag 1.2.
 #
 #     sudo ./vm-backup.sh second-copy --setup    make the key, print what to authorise
-#     sudo ./vm-backup.sh second-copy [-n] [--all]
+#     sudo ./vm-backup.sh second-copy [-n] [--all] [--verify-all]
 #
 # Today the only copy of every guest is on a drive attached to the host that runs them. Lose
 # host-4 and you lose the guests AND the way back - two mechanisms, one failure. This pushes
@@ -1425,12 +1429,13 @@ second_host() {   # the host the placement map sends this machine's copies to
 }
 
 cmd_second_copy() {
-  local setup=0 dry=0 all=0
+  local setup=0 dry=0 all=0 vall=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --setup) setup=1; shift ;;
       -n|--dry-run) dry=1; shift ;;
       --all) all=1; shift ;;
+      --verify-all) vall=1; shift ;;
       *) die "second-copy: unknown argument $1" ;;
     esac
   done
@@ -1476,7 +1481,7 @@ cmd_second_copy() {
   fi
 
   push_sets "second copy" "$SECOND_KEY" "$target" "$addr" "$SECOND_DIR" "$SECOND_SKIP" "$SECOND_STATE" \
-            "${BACKUP_SECOND_DELETE:-1}" "$dry" "$all"
+            "${BACKUP_SECOND_DELETE:-1}" "$dry" "$all" "$vall"
 }
 
 # ---------------------------------------------------------------- pushing sets off this host
@@ -1485,9 +1490,12 @@ cmd_second_copy() {
 # `rrsync -wo <dir>`, then re-read with --checksum. Moved out of second-copy unchanged on
 # 2026-10-01 when the third copy arrived, so the two cannot drift apart.
 #
-#   push_sets <label> <key> <target> <addr> <remote dir> <skip list> <state file> <delete 0|1> <dry 0|1> <all 0|1>
+#   push_sets <label> <key> <target> <addr> <remote dir> <skip list> <state file> <delete 0|1> <dry 0|1> <all 0|1> <verify-all 0|1>
+#
+# The ledger of verified files sits beside the state file: <state file>.verified.
 push_sets() {
-  local label="$1" key="$2" target="$3" addr="$4" rdir="$5" skip="$6" state="$7" del="$8" dry="$9" all="${10}"
+  local label="$1" key="$2" target="$3" addr="$4" rdir="$5" skip="$6" state="$7" del="$8" dry="$9" all="${10}" vall="${11:-0}"
+  local ledger="$state.verified"
   [ -r "$key" ] || die "no key at $key - run: sudo $0 ${label// /-} --setup"
   check_dest
   local -a doms=() skipped=()
@@ -1535,16 +1543,48 @@ push_sets() {
     # VERIFY WHAT ARRIVED, NOT WHAT WAS SENT - the same rule as `verify`. --checksum re-reads
     # the far end and compares content; anything listed here differs, and a clean run prints
     # nothing at all. It works through the restricted rrsync because the receiver does the work.
+    #
+    # ONLY FILES NOT VERIFIED BEFORE (2026-10-01). A set never changes once it is complete, so
+    # re-reading the whole history every night proved nothing new: it cost the third copy 12
+    # minutes a night re-reading 170 GiB already proven. The LEDGER records every file verified at
+    # this far end by path, size and mtime; a file is checked again only when one of those changes
+    # (the VERIFIED marker `verify --all` rewrites each week, say) - or with --verify-all, which the
+    # weekly unit runs, so rot on the far end's disk is still caught within a week.
     if [ "$dry" -eq 0 ]; then
-      local diff; diff="$(rsync -a --dry-run --itemize-changes --checksum -e "${SSH[*]}" "$DEST/$d/" "root@$addr:$d/" 2>&1 | grep -vE '^$|^sending|^total|^sent ' || true)"
-      if [ -n "$diff" ]; then
-        warn "$d: the copy DIFFERS from the source after transfer:"; printf '%s\n' "$diff" | head -5 >&2; rc=1
+      local cur need nn nb lst diff
+      cur="$(find "$DEST/$d" -type f -printf "$d/%P\t%s\t%T@\n" | LC_ALL=C sort)"
+      if [ "$vall" -eq 1 ]; then
+        need="$cur"
       else
-        ok "$d: copied and verified byte-for-byte"
+        need="$(LC_ALL=C comm -23 <(printf '%s\n' "$cur") <(LC_ALL=C sort -u "$ledger" 2>/dev/null || true))"
+      fi
+      need="$(printf '%s\n' "$need" | sed '/^$/d')"
+      if [ -z "$need" ]; then
+        ok "$d: up to date - every file was verified byte-for-byte on an earlier run"
+      else
+        nn="$(printf '%s\n' "$need" | wc -l)"
+        nb="$(printf '%s\n' "$need" | awk -F'\t' '{s+=$2} END{print s+0}')"
+        lst="$(mktemp)"
+        printf '%s\n' "$need" | cut -f1 | sed "s|^$d/||" > "$lst"
+        diff="$(rsync -a --dry-run --itemize-changes --checksum --files-from="$lst" -e "${SSH[*]}" "$DEST/$d/" "root@$addr:$d/" 2>&1 | grep -vE '^$|^sending|^total|^sent ' || true)"
+        rm -f "$lst"
+        if [ -n "$diff" ]; then
+          warn "$d: the copy DIFFERS from the source after transfer:"; printf '%s\n' "$diff" | head -5 >&2; rc=1
+        else
+          ok "$d: $nn file(s) verified byte-for-byte ($(human "$nb"))$([ "$nn" -eq "$(printf '%s\n' "$cur" | sed '/^$/d' | wc -l)" ] && echo ' - every file' || echo ' - the rest were verified on earlier runs')"
+          printf '%s\n' "$need" >> "$ledger"
+        fi
       fi
       bytes=$(( bytes + $(du -sb "$DEST/$d" | cut -f1) ))
     fi
   done
+  # The ledger keeps only files that still exist as recorded - pruned chains leave it.
+  if [ "$dry" -eq 0 ] && [ -f "$ledger" ]; then
+    LC_ALL=C comm -12 \
+      <(for d in "${doms[@]}"; do find "$DEST/$d" -type f -printf "$d/%P\t%s\t%T@\n"; done | LC_ALL=C sort) \
+      <(LC_ALL=C sort -u "$ledger") > "$ledger.new" && mv "$ledger.new" "$ledger"
+    chmod 0600 "$ledger"
+  fi
   local t1; t1="$(date +%s)"
   if [ "$dry" -eq 1 ]; then
     say "DRY RUN - nothing was transferred"
@@ -1570,7 +1610,7 @@ push_sets() {
 # offsite store (backlog 3.29, CP-6), the same values point at it.
 #
 #     sudo ./vm-backup.sh third-copy --setup    make its OWN key, print what to authorise there
-#     sudo ./vm-backup.sh third-copy [-n] [--all]
+#     sudo ./vm-backup.sh third-copy [-n] [--all] [--verify-all]
 #
 # The same transfer as the second copy (push_sets): a write-only rrsync on the far end, verified
 # byte-for-byte. Its own key, so revoking one store never touches the other.
@@ -1581,12 +1621,13 @@ push_sets() {
 # NOT MONITORED. It writes its state file and `status` shows it, but nothing alerts on a third
 # copy that stopped - lab-grade, and said so in lab-network.md 9.3.
 cmd_third_copy() {
-  local setup=0 dry=0 all=0
+  local setup=0 dry=0 all=0 vall=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --setup) setup=1; shift ;;
       -n|--dry-run) dry=1; shift ;;
       --all) all=1; shift ;;
+      --verify-all) vall=1; shift ;;
       *) die "third-copy: unknown argument $1" ;;
     esac
   done
@@ -1616,7 +1657,7 @@ cmd_third_copy() {
   fi
 
   push_sets "third copy" "$THIRD_KEY" "$THIRD_ADDR" "$THIRD_ADDR" "$THIRD_DIR" "$THIRD_SKIP" "$THIRD_STATE" \
-            "${BACKUP_THIRD_DELETE:-1}" "$dry" "$all"
+            "${BACKUP_THIRD_DELETE:-1}" "$dry" "$all" "$vall"
 }
 
 # ---------------------------------------------------------------- restore TEST
@@ -2072,5 +2113,5 @@ case "${1:-status}" in
   restore-test) shift || true; cmd_restore_test "$@" ;;
   second-copy)  shift || true; cmd_second_copy "$@" ;;
   third-copy)   shift || true; cmd_third_copy "$@" ;;
-  *) printf 'usage: %s {status|facts|full [vm]|incr [vm]|progress|verify [--all]|prune [--dry-run]|keyfile|reattach|schedule [HH:MM]|unschedule|restore-plan <vm>|restore-test <vm> [--set S] [--keep] [-n]|second-copy [--setup] [-n] [--all]|third-copy [--setup] [-n] [--all]}\n' "$0" >&2; exit 2 ;;
+  *) printf 'usage: %s {status|facts|full [vm]|incr [vm]|progress|verify [--all]|prune [--dry-run]|keyfile|reattach|schedule [HH:MM]|unschedule|restore-plan <vm>|restore-test <vm> [--set S] [--keep] [-n]|second-copy [--setup] [-n] [--all] [--verify-all]|third-copy [--setup] [-n] [--all] [--verify-all]}\n' "$0" >&2; exit 2 ;;
 esac

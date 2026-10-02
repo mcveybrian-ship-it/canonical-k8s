@@ -2630,13 +2630,21 @@ $out"
         # NOTHING THAT WAS THERE MAY BE LOST; additions are allowed. Equality was the first rule,
         # and it would have failed the repair of its own damage on host-4 (2026-10-02): the storage
         # address missing BEFORE and back AFTER is a change, and the right one.
-        local lost
+        # JUDGE ONLY A SETTLED NETWORK. networkd reconfigures links a moment AFTER `networkctl reload`
+        # returns; judged at once, a loss that lands a second later is missed (host-4 2026-10-02: the
+        # storage address came back only after the step had finished). Settled = no link still
+        # configuring or pending, and the same picture twice in a row, a second apart. Up to 30 s.
+        local lost prev=""
         for i in $(seq 1 30); do
-          after="$(ra_snapshot)"
-          lost="$(comm -23 <(printf '%s\n' "$before" | sort) <(printf '%s\n' "$after" | sort))"
-          [ -z "$lost" ] && break
           sleep 1
+          after="$(ra_snapshot)"
+          if ! networkctl --no-legend list 2>/dev/null | grep -qE '(configuring|pending)[[:space:]]*$' \
+             && [ "$after" = "$prev" ]; then
+            break
+          fi
+          prev="$after"
         done
+        lost="$(comm -23 <(printf '%s\n' "$before" | sort) <(printf '%s\n' "$after" | sort))"
         if [ -n "$lost" ]; then
           warn "the reload LOST something - check this machine and its VMs NOW. Gone:"
           printf '%s\n' "$lost" | sed 's/^/      /'

@@ -2496,14 +2496,79 @@ cmd_radio() {
 #
 #     sudo ./stig-tailor.sh ra status     which interfaces still listen
 #     sudo ./stig-tailor.sh ra off        write the file, apply it, prove nothing else moved
+# The merged configuration WITHOUT this tool's own add-on. The add-on must be derived from the base:
+# read through an earlier add-on, `netplan get` reports what that add-on did as if it were the base
+# (on host-4 2026-10-02 the broken first version showed up as match: name: "storage"), and the next
+# add-on would copy the damage. RA_NETPLAN_DIR replaces /etc/netplan for tests only.
+ra_netplan_get() {
+  local src="${RA_NETPLAN_DIR:-/etc/netplan}" tmp
+  tmp="$(mktemp -d)" || return 1
+  mkdir -p "$tmp/etc/netplan"
+  cp -p "$src"/*.yaml "$tmp/etc/netplan/" 2>/dev/null || true
+  rm -f "$tmp/etc/netplan/72-enclave-no-ra.yaml"
+  netplan get --root-dir "$tmp" 2>/dev/null
+  [ -d "$tmp" ] && rm -rf -- "$tmp"
+}
 ra_defs() {   # "<type> <id>" for every interface netplan defines, from the merged configuration
-  netplan get 2>/dev/null | python3 -c '
+  ra_netplan_get | python3 -c '
 import sys, yaml
 d = (yaml.safe_load(sys.stdin) or {}).get("network") or {}
 for t in ("ethernets", "bridges", "bonds", "vlans"):
     for i in (d.get(t) or {}):
         print(t, i)
 '
+}
+# The add-on file. AN INTERFACE DEFINED BY match: CARRIES THE SAME match: AND set-name HERE. Without
+# them netplan reads the bare id as a NAME match and ANDs it into the merged definition: on host-4
+# (2026-10-02) the storage NIC's [Match] became "PermanentMACAddress=... AND Name=storage", its real
+# name is enx00e04d00a418, it stopped matching, and networkd dropped its address. ra_prove below is
+# the check that would have refused it before anything was applied.
+ra_want() {
+  ra_netplan_get | python3 -c '
+import sys, yaml, json
+d = (yaml.safe_load(sys.stdin) or {}).get("network") or {}
+print("# Written by stig-tailor.sh ra off (backlog 3.55). Re-run it rather than editing; delete")
+print("# this file (then netplan generate && networkctl reload) to undo. IPv6 stays on - only router")
+print("# advertisements are ignored, on every interface netplan defines here. Each one defined by match:")
+print("# carries the same match and set-name, so merging cannot change what it matches.")
+print("network:")
+print("  version: 2")
+for t in ("ethernets", "bridges", "bonds", "vlans"):
+    ids = d.get(t) or {}
+    if not ids:
+        continue
+    print("  %s:" % t)
+    for i, v in ids.items():
+        v = v or {}
+        print("    %s:" % i)
+        if "match" in v:
+            print("      match:")
+            for k, val in (v["match"] or {}).items():
+                print("        %s: %s" % (k, json.dumps(val)))
+        if "set-name" in v:
+            print("      set-name: %s" % json.dumps(v["set-name"]))
+        print("      accept-ra: false")
+'
+}
+# ra_prove <candidate add-on> - render the netplan directory without the add-on and with it, into two
+# scratch roots, and compare EVERYTHING netplan generates (networkd units, .link files, udev rules,
+# the wait-online drop-in). The only difference allowed is an added "IPv6AcceptRA=no" line. Anything
+# else - a changed [Match], a new or missing file - is refused before the live config is touched.
+ra_prove() {
+  local src="${RA_NETPLAN_DIR:-/etc/netplan}" tmp d   # RA_NETPLAN_DIR: tests only
+  tmp="$(mktemp -d)"
+  mkdir -p "$tmp/a/etc/netplan" "$tmp/b/etc/netplan"
+  cp -p "$src"/*.yaml "$tmp/a/etc/netplan/" 2>/dev/null || true
+  rm -f "$tmp/a/etc/netplan/72-enclave-no-ra.yaml"
+  cp -p "$tmp/a/etc/netplan/"*.yaml "$tmp/b/etc/netplan/" 2>/dev/null || true
+  cp "$1" "$tmp/b/etc/netplan/72-enclave-no-ra.yaml"; chmod 600 "$tmp"/*/etc/netplan/*.yaml
+  netplan generate --root-dir "$tmp/a" >/dev/null 2>&1 || true
+  if ! netplan generate --root-dir "$tmp/b" >"$tmp/err" 2>&1 && grep -qiv 'daemon-reload\|reload request\|Reload daemon' "$tmp/err"; then
+    cat "$tmp/err"; [ -d "$tmp" ] && rm -rf -- "$tmp"; return 1
+  fi
+  d="$(diff -r "$tmp/a/run" "$tmp/b/run" 2>&1 | grep -vE '^diff |^[0-9]+(,[0-9]+)?[acd][0-9]+(,[0-9]+)?$|^---$' | grep -vx '> IPv6AcceptRA=no' || true)"
+  [ -d "$tmp" ] && rm -rf -- "$tmp"
+  [ -z "$d" ] || { printf '%s\n' "$d" | sed "s|$tmp/[ab]||g"; return 1; }
 }
 ra_state() {  # what networkd will do with RAs on one netplan id, from the file netplan generated
   local nf="/run/systemd/network/10-netplan-$1.network"
@@ -2537,23 +2602,22 @@ cmd_ra() {
       [ -f "$f" ] && say "  $f present" || say "  $f absent"
       ;;
     off)
-      local want
-      want="# Written by stig-tailor.sh ra off (backlog 3.55). Re-run it rather than editing; delete
-# this file (then netplan generate && networkctl reload) to undo. IPv6 stays on - only router
-# advertisements are ignored, on every interface netplan defines here.
-network:
-  version: 2
-$(for t in ethernets bridges bonds vlans; do
-    ids="$(awk -v t="$t" '$1==t{print $2}' <<< "$defs")"
-    [ -n "$ids" ] || continue
-    printf '  %s:\n' "$t"
-    for i in $ids; do printf '    %s:\n      accept-ra: false\n' "$i"; done
-  done)
+      local want cand
+      want="$(ra_want)" || die "could not read the netplan configuration (netplan get)"
+      want="$want
 "
       if [ -f "$f" ] && [ "$(cat "$f")" = "${want%$'\n'}" ]; then
         ok "$f already sets accept-ra: false on every interface netplan defines"
       else
         local before after out
+        cand="$(mktemp)"; printf '%s' "$want" > "$cand"
+        if ! out="$(ra_prove "$cand")"; then
+          rm -f "$cand"
+          die "the add-on would change more than IPv6AcceptRA - refusing, NOTHING applied:
+$out"
+        fi
+        rm -f "$cand"
+        ok "proved: with the add-on, netplan's output differs only by IPv6AcceptRA=no lines"
         before="$(ra_snapshot)"
         printf '%s' "$want" > "$f"; chmod 600 "$f"
         if ! out="$(netplan generate 2>&1)"; then
@@ -2563,18 +2627,26 @@ $out"
         fi
         ok "wrote $f"
         networkctl reload || die "networkctl reload failed - $f is in place; run it again by hand"
+        # NOTHING THAT WAS THERE MAY BE LOST; additions are allowed. Equality was the first rule,
+        # and it would have failed the repair of its own damage on host-4 (2026-10-02): the storage
+        # address missing BEFORE and back AFTER is a change, and the right one.
+        local lost
         for i in $(seq 1 30); do
-          after="$(ra_snapshot)"; [ "$after" = "$before" ] && break
+          after="$(ra_snapshot)"
+          lost="$(comm -23 <(printf '%s\n' "$before" | sort) <(printf '%s\n' "$after" | sort))"
+          [ -z "$lost" ] && break
           sleep 1
         done
-        if [ "$after" != "$before" ]; then
-          warn "the network CHANGED across the reload - check this machine and its VMs NOW:"
-          diff <(printf '%s\n' "$before") <(printf '%s\n' "$after") | sed 's/^/      /' || true
+        if [ -n "$lost" ]; then
+          warn "the reload LOST something - check this machine and its VMs NOW. Gone:"
+          printf '%s\n' "$lost" | sed 's/^/      /'
           say  "  to undo:  rm $f && netplan generate && networkctl reload"
           exit 1
         fi
-        ok "every bridge kept its address and ports, and every IPv4 address is still here:"
+        ok "nothing was lost - every bridge kept its address and ports, every IPv4 address is here:"
         printf '%s\n' "$after" | sed 's/^/      /'
+        [ -z "$(comm -13 <(printf '%s\n' "$before" | sort) <(printf '%s\n' "$after" | sort))" ] \
+          || say "  (new since the reload: $(comm -13 <(printf '%s\n' "$before" | sort) <(printf '%s\n' "$after" | sort) | tr '\n' ';'))"
       fi
       while read -r t i; do say "  $t $i: $(ra_state "$i")"; done <<< "$defs"
       if grep -q '^LISTENS' <(while read -r t i; do ra_state "$i"; echo; done <<< "$defs"); then

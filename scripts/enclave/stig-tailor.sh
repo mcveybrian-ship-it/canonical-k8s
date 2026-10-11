@@ -570,7 +570,11 @@ fixups_plan() {
 
   printf '\n  3. file_groupowner_var_log - /var/log must be group-owned by syslog\n'
   if getent group syslog >/dev/null 2>&1; then
-    say "   state: syslog group EXISTS - fix is 'chgrp syslog /var/log'"
+    if [ "$(stat -c %G /var/log 2>/dev/null)" = syslog ]; then
+      say "   state: already group-owned by syslog"
+    else
+      say "   state: syslog group EXISTS, /var/log is group $(stat -c %G /var/log 2>/dev/null) - fix is 'chgrp syslog /var/log'"
+    fi
   else
     say "   state: NO syslog group. It comes with rsyslog, which is not installed."
     say "   DECISION REQUIRED - this one is not ours to make silently:"
@@ -607,7 +611,12 @@ fixups_plan() {
   fi
 
   printf '\n  6. sudo passwd_tries - one faillock strike per invocation, not three\n'
-  if [ -f /etc/sudoers.d/99-stig-passwd-tries ]; then
+  # A plan run WITHOUT sudo cannot see into /etc/sudoers.d (root-only on a hardened machine),
+  # so [ -f ] is false and this used to report NOT set. Found 2026-10-11 on pg-01: NOT set
+  # as encadmin, already set under sudo. Say it could not look rather than what it did not see.
+  if [ ! -r /etc/sudoers.d ] || [ ! -x /etc/sudoers.d ]; then
+    say "   state: /etc/sudoers.d is not readable as this user - run the plan with sudo to see it"
+  elif [ -f /etc/sudoers.d/99-stig-passwd-tries ]; then
     say "   state: already set ($(grep -h passwd_tries /etc/sudoers.d/99-stig-passwd-tries 2>/dev/null))"
   else
     say "   state: NOT set - sudo allows 3 attempts per invocation and faillock is deny=3,"
@@ -1062,13 +1071,19 @@ cmd_fixups() {
   # `apt install libxml2-utils` two minutes later - and history.log was 0644 again, so the
   # rule FAILED. Same fix, same script, opposite result, purely from sequence. A chmod cannot
   # hold a value that another program sets.
-  if [ -d /etc/apt/apt.conf.d ]; then
-    cat > "$APT_HOOK" <<EOF
+  # Compared before writing: it used to be rewritten every run and reported as "wrote" two lines
+  # after "exists - nothing to do" (pg-01, 2026-10-11) - true either way, but not what happened.
+  local hook_want; hook_want="$(cat <<EOF
 // STIG file_permissions_var_log_stig. Written by stig-tailor.sh.
 // apt sets the mode of its own logs when it writes them, so a one-time chmod lasts until the
 // next apt run. This re-tightens them immediately after every dpkg invocation.
 DPkg::Post-Invoke { "find /var/log/apt -type f -exec chmod $LOGMODE {} + 2>/dev/null || true"; };
 EOF
+)"
+  if [ -d /etc/apt/apt.conf.d ] && [ -f "$APT_HOOK" ] && [ "$(cat "$APT_HOOK")" = "$hook_want" ]; then
+    say "   $APT_HOOK already in place - unchanged"
+  elif [ -d /etc/apt/apt.conf.d ]; then
+    printf '%s\n' "$hook_want" > "$APT_HOOK"
     chmod 0644 "$APT_HOOK"
     if apt-config dump >/dev/null 2>&1; then
       ok "   wrote $APT_HOOK - apt re-tightens its own logs after every run"

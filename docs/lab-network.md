@@ -359,7 +359,7 @@ answers, the deny is working.
 
 ## 9. PLANNED — storage network, USB adapters and the lab recovery store (2026-09-28)
 
-> **The GigaPlus and the four adapters are cabled (2026-09-29); the Dell is cabled and its vault built (2026-10-01); the NAS is not.** It is the agreed target. The management side (§1–§8)
+> **The GigaPlus and the four adapters are cabled (2026-09-29); the Dell is cabled and its vault built (2026-10-01); the NAS is cabled (2026-10-13): 10 G Mellanox by DAC into GigaPlus SFP+ 1, `10.2.30.171/24`, no gateway.** It is the agreed target. The management side (§1–§8)
 > does not change. Backlog 3.16 tracks progress; 3.48 is a related drive decision on host-4.
 
 ### 9.1 The target picture
@@ -382,10 +382,11 @@ answers, the deny is working.
    │ SFP+ 2 ← module ← Dell        │     │ uplink ← FortiGate dmz        │
    │ SFP+ 1 ← DAC    ← NAS         │     │ host-1..3 onboard 1G          │
    │ host-1..4 USB adapters 2.5G   │     │ host-4 onboard 2.5G           │
-   │ NO other uplink               │     │ NAS onboard port              │
+   │ NO other uplink               │     │                               │
    └───────────────────────────────┘     └───────────────────────────────┘
-     new subnet, chosen when the            10.2.20.0/24, unchanged
-     adapters are proven
+     10.2.30.0/24 (2026-10-01)              10.2.20.0/24, unchanged
+
+   NAS onboard port → office network 10.0.20.10  ◄── GAP CABLE #3  (lab only, 2026-10-13)
 ```
 
 | network | switch | carries |
@@ -393,9 +394,11 @@ answers, the deny is working.
 | **Management** | TL-SG108S-M2 | everything running today — SSH, monitoring, the mirror, Harbor, the database cluster. **Unchanged** |
 | **Storage** | GigaPlus | the lab recovery store (§9.3), and later Ceph replication. **Connects to nothing else** |
 
-**The gap becomes two cables:** the FortiGate `dmz` cable and the Dell's storage cable, both
-labelled, unplugged together when the enclave must be truly isolated. (The product design still
-specifies a physical break with no routed path — this is the lab.)
+**The gap is three cables:** the FortiGate `dmz` cable, the Dell's storage cable and the NAS's
+office cable, all labelled, unplugged together when the enclave must be truly isolated. The third
+was added 2026-10-13 by decision: the NAS keeps its onboard port on the office network for its web
+UI and updates, so it touches both sides — unlike the Dell, whose own OS is kept off the storage
+network. (The product design still specifies a physical break with no routed path — this is the lab.)
 
 ### 9.2 Every cable
 
@@ -405,7 +408,7 @@ specifies a physical break with no routed path — this is the lab.)
 | host-2 | onboard 1 Gb (today) | USB 2.5 Gb adapter — `enx00e04d01420e` |
 | host-3 | onboard 1 Gb (today) | USB 2.5 Gb adapter — `enx00e04d00a257` |
 | host-4 | onboard 2.5 Gb (today) | USB 2.5 Gb adapter — `enx00e04d00a418`, in the **top-of-case USB 3 port** (the chipset controller); the back panel's four USB 3 ports share one controller with both backup drives → `10.2.30.158` (2026-10-01) |
-| NAS (lab only) | onboard port | SFP+ 1, **DAC cable**, 10 Gb |
+| NAS (lab only) | — (onboard port on the **office network**, `10.0.20.10`: web UI and updates — **gap cable #3**) | SFP+ 1, **DAC cable**, 10 Gb → `10.2.30.171`, no gateway (2026-10-13) |
 | Dell R7515 (lab only) | — (stays on FortiGate `internal3`) | SFP+ 2: a **10GBASE-T SFP+ module** + Cat6a to its RJ45 10 Gb card — **gap cable #2** |
 | FortiGate `dmz` | uplink (today) — **gap cable #1** | — |
 
@@ -465,7 +468,12 @@ running enclave; that is `vm-backup.sh` and pgBackRest.
    drives more than staying on.
 7. **Group the wake-ups:** scrubs, SMART tests and copies to the archive pool on the same night,
    once a week. The first access after sleep takes ~10–15 s.
-8. **Network:** SFP+ card → GigaPlus SFP+ 1 (DAC); onboard port → management switch.
+8. **Network:** SFP+ card → GigaPlus SFP+ 1 (DAC), `10.2.30.171/24`, no gateway; onboard port →
+   the **office network** (`10.0.20.10`, the web UI and updates) — **gap cable #3**, labelled. Done
+   2026-10-13; host-4 reaches it at 0.56 ms. Its first address, `10.2.20.10`, was the management
+   subnet on the storage switch and could never answer: the two switches are not connected. The
+   web UI listens on every interface by default — to keep it off the storage network, set
+   System → General → GUI → Web Interface IPv4 Address to `10.0.20.10`.
 
 **The Dell R7515 — `lab-vault`, built 2026-10-01.** Its RAID 10 (`D:`, 7.4 TB) is the second
 recovery store.

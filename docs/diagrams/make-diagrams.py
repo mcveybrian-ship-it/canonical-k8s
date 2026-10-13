@@ -277,22 +277,28 @@ def page_networks():
             "is required for the cluster (B-07) and router advertisements are ignored everywhere (3.55).")
     p.legend()
     # outside
-    p.box(30, 90, 1320, 210, "<b>OUTSIDE THE GAP</b> - online side, not in the ATO boundary", "zone_out", 12)
+    p.box(30, 90, 1650, 210, "<b>OUTSIDE THE GAP</b> - online side, not in the ATO boundary", "zone_out", 12)
     fg = p.box(50, 130, 220, 70, "<b>FortiGate FG-60F</b><br>internet edge · staging 10.2.10.0/24", "outside")
     st1 = p.box(300, 130, 220, 70, "<b>stage-01</b><br>%s (+ 10.2.20.160 in State A)<br>mirror · repo · builds" % addr("STAGE_01"), "outside")
     b1 = p.box(550, 130, 220, 70, "<b>build-01</b><br>%s<br>transfer SSD · private backups" % addr("BUILD_01"), "outside")
     dell = p.box(800, 120, 520, 160, "<b>Dell R7515</b> - Hyper-V host (lab)<br>runs stage-01; RAID 10 on D:", "outside")
     vault = p.box(1010, 190, 290, 70, "<b>lab-vault</b> 10.2.30.170<br>LUKS2 /srv/cold · third copy (lab only)", "lab", 11)
-    # gap cables
+    office = p.box(1370, 130, 290, 70, "<b>office network</b> 10.0.20.0/24<br>internet · NAS web UI 10.0.20.10 (lab)", "outside", 11)
+    # gap cables - the NAS keeps its onboard port on the office network (decided 2026-10-13), so it is the third
     g1 = p.box(140, 320, 140, 36, "<b>gap cable #1</b><br>FortiGate dmz", "lab", 10)
     g2 = p.box(1030, 320, 160, 36, "<b>gap cable #2</b><br>Dell 10 Gb (lab only)", "lab", 10)
+    g3 = p.box(1700, 320, 250, 36, "<b>gap cable #3</b><br>NAS office port (lab only)", "lab", 10)
     p.edge(fg, g1, "", EDGE)
     p.edge(dell, g2, "", EDGE_ST)
+    p.edge(office, g3, "", EDGE)
     # switches
     mg = p.box(30, 390, 900, 60, "<b>MANAGEMENT</b> - TL-SG108S-M2, unmanaged · <b>10.2.20.0/24</b> · no gateway, no DHCP in use, no IPv6 router", "mgmt", 12)
     sg = p.box(960, 390, 690, 60, "<b>STORAGE</b> - GigaPlus 2.5 G + SFP+, unmanaged · <b>%s</b> · no uplink, no gateway" % addr("STORAGE_SUBNET"), "stor", 12)
     p.edge(g1, mg, "State A: cable in · State B: unplugged", EDGE)
     p.edge(g2, sg, "", EDGE_ST)
+    nas = p.box(1690, 390, 280, 60, "<b>NAS</b> (lab only) · TrueNAS<br>10 G DAC · 10.2.30.171", "lab", 11)
+    p.edge(g3, nas, "", EDGE)
+    p.edge(nas, sg, "", EDGE_ST)
     # hosts
     for i, h in enumerate(HOSTS):
         n = h.split("-")[1]
@@ -568,6 +574,8 @@ def page_overview():
     sg = p.box(1060, 280, 590, 46, "<b>STORAGE %s</b> · no uplink" % addr("STORAGE_SUBNET"), "stor", 12)
     p.edge(fg, mg, "gap cable #1", EDGE)
     p.edge(dl, sg, "gap cable #2 (lab)", EDGE_ST)
+    nas = p.box(1690, 280, 270, 46, "<b>NAS</b> (lab only)<br>office port = gap cable #3", "lab", 10)
+    p.edge(nas, sg, "", EDGE_ST)
     for i, h in enumerate(HOSTS):
         n = h.split("-")[1]
         x = 30 + i * 410

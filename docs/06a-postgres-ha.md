@@ -143,6 +143,7 @@ is watched by what is *on* it rather than by free space (§9.5).
       pg-01..03,host-3 stig-tailor.sh ufw --apply                              8432 open
   L   pg-01..03        06a backup-node                                         pgBackRest server
       host-4, host-3   06a backup-store <fullchain>                            stores + stanza
+                       (both take PGBACKREST_CIPHER_PASS - credentials file or prompt - §10.9)
       the primary      06a backup-enable                                       archiving → both
       host-4, host-3   06a backup-run full                                     first fulls + timers
   M   the primary      06a backup-restore-test                                 PITR from each store
@@ -820,7 +821,8 @@ any more — its disk is reserved — and **the filesystem whose filling does st
 Decided 2026-09-28 (HANDOFF §3): pgBackRest 2.50 over **TLS with enclave-CA certificates in both
 directions**; **two live stores** — host-4's spare 2 TB NVMe (repo1) and host-3's images pool
 (repo2, 100 GB counted by the planner) — each receiving every WAL file and taking its own backups;
-**encryption by the LUKS volumes underneath**, no pgBackRest passphrase; **2 weekly fulls + daily
+**encryption by the LUKS volumes underneath**, no pgBackRest passphrase (decided for an empty
+database; **reversed 2026-10-13 — pgBackRest encrypts too, §10.9**); **2 weekly fulls + daily
 differentials** (≈ 7–14 days of point-in-time restore). This also closed backlog **3.46**.
 
 ### 10.1 The shape
@@ -978,6 +980,51 @@ read the verdict from a JSON layout the 2.50 output does not use, so `DatabaseBa
 never have fired; caught by checking the live metrics, fixed to read both layouts and fall back to
 the stanza's verdict.
 
+### 10.9 Repository encryption — added 2026-10-13 (backlog 3.50)
+
+**Why it changed.** §10 decided LUKS alone, for an empty database. Since 2026-09-29 the repositories
+hold the application's records, and a copy that leaves its volume — the lab recovery store, an
+offsite copy (3.29) — would be readable records. So pgBackRest encrypts them itself; LUKS stays
+underneath.
+
+**What it is.** `aes-256-cbc` (pgBackRest 2.50 offers only that and `none`), through the host's
+OpenSSL — the same module as its TLS. The key is derived from a passphrase with `EVP_BytesToKey` and
+SHA-1 (`src/common/crypto/cipherBlock.c`, read 2026-10-13): a legacy derivation, **not an approved
+KDF**. The accurate claim is *"AES-256 in the validated module, with a non-approved key derivation"*
+(`ssp-inputs.md` §1.2) — never "FIPS-encrypted".
+
+**The passphrase** is the site credential `PGBACKREST_CIPHER_PASS`, 32+ characters, the **same on
+all five machines in the backup path** — pg-01..03 and both stores. `06a` takes it from the
+environment, then `/etc/enclave/credentials.env`, then asks twice without echo, and writes it to
+`/etc/pgbackrest/conf.d/enclave-cipher.conf` (0640 root:postgres; pgBackRest reads that directory by
+default), so `pgbackrest.conf` stays printable and the credentials file can be deleted after
+hardening without losing it. Each machine prints a **fingerprint** (sha256, first 8 hex) — the same
+fingerprint everywhere means the same passphrase. **Lost, no backup can be read**: the custodians
+seal a copy in its own envelope, marked with that fingerprint (`airgap-media.md` §9.6).
+`PGBR_CIPHER_TYPE=none` turns it off, and the script says what that leaves exposed.
+
+**A new build** is encrypted from the start: `backup-store` writes the store's passphrase file before
+its stanza exists, and `backup-node` writes every store's onto each pg node. `backup-store` refuses a
+store that already holds an unencrypted repository.
+
+**An existing store cannot be encrypted in place** — *"Once the repository has been configured and the
+stanza created and checked, the repository encryption settings cannot be changed"* (pgBackRest user
+guide, read 2026-10-13). It is replaced, in five steps, nothing deleted before the last:
+
+| | Where | Command | What it does |
+|---|---|---|---|
+| 1 | each store | `backup-store-encrypt prepare` | asks for the passphrase **first**, pauses the store's timers, moves the repository aside to `<path>.unencrypted-<UTC>` (a rename — kept whole), creates a new **encrypted** stanza. If that fails it **rolls back**: the old repository returns, unencrypted, timers running |
+| 2 | each pg node | `backup-node` | writes every store's passphrase, restarts the node's TLS server |
+| 3 | each store | `backup-store-encrypt finish` | a full backup **into** the new repository — which also proves the primary archives WAL into it — reads it back (`aes-256-cbc`, ≥ 1 full) and restores the timers |
+| 4 | the primary | `backup-restore-test` | a point-in-time restore from **each** new repository (§10.7) |
+| 5 | each store | `backup-store-retire` | destroys the moved-aside repository, each one a `DESTROYED` line in the records disposal log (contingency plan §4.7) — refused under a records hold, before the new repository holds a full, and without a typed confirmation |
+
+Between steps 1 and 3 WAL cannot reach the moved store; PostgreSQL keeps every WAL file until
+archiving succeeds, so nothing is lost, and the moved-aside repository holds everything up to the
+move. Tested offline 2026-10-13 against stand-ins: the rollback restored the old repository exactly;
+a success kept it whole beside the new one; retire refused under a hold, with no full, and without
+confirmation.
+
 ---
 
 ## 10a. Slice 6 prep — the application's database, loaded without its content leaving the gap (2026-09-29)
@@ -1057,7 +1104,8 @@ no-leak checks can fail). Then everything it made is dropped and shredded.
 - **PostGIS is 69 packages on every node, and the application has 1 table with a PostGIS column,
   holding 0 rows** — ask its owners whether it is needed (3.49).
 - **The stores now hold real records, and pgBackRest does not encrypt them** (`cipher: none` — LUKS
-  underneath). No copy to the lab recovery store until repository encryption is on (3.50).
+  underneath). No copy to the lab recovery store until repository encryption is on (3.50). → **Built
+  2026-10-13, §10.9.**
 
 ---
 
@@ -1325,6 +1373,7 @@ Read from pg-01..03 on 2026-09-28 (identical on all three), except where marked.
 | `/etc/default/prometheus-postgres-exporter` | 0640 root:prometheus | `06a monitor` | the exporter's login (no secret — peer) and listen address |
 | `/etc/pgbackrest/pgbackrest.conf` | 0640 root:postgres | `06a backup-node` | the two stores, and who may reach in (slice 5) |
 | `/etc/pgbackrest/pki/` | 0750 root:postgres | `06a backup-node` | `ca.crt`, `node.crt`, `node.key` (0640) — the third copy of the node key |
+| `/etc/pgbackrest/conf.d/enclave-cipher.conf` | 0640 root:postgres | `06a backup-node` / `backup-store` | the repository passphrase (3.50, §10.9) — **never print it**; every store's on a pg node, its own on a store |
 | `/var/log/pgbackrest/` | 0750 postgres | `06a backup-node` | pgBackRest's own logs |
 | `/etc/patroni/config.yml.in`, `dcs.yml` | 0644 root:root | the Ubuntu `patroni` package | Ubuntu's templates — **not used** |
 | `/var/log/enclave-app-restore/` | 0700 root | `06a app-restore` | the load logs, 0600 — they **can quote rows** (§10a.3) |
@@ -1449,7 +1498,7 @@ sudo -u postgres psql -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity
 | ⬜ | A FIPS-built etcd from Canonical | Q-CORE (h), not sent; ENG-68 |
 | ⬜ | Application users with logins and the connection string (`target_session_attrs=read-write` across the three nodes, runbook §9a.3) — the database itself is loaded (§10a) | B-07 |
 | ❓ | **PostGIS** — the audit exception as a tailoring entry, and whether the application needs it at all | 3.49 |
-| 🔴 | **pgBackRest repository encryption** before any copy to the lab recovery store | 3.50 |
+| 🔄 | **pgBackRest repository encryption** before any copy to the lab recovery store — built 2026-10-13 (§10.9); the two live stores are replaced next | 3.50 |
 | 🗳️ | Production sizing — the lab runs 2 vCPU / 4 GiB / 40 GB / 150 GB; `vm-specs.env`'s default of 8 GiB / 60 GB / 400 GB is explicitly not a production sizing | 2.8 |
 
 **Key:** ⬜ open · 🔄 in progress · 🗳️ a decision owed · ❓ a question for someone else · 🔴 blocks something.

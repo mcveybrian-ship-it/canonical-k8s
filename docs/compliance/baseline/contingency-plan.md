@@ -150,6 +150,13 @@ definition. It is client-side, so it works in an air gap, and it adds nothing to
 The cost is that applications need connect-time retry logic, because failover is detected at
 connect time (runbook §9a).
 
+**A database restore needs one thing that is not on any backup: the pgBackRest passphrase.** Since
+2026-10-13 pgBackRest encrypts both backup stores itself (backlog 3.50, `06a-postgres-ha.md` §10.9).
+The passphrase lives on the five machines in the backup path and in **one sealed envelope**
+(`airgap-media.md` §9.6). A restore on a surviving node uses the copy already on it; a restore after
+losing the site, from an offsite copy (3.29), needs the envelope — without it every backup is
+ciphertext. Check the envelope's seal at each inventory, as for the emergency passwords.
+
 ### 2.4 Rebuild beats restore for most of this enclave, and that is a recovery strategy
 
 **A rebuilt machine is identical to a restored one and arrives with evidence that it was built

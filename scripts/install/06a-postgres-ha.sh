@@ -23,6 +23,12 @@
 #     sudo ./06a-postgres-ha.sh backup-timers   on each store: (re)install the hold-aware wrapper + timers, no backup
 #     sudo ./06a-postgres-ha.sh backup-restore-test     on the PRIMARY: restore to a point in time
 #                                                      from EACH store, into scratch, and prove it
+#   REPOSITORY ENCRYPTION (backlog 3.50, 2026-10-13) - a NEW store is encrypted by backup-store; an
+#   EXISTING unencrypted one is replaced in five steps (see the block before cmd_backup_store_encrypt):
+#     sudo ./06a-postgres-ha.sh backup-store-encrypt prepare   on each STORE: old moved aside, new encrypted stanza
+#     sudo ./06a-postgres-ha.sh backup-store-encrypt finish    on each STORE, after backup-node on every pg node
+#     sudo ./06a-postgres-ha.sh backup-store-retire            on each STORE, after backup-restore-test: the old
+#                                                      repository destroyed and logged (refused under a hold)
 #   SLICE 6 PREP - THE APPLICATION'S DATABASE (real records: prints NUMBERS ONLY, see below):
 #     sudo ./06a-postgres-ha.sh stig-settings                 on the LEADER: the STIG's org-defined values
 #     sudo ./06a-postgres-ha.sh extensions                    on EVERY pg node: PG_EXTENSION_PACKAGES
@@ -74,6 +80,10 @@ set -euo pipefail
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENC="$(cd "$SELF/../enclave" && pwd)"
 ADDRS="$ENC/enclave-addresses.env"
+# the site credentials reader (3.32) - for the one shared secret this script needs, the pgBackRest
+# repository passphrase (3.50). Functions only; nothing is read until a command asks.
+# shellcheck disable=SC1091
+. "$ENC/credentials.sh"
 
 ETCD_PKI="${ETCD_PKI:-/etc/etcd/pki}"
 ETCD_DIR="${ETCD_DIR:-/var/lib/etcd/enclave-pg}"
@@ -345,6 +355,23 @@ RECORDS_DISPOSAL_LOG="${RECORDS_DISPOSAL_LOG:-/var/log/enclave/records-disposal.
 PGBR_WRAPPER="${PGBR_WRAPPER:-/usr/local/sbin/enclave-pgbackrest-backup}"
 PG_ARCHIVE_TIMEOUT="${PG_ARCHIVE_TIMEOUT:-300}"       # a quiet database still ships a WAL file every 5 min
 PGBR_ARCHIVE_CMD="pgbackrest --stanza=${PG_SCOPE:-enclave-pg} archive-push %p"
+# ---- repository encryption (backlog 3.50, decided 2026-10-13) ---------------------------------
+# The repositories hold the application's records (since 2026-09-29), so pgBackRest encrypts them
+# itself - AES-256-CBC through the system OpenSSL; the key is derived from the passphrase with
+# EVP_BytesToKey and SHA-1 (src/common/crypto/cipherBlock.c, 2.50, read 2026-10-13) - a legacy
+# derivation, NOT an approved KDF: say "AES-256 encrypted", never "FIPS-encrypted".
+# The passphrase lives in its OWN file in /etc/pgbackrest/conf.d (read by default - the path is
+# compiled into 2.50), so pgbackrest.conf stays secret-free. It is the site credential
+# PGBACKREST_CIPHER_PASS: environment > /etc/enclave/credentials.env > asked twice, never shown -
+# the same order every consumer uses (credentials.sh). It goes on EVERY machine in the backup
+# path, the pg nodes and the stores alike. LOSE IT AND EVERY BACKUP IS UNREADABLE: the sealed copy
+# the custodians make with make-credentials.sh is the only other one.
+# It CANNOT be switched on for a repository that already exists: "Once the repository has been
+# configured and the stanza created and checked, the repository encryption settings cannot be
+# changed" (pgBackRest user guide, read 2026-10-13) - hence backup-store-encrypt.
+PGBR_CIPHER_TYPE="${PGBR_CIPHER_TYPE:-aes-256-cbc}"   # none = unencrypted repositories, an explicit choice
+PGBR_CIPHER_FILE="${PGBR_CIPHER_FILE:-/etc/pgbackrest/conf.d/enclave-cipher.conf}"
+PGBR_CIPHER_MIN_LEN="${PGBR_CIPHER_MIN_LEN:-32}"
 
 # The pg nodes, the K8S workers - from the address file, as `ip name` pairs.
 addr_pairs() {   # addr_pairs PREFIX_REGEX
@@ -877,7 +904,10 @@ cmd_leave() {
 #   certificates, the pg nodes accept the stores'. tls-server-auth names each certificate CN that
 #   may use stanza $PG_SCOPE - nothing else gets in. Names, not addresses, on the client side:
 #   the certificates carry DNS names, and every machine resolves the others from /etc/hosts.
-#   Encryption is the volumes' LUKS underneath - no pgBackRest passphrase to hold (decided).
+#   Encryption: decided 2026-09-28 as the volumes' LUKS alone, for an empty database. REVERSED
+#   2026-10-13 (backlog 3.50) once the repositories held real records: pgBackRest encrypts them
+#   too, so a copy that leaves its volume - to the lab recovery store, or offsite (3.29) - is
+#   ciphertext. LUKS still sits underneath.
 # =========================================================================================
 PGBR_STANZA="$PG_SCOPE"
 
@@ -969,14 +999,81 @@ write_pgbr_conf() {
 
 pgbr() { runuser -u postgres -- pgbackrest --stanza="$PGBR_STANZA" "$@"; }
 
+# pgbr_cipher_pass -> the repository passphrase on stdout: the environment, then the site
+# credentials file, then the terminal - asked twice, never echoed. Refuses one shorter than
+# PGBR_CIPHER_MIN_LEN, and one with a ' (the credentials file's format) or a newline (the include
+# file's). The CALLER runs cred_require_safe first, in the main shell (credentials.sh says why).
+pgbr_cipher_pass() {
+  local p="${PGBACKREST_CIPHER_PASS:-}" b=""
+  [ -n "$p" ] || p="$(cred_get PGBACKREST_CIPHER_PASS)"
+  if [ -z "$p" ]; then
+    { : </dev/tty; } 2>/dev/null || { echo "  [x] no PGBACKREST_CIPHER_PASS in the environment or $ENCLAVE_CREDENTIALS, and no terminal to ask on" >&2; return 1; }
+    read -rsp "  pgBackRest repository passphrase (PGBACKREST_CIPHER_PASS): " p </dev/tty; echo >&2
+    read -rsp "  again: " b </dev/tty; echo >&2
+    [ "$p" = "$b" ] || { echo "  [x] the two entries differ" >&2; return 1; }
+    b=""
+  fi
+  [ "${#p}" -ge "$PGBR_CIPHER_MIN_LEN" ] || { echo "  [x] the passphrase is shorter than $PGBR_CIPHER_MIN_LEN characters" >&2; return 1; }
+  case "$p" in *"'"*|*$'\n'*) echo "  [x] the passphrase contains a ' or a newline" >&2; return 1 ;; esac
+  printf '%s' "$p"
+}
+
+# write_pgbr_cipher "INDEX ..." - the passphrase for these repositories, in its OWN file, 0640
+# root:postgres (pgBackRest runs as postgres). A pg node gets every store's index; a store ONLY its
+# own - an option like repo2-cipher-type on host-4 would DEFINE a repo2 there, at pgBackRest's
+# default path. Prints a FINGERPRINT (sha256, first 8 hex) so the operator can see the same
+# passphrase landed on every machine without it ever being shown.
+write_pgbr_cipher() {
+  local idxs="$1" pass i fp
+  case "$PGBR_CIPHER_TYPE" in
+    none)
+      rm -f "$PGBR_CIPHER_FILE"
+      warn "PGBR_CIPHER_TYPE=none - the repositories are NOT encrypted, and they hold the application's records (3.50)"
+      return 0 ;;
+    aes-256-cbc) ;;
+    *) die "PGBR_CIPHER_TYPE='$PGBR_CIPHER_TYPE' - pgBackRest 2.50 knows none and aes-256-cbc" ;;
+  esac
+  pass="$(pgbr_cipher_pass)" || die "no repository passphrase - nothing changed"
+  fp="$(printf '%s' "$pass" | sha256sum | cut -c1-8)"
+  install -d -m 0750 -o root -g postgres "$(dirname "$PGBR_CIPHER_FILE")"
+  ( umask 077
+    { printf '# MANAGED by 06a-postgres-ha.sh (backlog 3.50): the repository passphrase. NEVER print this file.\n[global]\n'
+      for i in $idxs; do printf 'repo%s-cipher-type=%s\nrepo%s-cipher-pass=%s\n' "$i" "$PGBR_CIPHER_TYPE" "$i" "$pass"; done
+    } > "$PGBR_CIPHER_FILE.new" )
+  pass=""
+  chown root:postgres "$PGBR_CIPHER_FILE.new"; chmod 0640 "$PGBR_CIPHER_FILE.new"
+  mv -f "$PGBR_CIPHER_FILE.new" "$PGBR_CIPHER_FILE"
+  ok "repository passphrase for repo${idxs// /, repo} in $PGBR_CIPHER_FILE - fingerprint $fp (it must match on every machine)"
+}
+
+# repo_state PATH -> empty | plain | encrypted, read from the stanza's backup.info. pgBackRest
+# starts every file it encrypts with the magic "Salted__" (CIPHER_BLOCK_MAGIC, cipherBlock.c 2.50).
+repo_state() {
+  local f="$1/backup/$PGBR_STANZA/backup.info"
+  [ -s "$f" ] || { echo empty; return 0; }
+  if [ "$(head -c 8 "$f")" = "Salted__" ]; then echo encrypted; else echo plain; fi
+}
+
+# pgbr_disposal_log EVENT... - one line in the records disposal log, in vm-backup.sh's format
+# (contingency plan 4.7): <UTC> host=<machine> run=<id> EVENT ...
+pgbr_disposal_log() {
+  local line
+  line="$(date -u +%Y-%m-%dT%H:%M:%SZ) host=$(hostname -s) run=${INVOCATION_ID:-manual:${SUDO_USER:-$(id -un)}} $*"
+  install -d -m 0750 "$(dirname "$RECORDS_DISPOSAL_LOG")"
+  printf '%s\n' "$line" >> "$RECORDS_DISPOSAL_LOG" && chmod 0640 "$RECORDS_DISPOSAL_LOG"
+  logger -t records-disposal -- "$*" 2>/dev/null || true
+}
+
 cmd_backup_node() {
-  need_root; whoami_pg
+  need_root; whoami_pg; cred_require_safe
   [ -n "$PG_BACKUP_STORES" ] || die "PG_BACKUP_STORES is empty (vm-specs.env) - where would the backups go?"
   local key="$SSL_DIR/$ME.key"
   [ -r "$ETCD_PKI/member.crt" ] && [ -r "$key" ] || die "no node certificate/key from slice 2"
   install_pgbackrest
   place_pgbr_pki "$ETCD_PKI/member.crt" "$key"
   render_pgbr_node "$ME" "$ME_ADDR" | write_pgbr_conf
+  # every store's passphrase: this node pushes WAL to all of them, and restores from any (3.50)
+  write_pgbr_cipher "$(store_lines | awk '{printf "%s ", $1}' | sed 's/ $//')"
   start_pgbr_server "$ME_ADDR"
   say "stores this node will push WAL to: $(store_lines | awk '{printf "repo%s=%s ", $1, $2}')"
 }
@@ -994,7 +1091,7 @@ whoami_store() {
 }
 
 cmd_backup_store() {
-  need_root; whoami_store
+  need_root; whoami_store; cred_require_safe
   local fc="${1:-}" key="$SSL_DIR/$ST_NAME.key" parent
   [ -n "$fc" ] && [ -r "$fc" ] || die "usage: sudo $0 backup-store <$ST_NAME.fullchain.crt from svc-mgmt-01>"
   [ -r "$key" ] || die "no key at $key - make it on THIS machine first: sudo $ENC/ca.sh request $ST_NAME"
@@ -1003,6 +1100,12 @@ cmd_backup_store() {
   parent="$(dirname "$ST_PATH")"
   mountpoint -q "$parent" || die "$parent is not a mount point - the repository $ST_PATH would land on the OS disk.
        host-4: sudo ./03-host-services.sh cryptdisk first (CRYPT_DISKS in services-params.env)."
+  # ENCRYPTION CANNOT CHANGE UNDER AN EXISTING STANZA (3.50) - say so before anything is touched.
+  case "$PGBR_CIPHER_TYPE:$(repo_state "$ST_PATH")" in
+    none:encrypted) die "$ST_PATH holds an ENCRYPTED repository but PGBR_CIPHER_TYPE=none - pgBackRest cannot remove encryption from one" ;;
+    aes-256-cbc:plain) die "$ST_PATH holds an UNENCRYPTED repository, and pgBackRest cannot encrypt one in place.
+       Replace it: sudo $0 backup-store-encrypt prepare  (the five steps are in this script's header)" ;;
+  esac
   install_pgbackrest
   # pgbackrest pulls postgresql-common, which ENABLES Debian's postgresql.service - on a store that
   # runs no PostgreSQL server that is a database unit enabled on a hypervisor, and nothing more.
@@ -1013,6 +1116,7 @@ cmd_backup_store() {
   ok "repository repo$ST_IDX: $ST_PATH on $parent ($(df -h --output=avail "$parent" | tail -1 | tr -d ' ') free)"
   place_pgbr_pki "$fc" "$key"
   render_pgbr_store "$ST_IDX" "$ST_ADDR" "$ST_PATH" | write_pgbr_conf
+  write_pgbr_cipher "$ST_IDX"     # this store's repository only (3.50)
   start_pgbr_server "$ST_ADDR"
   # the stanza, created from HERE (the repository host): it reaches every pg node's server, finds
   # the primary and records the cluster's identity - so this also proves the TLS path store -> nodes.
@@ -1070,6 +1174,136 @@ cmd_backup_run() {
   pgbr --repo="$ST_IDX" --type="$type" backup 2>&1 | sed 's/^/     /' || die "the backup failed - the lines above say why"
   pgbr info 2>&1 | sed 's/^/     /'
   install_backup_timers
+}
+
+# =========================================================================================
+# ENCRYPTING A STORE THAT ALREADY EXISTS (backlog 3.50, 2026-10-13). pgBackRest cannot change a
+# repository's encryption once its stanza exists, so the old repository is MOVED ASIDE - kept whole,
+# a rename on the same filesystem - and a new encrypted one is created in its place:
+#
+#   1. each store:   backup-store-encrypt prepare   old -> <path>.unencrypted-<UTC>, a new encrypted stanza
+#   2. each pg node: backup-node                     every store's passphrase; its TLS server restarted
+#   3. each store:   backup-store-encrypt finish    a full backup INTO the new repository - which also
+#                                                    proves the primary archives WAL into it - and the timers
+#   4. the primary:  backup-restore-test             a point-in-time restore from EACH new repository
+#   5. each store:   backup-store-retire            the old repository destroyed, logged as a disposal
+#
+# Between 1 and 3 WAL cannot reach the moved store. PostgreSQL keeps every WAL file until archiving
+# succeeds, so nothing is lost, and the moved-aside repository still holds everything up to the
+# move. Nothing is deleted before step 5, and step 5 refuses under a records hold (3.27). If the new
+# stanza cannot be made - FIPS refusing the cipher, a wrong passphrase file - prepare ROLLS BACK:
+# the old repository is put back, unencrypted, timers running.
+# =========================================================================================
+# pgbr_repo_check INDEX -> "<cipher> <full backups>" for that repository, from pgBackRest's own JSON.
+# Prints the JSON's shape instead, and fails, if it is not the shape expected - a check that cannot
+# read its input must not answer.
+pgbr_repo_check() {
+  runuser -u postgres -- pgbackrest --stanza="$PGBR_STANZA" --repo="$1" --output=json info 2>&1 | python3 -c '
+import json, sys
+raw = sys.stdin.read()
+try:
+    st = json.loads(raw)[0]
+    rk = int(sys.argv[1])
+    ciph = [r["cipher"] for r in st["repo"] if int(r["key"]) == rk]
+    fulls = [b for b in st.get("backup", []) if b.get("type") == "full" and int(b["database"]["repo-key"]) == rk]
+    print(ciph[0] if ciph else "unknown", len(fulls))
+except Exception as e:
+    sys.stderr.write("  [x] pgBackRest info was not the shape expected (%s): %s\n" % (e, raw[:300]))
+    sys.exit(1)' "$1"
+}
+
+cmd_backup_store_encrypt() {
+  need_root; whoami_store; cred_require_safe
+  local step="${1:-}" st old out c n
+  [ "$PGBR_CIPHER_TYPE" = aes-256-cbc ] || die "PGBR_CIPHER_TYPE is '$PGBR_CIPHER_TYPE' - set aes-256-cbc to encrypt"
+  # the guard on the path FIRST: everything below renames, and on a failed prepare removes, $ST_PATH
+  case "$ST_PATH" in /?*/?*) ;; *) die "refusing: repository path '$ST_PATH' is too short to be a repository" ;; esac
+  mountpoint -q "$(dirname "$ST_PATH")" || die "$(dirname "$ST_PATH") is not mounted - the store is not where it should be"
+  case "$step" in
+    prepare)
+      st="$(repo_state "$ST_PATH")"
+      case "$st" in
+        encrypted) ok "repo$ST_IDX at $ST_PATH is already encrypted - nothing to prepare (next: finish)"; return 0 ;;
+        empty)     die "repo$ST_IDX at $ST_PATH holds no stanza - a new store is made with backup-store, not this" ;;
+      esac
+      for c in pgbackrest-full.service pgbackrest-diff.service; do
+        systemctl is-active --quiet "$c" && die "$c is running a backup right now - wait for it, then run this again"
+      done
+      # the passphrase is asked BEFORE anything moves; exported so write_pgbr_cipher does not ask again
+      PGBACKREST_CIPHER_PASS="$(pgbr_cipher_pass)" || die "no repository passphrase - nothing changed"
+      export PGBACKREST_CIPHER_PASS
+      old="$ST_PATH.unencrypted-$(date -u +%Y%m%dT%H%M%SZ)"
+      [ ! -e "$old" ] || die "$old already exists - nothing changed"
+      systemctl stop pgbackrest-full.timer pgbackrest-diff.timer 2>/dev/null || true
+      mv "$ST_PATH" "$old" || die "could not move $ST_PATH aside - nothing changed"
+      ok "the unencrypted repository is kept whole at $old"
+      install -d -m 0750 -o postgres -g postgres "$ST_PATH"
+      write_pgbr_cipher "$ST_IDX"
+      unset PGBACKREST_CIPHER_PASS
+      start_pgbr_server "$ST_ADDR"
+      if ! out="$(pgbr stanza-create 2>&1)" || [ "$(repo_state "$ST_PATH")" != encrypted ]; then
+        printf '%s\n' "$out" | sed 's/^/     /'
+        # BACK TO WHERE IT WAS. The new directory holds only what stanza-create just wrote.
+        rm -rf -- "$ST_PATH"; mv "$old" "$ST_PATH"; rm -f "$PGBR_CIPHER_FILE"
+        start_pgbr_server "$ST_ADDR"
+        systemctl start pgbackrest-full.timer pgbackrest-diff.timer 2>/dev/null || true
+        die "no encrypted stanza (pgBackRest's answer is above) - ROLLED BACK: $ST_PATH is the old, unencrypted repository again, timers running"
+      fi
+      printf '%s\n' "$out" | sed 's/^/     /'
+      ok "repo$ST_IDX: a NEW, ENCRYPTED stanza at $ST_PATH (its files begin with pgBackRest's cipher header)"
+      say "WAL cannot reach repo$ST_IDX until the pg nodes have the passphrase. PostgreSQL keeps the files until it can."
+      say "next: sudo $0 backup-node  on pg-01, pg-02 and pg-03 (any order) - then  sudo $0 backup-store-encrypt finish  here"
+      ;;
+    finish)
+      [ "$(repo_state "$ST_PATH")" = encrypted ] || die "repo$ST_IDX is not an encrypted repository - run  backup-store-encrypt prepare  first"
+      [ -s "$PGBR_CIPHER_FILE" ] || die "no $PGBR_CIPHER_FILE here - prepare writes it"
+      say "a full backup INTO the encrypted repo$ST_IDX - it also proves the primary archives WAL into it"
+      pgbr --repo="$ST_IDX" --type=full backup 2>&1 | sed 's/^/     /' \
+        || die "the backup failed (above). If it timed out waiting for WAL: backup-node has not run on every pg node since prepare"
+      out="$(pgbr_repo_check "$ST_IDX")" || die "could not read repo$ST_IDX back (above)"
+      read -r c n <<<"$out"
+      [ "$c" = aes-256-cbc ] && [ "${n:-0}" -ge 1 ] || die "repo$ST_IDX reads back as cipher=$c with $n full backup(s) - expected aes-256-cbc and at least 1"
+      ok "repo$ST_IDX: cipher $c, $n full backup(s)"
+      install_backup_timers
+      say "next, once EVERY store is finished: sudo $0 backup-restore-test  on the PRIMARY - then  backup-store-retire  on each store"
+      ;;
+    *) die "usage: sudo $0 backup-store-encrypt prepare|finish   (the five steps are in this script's header)" ;;
+  esac
+}
+
+# backup-store-retire: destroy what prepare moved aside - only an exact <path>.unencrypted-<UTC> name,
+# only once the new repository is encrypted and holds a full backup, never under a records hold, and
+# only on a typed confirmation that backup-restore-test has passed. Each one is a records disposal.
+cmd_backup_store_retire() {
+  need_root; whoami_store
+  local d found="" c n b answer=""
+  case "$ST_PATH" in /?*/?*) ;; *) die "refusing: repository path '$ST_PATH' is too short to be a repository" ;; esac
+  [ -s "$RECORDS_HOLD_FILE" ] && die "a RECORDS HOLD is in force ($RECORDS_HOLD_FILE) - destroying a repository of records is what it forbids. Nothing changed"
+  [ "$(repo_state "$ST_PATH")" = encrypted ] || die "repo$ST_IDX is not encrypted - nothing has replaced the old repository yet"
+  local chk; chk="$(pgbr_repo_check "$ST_IDX")" || die "could not read repo$ST_IDX back (above)"
+  read -r c n <<<"$chk"
+  [ "$c" = aes-256-cbc ] && [ "${n:-0}" -ge 1 ] || die "repo$ST_IDX: cipher=$c, $n full backup(s) - it must be encrypted and hold a full first"
+  for d in "$ST_PATH".unencrypted-*; do
+    [ -d "$d" ] || continue
+    [[ "$d" =~ ^"$ST_PATH".unencrypted-[0-9]{8}T[0-9]{6}Z$ ]] || { warn "skipping $d - not a name prepare makes"; continue; }
+    found="$found $d"
+    say "  to destroy: $d  ($(du -sh "$d" | cut -f1))"
+  done
+  [ -n "$found" ] || { ok "no moved-aside repository on $ST_NAME - nothing to retire"; return 0; }
+  say "these hold the application's records, UNENCRYPTED. Destroy them only after backup-restore-test passed from repo$ST_IDX."
+  { : </dev/tty; } 2>/dev/null || die "no terminal for the confirmation - nothing changed"
+  read -rp "  type the hostname to destroy them ($(hostname -s)): " answer </dev/tty
+  [ "$answer" = "$(hostname -s)" ] || die "not confirmed - nothing changed"
+  for d in $found; do
+    b="$(du -sb "$d" | cut -f1)"
+    if rm -rf -- "$d"; then
+      pgbr_disposal_log "DESTROYED pgbackrest-repository=$d bytes=$b reason=replaced-by-encrypted-repo$ST_IDX"
+      ok "destroyed $d ($b bytes) - logged in $RECORDS_DISPOSAL_LOG"
+    else
+      pgbr_disposal_log "DESTROY-FAILED pgbackrest-repository=$d"
+      warn "could not fully remove $d - logged; look before running this again"
+    fi
+  done
 }
 
 # backup-timers: (re)install the scheduled backups on THIS store - the wrapper and the two timers -
@@ -1775,9 +2009,11 @@ case "${1:-}" in
   backup-enable) cmd_backup_enable ;;
   backup-run)    shift; cmd_backup_run "$@" ;;
   backup-timers) cmd_backup_timers ;;
+  backup-store-encrypt) shift; cmd_backup_store_encrypt "$@" ;;
+  backup-store-retire)  cmd_backup_store_retire ;;
   backup-restore-test) cmd_backup_restore_test ;;
   extensions)    cmd_extensions ;;
   stig-settings) cmd_stig_settings ;;
   app-restore)   shift; cmd_app_restore "$@" ;;
-  *) sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  *) sed -n '2,43p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

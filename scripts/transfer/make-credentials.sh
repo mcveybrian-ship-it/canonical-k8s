@@ -67,6 +67,11 @@ ADDRS="$SELF/../enclave/enclave-addresses.env"
 CRED_LABEL="${CRED_LABEL:-enclave-cred}"
 HARBOR_MACHINE="${HARBOR_MACHINE:-SVC_HARBOR_01}"   # who gets HARBOR_*  (address-file key)
 OBS_MACHINE="${OBS_MACHINE:-SVC_OBS_01}"            # who gets GRAFANA_* (address-file key)
+# Who gets PGBACKREST_CIPHER_PASS (backlog 3.50): every pg node, and each pgBackRest store named in
+# vm-specs.env's PG_BACKUP_STORES - the same line 06a-postgres-ha.sh reads. 32+ characters.
+SPECS="$SELF/../enclave/vm-specs.env"
+PGBR_STORE_KEYS="$( [ -r "$SPECS" ] && sed -n "s/^PG_BACKUP_STORES='\([^']*\)'.*/\1/p" "$SPECS" | tr ' ' '\n' | sed 's/=.*//' | tr '[:lower:]-' '[:upper:]_' | tr '\n' ' ' || true)"
+PGBR_MIN_LEN="${PGBR_MIN_LEN:-32}"
 # The collector's drop directory and forced command - must be EXACTLY what the collector runs
 # (audit-offload.sh DROP and rrsync), or `collector-trust` refuses the line.
 AUDIT_DROP_DIR="${AUDIT_DROP_DIR:-/srv/audit-offload}"
@@ -83,6 +88,8 @@ die()  { printf '\n  [x] %s\n\n' "$*" >&2; exit 1; }
 usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
 lower() { printf '%s' "$1" | tr '[:upper:]_' '[:lower:]-'; }
 has()   { local x="$1"; shift; printf '%s\n' "$@" | grep -qxF "$x"; }   # has ITEM LIST...
+# shellcheck disable=SC2086  # the store list is space-separated on purpose
+pgbr_machine() { [[ "$1" =~ ^PG_[0-9]+$ ]] || has "$1" $PGBR_STORE_KEYS; }   # gets the pgBackRest passphrase?
 
 # The site label defaults to the system's acronym, so the documented command needs no edit.
 # A value still holding its placeholder (or anything but a plain label) falls back.
@@ -162,9 +169,9 @@ trap 'stty echo 2>/dev/null || true; [ -z "$tmpd" ] || rm -rf "$tmpd"' EXIT
 HAVE_CRACKLIB=0; command -v cracklib-check >/dev/null && HAVE_CRACKLIB=1
 SEEN=()   # sha256 of each secret accepted in THIS run, to refuse reuse. Memory only.
 
-policy_ok() {   # $1 candidate, $2 = 1 when stored as the REAL value. Mirrors the targets' pwquality.
-  local p="$1" r
-  [ "${#p}" -ge 15 ]         || { warn "too short: ${#p} characters, the policy wants 15"; return 1; }
+policy_ok() {   # $1 candidate, $2 = 1 when stored as the REAL value, $3 minimum length (15). Mirrors the targets' pwquality.
+  local p="$1" r min="${3:-15}"
+  [ "${#p}" -ge "$min" ]     || { warn "too short: ${#p} characters, this one wants $min"; return 1; }
   [[ "$p" =~ [A-Z] ]]        || { warn "needs an upper-case letter"; return 1; }
   [[ "$p" =~ [a-z] ]]        || { warn "needs a lower-case letter"; return 1; }
   [[ "$p" =~ [0-9] ]]        || { warn "needs a digit"; return 1; }
@@ -180,9 +187,9 @@ policy_ok() {   # $1 candidate, $2 = 1 when stored as the REAL value. Mirrors th
   return 0
 }
 
-# ask LABEL OPTIONAL REAL -> sets SECRET (left empty only when OPTIONAL=1 and Enter was pressed)
+# ask LABEL OPTIONAL REAL [MINLEN] -> sets SECRET (left empty only when OPTIONAL=1 and Enter was pressed)
 ask() {
-  local label="$1" optional="$2" real="$3" a b d
+  local label="$1" optional="$2" real="$3" minlen="${4:-15}" a b d
   SECRET=""
   for _ in 1 2 3; do
     read -rsp "  $label: " a || die "input closed - nothing written"; echo
@@ -193,7 +200,7 @@ ask() {
     read -rsp "  again: " b || die "input closed - nothing written"; echo
     if [ "$a" != "$b" ]; then warn "the two entries differ - try again"; a=""; b=""; continue; fi
     b=""
-    policy_ok "$a" "$real" || { a=""; continue; }
+    policy_ok "$a" "$real" "$minlen" || { a=""; continue; }
     d="$(printf '%s' "$a" | sha256sum | cut -c1-64)"
     if [ "${#SEEN[@]}" -gt 0 ] && has "$d" "${SEEN[@]}"; then
       warn "already used for another item in this file - every password must be different"; a=""; continue
@@ -248,6 +255,21 @@ if has "$OBS_MACHINE" "${KEYS[@]}"; then
   ask "Grafana admin password (stored as the REAL value)" 1 1
   [ -z "$SECRET" ] || V[GRAFANA_ADMIN_PASSWORD]="$SECRET"
 fi
+# THE pgBackRest REPOSITORY PASSPHRASE (backlog 3.50). A REAL value, the SAME on every pg node and
+# store, because it encrypts every database backup. LOST, EVERY BACKUP IS UNREADABLE: the custodians
+# seal a copy in its own envelope - the register records where, and its FINGERPRINT (sha256, first 8
+# hex), which 06a-postgres-ha.sh prints on each machine it reaches. The fingerprint is not the secret.
+PGBR_FP=""
+pg=0; for k in "${KEYS[@]}"; do pgbr_machine "$k" && pg=1; done
+if [ "$pg" = 1 ]; then
+  say "the pgBackRest repository passphrase: $PGBR_MIN_LEN+ characters, the SAME on every database node and"
+  say "store. SEAL A COPY in its own envelope - without it no database backup can ever be read."
+  ask "pgBackRest repository passphrase (stored as the REAL value)" 1 1 "$PGBR_MIN_LEN"
+  if [ -n "$SECRET" ]; then
+    V[PGBACKREST_CIPHER_PASS]="$SECRET"; PGBR_FP="$(printf '%s' "$SECRET" | sha256sum | cut -c1-8)"
+    ok "pgBackRest passphrase taken - fingerprint $PGBR_FP (write it on the envelope)"
+  fi
+fi
 SECRET=""
 
 # ---- which keys each machine gets ---------------------------------------------------------
@@ -259,6 +281,7 @@ keys_for() {   # MACHINE_KEY -> the credential keys that machine uses, one per l
     for k in HARBOR_ADMIN_PASSWORD HARBOR_DB_PASSWORD; do [ -z "${V[$k]:-}" ] || printf '%s\n' "$k"; done
   fi
   if [ "$m" = "$OBS_MACHINE" ] && [ -n "${V[GRAFANA_ADMIN_PASSWORD]:-}" ]; then printf '%s\n' GRAFANA_ADMIN_PASSWORD; fi
+  if pgbr_machine "$m" && [ -n "${V[PGBACKREST_CIPHER_PASS]:-}" ]; then printf '%s\n' PGBACKREST_CIPHER_PASS; fi
   return 0
 }
 
@@ -370,6 +393,11 @@ reg="$OUT/REGISTER.txt"
       printf '  %-34s %-51s  ____________________\n' "$(basename "$kf")" "$(ssh-keygen -l -f "$kf" | awk '{print $2}')"
     done
     printf '  %-34s %-51s  ____________________\n' audit-collector.authorized_keys "$(wc -l < "$OUT/audit-collector.authorized_keys") line(s), merged on $(lower "$OBS_MACHINE")"
+  fi
+  if [ -n "$PGBR_FP" ]; then
+    printf '\n  pgBackRest   the repository passphrase, SEALED in its own envelope marked with fingerprint %s\n' "$PGBR_FP"
+    printf '               (sha256, first 8 - 06a-postgres-ha.sh prints the same on every machine it reaches).\n'
+    printf '               LOST = every database backup unreadable. Signed: ______ / ______  location ____________\n'
   fi
   printf '\n  envelopes    %s emergency passwords sealed, one per machine, signed across the seal\n' "${#KEYS[@]}"
   printf '               by both custodians: ______ / ______   location ____________________\n'

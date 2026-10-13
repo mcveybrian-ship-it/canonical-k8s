@@ -72,8 +72,13 @@ inventoried rather than assumed:
   **Claim "approved algorithms, non-validated module" — POA&M ENG-68**, never "FIPS-validated".
 - **pgBackRest** (WAL archive and backups, B-06a slice 5) does **not** bring its own: it links the
   host's OpenSSL (`libssl3t64`, a package dependency), so its TLS is the §1.2 module — say it the
-  §1.2 way. Listed here only so the inventory is complete. Its repositories are encrypted by the
-  volumes' LUKS (Kernel Crypto API, #5215), not by pgBackRest's own cipher (decided 2026-09-28).
+  §1.2 way. Listed here only so the inventory is complete. Its repositories sit on the volumes'
+  LUKS (Kernel Crypto API, #5215) **and, from 2026-10-13, are encrypted by pgBackRest itself**
+  (backlog 3.50 — they hold the application's records, and a copy that leaves its volume must be
+  ciphertext): AES-256-CBC through the same host OpenSSL, with the key derived from a passphrase by
+  `EVP_BytesToKey`/SHA-1 — a legacy derivation, **not an approved KDF**. **Claim "AES-256 in the
+  validated module, with a non-approved key derivation"** — never "FIPS-encrypted".
+  (`06a-postgres-ha.md` §10.9.)
 - **Container images** (Harbor on `svc-harbor-01`, and every workload image) carry their own
   userland libraries, which are **not** the host's validated modules. Their crypto must be listed
   and either justified or kept off the data path.

@@ -1124,6 +1124,12 @@ target data recovery infeasible using state-of-the-art laboratory techniques"*.
   Who holds them is `CP_BOOT_SECRET_CUSTODIAN` in `facility-profile.env` — the same person or
   office that holds the LUKS passphrase; who may authorise the stick crossing the gap is
   `CM_MEDIA_TRANSFER_AUTHORITY`.
+- **One for the pgBackRest repository passphrase** (backlog 3.50), marked with its fingerprint —
+  sha256, first 8 hex, printed by `make-credentials.sh` and on REGISTER.txt, and by `06a` on each
+  machine it reaches. It is the same on all five database-backup machines, and it is the **only copy
+  outside them: lost, no database backup can ever be read** — a restore after losing the site needs
+  this envelope. Kept with the others; it is never rotated casually, because existing backups stay
+  encrypted with it.
 - The second admin's password is that person's own and is not sealed. The guest admin, Harbor and
   Grafana passwords are working administrator credentials, held the way the site holds its other
   administrator passwords. A facility that wants them sealed too adds envelopes; nothing else

@@ -82,7 +82,7 @@ STATUS = {
     "kubernetes": "",                               # B-07: date the cluster was bootstrapped
     "ceph": "",                                     # B-08: date Ceph served its first volume
     "witness": "",                                  # 2.8: an OPTION until decided
-    "storage_address": {"host-4": "2026-10-01"},    # 3.16: `03-host-services.sh storage`, per host
+    "storage_address": {"host-1": "2026-10-13", "host-2": "2026-10-13", "host-3": "2026-10-13", "host-4": "2026-10-01"},    # 3.16: `03-host-services.sh storage`, per host
 }
 
 

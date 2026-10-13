@@ -404,17 +404,18 @@ network. (The product design still specifies a physical break with no routed pat
 
 | device | management switch | storage switch |
 |---|---|---|
-| host-1 | onboard 1 Gb (today) | USB 2.5 Gb adapter (RTL8156BG, `r8152`) — `enx00e04d00a591` |
-| host-2 | onboard 1 Gb (today) | USB 2.5 Gb adapter — `enx00e04d01420e` |
-| host-3 | onboard 1 Gb (today) | USB 2.5 Gb adapter — `enx00e04d00a257` |
+| host-1 | onboard 1 Gb (today) | USB 2.5 Gb adapter (RTL8156BG, `r8152`) — `enx00e04d00a591` → `10.2.30.155` (2026-10-13) |
+| host-2 | onboard 1 Gb (today) | USB 2.5 Gb adapter — `enx00e04d01420e` → `10.2.30.156` (2026-10-13) |
+| host-3 | onboard 1 Gb (today) | USB 2.5 Gb adapter — `enx00e04d00a257` → `10.2.30.157` (2026-10-13) |
 | host-4 | onboard 2.5 Gb (today) | USB 2.5 Gb adapter — `enx00e04d00a418`, in the **top-of-case USB 3 port** (the chipset controller); the back panel's four USB 3 ports share one controller with both backup drives → `10.2.30.158` (2026-10-01) |
 | NAS (lab only) | — (onboard port on the **office network**, `10.0.20.10`: web UI and updates — **gap cable #3**) | SFP+ 1, **DAC cable**, 10 Gb → `10.2.30.171`, no gateway (2026-10-13) |
 | Dell R7515 (lab only) | — (stays on FortiGate `internal3`) | SFP+ 2: a **10GBASE-T SFP+ module** + Cat6a to its RJ45 10 Gb card — **gap cable #2** |
 | FortiGate `dmz` | uplink (today) — **gap cable #1** | — |
 
 Storage addresses are `STORAGE_HOST_n` in `enclave-addresses.env` (.155–.158). The vault is .170
-and the NAS .171 — lab gear, so not in that file. host-4 has its address (2026-10-01,
-`03-host-services.sh storage`); host-1..3 not yet.
+and the NAS .171 — lab gear, so not in that file. All four hosts have theirs: host-4
+2026-10-01, host-1..3 2026-10-13 (`03-host-services.sh storage`, then `stig-tailor.sh ra off` so
+the adapter ignores router advertisements). Each answers the others, the vault and the NAS.
 
 Speeds that matter: 1 Gb ≈ 110 MB/s (the old USB backup drive's speed, rejected as unworkable);
 a host's 2.5 Gb adapter ≈ 280 MB/s; NAS ↔ Dell at 10 Gb ≈ 1 GB/s.

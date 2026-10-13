@@ -1015,7 +1015,7 @@ guide, read 2026-10-13). It is replaced, in five steps, nothing deleted before t
 |---|---|---|---|
 | 1 | each store | `backup-store-encrypt prepare` | asks for the passphrase **first**, pauses the store's timers, moves the repository aside to `<path>.unencrypted-<UTC>` (a rename — kept whole), creates a new **encrypted** stanza. If that fails it **rolls back**: the old repository returns, unencrypted, timers running |
 | 2 | each pg node | `backup-node` | writes every store's passphrase, restarts the node's TLS server |
-| 3 | each store | `backup-store-encrypt finish` | a full backup **into** the new repository — which also proves the primary archives WAL into it — reads it back (`aes-256-cbc`, ≥ 1 full) and restores the timers |
+| 3 | each store, **one at a time** | `backup-store-encrypt finish` | a full backup **into** the new repository — which also proves the primary archives WAL into it — reads it back (`aes-256-cbc`, ≥ 1 full) and restores the timers. pgBackRest backs a cluster up once at a time: run on both stores together, the second fails with `LockAcquireError` and is simply run again |
 | 4 | the primary | `backup-restore-test` | a point-in-time restore from **each** new repository (§10.7) |
 | 5 | each store | `backup-store-retire` | destroys the moved-aside repository, each one a `DESTROYED` line in the records disposal log (contingency plan §4.7) — refused under a records hold, before the new repository holds a full, and without a typed confirmation |
 
@@ -1024,6 +1024,14 @@ archiving succeeds, so nothing is lost, and the moved-aside repository holds eve
 move. Tested offline 2026-10-13 against stand-ins: the rollback restored the old repository exactly;
 a success kept it whole beside the new one; retire refused under a hold, with no full, and without
 confirmation.
+
+**Done live 2026-10-13, 22:55–23:06 UTC, on both stores.** `prepare` on host-3 was the first real test
+under FIPS and created the encrypted stanza first time; every machine printed the same fingerprint;
+the database was idle, so no WAL waited during the window (0 failed archive attempts). `finish` gave
+each repository one full backup, read back as `aes-256-cbc` (host-4's needed a second run — the two
+were started together, see step 3). `backup-restore-test` restored **each** encrypted repository to
+23:02:33 UTC with the marker rows exactly right. `backup-store-retire` then destroyed the two
+unencrypted repositories (347 MB each), each a `DESTROYED` line in the records disposal log.
 
 ---
 
@@ -1498,7 +1506,7 @@ sudo -u postgres psql -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity
 | ⬜ | A FIPS-built etcd from Canonical | Q-CORE (h), not sent; ENG-68 |
 | ⬜ | Application users with logins and the connection string (`target_session_attrs=read-write` across the three nodes, runbook §9a.3) — the database itself is loaded (§10a) | B-07 |
 | ❓ | **PostGIS** — the audit exception as a tailoring entry, and whether the application needs it at all | 3.49 |
-| 🔄 | **pgBackRest repository encryption** before any copy to the lab recovery store — built 2026-10-13 (§10.9); the two live stores are replaced next | 3.50 |
+| ✅ | **pgBackRest repository encryption** — built and live 2026-10-13: both stores replaced, restore proven from each, the unencrypted ones destroyed and logged (§10.9) | 3.50 |
 | 🗳️ | Production sizing — the lab runs 2 vCPU / 4 GiB / 40 GB / 150 GB; `vm-specs.env`'s default of 8 GiB / 60 GB / 400 GB is explicitly not a production sizing | 2.8 |
 
 **Key:** ⬜ open · 🔄 in progress · 🗳️ a decision owed · ❓ a question for someone else · 🔴 blocks something.

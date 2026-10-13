@@ -1184,7 +1184,9 @@ cmd_backup_run() {
 #   1. each store:   backup-store-encrypt prepare   old -> <path>.unencrypted-<UTC>, a new encrypted stanza
 #   2. each pg node: backup-node                     every store's passphrase; its TLS server restarted
 #   3. each store:   backup-store-encrypt finish    a full backup INTO the new repository - which also
-#                                                    proves the primary archives WAL into it - and the timers
+#                                                    proves the primary archives WAL into it - and the timers.
+#                                                    ONE STORE AT A TIME: pgBackRest backs a cluster up once at
+#                                                    a time (2026-10-13: run together, host-4's hit LockAcquireError)
 #   4. the primary:  backup-restore-test             a point-in-time restore from EACH new repository
 #   5. each store:   backup-store-retire            the old repository destroyed, logged as a disposal
 #
@@ -1259,7 +1261,9 @@ cmd_backup_store_encrypt() {
       [ -s "$PGBR_CIPHER_FILE" ] || die "no $PGBR_CIPHER_FILE here - prepare writes it"
       say "a full backup INTO the encrypted repo$ST_IDX - it also proves the primary archives WAL into it"
       pgbr --repo="$ST_IDX" --type=full backup 2>&1 | sed 's/^/     /' \
-        || die "the backup failed (above). If it timed out waiting for WAL: backup-node has not run on every pg node since prepare"
+        || die "the backup failed (above). LockAcquireError: another store's backup is running - pgBackRest backs a cluster
+       up once at a time, so finish ONE store at a time and run this again. A timeout waiting for WAL: backup-node has
+       not run on every pg node since prepare"
       out="$(pgbr_repo_check "$ST_IDX")" || die "could not read repo$ST_IDX back (above)"
       read -r c n <<<"$out"
       [ "$c" = aes-256-cbc ] && [ "${n:-0}" -ge 1 ] || die "repo$ST_IDX reads back as cipher=$c with $n full backup(s) - expected aes-256-cbc and at least 1"

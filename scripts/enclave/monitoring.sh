@@ -1526,12 +1526,12 @@ groups:
       - alert: BackupCopyFailed
         expr: >-
           enclave_backup_copy_last_rc != 0
-          and on(instance, copy) (enclave_backup_copy_configured == 1)
+          and on(instance, copy, target) (enclave_backup_copy_configured == 1)
         for: 30m
         labels:
           severity: warning
         annotations:
-          summary: "the {{ \$labels.copy }} backup copy on {{ \$labels.machine }} failed its last run"
+          summary: "the {{ \$labels.copy }} backup copy on {{ \$labels.machine }} to {{ \$labels.target }} failed its last run"
           description: "Exit code {{ \$value }}. The far end holds whatever the last clean run left; nothing newer reached it."
           action: >-
             'sudo journalctl -u enclave-vm-backup --since today' on {{ \$labels.machine }} - the
@@ -1541,7 +1541,7 @@ groups:
       - alert: BackupCopyStale
         expr: >-
           (enclave_backup_copy_configured == 1)
-          unless on(instance, copy) ((time() - enclave_backup_copy_last_success_seconds) < ${AL_BACKUP_COPY_STALE})
+          unless on(instance, copy, target) ((time() - enclave_backup_copy_last_success_seconds) < ${AL_BACKUP_COPY_STALE})
         for: 1h
         labels:
           severity: warning

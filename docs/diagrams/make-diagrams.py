@@ -527,7 +527,7 @@ def page_backup():
     vb = p.box(470, 110, 380, 90, "<b>vm-backup.sh</b> nightly 02:00 Central<br>incr · verify (new sets) · prune · weekly verify --all", "svc", 11)
     drv = p.box(950, 110, 330, 90, "<b>/mnt/vmbackup</b> on host-4<br>USB SSD, LUKS · 2 chains kept", "svc", 11)
     c2 = p.box(950, 240, 330, 80, "<b>second copy → host-1</b><br>write-only rrsync · svc-repo-01 skipped", "svc", 11)
-    c3 = p.box(1320, 240, 330, 80, "<b>third copy → lab-vault</b><br>10.2.30.170, storage network", "lab", 11)
+    c3 = p.box(1320, 240, 330, 80, "<b>third copy → lab-vault + NAS</b><br>10.2.30.170 · 10.2.30.171 (encrypted dataset), storage network", "lab", 11)
     p.edge(vms, vb, "", FLOW)
     p.edge(vb, drv, "", FLOW)
     p.edge(drv, c2, "nightly · new files verified", FLOW)

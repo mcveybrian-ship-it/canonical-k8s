@@ -16,9 +16,9 @@
 #                                                machine (red flag 1.2). --setup makes the key
 #     sudo ./vm-backup.sh hold status|set|release  a records (legal) hold: prune and pgBackRest stop
 #                                                destroying backups until released (3.27)
-#     sudo ./vm-backup.sh third-copy             the same, to a store the site names in
-#                                                BACKUP_THIRD_ADDR - the Dell vault in the lab;
-#                                                off (a no-op) when that is empty
+#     sudo ./vm-backup.sh third-copy [--target A] the same, to each store the site names in
+#                                                BACKUP_THIRD_ADDR - a list; in the lab the Dell vault
+#                                                and the NAS; off (a no-op) when that is empty
 #     sudo ./vm-backup.sh restore-test <vm>      REHEARSE one: rebuild the chain into its own
 #                                                directory, boot it as restore-test-<vm> with
 #                                                no NIC, prove it, remove it. Touches nothing live
@@ -100,7 +100,8 @@ SECOND_STATE="${BACKUP_SECOND_STATE:-/var/lib/enclave-backup-second.state}"
 # and every byte of it is an apt mirror, rebuildable from the transfer bundle. Copying it a
 # second time costs the most and protects the least. --all overrides.
 SECOND_SKIP="${BACKUP_SECOND_SKIP:-svc-repo-01}"
-# THE THIRD COPY - lab only in this repo (the Dell vault); see cmd_third_copy. Empty address = off.
+# THE THIRD COPY - lab only in this repo; see cmd_third_copy. Empty = off. A LIST since 2026-10-13
+# (the Dell vault and the lab NAS): each item [user@]address[:directory] - see third_targets.
 THIRD_ADDR="${BACKUP_THIRD_ADDR:-}"
 THIRD_DIR="${BACKUP_THIRD_DIR:-/srv/cold/backup-copy}"
 THIRD_KEY="${BACKUP_THIRD_KEY:-/etc/enclave/backup-third.key}"
@@ -417,22 +418,21 @@ cmd_status() {
   if hold_active; then warn "  RECORDS HOLD IN FORCE - prune destroys nothing: $(hold_line)"
   else say "  records hold: none"; fi
   printf '\n  off-host copies, last run (from their state files):\n'
-  local which sf when lok
-  for which in second third; do
-    sf="$SECOND_STATE"; [ "$which" = third ] && sf="$THIRD_STATE"
-    if [ -r "$sf" ]; then
+  local which tgt sf when lok
+  while read -r which tgt sf; do
+    if [ "$tgt" = none ]; then
+      printf '     %-7s not configured%s\n' "$which" "$( [ "$which" = third ] && echo ' (BACKUP_THIRD_ADDR empty - lab only)')"
+    elif [ -r "$sf" ]; then
       when="$(awk -F= '/^seconds=/{print $2}' "$sf")"
       lok="$(state_last_ok "$sf")"
-      printf '     %-7s -> %-14s %s  rc=%s  %s  last clean run: %s\n' "$which" "$(awk -F= '/^host=/{print $2}' "$sf")" \
+      printf '     %-7s -> %-14s %s  rc=%s  %s  last clean run: %s\n' "$which" "$tgt" \
         "$(date -d "@${when:-0}" '+%Y-%m-%d %H:%M %Z' 2>/dev/null)" "$(awk -F= '/^rc=/{print $2}' "$sf")" \
         "$(human "$(awk -F= '/^bytes=/{print $2}' "$sf")")" \
         "$( [ -n "$lok" ] && date -d "@$lok" '+%Y-%m-%d %H:%M %Z' 2>/dev/null || echo 'none recorded')"
-    elif [ "$which" = third ] && [ -z "$THIRD_ADDR" ]; then
-      printf '     %-7s not configured (BACKUP_THIRD_ADDR empty - lab only)\n' "$which"
     else
-      printf '     %-7s never run\n' "$which"
+      printf '     %-7s -> %-14s never run\n' "$which" "$tgt"
     fi
-  done
+  done < <(copy_rows)
   printf '\n'
 }
 
@@ -1676,11 +1676,14 @@ cmd_second_copy() {
 # `rrsync -wo <dir>`, then re-read with --checksum. Moved out of second-copy unchanged on
 # 2026-10-01 when the third copy arrived, so the two cannot drift apart.
 #
-#   push_sets <label> <key> <target> <addr> <remote dir> <skip list> <state file> <delete 0|1> <dry 0|1> <all 0|1> <verify-all 0|1>
+#   push_sets <label> <key> <target> <addr> <remote dir> <skip list> <state file> <delete 0|1> <dry 0|1> <all 0|1> <verify-all 0|1> [user]
+#
+# The far end's login is root unless a user is given - the lab NAS (TrueNAS) refuses root over ssh,
+# so its copy logs in as its own user (2026-10-13).
 #
 # The ledger of verified files sits beside the state file: <state file>.verified.
 push_sets() {
-  local label="$1" key="$2" target="$3" addr="$4" rdir="$5" skip="$6" state="$7" del="$8" dry="$9" all="${10}" vall="${11:-0}"
+  local label="$1" key="$2" target="$3" addr="$4" rdir="$5" skip="$6" state="$7" del="$8" dry="$9" all="${10}" vall="${11:-0}" ruser="${12:-root}"
   local ledger="$state.verified"
   [ -r "$key" ] || die "no key at $key - run: sudo $0 ${label// /-} --setup"
   check_dest
@@ -1723,7 +1726,7 @@ push_sets() {
   # a master that exits by itself after ControlPersist and an empty directory a reboot clears.
   mux_close() {
     local i
-    ssh -o "ControlPath=$ctl/%C" -O exit "root@$addr" >/dev/null 2>&1 || true
+    ssh -o "ControlPath=$ctl/%C" -O exit "$ruser@$addr" >/dev/null 2>&1 || true
     for i in 1 2 3 4 5 6 7 8 9 10; do [ -z "$(ls -A "$ctl" 2>/dev/null)" ] && break; sleep 0.2; done
     rmdir "$ctl" 2>/dev/null || true
   }
@@ -1744,7 +1747,7 @@ push_sets() {
   for d in "${doms[@]}"; do
     say "  $d ..."
     if [ "$dry" -eq 1 ]; then
-      if ! "${RS[@]}" "$DEST/$d/" "root@$addr:$d/"; then
+      if ! "${RS[@]}" "$DEST/$d/" "$ruser@$addr:$d/"; then
         warn "$d: rsync FAILED - see the error above"; rc=1; continue
       fi
     else
@@ -1752,7 +1755,7 @@ push_sets() {
       # --info=del1 names each file rsync deletes at the far end, and every deleted SET goes to the
       # disposal log - so "the copies follow the source" is recorded, not assumed.
       local rout delset
-      if ! rout="$("${RS[@]}" --info=del1 "$DEST/$d/" "root@$addr:$d/" 2>&1)"; then
+      if ! rout="$("${RS[@]}" --info=del1 "$DEST/$d/" "$ruser@$addr:$d/" 2>&1)"; then
         [ -z "$rout" ] || printf '%s\n' "$rout" | sed 's/^/     /'
         warn "$d: rsync FAILED - see the error above"; rc=1; continue
       fi
@@ -1789,7 +1792,7 @@ push_sets() {
         lst="$(mktemp)"
         printf '%s\n' "$need" | cut -f1 | sed "s|^$d/||" > "$lst"
         local vout vrc=0
-        vout="$(rsync -a --dry-run --itemize-changes --checksum --files-from="$lst" -e "${SSH[*]}" "$DEST/$d/" "root@$addr:$d/" 2>&1)" || vrc=$?
+        vout="$(rsync -a --dry-run --itemize-changes --checksum --files-from="$lst" -e "${SSH[*]}" "$DEST/$d/" "$ruser@$addr:$d/" 2>&1)" || vrc=$?
         rm -f "$lst"
         diff="$(printf '%s\n' "$vout" | grep -vE '^$|^sending|^total|^sent ' || true)"
         # A REFUSED CONNECTION IS NOT A DIFFERENCE. Until 2026-10-13 rsync's own error lines landed
@@ -1857,14 +1860,83 @@ push_sets() {
 # MONITORED SINCE 2026-10-13 (3.58), like the second copy: its facts carry copy="third", and
 # BackupCopyFailed / BackupCopyStale fire only where BACKUP_THIRD_ADDR is set - a site without
 # a third store reports configured 0 and sees nothing.
+# copy_rows -> "COPY TARGET STATEFILE" for every off-host copy target: the second copy, then each
+# third-copy target. An unconfigured copy is one row with target "none" and state "-", so status and
+# the facts can still say so - a missing series reads as silence (dashboards-and-metrics.md).
+copy_rows() {
+  local h u a d k st
+  h="$(second_host)"
+  printf 'second %s %s\n' "${h:-none}" "$( [ -n "$h" ] && echo "$SECOND_STATE" || echo - )"
+  if [ -z "$THIRD_ADDR" ]; then printf 'third none -\n'; return 0; fi
+  while read -r u a d; do
+    read -r k st <<<"$(third_paths "$a")"
+    printf 'third %s %s\n' "$a" "$st"
+  done < <(third_targets)
+}
+
+# third_targets -> one line per target, "USER ADDRESS DIRECTORY". BACKUP_THIRD_ADDR is a LIST since
+# 2026-10-13 - in the lab, the Dell vault and the NAS - of [user@]address[:directory] items; the user
+# is root and the directory BACKUP_THIRD_DIR when left out, so the old one-address form still means
+# what it meant. Still ONE optional setting, empty = off (lab-network.md 9.3).
+third_targets() {
+  local t u a d
+  for t in $THIRD_ADDR; do
+    u=root; a="$t"; d="$THIRD_DIR"
+    case "$a" in *@*) u="${a%%@*}"; a="${a#*@}" ;; esac
+    case "$a" in *:*) d="${a#*:}"; a="${a%%:*}" ;; esac
+    printf '%s %s %s\n' "$u" "$a" "$d"
+  done
+}
+
+# third_paths ADDRESS -> "KEY STATE" for that target, <base>-<address>. The files made before the list
+# (backup-third.key and enclave-backup-third.state, 2026-10-01..13) stay with the store their state
+# file names - the vault - so nothing was re-keyed and its ledger of verified files carries on.
+third_paths() {
+  local a="$1" k s
+  k="${THIRD_KEY%.key}-$a.key"; s="${THIRD_STATE%.state}-$a.state"
+  if [ ! -e "$s" ] && [ -e "$THIRD_STATE" ] && [ "$(awk -F= '/^host=/{print $2}' "$THIRD_STATE" 2>/dev/null)" = "$a" ]; then
+    k="$THIRD_KEY"; s="$THIRD_STATE"
+  fi
+  printf '%s %s\n' "$k" "$s"
+}
+
+# third_setup USER ADDRESS DIRECTORY KEY - make the target's own key, print what to authorise there
+third_setup() {
+  local u="$1" a="$2" d="$3" k="$4" myaddr line
+  copy_key "$k" "vm-backup third copy from $(hostname -s) to $a"
+  # The address this host connects FROM - asked of the kernel, as second-copy does. For the lab
+  # stores that is the storage NIC's address (3.16), and that is correct.
+  myaddr="$(ip -4 route get "$a" 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1)"
+  [ -n "$myaddr" ] || die "cannot tell which address $(hostname -s) uses to reach $a - check 'ip -4 route get $a'"
+  say "this host reaches $a from $myaddr"
+  line="from=\"$myaddr\",restrict,command=\"/usr/bin/rrsync -wo $d\" $(cut -d" " -f1-2 "$k.pub")"
+  if [ "$u" = root ]; then
+    printf '\n  ON THE THIRD-COPY STORE (%s), run this ONCE - it authorises a WRITE-ONLY rsync into one directory:\n\n' "$a"
+    printf '    ls -l /usr/bin/rsync /usr/bin/rrsync\n'
+    printf '    sudo install -d -m 0750 -o root -g root %s\n' "$d"
+    printf '    sudo install -d -m 0700 /root/.ssh\n'
+    printf '    echo %s | sudo tee -a /root/.ssh/authorized_keys >/dev/null\n' "'$line'"
+    printf '    sudo chmod 600 /root/.ssh/authorized_keys\n\n'
+  else
+    # A STORE THAT LOGS THE COPY IN AS ITS OWN USER (the lab NAS - TrueNAS refuses root over ssh).
+    printf '\n  ON THE THIRD-COPY STORE (%s), ONCE, as its administrator - a WRITE-ONLY rsync for user %s:\n\n' "$a" "$u"
+    printf '    1. the directory must exist and belong to %s:   install -d -m 0700 -o %s -g %s %s\n' "$u" "$u" "$u" "$d"
+    printf '    2. this ONE line goes in %s'"'"'s authorized keys - on TrueNAS: Credentials > Users > %s >\n' "$u" "$u"
+    printf '       Edit > SSH Access > Public SSH Key (the whole line, restrictions and all):\n\n'
+    printf '    %s\n\n' "$line"
+  fi
+  say "then:  sudo $0 third-copy -n --target $a"
+}
+
 cmd_third_copy() {
-  local setup=0 dry=0 all=0 vall=0
+  local setup=0 dry=0 all=0 vall=0 only=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --setup) setup=1; shift ;;
       -n|--dry-run) dry=1; shift ;;
       --all) all=1; shift ;;
       --verify-all) vall=1; shift ;;
+      --target) only="${2:?--target needs an address from BACKUP_THIRD_ADDR}"; shift 2 ;;
       *) die "third-copy: unknown argument $1" ;;
     esac
   done
@@ -1873,28 +1945,23 @@ cmd_third_copy() {
     say "third copy not configured (BACKUP_THIRD_ADDR is empty) - nothing to do"
     return 0
   fi
-
-  if [ "$setup" -eq 1 ]; then
-    copy_key "$THIRD_KEY" "vm-backup third copy from $(hostname -s)"
-    # The address this host connects FROM - asked of the kernel, as second-copy does. For the
-    # lab vault that is the storage NIC's address (3.16), and that is correct.
-    local myaddr
-    myaddr="$(ip -4 route get "$THIRD_ADDR" 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1)"
-    [ -n "$myaddr" ] || die "cannot tell which address $(hostname -s) uses to reach $THIRD_ADDR - check 'ip -4 route get $THIRD_ADDR'"
-    say "this host reaches $THIRD_ADDR from $myaddr"
-    printf '\n  ON THE THIRD-COPY STORE (%s), run this ONCE - it authorises a WRITE-ONLY rsync into one directory:\n\n' "$THIRD_ADDR"
-    printf '    ls -l /usr/bin/rsync /usr/bin/rrsync\n'
-    printf '    sudo install -d -m 0750 -o root -g root %s\n' "$THIRD_DIR"
-    printf '    sudo install -d -m 0700 /root/.ssh\n'
-    printf '    echo %s | sudo tee -a /root/.ssh/authorized_keys >/dev/null\n' \
-      "'from=\"$myaddr\",restrict,command=\"/usr/bin/rrsync -wo $THIRD_DIR\" $(cut -d" " -f1-2 "$THIRD_KEY.pub")'"
-    printf '    sudo chmod 600 /root/.ssh/authorized_keys\n\n'
-    say "then:  sudo $0 third-copy -n"
-    return 0
-  fi
-
-  push_sets "third copy" "$THIRD_KEY" "$THIRD_ADDR" "$THIRD_ADDR" "$THIRD_DIR" "$THIRD_SKIP" "$THIRD_STATE" \
-            "${BACKUP_THIRD_DELETE:-1}" "$dry" "$all" "$vall"
+  local u a d k st n=0 failed=""
+  while read -r u a d; do
+    [ -z "$only" ] || [ "$only" = "$a" ] || continue
+    [[ "$a" =~ ^[A-Za-z0-9.-]+$ ]] || die "BACKUP_THIRD_ADDR item '$a' is not an address"
+    [[ "$u" =~ ^[a-z_][a-z0-9_-]*$ ]] || die "BACKUP_THIRD_ADDR user '$u' is not a user name"
+    n=$((n + 1))
+    read -r k st <<<"$(third_paths "$a")"
+    # </dev/null ON EVERY CALL: this loop reads its targets from stdin, and ssh reads stdin too - the
+    # first target's ssh would swallow the rest of the list, and they would silently never run.
+    if [ "$setup" -eq 1 ]; then third_setup "$u" "$a" "$d" "$k" </dev/null; continue; fi
+    # EACH TARGET IN ITS OWN SUBSHELL: push_sets dies on a failure, and one store failing must not
+    # stop the next - the vault and the NAS are independent.
+    ( push_sets "third copy" "$k" "$a" "$a" "$d" "$THIRD_SKIP" "$st" \
+                "${BACKUP_THIRD_DELETE:-1}" "$dry" "$all" "$vall" "$u" ) </dev/null || failed="$failed $a"
+  done < <(third_targets)
+  [ "$n" -gt 0 ] || die "no third-copy target is '$only' (BACKUP_THIRD_ADDR: $THIRD_ADDR)"
+  [ -z "$failed" ] || die "third copy FAILED for:$failed - every other target ran; each one's section is above"
 }
 
 # ---------------------------------------------------------------- restore TEST
@@ -2310,28 +2377,28 @@ cmd_facts() {
     # them: the second copy failed on and off for ten nights and nothing said so. Now the last
     # run's exit code is a fact of its own, and the last CLEAN run survives a failure. Grouped by
     # metric, not by copy - the text format wants each family's samples together.
-    local cp ct cs cv
-    copy_state() { if [ "$1" = third ]; then echo "$THIRD_STATE"; else echo "$SECOND_STATE"; fi; }
-    copy_target() { if [ "$1" = third ]; then echo "$THIRD_ADDR"; else second_host; fi; }
-    copy_kv() { awk -F= -v k="$2" '$1 == k {print $2}' "$(copy_state "$1")" 2>/dev/null || true; }
+    # Labelled copy AND target since 2026-10-13: the third copy became a list (the vault and the NAS),
+    # and two targets under one label would be one series overwriting the other.
+    local rows cp ct cf cv
+    rows="$(copy_rows)"
+    copy_kv() { [ -r "$1" ] && awk -F= -v k="$2" '$1 == k {print $2}' "$1" 2>/dev/null || true; }
     printf '# HELP enclave_backup_copy_configured 1 if this off-host copy has a target, else 0 - the series exists either way\n'
     printf '# TYPE enclave_backup_copy_configured gauge\n'
-    for cp in second third; do
-      ct="$(copy_target "$cp")"
-      printf 'enclave_backup_copy_configured{copy="%s",target="%s"} %s\n' "$cp" "${ct:-none}" "$([ -n "$ct" ] && echo 1 || echo 0)"
-    done
+    while read -r cp ct cf; do
+      printf 'enclave_backup_copy_configured{copy="%s",target="%s"} %s\n' "$cp" "$ct" "$([ "$ct" != none ] && echo 1 || echo 0)"
+    done <<<"$rows"
     printf '# HELP enclave_backup_copy_last_run_seconds unix time this copy last ran, clean or not\n'
     printf '# TYPE enclave_backup_copy_last_run_seconds gauge\n'
-    for cp in second third; do cv="$(copy_kv "$cp" seconds)"; [ -z "$cv" ] || printf 'enclave_backup_copy_last_run_seconds{copy="%s"} %s\n' "$cp" "$cv"; done
+    while read -r cp ct cf; do cv="$(copy_kv "$cf" seconds)"; [ -z "$cv" ] || printf 'enclave_backup_copy_last_run_seconds{copy="%s",target="%s"} %s\n' "$cp" "$ct" "$cv"; done <<<"$rows"
     printf '# HELP enclave_backup_copy_last_rc exit code of the last run - 0 clean, anything else a failure\n'
     printf '# TYPE enclave_backup_copy_last_rc gauge\n'
-    for cp in second third; do cv="$(copy_kv "$cp" rc)"; [ -z "$cv" ] || printf 'enclave_backup_copy_last_rc{copy="%s"} %s\n' "$cp" "$cv"; done
+    while read -r cp ct cf; do cv="$(copy_kv "$cf" rc)"; [ -z "$cv" ] || printf 'enclave_backup_copy_last_rc{copy="%s",target="%s"} %s\n' "$cp" "$ct" "$cv"; done <<<"$rows"
     printf '# HELP enclave_backup_copy_last_success_seconds unix time this copy last completed cleanly - kept across failed runs\n'
     printf '# TYPE enclave_backup_copy_last_success_seconds gauge\n'
-    for cp in second third; do cs="$(state_last_ok "$(copy_state "$cp")")"; [ -z "$cs" ] || printf 'enclave_backup_copy_last_success_seconds{copy="%s"} %s\n' "$cp" "$cs"; done
+    while read -r cp ct cf; do cv="$(state_last_ok "$cf")"; [ -z "$cv" ] || printf 'enclave_backup_copy_last_success_seconds{copy="%s",target="%s"} %s\n' "$cp" "$ct" "$cv"; done <<<"$rows"
     printf '# HELP enclave_backup_copy_last_bytes bytes held in this copy at its last run\n'
     printf '# TYPE enclave_backup_copy_last_bytes gauge\n'
-    for cp in second third; do cv="$(copy_kv "$cp" bytes)"; [ -z "$cv" ] || printf 'enclave_backup_copy_last_bytes{copy="%s"} %s\n' "$cp" "$cv"; done
+    while read -r cp ct cf; do cv="$(copy_kv "$cf" bytes)"; [ -z "$cv" ] || printf 'enclave_backup_copy_last_bytes{copy="%s",target="%s"} %s\n' "$cp" "$ct" "$cv"; done <<<"$rows"
     printf '# HELP enclave_backup_facts_generated_seconds unix time these facts were written\n'
     printf '# TYPE enclave_backup_facts_generated_seconds gauge\n'
     printf 'enclave_backup_facts_generated_seconds %s\n' "$(date +%s)"

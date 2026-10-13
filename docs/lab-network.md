@@ -515,7 +515,17 @@ setup: `third-copy --setup` on host-4 prints the lines to authorise on the vault
 | vault disk | write 430 MB/s; read-back during verify ~250–390 MB/s |
 | each night | only files not verified before are re-read (a ledger on host-4); the weekly verify re-reads both copies in full (`--verify-all`) |
 
-**Monitored since 2026-10-13** (backlog 3.58): its facts carry `copy="third"`, and
+**The NAS too, since 2026-10-13.** `BACKUP_THIRD_ADDR` is a list: the vault, then
+`enclave-copy@10.2.30.171:/mnt/bulk/backups/enclave/vm`. The NAS side, once, in the TrueNAS UI: an
+**encrypted** dataset `bulk/backups/enclave` (key-based, AES-256-GCM, so it unlocks itself at boot -
+the sets carry svc-mgmt-01's CA key; export the key and keep it off the NAS); a user `enclave-copy`
+(home that dataset, shell bash, no password, no SMB) owning it 0700; **SSH bound to `enp9s0` only**,
+password authentication off. Then on host-4 `vm-backup.sh third-copy --setup --target 10.2.30.171`
+makes the NAS's own key and prints the one line for the user's Public SSH Key field - from host-4's
+storage address only, forced to a write-only `rrsync` into `vm/`. The vault keeps its key and its
+ledger; each target runs on its own (one failing does not stop the other).
+
+**Monitored since 2026-10-13** (backlog 3.58): its facts carry `copy="third"` and the target, and
 `BackupCopyFailed` / `BackupCopyStale` fire for it as for the second copy. `vm-backup.sh status`
 shows its last run and last clean run. **A difference found by `--verify-all` is reported, not
 repaired.**

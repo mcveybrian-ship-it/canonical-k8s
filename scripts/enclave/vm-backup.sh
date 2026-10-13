@@ -1059,7 +1059,13 @@ cmd_hold() {
         say  "   reason   $(hold_kv reason)"
         say  "   effect   vm-backup prune destroys nothing; pgBackRest does not expire; copies keep all"
       else
-        ok "no records hold on $(hostname -s) - normal retention: fulls every $FULL_MAX_DAYS days, $KEEP chains kept"
+        # Name what THIS machine retains: host-3 is a pgBackRest store with no VM backups, and the
+        # first version told it "fulls every 30 days, 2 chains" - the VM rule (2026-10-13).
+        local what=""
+        mountpoint -q "$DEST" 2>/dev/null && what="VM backups: a full every $FULL_MAX_DAYS days, $KEEP chains kept"
+        [ -x "${PGBR_WRAPPER:-/usr/local/sbin/enclave-pgbackrest-backup}" ] \
+          && what="${what:+$what; }pgBackRest: its own expiry after each backup (06a PGBR_RETENTION_FULL fulls kept)"
+        ok "no records hold on $(hostname -s) - normal retention${what:+ - $what}"
       fi
       ;;
     set)

@@ -602,6 +602,59 @@ And know that a timer may fire on its own: `Persistent=true` means a nightly mis
 outage starts shortly after boot, which is correct and worth knowing before it surprises
 somebody mid-maintenance (runbook §10c).
 
+### 5.3 Planned shutdown of the whole enclave — the database leader goes down last and comes up first (backlog 3.57)
+
+§5.2 stops host 4's guests. The PostgreSQL cluster lives on hosts 1–3, one node per host, and
+**the order across hosts decides whether a planned shutdown costs a failover.** Measured on
+2026-10-11, the first whole-enclave shutdown, done without an order: the leader's host (pg-03)
+went down before a replica's, so Patroni promoted pg-01 on the way down (timeline 3 → 4). pg-01's
+host then booted last, so for **~90 seconds nothing was writable**: pg-02 and pg-03 were up, and
+synchronous mode, correctly, would not promote either past pg-01's newer data. It came back
+unattended and lost nothing — all three had shut down cleanly (their statistics survived, which
+Postgres discards after crash recovery). That was the luck of the order, not a design.
+
+**First, which node leads.** The host it runs on is *the leader's host* below. If that host has
+to go down early for some other reason, move the lead first: `06a-postgres-ha.sh switchover` on
+the leader hands it to the synchronous standby without losing a commit (`06a-postgres-ha.md` §9.2).
+
+```bash
+### MACHINE: any pg node - read-only ###
+sudo patronictl -c /etc/patroni/config.yml list
+```
+
+**Going down — the replicas' hosts, then the leader's host, then host 4.**
+
+1. **Stop the application's writers** (once it is live). With both replicas off, the leader runs
+   alone, and whatever it accepts then exists on one machine only.
+2. **Each replica's host, one at a time**, then **the leader's host last of the three** — the same
+   command on each. It stops that host's pg guest, refuses if anything is still running, asks for
+   the hostname, then powers off:
+
+   ```bash
+   ### MACHINE: a database host - host-1, host-2 or host-3 ###
+   h="$(hostname -s)"; case "$h" in host-[123]) cd ~/canonical-k8s/scripts/enclave && sudo ./vm-power.sh host-down --only "pg-0${h#host-}" ;; *) echo "WRONG MACHINE: $h" ;; esac
+   ```
+
+   `--only` is required on these hosts: `VM_POWER_ORDER` names host 4's guests, so without it
+   `vm-power.sh` finds nothing to stop and refuses.
+3. **Host 4 last, by §5.2** (`vm-power.sh host-down`). It is the enclave's time source, DNS
+   (`svc-mgmt-01`) and monitoring; stopped earlier, the rest of the shutdown goes unrecorded —
+   which is what happened on 2026-10-11.
+
+**Coming up — the reverse.**
+
+1. **Host 4 first**, with §5.2's three checks: time, DNS and monitoring are back before the
+   database is.
+2. **The last leader's host next.** Wait until `patronictl list` shows it `Leader` and `running`.
+   It holds the newest data, and until it is back nothing is writable — by design.
+3. **The other two**, then wait for both to show `streaming` with lag 0.
+4. `vm-power.sh after-boot` on each host (§5.2).
+
+**If the last leader's host does not come back,** the cluster stays read-only. Patroni will not
+promote a node that may be missing committed transactions, and it should not. Forcing one to lead
+accepts losing whatever only the last leader held: that is an AO decision with the loss stated, not
+an operator's at the rack — and forcing it is not yet a rehearsed procedure (backlog 3.57).
+
 ---
 
 ## 6. Two failures of this mechanism, recorded because they are the evidence it is trustworthy

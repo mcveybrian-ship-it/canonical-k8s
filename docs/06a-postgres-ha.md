@@ -1359,6 +1359,10 @@ curl -sk https://10.2.20.165:8008/cluster
 sudo ~/canonical-k8s/scripts/install/06a-postgres-ha.sh etcd-check
 ```
 
+**Shut the whole enclave down** — a different job: `leave` deliberately refuses a second node. The
+order (replicas' hosts first, the leader's host last, the leader's host first back up) is in the
+contingency plan §5.3, with what 2026-10-11 cost without it.
+
 **Take a node down for maintenance** (§9.2) — `leave` refuses the leader and refuses unless the
 other two are healthy; hand the lead over first with `switchover`:
 

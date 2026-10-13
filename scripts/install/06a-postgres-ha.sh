@@ -20,6 +20,7 @@
 #     sudo ./06a-postgres-ha.sh backup-store <fullchain> on each STORE (host-4, host-3): the store
 #     sudo ./06a-postgres-ha.sh backup-enable           on the PRIMARY: WAL archiving on (rolling restart)
 #     sudo ./06a-postgres-ha.sh backup-run [full|diff]  on each store: a backup now + the timers
+#     sudo ./06a-postgres-ha.sh backup-timers   on each store: (re)install the hold-aware wrapper + timers, no backup
 #     sudo ./06a-postgres-ha.sh backup-restore-test     on the PRIMARY: restore to a point in time
 #                                                      from EACH store, into scratch, and prove it
 #   SLICE 6 PREP - THE APPLICATION'S DATABASE (real records: prints NUMBERS ONLY, see below):
@@ -336,6 +337,12 @@ PGBR_LOG="${PGBR_LOG:-/var/log/pgbackrest}"
 PGBR_RETENTION_FULL="${PGBR_RETENTION_FULL:-2}"
 PGBR_FULL_DAY="${PGBR_FULL_DAY:-Sun}"                 # the weekly full; differentials the other days
 PGBR_BACKUP_MINUTE="${PGBR_BACKUP_MINUTE:-30}"        # store N runs at 00:MM + N hours (repo1 01:30, repo2 02:30)
+# RECORDS DESTRUCTION (backlog 3.27): the hold switch and the disposal log, shared with vm-backup.sh.
+RECORDS_HOLD_FILE="${RECORDS_HOLD_FILE:-$(awk -F"'" '/^RECORDS_HOLD_FILE=/{print $2}' "$ENC/vm-specs.env" 2>/dev/null)}"
+RECORDS_HOLD_FILE="${RECORDS_HOLD_FILE:-/etc/enclave/records-hold}"
+RECORDS_DISPOSAL_LOG="${RECORDS_DISPOSAL_LOG:-$(awk -F"'" '/^RECORDS_DISPOSAL_LOG=/{print $2}' "$ENC/vm-specs.env" 2>/dev/null)}"
+RECORDS_DISPOSAL_LOG="${RECORDS_DISPOSAL_LOG:-/var/log/enclave/records-disposal.log}"
+PGBR_WRAPPER="${PGBR_WRAPPER:-/usr/local/sbin/enclave-pgbackrest-backup}"
 PG_ARCHIVE_TIMEOUT="${PG_ARCHIVE_TIMEOUT:-300}"       # a quiet database still ships a WAL file every 5 min
 PGBR_ARCHIVE_CMD="pgbackrest --stanza=${PG_SCOPE:-enclave-pg} archive-push %p"
 
@@ -1062,11 +1069,62 @@ cmd_backup_run() {
   say "a $type backup to repo$ST_IDX now - reaching into the primary"
   pgbr --repo="$ST_IDX" --type="$type" backup 2>&1 | sed 's/^/     /' || die "the backup failed - the lines above say why"
   pgbr info 2>&1 | sed 's/^/     /'
+  install_backup_timers
+}
+
+# backup-timers: (re)install the scheduled backups on THIS store - the wrapper and the two timers -
+# WITHOUT taking a backup. backup-run calls the same function; this is for a store that already
+# exists (3.27 added the wrapper on 2026-10-02).
+cmd_backup_timers() {
+  need_root; whoami_store
+  install_backup_timers
+}
+
+# THE SCHEDULED BACKUP RUNS THROUGH A WRAPPER (backlog 3.27, 2026-10-02), not pgbackrest directly:
+#   - while a RECORDS HOLD is in force ($RECORDS_HOLD_FILE, set with vm-backup.sh hold) it adds
+#     --no-expire-auto, so no backup or WAL ages out - pgBackRest 2.50 runs expire after every
+#     backup by default, and that expiry IS records destruction;
+#   - every expiry pgBackRest performs is copied into the records disposal log and syslog. The match
+#     is pgBackRest 2.50's own INFO messages (src/command/expire/expire.c, read 2026-10-02): expire
+#     adhoc|diff|full|time-based backup, remove archive [path], remove expired backup, remove history
+#     file. A new pgBackRest that rewords them would log NOTHING - re-check them on an upgrade.
+# Root-owned, self-contained, written here - the timers must not depend on a checkout in a home dir.
+install_backup_timers() {
+  local u hh
+  cat > "$PGBR_WRAPPER" <<WRAP
+#!/bin/sh
+# enclave-pgbackrest-backup <stanza> <repo> <full|diff>
+# Written by 06a-postgres-ha.sh backup-timers (backlog 3.27). Do not edit - re-run that step.
+# The scheduled pgBackRest backup of one store, run as postgres. While a records hold is in force
+# it adds --no-expire-auto; every expiry pgBackRest performs is copied to the disposal log.
+set -u
+stanza="\$1"; repo="\$2"; type="\$3"
+hold='$RECORDS_HOLD_FILE'; log='$RECORDS_DISPOSAL_LOG'
+record() {
+  line="\$(date -u +%Y-%m-%dT%H:%M:%SZ) host=\$(hostname -s) run=\${INVOCATION_ID:-manual} \$*"
+  mkdir -p "\$(dirname "\$log")" && printf '%s\n' "\$line" >> "\$log" && chmod 0640 "\$log"
+  logger -t records-disposal -- "\$*" 2>/dev/null || true
+}
+extra=""
+if [ -e "\$hold" ]; then
+  extra="--no-expire-auto"
+  record "PGBACKREST-HELD stanza=\$stanza repo=\$repo type=\$type - expiry suspended by the records hold"
+fi
+out="\$(runuser -u postgres -- /usr/bin/pgbackrest --stanza="\$stanza" --repo="\$repo" --type="\$type" --log-level-console=info \$extra backup 2>&1)"
+rc=\$?
+printf '%s\n' "\$out"
+printf '%s\n' "\$out" | grep -E 'expire (adhoc|diff|full|time-based) backup|remove archive|remove expired backup|remove history file' | sed 's/^.*INFO: //' |
+  while IFS= read -r l; do record "PGBACKREST-EXPIRED stanza=\$stanza repo=\$repo \$l"; done
+exit \$rc
+WRAP
+  chmod 0755 "$PGBR_WRAPPER"; chown root:root "$PGBR_WRAPPER"
+  sh -n "$PGBR_WRAPPER" || die "the wrapper $PGBR_WRAPPER does not parse - nothing else changed"
+  ok "wrote $PGBR_WRAPPER (records hold aware, logs expiry)"
   # ---- the timers: the weekly full, differentials the other days, stores an hour apart ----
-  local hh; hh="$(printf '%02d' "$ST_IDX")"
+  hh="$(printf '%02d' "$ST_IDX")"
   for u in full diff; do
-    printf '[Unit]\nDescription=pgBackRest %s backup of %s to repo%s (06a, B-06a slice 5)\nAfter=network-online.target pgbackrest.service\n[Service]\nType=oneshot\nUser=postgres\nExecStart=/usr/bin/pgbackrest --stanza=%s --repo=%s --type=%s backup\n' \
-      "$u" "$PGBR_STANZA" "$ST_IDX" "$PGBR_STANZA" "$ST_IDX" "$u" > "/etc/systemd/system/pgbackrest-$u.service"
+    printf '[Unit]\nDescription=pgBackRest %s backup of %s to repo%s (06a, B-06a slice 5; 3.27 wrapper)\nAfter=network-online.target pgbackrest.service\n[Service]\nType=oneshot\nExecStart=%s %s %s %s\n' \
+      "$u" "$PGBR_STANZA" "$ST_IDX" "$PGBR_WRAPPER" "$PGBR_STANZA" "$ST_IDX" "$u" > "/etc/systemd/system/pgbackrest-$u.service"
     if [ "$u" = full ]; then
       printf '[Unit]\nDescription=weekly full backup (06a)\n[Timer]\nOnCalendar=%s *-*-* %s:%s:00\nPersistent=true\n[Install]\nWantedBy=timers.target\n' "$PGBR_FULL_DAY" "$hh" "$PGBR_BACKUP_MINUTE" > "/etc/systemd/system/pgbackrest-$u.timer"
     else
@@ -1716,6 +1774,7 @@ case "${1:-}" in
   backup-store)  shift; cmd_backup_store "$@" ;;
   backup-enable) cmd_backup_enable ;;
   backup-run)    shift; cmd_backup_run "$@" ;;
+  backup-timers) cmd_backup_timers ;;
   backup-restore-test) cmd_backup_restore_test ;;
   extensions)    cmd_extensions ;;
   stig-settings) cmd_stig_settings ;;

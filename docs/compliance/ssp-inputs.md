@@ -366,13 +366,13 @@ the backups, and in the mirrored second copy, indefinitely.
 | Copy | Mechanism | State |
 |---|---|---|
 | Live database | **The CAD application's own retention/purge**, keyed to case closure and the criminal/non-criminal flag, honouring holds. The enclave does not write deletes against a vendor schema. | ⬜ vendor must **demonstrate** it — an acceptance requirement |
-| Nightly VM backups | A **full backup whenever the newest full is older than 30 days** (`BACKUP_FULL_MAX_DAYS`), **2 chains kept** → a deleted record leaves every backup within **~60 days** | ⬜ build in `vm-backup.sh` |
+| Nightly VM backups | A **full backup whenever the newest full is older than 30 days** (`BACKUP_FULL_MAX_DAYS`), **2 chains kept** → a deleted record leaves every backup within **~60 days** | ✅ built 2026-10-02 (contingency plan §4.7) |
 | Second copy (host-1) | mirrors the primary with `rsync --delete` — inherits the same bound | ✅ |
-| WAL archive | pgBackRest keeps 2 fulls per store; WAL is kept back to the oldest retained full (≈ 7–14 days) and pruned with it — on host-4 and host-3 alike | ✅ built 2026-09-28 (B-06a slice 5) |
+| WAL archive | pgBackRest keeps 2 fulls per store; WAL is kept back to the oldest retained full (≈ 7–14 days) and pruned with it — on host-4 and host-3 alike; its expiries are logged, and a records hold suspends them | ✅ built 2026-09-28 (B-06a slice 5) |
 | Offsite copy (backlog 3.29) | media rotated at most every 60 days; retired media sanitised (3.19, MP-6) | ⬜ 3.29 |
-| Legal / litigation hold | per-record hold in the application; for backups, a **hold switch that suspends pruning** (backups cannot hold one record, so they hold all), logged with who and why | ⬜ build |
-| Drift | alert when the oldest backup exceeds ~70 days, or a hold outlives its review date | ⬜ build (alert path proven, B-09a) |
-| Evidence | every prune appends to a **disposal log**: which sets were destroyed, when, by which run | ⬜ build |
+| Legal / litigation hold | per-record hold in the application; for backups, a **hold switch that suspends pruning** (backups cannot hold one record, so they hold all), logged with who and why | ✅ built 2026-10-02 (contingency plan §4.7) |
+| Drift | alert when the oldest backup exceeds ~70 days, or a hold outlives its review date | ✅ built 2026-10-02 (contingency plan §4.7) |
+| Evidence | every prune appends to a **disposal log**: which sets were destroyed, when, by which run | ✅ built 2026-10-02 (contingency plan §4.7) |
 
 **The disposal lag is stated, not hidden:** a record is destroyed in the application on schedule
 and leaves the last backup up to ~60 days later. Sizing (Q22, <500 GB usable) was confirmed by

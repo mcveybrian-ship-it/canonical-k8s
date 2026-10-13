@@ -1380,6 +1380,11 @@ A backup now: `06a backup-run full|diff` on a store. A restore drill: `06a backu
 the primary. A real restore is a different operation — it replaces a cluster — and is not yet
 written as a procedure (§16).
 
+**Retention and legal holds** (backlog 3.27): `06a backup-timers` on each store installs the timers
+through `/usr/local/sbin/enclave-pgbackrest-backup`, a wrapper that logs every pgBackRest expiry to
+the records-disposal log and runs with `--no-expire-auto` while a records hold is set. How to set a
+hold, read the log and answer the alerts: contingency plan §4.7.
+
 **Force a user to log in again** (V-261927) — on the leader, as `postgres`:
 
 ```bash

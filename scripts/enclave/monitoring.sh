@@ -420,6 +420,8 @@ AL_AIDE_STALE="${AL_AIDE_STALE:-129600}"          # 36h - dailyaidecheck has mis
 AL_BACKUP_STALE="${AL_BACKUP_STALE:-93600}"       # 26h - the nightly backup missed a run
 AL_BACKUP_DETACHED_FOR="${AL_BACKUP_DETACHED_FOR:-2h}"  # detached is normal briefly, not for hours
 AL_BACKUP_FREE_BYTES="${AL_BACKUP_FREE_BYTES:-200000000000}"  # 200 GB left on the backup volume
+AL_BACKUP_RETENTION_MAX="${AL_BACKUP_RETENTION_MAX:-6048000}"  # 70 days - a backup outliving the ~60-day bound (3.27)
+AL_BACKUP_COPY_STALE="${AL_BACKUP_COPY_STALE:-129600}"  # 36h - an off-host copy with no clean nightly run (3.58)
 # TRIVY DB AGE - AO DECISION 2026-09-18: the refresh policy is WEEKLY.
 #
 # THE ALERT THRESHOLD IS NOT THE POLICY. A weekly refresh means the database is legitimately
@@ -1514,6 +1516,79 @@ groups:
             'sudo ./scripts/enclave/vm-backup.sh prune' keeps BACKUP_KEEP_CHAINS sets per
             domain. If prune has been running, the volume is simply too small for the chain
             depth configured.
+
+      # THE OFF-HOST COPIES (backlog 3.58). Neither copy was watched until 2026-10-13, by which time
+      # the second had failed on and off for ten nights - host-1's ufw refused its 7th ssh connection
+      # inside 30 s - and nothing said so. FAILED reads the last run's exit code. STALE fires when no
+      # clean run is recorded inside AL_BACKUP_COPY_STALE, which also catches a copy that stopped
+      # RUNNING (its last rc stays 0 for ever) and one configured but never once successful.
+      # Both need copy_configured == 1, so a site without a third store sees nothing for it.
+      - alert: BackupCopyFailed
+        expr: >-
+          enclave_backup_copy_last_rc != 0
+          and on(instance, copy) (enclave_backup_copy_configured == 1)
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "the {{ \$labels.copy }} backup copy on {{ \$labels.machine }} failed its last run"
+          description: "Exit code {{ \$value }}. The far end holds whatever the last clean run left; nothing newer reached it."
+          action: >-
+            'sudo journalctl -u enclave-vm-backup --since today' on {{ \$labels.machine }} - the
+            copy's section names the domain and the error. 'sudo ./scripts/enclave/vm-backup.sh
+            status' shows the last clean run. Re-run with 'vm-backup.sh {{ \$labels.copy }}-copy'.
+
+      - alert: BackupCopyStale
+        expr: >-
+          (enclave_backup_copy_configured == 1)
+          unless on(instance, copy) ((time() - enclave_backup_copy_last_success_seconds) < ${AL_BACKUP_COPY_STALE})
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "the {{ \$labels.copy }} backup copy on {{ \$labels.machine }} has had no clean run in over 36 hours"
+          description: "Target {{ \$labels.target }}. Either it keeps failing or it has stopped running - an off-host copy is the recovery path when this host is gone."
+          action: >-
+            'sudo ./scripts/enclave/vm-backup.sh status' on {{ \$labels.machine }}: the copy's line
+            shows its last run, rc and last clean run. 'systemctl list-timers enclave-vm-backup*'
+            shows whether it still runs.
+
+      # RECORDS DESTRUCTION (backlog 3.27, ssp-inputs.md 2.8). The SORN's schedule applies to every
+      # copy, so a backup must age out: a full every BACKUP_FULL_MAX_DAYS and 2 chains kept bound
+      # the oldest set at ~60 days. This fires when a set outlives AL_BACKUP_RETENTION_MAX (70 days)
+      # - the age-based full stopped, or prune did - unless a records hold explains it, in which
+      # case RecordsHoldReviewOverdue is the alert that watches the hold.
+      - alert: BackupRetentionExceeded
+        expr: >-
+          (time() - enclave_backup_oldest_set_seconds) > ${AL_BACKUP_RETENTION_MAX}
+          unless on(instance) (enclave_records_hold_active == 1)
+        for: 6h
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ \$labels.domain }} keeps a backup older than the records schedule allows"
+          description: "The oldest retained set of {{ \$labels.domain }} is {{ \$value | humanizeDuration }} old; the decided bound is about 60 days. Records already destroyed in the application are still in it."
+          action: >-
+            'sudo ./scripts/enclave/vm-backup.sh status' on the hypervisor: is a full being taken
+            every BACKUP_FULL_MAX_DAYS, and is the nightly prune running? 'vm-backup.sh prune
+            --dry-run' shows what it would retire. Disposals are in /var/log/enclave/records-disposal.log.
+
+      # A HOLD NOBODY REVIEWS IS INDEFINITE RETENTION UNDER ANOTHER NAME (3.27). Every hold carries
+      # a review date ('vm-backup.sh hold set ... --review'); this fires the day after it passes.
+      - alert: RecordsHoldReviewOverdue
+        expr: >-
+          enclave_records_hold_active == 1
+          and on(instance) (time() > enclave_records_hold_review_seconds)
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "the records hold on {{ \$labels.machine }} is past its review date"
+          description: "A legal hold suspends backup destruction on {{ \$labels.machine }}, and its review date has passed with no renewal or release."
+          action: >-
+            'sudo ./scripts/enclave/vm-backup.sh hold status' on {{ \$labels.machine }}. If the
+            matter still needs it, release it and set it again with a new review date; otherwise
+            release it - retention resumes that night. Do the same on the other backup store.
       # A DATABASE DISK THAT IS NO LONGER RESERVED (3.42, 2026-09-28). Created falloc so a
       # full volume fails the backup copy or the compose, never a database write - and undone
       # on all three hosts within the hour by guest TRIM through discard=unmap.
@@ -2277,6 +2352,36 @@ except FileNotFoundError:
     SRC["credentials_file"] = 1
 except Exception:
     SRC["credentials_file"] = 0      # could not tell - enclave_facts_source_ok says so
+
+# ------------------------------------------------------------------ records hold (backlog 3.27)
+# While the hold file exists, backup destruction is suspended on this machine (vm-backup.sh
+# hold: prune destroys nothing, pgBackRest stops expiring). Published from HERE, on every
+# machine, because vm-backup.sh's own facts do not run on the pgBackRest store host-3. The review
+# date is published so a hold nobody reviews alerts (RecordsHoldReviewOverdue).
+hf = os.environ.get("RECORDS_HOLD_FILE") or "/etc/enclave/records-hold"
+try:
+    kv = {}
+    with open(hf) as fh:
+        for line in fh:
+            if "=" in line:
+                k, v = line.rstrip("\n").split("=", 1)
+                kv[k] = v
+    emit("enclave_records_hold_active", 1,
+         help="1 while a records (legal) hold suspends backup destruction on this machine")
+    try:
+        rv = calendar.timegm(time.strptime(kv.get("review", ""), "%Y-%m-%d")) + 86399
+        emit("enclave_records_hold_review_seconds", rv,
+             help="end of the hold's review date (unix time, UTC) - past it, RecordsHoldReviewOverdue")
+    except Exception:
+        emit("enclave_records_hold_review_seconds", 0,
+             help="end of the hold's review date (unix time, UTC) - past it, RecordsHoldReviewOverdue")
+    SRC["records_hold"] = 1
+except FileNotFoundError:
+    emit("enclave_records_hold_active", 0,
+         help="1 while a records (legal) hold suspends backup destruction on this machine")
+    SRC["records_hold"] = 1
+except Exception:
+    SRC["records_hold"] = 0
 
 rc, o, _ = run(["journalctl", "--since", "-24h", "-t", "sudo", "-o", "cat", "--no-pager"], timeout=60)
 if rc == 0:

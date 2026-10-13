@@ -271,15 +271,33 @@ and the per-domain families vanish. After a reboot that is the normal state, for
 reasons: `usb-storage` is STIG-blocked, LUKS is locked, and nothing types the passphrase.
 `vm-backup.sh reattach` is the fix.
 
-**The second copy has its own family, and it reports even when it is not configured.**
-`enclave_backup_second_configured{target=...}` is emitted as `0` when no target is set, because
-a *missing* series reads as "no data" on a dashboard and that is indistinguishable from silence —
-the same trap as the unmounted destination above. When a copy has run,
-`enclave_backup_second_last_success_seconds` and `enclave_backup_second_last_bytes` follow, and
-only a run that completed **and verified** updates them. A copy that quietly stopped therefore
-shows as an ageing timestamp rather than as nothing at all. Added 2026-09-20 with
-`vm-backup.sh second-copy` (red flag 1.2 — the only copy of every guest lived on the host that
-runs them).
+**Both off-host copies share one family, labelled `copy="second"` / `copy="third"`, and it reports
+even when a copy is not configured.** `enclave_backup_copy_configured{copy,target}` is emitted as
+`0` when no target is set, because a *missing* series reads as "no data" on a dashboard and that
+is indistinguishable from silence — the same trap as the unmounted destination above. Once a copy
+has run: `enclave_backup_copy_last_run_seconds`, `enclave_backup_copy_last_rc` (0 = clean),
+`enclave_backup_copy_last_success_seconds` (the last run that completed **and verified** — kept
+across failed runs) and `enclave_backup_copy_last_bytes`. Two alerts read them:
+`BackupCopyFailed` (the last run's rc is not 0, for 30 min) and `BackupCopyStale` (no clean run
+inside `AL_BACKUP_COPY_STALE`, 36 h — which also catches a copy that stopped running, and one never
+once successful). Both need `configured == 1`, so a site without a third store sees nothing for it.
+
+**Corrected 2026-10-13 (backlog 3.58).** Until then the family was `enclave_backup_second_*`,
+second copy only, and this paragraph said a copy that quietly stopped "shows as an ageing
+timestamp". It did not: a failed run **removed** the success line, no rule read the family at all,
+and the second copy failed on and off for ten nights with nothing saying so. The second copy was
+added 2026-09-20 with `vm-backup.sh second-copy` (red flag 1.2 — the only copy of every guest lived
+on the host that runs them).
+
+**Records retention has its own three metrics and two alerts (backlog 3.27, built 2026-10-02).**
+`enclave_backup_oldest_set_seconds{domain}` is the time of the oldest set still retained for each
+guest. `enclave_records_hold_active` is `1` while a records (legal) hold is set on that machine —
+read from `RECORDS_HOLD_FILE` on host-4 and host-3 — and `enclave_records_hold_review_seconds` is
+the hold's review date. `BackupRetentionExceeded` fires when a retained set outlives
+`AL_BACKUP_RETENTION_MAX` (70 days, against a decided bound of ~60) **unless a hold explains it**;
+`RecordsHoldReviewOverdue` fires the day after a hold passes its review date, because a hold nobody
+reviews is indefinite retention under another name. How to set a hold and read the disposal log:
+contingency plan §4.7.
 
 ### Row: Hypervisor — host-4 and the guests it runs
 

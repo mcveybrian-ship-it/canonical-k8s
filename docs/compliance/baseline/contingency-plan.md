@@ -440,6 +440,86 @@ sustained write speed without it. **`BACKUP_TRIM` defaults to false so that enab
 explicit act**, and it belongs in the SSP as a stated choice rather than being found in a
 configuration file later (`ssp-inputs.md` §2.3, `poam.md` AO-15).
 
+### 4.7 Records retention and legal holds — how it works and how to run it (backlog 3.27)
+
+**The rule.** The agency's SORN sets how long case records live. The application deletes them
+from the live database on schedule; that is the vendor's job, demonstrated before go-live. A record
+deleted there still lives in every backup, so **backups age out too: a record leaves the last
+backup within about 60 days** (`ssp-inputs.md` §2.8, acting AO, 2026-09-24).
+
+**How it works — nothing to do day to day.**
+
+| | runs | bounds retention by |
+|---|---|---|
+| VM backups | host-4, nightly 02:00 Central | the nightly incremental becomes a **full** for any VM whose newest full is `BACKUP_FULL_MAX_DAYS` (30) old. When a third chain starts, `prune` destroys the oldest, so 2 chains kept means ~60 days |
+| off-host copies | host-1 (second), lab-vault (third, lab only) | they mirror the source with `--delete` the same night, so a set pruned on host-4 is deleted there too |
+| database backups | pgBackRest: host-4 (repo1) and host-3 (repo2), full on Sunday, differential daily | 2 fulls kept. Each backup ends with pgBackRest's own expiry, which deletes the oldest full, its differentials and older WAL: ~14 days |
+| evidence | `/var/log/enclave/records-disposal.log` on host-4 and host-3, plus syslog tag `records-disposal` | one line per destroyed set, copy deletion, pgBackRest expiry and hold event |
+| watch | the alert rules on svc-obs-01 | `BackupRetentionExceeded` and `RecordsHoldReviewOverdue`; for the copies, `BackupCopyFailed` and `BackupCopyStale` (3.58) — a copy that stops running stops following the source |
+
+**Check it.**
+
+```bash
+### MACHINE: host-4 (10.2.20.158) - read-only; the same log is on host-3 for repo2 ###
+cd ~/canonical-k8s/scripts/enclave && sudo ./vm-backup.sh status   # retention: newest full per VM, next one due, hold state
+sudo ./vm-backup.sh prune --dry-run                                  # what retention would destroy tonight
+sudo tail -n 50 /var/log/enclave/records-disposal.log                # what it has destroyed
+```
+
+**A legal hold.** When counsel or the programme asks to preserve records (litigation, an
+investigation, a FOIA request), set a hold on **both backup stores**. Backups can't hold one
+record, so a hold holds everything: prune destroys nothing, pgBackRest stops expiring, and the
+copies keep everything. The per-record hold in the live database is the application's.
+
+```bash
+### MACHINE: host-4 (10.2.20.158), then host-3 (10.2.20.157) ###
+if [ "$(hostname -s)" != host-4 ] && [ "$(hostname -s)" != host-3 ]; then echo "WRONG MACHINE: $(hostname -s)"; else
+  cd ~/canonical-k8s/scripts/enclave && sudo ./vm-backup.sh hold set "<the matter, who asked, the ticket>" --review YYYY-MM-DD
+fi
+```
+
+- The reason and the review date are both required. The **review date** is when someone must
+  decide whether the hold still applies; it isn't the end of the hold.
+- `sudo ./vm-backup.sh hold status` shows who set it, when, why, and the review date.
+- To change a hold, `release` it and `set` it again. Both are logged.
+- To end it, run `sudo ./vm-backup.sh hold release` **on both stores**. That night, prune and
+  pgBackRest destroy everything held past the schedule, and log each item.
+- **What a hold costs is space.** The VM backup volume grows by about one full chain a month
+  (svc-repo-01 alone is about 330 GB per full); watch `BackupVolumeFilling`. pgBackRest grows by
+  one full a week plus WAL.
+
+**When an alert fires.**
+
+- **`BackupRetentionExceeded {domain}`** — a backup older than 70 days with no hold. Run `status`:
+  is a full marked DUE but not happening? See `journalctl -u enclave-vm-backup.service`.
+  `prune --dry-run` shows what it would remove.
+- **`RecordsHoldReviewOverdue {machine}`** — a hold is past its review date. Ask whoever requested
+  it, then renew it (release, then set with a new date) or release it.
+- **`BackupCopyFailed` / `BackupCopyStale {copy}`** — a copy's last run failed, or it has had no
+  clean run in 36 hours. Its line in `status` shows the last run, its exit code and the last clean
+  run; the copy's section of `journalctl -u enclave-vm-backup.service` names the error.
+
+**Settings** (a site with a different schedule changes values, not code):
+
+- in `vm-specs.env`: `BACKUP_FULL_MAX_DAYS` (30), `BACKUP_KEEP_CHAINS` (2), `RECORDS_HOLD_FILE`,
+  `RECORDS_DISPOSAL_LOG`;
+- in `06a-postgres-ha.sh`: `PGBR_RETENTION_FULL` (2), `PGBR_FULL_DAY` (Sun);
+- in `monitoring.sh`: `AL_BACKUP_RETENTION_MAX` (70 days), `AL_BACKUP_COPY_STALE` (36 hours).
+
+**Disposal log lines** read `<UTC time> host=<machine> run=<id> <EVENT> …`, where EVENT is one of
+DESTROYED, DESTROY-FAILED, COPY-DELETED, PGBACKREST-EXPIRED, PGBACKREST-HELD, PRUNE-HELD, HELD,
+HOLD-SET or HOLD-RELEASED. `run=` is the systemd invocation id of a timer run — `journalctl
+_SYSTEMD_INVOCATION_ID=<id>` shows that run — or `manual:<user>` for one typed at a prompt.
+
+**Limits, stated.**
+
+- The bound is about 60 days, not exact: a full comes the first night after 30 days, and the
+  oldest chain goes the night the third starts.
+- Far-end deletions are logged on host-4, the sender. The far ends keep no log of their own.
+- Expiry logging matches pgBackRest 2.50's wording, so re-check it on a pgBackRest upgrade.
+- The disposal log lives on the backup hosts. Until syslog is collected centrally (3.37), losing
+  host-4 loses its log.
+
 ---
 
 ## 5. Restore

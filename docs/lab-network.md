@@ -514,8 +514,10 @@ setup: `third-copy --setup` on host-4 prints the lines to authorise on the vault
 | vault disk | write 430 MB/s; read-back during verify ~250–390 MB/s |
 | each night | only files not verified before are re-read (a ledger on host-4); the weekly verify re-reads both copies in full (`--verify-all`) |
 
-**Not monitored:** it writes `/var/lib/enclave-backup-third.state` and `vm-backup.sh status` shows
-the last run, but nothing alerts. **A difference found by `--verify-all` is reported, not repaired.**
+**Monitored since 2026-10-13** (backlog 3.58): its facts carry `copy="third"`, and
+`BackupCopyFailed` / `BackupCopyStale` fire for it as for the second copy. `vm-backup.sh status`
+shows its last run and last clean run. **A difference found by `--verify-all` is reported, not
+repaired.**
 
 **A. The password hash, then the build.** `openssl` asks twice and refuses a mismatch (`mkpasswd`
 asks once — that cost a rebuild). Copy the `$6$` line; the Dell block asks for it, so it never sits

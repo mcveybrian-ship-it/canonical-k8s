@@ -14,6 +14,8 @@
 #     sudo ./vm-backup.sh second-copy            push completed sets to the host the placement
 #                                                map names - a copy that does not die with this
 #                                                machine (red flag 1.2). --setup makes the key
+#     sudo ./vm-backup.sh hold status|set|release  a records (legal) hold: prune and pgBackRest stop
+#                                                destroying backups until released (3.27)
 #     sudo ./vm-backup.sh third-copy             the same, to a store the site names in
 #                                                BACKUP_THIRD_ADDR - the Dell vault in the lab;
 #                                                off (a no-op) when that is empty
@@ -104,6 +106,10 @@ THIRD_DIR="${BACKUP_THIRD_DIR:-/srv/cold/backup-copy}"
 THIRD_KEY="${BACKUP_THIRD_KEY:-/etc/enclave/backup-third.key}"
 THIRD_STATE="${BACKUP_THIRD_STATE:-/var/lib/enclave-backup-third.state}"
 THIRD_SKIP="${BACKUP_THIRD_SKIP:-$SECOND_SKIP}"
+# RECORDS DESTRUCTION (backlog 3.27) - see vm-specs.env and cmd_hold below.
+FULL_MAX_DAYS="${BACKUP_FULL_MAX_DAYS:-30}"
+HOLD_FILE="${RECORDS_HOLD_FILE:-/etc/enclave/records-hold}"
+DISPOSAL_LOG="${RECORDS_DISPOSAL_LOG:-/var/log/enclave/records-disposal.log}"
 ACCEPT_PLAIN=0
 ALLOW_NONMOUNT=0
 DETACH=0
@@ -234,6 +240,54 @@ alloc_bytes() {  # actual bytes on disk for a domain's disks, not the qcow2 ceil
 
 human() { numfmt --to=iec --suffix=B "${1:-0}" 2>/dev/null || printf '%s\n' "${1:-0}"; }
 
+# ---------------------------------------------------------------- records destruction (3.27)
+# A set's stamp (its directory name, YYYYMMDDTHHMMSSZ, UTC) as unix time; nothing if malformed.
+stamp_epoch() {
+  local s="$1"
+  [[ "$s" =~ ^([0-9]{4})([0-9]{2})([0-9]{2})T([0-9]{2})([0-9]{2})([0-9]{2})Z$ ]] || return 0
+  date -u -d "${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]} ${BASH_REMATCH[4]}:${BASH_REMATCH[5]}:${BASH_REMATCH[6]}" +%s 2>/dev/null || true
+}
+
+# <domain> -> the stamp of its newest COMPLETE full (INFO says full AND the manifest exists), or
+# nothing. An interrupted full is not a full: a chain cannot be started from it.
+newest_full_stamp() {
+  local d newest=""
+  for d in "$DEST/$1"/*/; do
+    [ -f "$d/INFO" ] && [ -f "$d/MANIFEST.sha256" ] || continue
+    [ "$(awk -F= '/^mode=/{print $2}' "$d/INFO" 2>/dev/null)" = full ] || continue
+    d="${d%/}"; d="${d##*/}"
+    [[ "$d" > "$newest" ]] && newest="$d"
+  done
+  printf '%s' "$newest"
+}
+
+# <domain> -> whole days since its newest complete full, or nothing if it has none.
+newest_full_age_days() {
+  local s e; s="$(newest_full_stamp "$1")"
+  [ -n "$s" ] || return 0
+  e="$(stamp_epoch "$s")"; [ -n "$e" ] || return 0
+  printf '%s' $(( ( $(date -u +%s) - e ) / 86400 ))
+}
+
+# The hold file is KEY=value lines written by `hold set`. Read, never sourced.
+hold_kv() { awk -v k="$1" 'index($0, k "=") == 1 { print substr($0, length(k) + 2); exit }' "$HOLD_FILE" 2>/dev/null; }
+hold_active() { [ -f "$HOLD_FILE" ]; }
+hold_line() { hold_active && printf 'set by %s at %s, review by %s: %s' "$(hold_kv set_by)" "$(hold_kv set_utc)" "$(hold_kv review)" "$(hold_kv reason)"; }
+
+# One line per disposal event, to the log AND to syslog. run= is the systemd invocation for the
+# nightly job, so a line can be tied back to the journal of the run that did it.
+disposal_log() {
+  local line
+  line="$(date -u +%Y-%m-%dT%H:%M:%SZ) host=$(hostname -s) run=${INVOCATION_ID:-manual:${SUDO_USER:-$(id -un)}} $*"
+  install -d -m 0750 "$(dirname "$DISPOSAL_LOG")" 2>/dev/null || true
+  if printf '%s\n' "$line" >> "$DISPOSAL_LOG" 2>/dev/null; then
+    chmod 0640 "$DISPOSAL_LOG" 2>/dev/null || true
+  else
+    warn "could not write the disposal log $DISPOSAL_LOG - the event goes to syslog only: $*"
+  fi
+  logger -t records-disposal -- "$*" 2>/dev/null || true
+}
+
 # ---------------------------------------------------------------- destination checks
 check_dest() {
   [ -n "$DEST" ] || die "no destination. Set BACKUP_DEST in vm-specs.env, or pass --dest."
@@ -347,15 +401,32 @@ cmd_status() {
     local cps; cps="$(virsh checkpoint-list "$d" --name 2>/dev/null | sed '/^$/d' | tr '\n' ' ')"
     printf '     %-16s %s\n' "$d" "${cps:-none - next run must be a full}"
   done
+  # RECORDS DESTRUCTION (3.27): when each domain's next full is due, and whether a hold stops prune.
+  printf '\n  retention (3.27): a full every %s days, %s chains kept -> nothing older than ~%s days\n' \
+    "$FULL_MAX_DAYS" "$KEEP" "$(( FULL_MAX_DAYS * KEEP ))"
+  local fs fa fe
+  for d in $(domains); do
+    fs="$(newest_full_stamp "$d")"
+    if [ -z "$fs" ]; then
+      printf '     %-16s no complete full - the next nightly run takes one\n' "$d"; continue
+    fi
+    fa="$(newest_full_age_days "$d")"; fe="$(stamp_epoch "$fs")"
+    printf '     %-16s newest full %s, %s day(s) old - next full: first nightly run from %s%s\n' "$d" "$fs" "$fa" \
+      "$(date -u -d "@$(( fe + FULL_MAX_DAYS * 86400 ))" +%F)" "$( [ "$fa" -ge "$FULL_MAX_DAYS" ] && echo '   <-- DUE')"
+  done
+  if hold_active; then warn "  RECORDS HOLD IN FORCE - prune destroys nothing: $(hold_line)"
+  else say "  records hold: none"; fi
   printf '\n  off-host copies, last run (from their state files):\n'
-  local which sf when
+  local which sf when lok
   for which in second third; do
     sf="$SECOND_STATE"; [ "$which" = third ] && sf="$THIRD_STATE"
     if [ -r "$sf" ]; then
       when="$(awk -F= '/^seconds=/{print $2}' "$sf")"
-      printf '     %-7s -> %-14s %s  rc=%s  %s\n' "$which" "$(awk -F= '/^host=/{print $2}' "$sf")" \
+      lok="$(state_last_ok "$sf")"
+      printf '     %-7s -> %-14s %s  rc=%s  %s  last clean run: %s\n' "$which" "$(awk -F= '/^host=/{print $2}' "$sf")" \
         "$(date -d "@${when:-0}" '+%Y-%m-%d %H:%M %Z' 2>/dev/null)" "$(awk -F= '/^rc=/{print $2}' "$sf")" \
-        "$(human "$(awk -F= '/^bytes=/{print $2}' "$sf")")"
+        "$(human "$(awk -F= '/^bytes=/{print $2}' "$sf")")" \
+        "$( [ -n "$lok" ] && date -d "@$lok" '+%Y-%m-%d %H:%M %Z' 2>/dev/null || echo 'none recorded')"
     elif [ "$which" = third ] && [ -z "$THIRD_ADDR" ]; then
       printf '     %-7s not configured (BACKUP_THIRD_ADDR empty - lab only)\n' "$which"
     else
@@ -386,6 +457,18 @@ backup_one() {  # <domain> <full|incr>
   if [ "$mode" = incr ]; then
     prev="$(virsh checkpoint-list "$dom" --name 2>/dev/null | sed '/^$/d' | tail -1)"
     [ -n "$prev" ] || { warn "$dom: no checkpoint to build on - doing a FULL instead"; mode=full; }
+  fi
+  # RECORDS DESTRUCTION (backlog 3.27): a chain may not grow older than BACKUP_FULL_MAX_DAYS. When
+  # the newest full is that old - or there is no complete full at all - this run is a FULL, which
+  # starts a new chain; once KEEP newer fulls exist, prune retires the old chain and every record in
+  # it. Without this, fulls happened only by hand and retention was unbounded (measured 2026-09-24).
+  if [ "$mode" = incr ]; then
+    local fage; fage="$(newest_full_age_days "$dom")"
+    if [ -z "$fage" ] || [ "$fage" -ge "$FULL_MAX_DAYS" ]; then
+      say "$dom: newest full is ${fage:-missing}$([ -n "$fage" ] && echo ' day(s) old') - BACKUP_FULL_MAX_DAYS=$FULL_MAX_DAYS,"
+      say "   so this run is a FULL: a new chain, and the oldest one retires once $KEEP newer fulls exist (3.27)"
+      mode=full; prev=""
+    fi
   fi
 
   # A DOMAIN WITH NOTHING BACKUP-CAPABLE MUST NOT PRODUCE AN EMPTY, SUCCESSFUL-LOOKING SET.
@@ -801,16 +884,15 @@ cmd_verify() {
 }
 
 # ---------------------------------------------------------------- prune
-# WHAT PRUNE DOES NOT DO: bound retention in time (backlog 3.27, measured 2026-09-24). It
-# retires a chain only once KEEP newer FULLS exist - but the nightly unit runs `incr`, and a
-# full is taken only when a domain has no checkpoint (first run, the broken-bitmap fallback in
-# backup_one) or by hand. So chains are rarely closed, KEEP=2 retires almost nothing, and a
-# set - with every record in it - stays on this volume and in the second copy indefinitely.
-# The designed fix (an age-based full, BACKUP_FULL_MAX_DAYS, plus a hold switch and a disposal
-# log; ssp-inputs.md 2.8) is owed and not in this code.
+# RETENTION IN TIME (backlog 3.27, built 2026-10-02). Prune retires a chain once KEEP newer FULLS
+# exist; on its own that bounded nothing, because the nightly unit runs `incr` and fulls happened
+# only by hand (measured 2026-09-24: retention was unbounded). backup_one now turns the nightly
+# run into a full when the newest full is BACKUP_FULL_MAX_DAYS old, so chains close on a calendar
+# and nothing outlives ~KEEP x that. Every set destroyed here is written to the disposal log;
+# while a records hold is in force (cmd_hold) nothing is destroyed, and that is logged too.
 cmd_prune() {
   need_root; check_dest
-  local dry=0
+  local dry=0 held=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --dry-run|-n) dry=1; shift ;;
@@ -818,6 +900,15 @@ cmd_prune() {
        usage: $0 prune [--dry-run]" ;;
     esac
   done
+  # A LEGAL HOLD SUSPENDS DESTRUCTION. Backups cannot hold one record, so they hold everything:
+  # prune runs as a dry run and logs what it would have destroyed, so the eventual release is
+  # auditable against what was kept.
+  if hold_active && [ "$dry" -eq 0 ]; then
+    warn "RECORDS HOLD IN FORCE - $(hold_line)"
+    warn "  nothing will be destroyed; what retention would have removed is logged as HELD"
+    disposal_log "PRUNE-HELD $(hold_line)"
+    dry=1; held=1
+  fi
 
   # ================================================================================
   # THIS FUNCTION DESTROYED EVERY FULL BACKUP IN THE ENCLAVE ON 2026-09-16.
@@ -891,9 +982,15 @@ cmd_prune() {
       case "${sz:-}" in ''|*[!0-9]*) sz=0 ;; esac
       if [ "$dry" -eq 1 ]; then
         say "  would remove $(basename "${sets[$i]}") [${modes[$i]}] $(human "$sz")"
+        [ "$held" -eq 1 ] && disposal_log "HELD domain=$name set=$(basename "${sets[$i]}") mode=${modes[$i]} bytes=$sz"
       else
         say "  removing $(basename "${sets[$i]}") [${modes[$i]}] $(human "$sz")"
-        rm -rf -- "${sets[$i]}"
+        if rm -rf -- "${sets[$i]}" && [ ! -e "${sets[$i]}" ]; then
+          disposal_log "DESTROYED domain=$name set=$(basename "${sets[$i]}") mode=${modes[$i]} bytes=$sz dest=$DEST"
+        else
+          warn "  could NOT remove ${sets[$i]}"
+          disposal_log "DESTROY-FAILED domain=$name set=$(basename "${sets[$i]}") mode=${modes[$i]} dest=$DEST"
+        fi
         freed=$((freed + sz))
       fi
     done
@@ -916,7 +1013,9 @@ cmd_prune() {
     fi
   done
 
-  if [ "$dry" -eq 1 ]; then
+  if [ "$held" -eq 1 ]; then
+    ok "RECORDS HOLD - nothing was removed; what retention would have removed is in $DISPOSAL_LOG"
+  elif [ "$dry" -eq 1 ]; then
     ok "DRY RUN - nothing was removed"
   else
     # REPORT WHAT WAS KEPT, NOT WHAT THE POLICY SAYS. This line used to read
@@ -929,6 +1028,79 @@ cmd_prune() {
     # they should.
     ok "prune complete - freed $(human "$freed"), retained chains per domain listed above"
   fi
+}
+
+# ---------------------------------------------------------------- records hold (3.27)
+# A LEGAL / LITIGATION HOLD FOR BACKUPS (ssp-inputs.md 2.8, decided 2026-09-24).
+#
+#     sudo ./vm-backup.sh hold set "<reason - case or matter, who asked>" --review YYYY-MM-DD
+#     sudo ./vm-backup.sh hold status
+#     sudo ./vm-backup.sh hold release
+#
+# Backups cannot hold one record, so a hold holds everything: while it is in force `prune`
+# destroys nothing (it logs what it would have), the off-host copies keep everything because they
+# mirror a source that is not pruning, and pgBackRest runs with --no-expire-auto (06a's backup
+# wrapper reads the same file). The per-record hold in the LIVE database is the application's.
+#
+# SET IT ON EVERY BACKUP STORE - host-4 (VM backups + pgBackRest repo1) and host-3 (pgBackRest
+# repo2). Each machine reads its own file; a hold set on one does not reach the other.
+#
+# The review date is required: a hold nobody reviews is indefinite retention under another name,
+# which is the failure 3.27 exists to prevent. RecordsHoldReviewOverdue fires the day it passes.
+cmd_hold() {
+  local action="${1:-status}"; shift || true
+  case "$action" in
+    status)
+      if hold_active; then
+        warn "RECORDS HOLD IN FORCE on $(hostname -s):"
+        say  "   set by   $(hold_kv set_by)"
+        say  "   set at   $(hold_kv set_utc)"
+        say  "   review   $(hold_kv review)$( [ "$(date -u +%F)" \> "$(hold_kv review)" ] && echo '   <-- OVERDUE')"
+        say  "   reason   $(hold_kv reason)"
+        say  "   effect   vm-backup prune destroys nothing; pgBackRest does not expire; copies keep all"
+      else
+        ok "no records hold on $(hostname -s) - normal retention: fulls every $FULL_MAX_DAYS days, $KEEP chains kept"
+      fi
+      ;;
+    set)
+      need_root
+      local reason="" review=""
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --review) review="${2:-}"; shift 2 ;;
+          *) reason="${reason:+$reason }$1"; shift ;;
+        esac
+      done
+      reason="$(printf '%s' "$reason" | tr '\n\r\t' '   ')"
+      [ -n "$reason" ] || die "a hold needs a reason - the case or matter, and who asked for it:
+       sudo $0 hold set \"<reason>\" --review YYYY-MM-DD"
+      [[ "$review" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] && date -u -d "$review" >/dev/null 2>&1 \
+        || die "a hold needs a review date, --review YYYY-MM-DD"
+      [ "$review" \> "$(date -u +%F)" ] || die "the review date $review is not in the future"
+      if hold_active; then
+        die "a hold is already in force: $(hold_line)
+       To change it: release it, then set the new one - both are logged."
+      fi
+      install -d -m 0755 "$(dirname "$HOLD_FILE")"
+      printf 'set_by=%s\nset_utc=%s\nreview=%s\nreason=%s\n' \
+        "${SUDO_USER:-$(id -un)}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$review" "$reason" > "$HOLD_FILE"
+      chmod 0644 "$HOLD_FILE"     # pgBackRest's wrapper and the facts read it
+      disposal_log "HOLD-SET $(hold_line)"
+      warn "RECORDS HOLD SET on $(hostname -s): $(hold_line)"
+      say  "   prune now destroys nothing; pgBackRest stops expiring at its next backup."
+      say  "   SET IT ON THE OTHER STORE TOO (host-4 and host-3 each read their own)."
+      ;;
+    release)
+      need_root
+      hold_active || die "there is no records hold on $(hostname -s)"
+      disposal_log "HOLD-RELEASED by ${SUDO_USER:-$(id -un)} - was: $(hold_line)"
+      rm -f -- "$HOLD_FILE"
+      ok "records hold released on $(hostname -s)"
+      say "   the next nightly prune and pgBackRest backup resume normal retention - anything held"
+      say "   past the schedule is destroyed then, and logged. Release it on the other store too."
+      ;;
+    *) die "usage: $0 hold {status|set \"<reason>\" --review YYYY-MM-DD|release}" ;;
+  esac
 }
 
 # ---------------------------------------------------------------- keyfile / reattach
@@ -1407,6 +1579,14 @@ copy_key() {   # <keyfile> <comment> - make an off-host copy's key once; say so 
   ok "created $1"
 }
 
+# state_last_ok <copy state file> -> unix time of that copy's last CLEAN run, or nothing. A file
+# written before 2026-10-13 holds only the latest run, which counts if its rc was 0 (3.58).
+state_last_ok() {
+  [ -r "$1" ] || return 0
+  awk -F= '$1=="last_ok" && $2!="" {lo=$2} $1=="seconds" {s=$2} $1=="rc" {rc=$2}
+           END { if (lo != "") print lo; else if (rc == "0" && s != "") print s }' "$1"
+}
+
 second_host() {   # the host the placement map sends this machine's copies to
   local want="${BACKUP_SECOND_HOST:-${PLACE_BACKUP_SECOND:-}}" me; me="$(hostname -s)"
   case "$want" in
@@ -1520,7 +1700,27 @@ push_sets() {
   # landing outside the one directory this key is confined to.
   # LogLevel=ERROR silences the login BANNER - which OpenSSH prints at INFO and which otherwise
   # repeats its full DoD text once per rsync - WITHOUT hiding errors, which are logged above it.
-  local SSH=(ssh -i "$key" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o LogLevel=ERROR -o IdentitiesOnly=yes)
+  #
+  # ONE SSH CONNECTION FOR THE WHOLE COPY (2026-10-13, backlog 3.58). Every enclave host's ufw
+  # carries `limit 22/tcp`, which REFUSES a source's 7th new connection inside 30 seconds. This
+  # function runs an rsync per step - a transfer and a verify per domain - and each used to open
+  # its own connection. Once the 2026-10-02 ledger let a quiet night finish in ~25 s, the 7th
+  # landed inside the window: host-1 refused it on 10-03 and on most nights after, while the vault
+  # (no rate limit) never noticed. A multiplexed master carries every rsync over ONE connection -
+  # push-repo-to-host.sh's fix for the same rule. The forced rrsync command still applies: it
+  # belongs to the key, and sshd applies a key's options to every session on its connection.
+  local ctl
+  ctl="$(mktemp -d /run/vm-backup-ssh.XXXXXX)" || die "cannot create an ssh control directory under /run"
+  local SSH=(ssh -i "$key" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o LogLevel=ERROR -o IdentitiesOnly=yes
+             -o ControlMaster=auto -o "ControlPath=$ctl/%C" -o ControlPersist=120)
+  # Closed on both ways out below. The socket is in /run, so a run killed part-way leaves at most
+  # a master that exits by itself after ControlPersist and an empty directory a reboot clears.
+  mux_close() {
+    local i
+    ssh -o "ControlPath=$ctl/%C" -O exit "root@$addr" >/dev/null 2>&1 || true
+    for i in 1 2 3 4 5 6 7 8 9 10; do [ -z "$(ls -A "$ctl" 2>/dev/null)" ] && break; sleep 0.2; done
+    rmdir "$ctl" 2>/dev/null || true
+  }
   # --delete MIRRORS THE SOURCE, and without it the copy only ever grows. `prune` removes old
   # chains here, nothing removes them there, and each new full adds ~84 GB to a 196 GB volume -
   # so the far end fills and then silently stops being a copy at all. Measured on the first run,
@@ -1537,8 +1737,24 @@ push_sets() {
   local t0 bytes=0 rc=0; t0="$(date +%s)"
   for d in "${doms[@]}"; do
     say "  $d ..."
-    if ! "${RS[@]}" "$DEST/$d/" "root@$addr:$d/"; then
-      warn "$d: rsync FAILED - see the error above"; rc=1; continue
+    if [ "$dry" -eq 1 ]; then
+      if ! "${RS[@]}" "$DEST/$d/" "root@$addr:$d/"; then
+        warn "$d: rsync FAILED - see the error above"; rc=1; continue
+      fi
+    else
+      # THE COPIES' HALF OF THE DISPOSAL EVIDENCE (3.27). --delete mirrors what prune destroyed;
+      # --info=del1 names each file rsync deletes at the far end, and every deleted SET goes to the
+      # disposal log - so "the copies follow the source" is recorded, not assumed.
+      local rout delset
+      if ! rout="$("${RS[@]}" --info=del1 "$DEST/$d/" "root@$addr:$d/" 2>&1)"; then
+        [ -z "$rout" ] || printf '%s\n' "$rout" | sed 's/^/     /'
+        warn "$d: rsync FAILED - see the error above"; rc=1; continue
+      fi
+      [ -z "$rout" ] || printf '%s\n' "$rout" | sed 's/^/     /'
+      while IFS= read -r delset; do
+        [ -n "$delset" ] || continue
+        disposal_log "COPY-DELETED copy=${label// /-} target=$target addr=$addr domain=$d set=$delset"
+      done < <(printf '%s\n' "$rout" | sed -n 's|^deleting \([0-9]\{8\}T[0-9]\{6\}Z\)/$|\1|p')
     fi
     # VERIFY WHAT ARRIVED, NOT WHAT WAS SENT - the same rule as `verify`. --checksum re-reads
     # the far end and compares content; anything listed here differs, and a clean run prints
@@ -1566,9 +1782,16 @@ push_sets() {
         nb="$(printf '%s\n' "$need" | awk -F'\t' '{s+=$2} END{print s+0}')"
         lst="$(mktemp)"
         printf '%s\n' "$need" | cut -f1 | sed "s|^$d/||" > "$lst"
-        diff="$(rsync -a --dry-run --itemize-changes --checksum --files-from="$lst" -e "${SSH[*]}" "$DEST/$d/" "root@$addr:$d/" 2>&1 | grep -vE '^$|^sending|^total|^sent ' || true)"
+        local vout vrc=0
+        vout="$(rsync -a --dry-run --itemize-changes --checksum --files-from="$lst" -e "${SSH[*]}" "$DEST/$d/" "root@$addr:$d/" 2>&1)" || vrc=$?
         rm -f "$lst"
-        if [ -n "$diff" ]; then
+        diff="$(printf '%s\n' "$vout" | grep -vE '^$|^sending|^total|^sent ' || true)"
+        # A REFUSED CONNECTION IS NOT A DIFFERENCE. Until 2026-10-13 rsync's own error lines landed
+        # in $diff and were reported as "the copy DIFFERS from the source" - host-1's log said the
+        # copy was wrong when the truth was that nothing had been compared at all (3.58).
+        if [ "$vrc" -ne 0 ]; then
+          warn "$d: could NOT verify the copy - rsync exited $vrc before comparing anything:"; printf '%s\n' "$vout" | head -5 >&2; rc=1
+        elif [ -n "$diff" ]; then
           warn "$d: the copy DIFFERS from the source after transfer:"; printf '%s\n' "$diff" | head -5 >&2; rc=1
         else
           ok "$d: $nn file(s) verified byte-for-byte ($(human "$nb"))$([ "$nn" -eq "$(printf '%s\n' "$cur" | sed '/^$/d' | wc -l)" ] && echo ' - every file' || echo ' - the rest were verified on earlier runs')"
@@ -1586,6 +1809,7 @@ push_sets() {
     chmod 0600 "$ledger"
   fi
   local t1; t1="$(date +%s)"
+  mux_close
   if [ "$dry" -eq 1 ]; then
     say "DRY RUN - nothing was transferred"
     # A DRY RUN THAT COULD NOT REACH THE FAR END IS A FAILED CHECK, NOT A PASSED ONE. Until
@@ -1596,8 +1820,14 @@ push_sets() {
   fi
 
   # State for the facts below: a second copy that silently stopped is the failure mode here.
-  printf 'host=%s\nseconds=%s\nbytes=%s\ndomains=%s\nrc=%s\nduration=%s\n' \
-    "$target" "$(date +%s)" "$bytes" "${#doms[@]}" "$rc" "$((t1-t0))" > "$state"
+  # LAST SUCCESS SURVIVES A FAILED RUN (3.58). The file used to hold only the latest run, so one
+  # failure erased when the copy last worked, and the facts went quiet instead of saying how long.
+  local now prev_ok
+  now="$(date +%s)"
+  prev_ok="$(state_last_ok "$state")"
+  [ "$rc" -ne 0 ] || prev_ok="$now"
+  printf 'host=%s\nseconds=%s\nbytes=%s\ndomains=%s\nrc=%s\nduration=%s\nlast_ok=%s\n' \
+    "$target" "$now" "$bytes" "${#doms[@]}" "$rc" "$((t1-t0))" "$prev_ok" > "$state"
   chmod 0644 "$state"
   [ "$rc" -eq 0 ] || die "$label finished WITH ERRORS in $((t1-t0))s"
   ok "$label complete: ${#doms[@]} domain(s), $(numfmt --to=iec "$bytes" 2>/dev/null || echo "$bytes")B, $((t1-t0))s"
@@ -1618,8 +1848,9 @@ push_sets() {
 # WHAT GOES: only this script's sets - the guests on this host. Never pgBackRest's repositories:
 # they hold the application's real records with no encryption of their own (backlog 3.50).
 #
-# NOT MONITORED. It writes its state file and `status` shows it, but nothing alerts on a third
-# copy that stopped - lab-grade, and said so in lab-network.md 9.3.
+# MONITORED SINCE 2026-10-13 (3.58), like the second copy: its facts carry copy="third", and
+# BackupCopyFailed / BackupCopyStale fire only where BACKUP_THIRD_ADDR is set - a site without
+# a third store reports configured 0 and sees nothing.
 cmd_third_copy() {
   local setup=0 dry=0 all=0 vall=0
   while [ $# -gt 0 ]; do
@@ -1996,6 +2227,8 @@ cmd_facts() {
     printf '# TYPE enclave_backup_sets_complete gauge\n'
     printf '# HELP enclave_backup_sets_incomplete set directories with NO manifest - interrupted runs\n'
     printf '# TYPE enclave_backup_sets_incomplete gauge\n'
+    printf '# HELP enclave_backup_oldest_set_seconds unix time the oldest retained complete set began (3.27)\n'
+    printf '# TYPE enclave_backup_oldest_set_seconds gauge\n'
     printf '# HELP enclave_backup_last_set_bytes size of the newest complete set\n'
     printf '# TYPE enclave_backup_last_set_bytes gauge\n'
     printf '# HELP enclave_backup_checkpoints libvirt checkpoints - what an incremental builds on\n'
@@ -2021,6 +2254,14 @@ cmd_facts() {
       [ -n "$newest_any" ] && printf 'enclave_backup_last_attempt_seconds{domain="%s"} %s\n' "$d" "$newest_any"
       printf 'enclave_backup_sets_complete{domain="%s"} %s\n'   "$d" "$nc"
       printf 'enclave_backup_sets_incomplete{domain="%s"} %s\n' "$d" "$ni"
+
+      # RECORDS DESTRUCTION (3.27): when the OLDEST retained complete set began. Its age is what the
+      # ~60-day bound is about - BackupRetentionExceeded fires past AL_BACKUP_RETENTION_MAX. The
+      # set's directory name is its UTC start stamp, so this reads names, not files.
+      local oldest_set oldest_e
+      oldest_set="$(find "$DEST/$d" -mindepth 2 -maxdepth 2 -name MANIFEST.sha256 -printf '%h\n' 2>/dev/null | sort | head -1)"
+      oldest_e="$( [ -n "$oldest_set" ] && stamp_epoch "${oldest_set##*/}")"
+      [ -n "$oldest_e" ] && printf 'enclave_backup_oldest_set_seconds{domain="%s"} %s\n' "$d" "$oldest_e"
 
       # SUM FILE SIZES, DO NOT `du` THE TREE. du walks and stats every block on a USB disk,
       # every 15 minutes, on a volume holding hundreds of GB. A set holds a handful of qcow2
@@ -2053,26 +2294,38 @@ cmd_facts() {
     printf '# TYPE enclave_backup_total_bytes gauge\n'
     printf 'enclave_backup_total_bytes %s\n' "$total"
 
-    # THE SECOND COPY - red flag 1.2. A copy that quietly stopped is indistinguishable from one
+    # THE OFF-HOST COPIES - red flag 1.2. A copy that quietly stopped is indistinguishable from one
     # that never ran, and both look like "we have backups" until the day host-4 is gone. The
     # metric is emitted even when it is NOT configured, as a 0, because a missing series reads
     # as "no data" on a dashboard and that is the one answer that must never look like silence.
-    local sec_host sec_when sec_bytes sec_rc
-    sec_host="$(second_host)"
-    if [ -n "$sec_host" ]; then
-      sec_when="$(awk -F= '/^seconds=/{print $2}' "$SECOND_STATE" 2>/dev/null)"
-      sec_bytes="$(awk -F= '/^bytes=/{print $2}' "$SECOND_STATE" 2>/dev/null)"
-      sec_rc="$(awk -F= '/^rc=/{print $2}' "$SECOND_STATE" 2>/dev/null)"
-    fi
-    printf '# HELP enclave_backup_second_configured 1 if a second copy target is set\n'
-    printf '# TYPE enclave_backup_second_configured gauge\n'
-    printf 'enclave_backup_second_configured{target="%s"} %s\n' "${sec_host:-none}" "$([ -n "$sec_host" ] && echo 1 || echo 0)"
-    printf '# HELP enclave_backup_second_last_success_seconds unix time the second copy last completed cleanly\n'
-    printf '# TYPE enclave_backup_second_last_success_seconds gauge\n'
-    [ -n "${sec_when:-}" ] && [ "${sec_rc:-1}" = 0 ] && printf 'enclave_backup_second_last_success_seconds %s\n' "$sec_when"
-    printf '# HELP enclave_backup_second_last_bytes bytes held in the second copy at the last run\n'
-    printf '# TYPE enclave_backup_second_last_bytes gauge\n'
-    [ -n "${sec_bytes:-}" ] && printf 'enclave_backup_second_last_bytes %s\n' "$sec_bytes"
+    #
+    # BOTH COPIES, ONE FAMILY labelled copy="second|third" (2026-10-13, 3.58). Until then only the
+    # second copy had facts, its success line VANISHED on a failed run, and no rule read any of
+    # them: the second copy failed on and off for ten nights and nothing said so. Now the last
+    # run's exit code is a fact of its own, and the last CLEAN run survives a failure. Grouped by
+    # metric, not by copy - the text format wants each family's samples together.
+    local cp ct cs cv
+    copy_state() { if [ "$1" = third ]; then echo "$THIRD_STATE"; else echo "$SECOND_STATE"; fi; }
+    copy_target() { if [ "$1" = third ]; then echo "$THIRD_ADDR"; else second_host; fi; }
+    copy_kv() { awk -F= -v k="$2" '$1 == k {print $2}' "$(copy_state "$1")" 2>/dev/null || true; }
+    printf '# HELP enclave_backup_copy_configured 1 if this off-host copy has a target, else 0 - the series exists either way\n'
+    printf '# TYPE enclave_backup_copy_configured gauge\n'
+    for cp in second third; do
+      ct="$(copy_target "$cp")"
+      printf 'enclave_backup_copy_configured{copy="%s",target="%s"} %s\n' "$cp" "${ct:-none}" "$([ -n "$ct" ] && echo 1 || echo 0)"
+    done
+    printf '# HELP enclave_backup_copy_last_run_seconds unix time this copy last ran, clean or not\n'
+    printf '# TYPE enclave_backup_copy_last_run_seconds gauge\n'
+    for cp in second third; do cv="$(copy_kv "$cp" seconds)"; [ -z "$cv" ] || printf 'enclave_backup_copy_last_run_seconds{copy="%s"} %s\n' "$cp" "$cv"; done
+    printf '# HELP enclave_backup_copy_last_rc exit code of the last run - 0 clean, anything else a failure\n'
+    printf '# TYPE enclave_backup_copy_last_rc gauge\n'
+    for cp in second third; do cv="$(copy_kv "$cp" rc)"; [ -z "$cv" ] || printf 'enclave_backup_copy_last_rc{copy="%s"} %s\n' "$cp" "$cv"; done
+    printf '# HELP enclave_backup_copy_last_success_seconds unix time this copy last completed cleanly - kept across failed runs\n'
+    printf '# TYPE enclave_backup_copy_last_success_seconds gauge\n'
+    for cp in second third; do cs="$(state_last_ok "$(copy_state "$cp")")"; [ -z "$cs" ] || printf 'enclave_backup_copy_last_success_seconds{copy="%s"} %s\n' "$cp" "$cs"; done
+    printf '# HELP enclave_backup_copy_last_bytes bytes held in this copy at its last run\n'
+    printf '# TYPE enclave_backup_copy_last_bytes gauge\n'
+    for cp in second third; do cv="$(copy_kv "$cp" bytes)"; [ -z "$cv" ] || printf 'enclave_backup_copy_last_bytes{copy="%s"} %s\n' "$cp" "$cv"; done
     printf '# HELP enclave_backup_facts_generated_seconds unix time these facts were written\n'
     printf '# TYPE enclave_backup_facts_generated_seconds gauge\n'
     printf 'enclave_backup_facts_generated_seconds %s\n' "$(date +%s)"
@@ -2113,5 +2366,6 @@ case "${1:-status}" in
   restore-test) shift || true; cmd_restore_test "$@" ;;
   second-copy)  shift || true; cmd_second_copy "$@" ;;
   third-copy)   shift || true; cmd_third_copy "$@" ;;
-  *) printf 'usage: %s {status|facts|full [vm]|incr [vm]|progress|verify [--all]|prune [--dry-run]|keyfile|reattach|schedule [HH:MM]|unschedule|restore-plan <vm>|restore-test <vm> [--set S] [--keep] [-n]|second-copy [--setup] [-n] [--all] [--verify-all]|third-copy [--setup] [-n] [--all] [--verify-all]}\n' "$0" >&2; exit 2 ;;
+  hold)         shift || true; cmd_hold "$@" ;;
+  *) printf 'usage: %s {status|facts|full [vm]|incr [vm]|progress|verify [--all]|prune [--dry-run]|keyfile|reattach|schedule [HH:MM]|unschedule|restore-plan <vm>|restore-test <vm> [--set S] [--keep] [-n]|second-copy [--setup] [-n] [--all] [--verify-all]|third-copy [--setup] [-n] [--all] [--verify-all]|hold {status|set "<reason>" --review YYYY-MM-DD|release}}\n' "$0" >&2; exit 2 ;;
 esac

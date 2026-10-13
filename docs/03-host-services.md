@@ -356,6 +356,11 @@ cd ~/canonical-k8s && sudo ./scripts/install/03-host-services.sh storage
 - **The NIC is discovered:** the one physical interface that is up, is not a bridge port, and has
   no address outside the storage subnet. Two candidates and it refuses — set `STORAGE_NIC` in the
   params file.
+- **An adapter nothing has configured yet is down**, and the step raises it (2026-10-13): a
+  physical, unaddressed, admin-down NIC is brought up and given 10 s to find a carrier; one that
+  finds none goes back down. host-4 passed the first time only because its adapter had been raised
+  by hand; host-1..3's went down at the 10-11 shutdown, and a fresh build's always start down. A
+  refusal lowers whatever the step raised.
 - **netplan, like the bridge:** `/etc/netplan/75-enclave-storage.yaml`, matched by MAC,
   `optional: true`. Boot waits only for `br0`, so a dead adapter costs speed, never a boot.
 - **The reload reconfigures `br0` too.** On systemd 255, `networkctl reload` reconfigured `br0`

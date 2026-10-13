@@ -660,11 +660,25 @@ cmd_storage() {
     [ -e "/sys/class/net/$nic" ] || die "STORAGE_NIC='$nic' (from $PARAMS) does not exist here"
     ok "STORAGE_NIC=$nic (from $PARAMS)"
   else
+    local raised=""
     for d in /sys/class/net/*; do
       i="${d##*/}"
       [ -e "$d/device" ] || continue                      # physical only: not lo, br0, vnet*, virbr*
       [ -e "$d/master" ] && continue                      # a bridge port - the management NIC under br0
-      [ "$(cat "$d/operstate" 2>/dev/null)" = up ] || continue
+      # AN ADAPTER NOTHING HAS CONFIGURED YET IS ADMIN-DOWN (2026-10-13). host-4's passed only
+      # because it had been raised by hand on 2026-09-29; host-1..3's went down again at the 10-11
+      # shutdown, and on a fresh build (2.6) every one starts down - so "up" alone refused the one
+      # NIC this step exists to configure. A physical, unaddressed, ADMIN-DOWN NIC is raised and
+      # given 10 s to find a carrier; one that finds none goes back down. An admin-UP NIC with no
+      # carrier is left alone: something raised it, and it is unplugged.
+      if [ "$(cat "$d/operstate" 2>/dev/null)" != up ]; then
+        ip -o link show dev "$i" | grep -Eq '<([^>]*,)?UP[,>]' && continue
+        [ -z "$(ip -o addr show dev "$i" scope global)" ] || continue
+        ip link set "$i" up 2>/dev/null || continue
+        for _ in 1 2 3 4 5 6 7 8 9 10; do [ "$(cat "$d/operstate" 2>/dev/null)" = up ] && break; sleep 1; done
+        if [ "$(cat "$d/operstate" 2>/dev/null)" != up ]; then ip link set "$i" down 2>/dev/null; continue; fi
+        raised="$raised $i"
+      fi
       other=0
       while read -r a; do
         [ -n "$a" ] || continue
@@ -673,13 +687,16 @@ cmd_storage() {
       [ "$other" -eq 0 ] && cands="$cands $i"
     done
     cands="${cands# }"
+    # A refusal leaves every NIC as it found it: what this loop raised goes back down.
+    _lower_raised() { local r; for r in $raised; do ip link set "$r" down 2>/dev/null || true; done; }
     case "$cands" in
-      "")    die "no candidate storage NIC: none is physical, up, outside the bridge and without
-       another address. Is the adapter plugged in and linked?  ip -br link" ;;
-      *" "*) die "more than one candidate storage NIC: $cands
+      "")    _lower_raised; die "no candidate storage NIC: none is physical, linked, outside the bridge and
+       without another address. Is the adapter plugged in?  ip -br link" ;;
+      *" "*) _lower_raised; die "more than one candidate storage NIC: $cands
        This is a question for a person. Set STORAGE_NIC in $PARAMS." ;;
     esac
     nic="$cands"
+    case " $raised " in *" $nic "*) ok "$nic was down - raised it, and it found a carrier" ;; esac
     ok "discovered STORAGE_NIC=$nic ($(basename "$(readlink -f "/sys/class/net/$nic/device/driver" 2>/dev/null)" 2>/dev/null), $(cat "/sys/class/net/$nic/speed" 2>/dev/null) Mb/s)"
   fi
   local mac; mac="$(cat "/sys/class/net/$nic/address")"

@@ -82,6 +82,15 @@ inventoried rather than assumed:
 - **Container images** (Harbor on `svc-harbor-01`, and every workload image) carry their own
   userland libraries, which are **not** the host's validated modules. Their crypto must be listed
   and either justified or kept off the data path.
+- **`snapd`, the snap installer** (B-07, 2026-10-14) verifies the signature of every snap it
+  installs. The enclave runs **2.78+fips, rev 28333, from `fips-updates/candidate`** — the FIPS
+  build, but `fips-updates/stable` was **empty** that day (`snap info snapd`). Claim "the FIPS build
+  of snapd, from a pre-stable channel"; whether candidate is supportable is **Q-CORE**. `k8s` rev
+  5526 is itself from a candidate channel.
+- **Canonical's Kubernetes add-on images are built with Go's OpenSSL backend** — observed, not
+  assumed: MetalLB 0.16.1 reports `go1.25.12 X:opensslcrypto` at start (2026-10-14). That says the
+  binary calls OpenSSL; it does **not** say which OpenSSL, because a container brings its own. Which
+  library each image loads, and whether it is a validated one, is **Q-CORE**; do not claim it.
 
 Source: backlog 1.4 / 3.25 / Q-CORE · `HANDOFF.md` §3 · suggested control SC-13.
 
@@ -852,6 +861,23 @@ visible. Source: backlog 6a.18, 6a.19 · suggested controls AU-12(1), AC-12(1), 
 | Where it closes | **Backlog 6a.23 (CAC/PIV access)** — a **go-live gate** since 2026-09-24, because the published SORN for these records states that CAC authenticates users (`HANDOFF.md` §3). |
 | Measured | `systemctl is-enabled sssd` → `disabled` on host-1, host-2, host-3, 2026-09-24. |
 | Source | backlog B-05a, 6a.23 · `poam.md` AO-06 · suggested controls IA-2(12), IA-5(2) |
+
+### 4.1m 🔄 Kubernetes — as built 2026-10-14 (B-07), and the three STIG decisions
+
+> **Canonical Kubernetes 1.36.4 on seven hardened guests, bootstrapped from Canonical's own DISA
+> STIG configuration (shipped in the pinned snap), with three enclave decisions on top.**
+> The procedure is `docs/07-kubernetes.md`.
+
+| | |
+|---|---|
+| **K-A — V-242403: a narrow, DOCUMENTED DEVIATION** | The STIG's check requires the API audit policy to be exactly `- level: RequestResponse` for everything. That writes **every Secret's value** into the audit log — and the log is offloaded to `svc-obs-01` and copied from there to the vault and the NAS. So Secrets, `serviceaccounts/token` and `tokenreviews` are logged at `Metadata` (who, what, when, the result — not the value), everything else at `RequestResponse`. **V-242403 stays an OPEN finding with this rationale**, decided by the acting AO 2026-10-14. |
+| **K-B — V-242393 / V-242394: comply** | sshd stopped and disabled on the four workers once they are joined and verified; worker maintenance through the serial console from its host. Control planes keep ssh, which the STIG allows. ⬜ Not yet applied. |
+| **K-C — V-254800: Pod Security `baseline`** | Canonical's default admission configuration. `restricted` to be revisited once the vendor's images are measured. |
+| Audit log | `--audit-log-path /var/log/kubernetes/audit.log`, 30 days, 10 files of 100 MB (Canonical's STIG values; V-242402, V-242461–465). |
+| Firewall | Every node default-deny, sources narrowed per port (B-07 A3). **Routed** pod traffic is allowed for the pod ranges only — pods → the enclave subnet, pods → pods — measured as necessary after bootstrap (`[UFW BLOCK] IN=lxc… OUT=enp1s0`), never `DEFAULT_FORWARD_POLICY=ACCEPT`. **ufw does not see** LoadBalancer or NodePort traffic, which Cilium handles in eBPF before netfilter — state that, as for Docker on Harbor. The `allow` rows are the same `ufw_rate_limit` finding as Harbor's and PostgreSQL's. |
+| ⚠️ Expect at the rescan | Cilium writes `/etc/sysctl.d/99-zzz-override_cilium.conf`, setting `net.ipv4.conf.all.rp_filter=0`; the STIG wants 1. The datapath requires it — document it, do not revert it. |
+| Images | Only from Harbor (`containerd` `hosts.d/ghcr.io` → `svc-harbor-01`; the path checked on the machine). Harbor's scan-on-push finds Critical and High CVEs in 11 of the 12 Canonical images — backlog **3.59**: ask Canonical, POA&M rows. |
+| Source | backlog B-07, 3.59, 3.60 · `docs/07-kubernetes.md` · Kubernetes STIG V2R6 (`docs/compliance/stigs/`) · suggested controls AU-2, AU-3, AU-9, SC-7, SC-13, CM-6, CM-7 |
 
 ### 4.2 ⬜ Third-party packages no subscription tier covers
 

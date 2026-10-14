@@ -96,6 +96,8 @@ file and a ufw table for the guest must exist. Staged on `/run` (tmpfs), imaged 
 so a PG guest's data disk stays `vdc`. The profile was dropped from the list: nothing on the guest
 reads it.
 
+**As built for Kubernetes (2026-10-14):** the seven K8S guests were composed this way, unchanged, each `DONE pass=211 fail=4` and finished — `docs/07-kubernetes.md` §3.3. Two composer changes came with them: a K8S node gets its **IPv6 address** in the network config, derived from `K8S_NODE_V6_NET` and its IPv4 last octet (refused if the prefix is missing — B-07 A2); and the qemu reach check covers the **data pool only for a guest that has a data disk** (it had refused k8s-wk-04 on host-4, which has no data pool). Their ufw table (D4) was written before composing — a guest with no table is refused, by design.
+
 Why not the seed: the seed has to exist for cloud-init and is small and public-shaped; putting the
 token and the credentials in it would make the thing that currently never gets detached into the
 thing that holds secrets. A separate disk has one job and a clear end of life (4.5).

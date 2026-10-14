@@ -17,6 +17,8 @@ outstanding and this section wins for what order to do it in.
 
 ### ⏭ NEXT SESSION — start here, in this order
 
+**2026-10-14 04:30 UTC — tomorrow starts at B-07's verify step.** The Kubernetes cluster is running (7 nodes Ready, HA, every pod Running): [`docs/07-kubernetes.md`](../docs/07-kubernetes.md) §6 is the order — verify, the API VIP, ssh off on the workers (K-B), then the survivability tests. Also owed: the 07:00 UTC nightly backup check → close 3.58. The rest of this section is the 2026-09-18 state, kept for its history.
+
 **2026-09-18 01:30 UTC — `host-1/2/3` are done and identical: USG 213/3, V1R6 171/9/9/5.**
 Three controls closed on 2026-09-17/18, each of which had been passing or unreviewed for the
 wrong reason:
@@ -357,7 +359,7 @@ the gap. Q6 — the container-image bundle size — still gates Harbor's disk si
 | `debs/` | `contracts-airgapped`, `pro-airgapped`, `get-resource-tokens` — the three the mirror can never serve |
 | `keys/` | `ubuntu-pro-{cis,esm-apps,esm-infra,fips}.gpg` · **`maas-ppa.gpg`** — 5 keyrings |
 | `media/` | the server ISO, the Minimal cloud image, `SHA256SUMS` + `.gpg` |
-| `snaps/` | `k8s` 1.35.7 + 1.36.4, `core22`-FIPS, `core24`, `microceph`, `maas` — **6 snaps + 6 assertions, pairing verified** |
+| `snaps/` | `k8s` 1.35.7 + 1.36.4, `core22`-FIPS, `core24`, `microceph`, `maas` — **6 snaps + 6 assertions, pairing verified** · **+ `snapd` 2.78+fips rev 28333, added 2026-10-14** (a prerequisite of `k8s` that was never staged; FIPS build from `fips-updates/candidate` — `docs/07-kubernetes.md` §2) |
 | `scripts/` | `restore-mirror.sh` + its params, so `svc-repo-01` needs nothing it cannot read off the disk |
 
 **Machine roster** — every name a command block can carry (addresses: `scripts/enclave/enclave-addresses.env`):
@@ -376,6 +378,8 @@ the gap. Q6 — the container-image bundle size — still gates Harbor's disk si
 | `lab-vault` | `10.2.30.170` | **lab only** — the storage network, on the Dell | Built 2026-10-01. The lab's cold store: LUKS2 `/srv/cold` on the Dell's RAID 10; receives vm-backup's third copy (write-only `rrsync`). Hyper-V console, or SecureCRT through a host-4 port forward. `docs/lab-network.md` §9.3 |
 | `lab-nas` | `10.2.30.171` (storage) · `10.0.20.10` (office, web UI) | **lab only** — gap cable #3 | Built 2026-10-13. TrueNAS; receives vm-backup's VM copy and the encrypted pgBackRest copy as `enclave-copy` (write-only `rrsync`). TrueNAS refuses root ssh. `docs/lab-network.md` §9 |
 | `pg-01..03` | `10.2.20.165-167` | **air-gapped** | **One per `host-1..3`.** ✅ **COMPOSED `--harden` 2026-09-27**, hardened themselves unattended (211/4, Evaluate-STIG Open 4). PostgreSQL 16 under Patroni with its own etcd — `06a-postgres-ha.sh`, **slices 1–5 passed 2026-09-28**: monitored, failover proven by a power cut, backed up live to host-4 and host-3 with a point-in-time restore proven from each (`docs/06a-postgres-ha.md`). **The leader moves** — pg-01, pg-02 and pg-03 have each led on 2026-09-28; ask `patronictl list`, never assume |
+| `k8s-cp-01..03` | `10.2.20.171-173` · IPv6 `fd6e:32f0:f4b3:20::171-173` | **air-gapped** | **One per `host-1..3`.** ✅ **BUILT 2026-10-14** — composed `--harden` (each 211/4), finished. The Kubernetes control planes: etcd voters, the API; **cluster bootstrapped 2026-10-14** (`docs/07-kubernetes.md`), `high availability: yes`. Dual-stack: the only machines besides the workers with IPv6. ssh stays on |
+| `k8s-wk-01..04` | `10.2.20.181-184` · IPv6 `fd6e:32f0:f4b3:20::181-184` | **air-gapped** | wk-01..03 on `host-1..3`, **wk-04 on `host-4`** (lab and production alike, 2026-10-14). ✅ **BUILT and JOINED 2026-10-14.** ⚠️ **ssh will be disabled on these once verified (decision K-B, V-242393/242394)** — after that, reach one through its host: `sudo virsh console k8s-wk-0N` |
 
 **THE MIRROR — 320 GB, seven archives.** Landscape added 2026-09-04 (Track B item 1).
 

@@ -596,8 +596,10 @@ cmd_bootstrap() {
   # --address: these guests have NO default route, so "the IP of the default-route interface"
   # has nothing to find. Always explicit.
   /snap/bin/k8s bootstrap --file "$cfg" --address "$ME_ADDR" --timeout "$K8S_WAIT" || die "k8s bootstrap failed - read the output above"
-  /snap/bin/k8s status --wait-ready --timeout "$K8S_WAIT" || die "the cluster did not become ready within $K8S_WAIT"
+  # BEFORE waiting for ready: with the wrong registry path every image pull fails, and the wait
+  # would burn its whole timeout before saying anything.
   check_containerd_path
+  /snap/bin/k8s status --wait-ready --timeout "$K8S_WAIT" || die "the cluster did not become ready within $K8S_WAIT"
   echo
   ok "cluster bootstrapped on $ME - next, for each other node: sudo $0 join-token <node> HERE, then join THERE"
 }

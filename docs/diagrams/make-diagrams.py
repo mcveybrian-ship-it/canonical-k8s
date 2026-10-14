@@ -256,15 +256,13 @@ def page_hosts():
                        % (h, addr("HOST_" + n), addr("STORAGE_HOST_" + n)), "host", 13)
             for j, vm in enumerate(vms):
                 st = vm_style(vm)
-                if specs is LAB and vm == "k8s-wk-04":
-                    st = "option"
                 p.box(x + 15, y0 + 50 + 92 * j, 360, 82, vm_label(vm, specs), st, 11)
         if specs is LAB:
             p.box(30, 1160, 1620, 90,
                   "<b>Lab differences (vm-specs.env, profile lab):</b> the four service VMs stay on host-4 - the only "
-                  "machine with the memory (125 GiB against 30 on host-1..3) - and k8s-wk-04 is <b>not composed</b> "
-                  "in the lab, so the lab's Ceph would have three OSD nodes, the no-self-heal case the fourth exists to fix "
-                  "(open: K4 / backlog 3.48)." + ("" if built("kubernetes") else " Kubernetes guests are planned only - none is composed yet (B-07)."),
+                  "machine with the memory (125 GiB against 30 on host-1..3) - and k8s-wk-04 joins them there, as in "
+                  "production (decided 2026-10-14). It has <b>no OSD device yet</b>: host-4's spare NVMe became the pgBackRest "
+                  "store, so until backlog 3.48 is decided the lab's Ceph has three OSD nodes, the no-self-heal case." + ("" if built("kubernetes") else " Kubernetes guests are planned only - none is composed yet (B-07)."),
                   "note")
     return p
 

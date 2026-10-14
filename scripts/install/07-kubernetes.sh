@@ -1,0 +1,324 @@
+#!/usr/bin/env bash
+# =========================================================================================
+# 07-kubernetes.sh - Canonical Kubernetes on the k8s guests (backlog B-07).
+#
+#   IMAGES - the cluster's own images, carried in and served by Harbor (decided 2026-10-14):
+#     sudo ./07-kubernetes.sh images-export      MACHINE: stage-01 (online), refuses elsewhere.
+#                                                the list from the PINNED snap's images.txt;
+#                                                each image to an OCI layout under K8S_OCI_DIR,
+#                                                plus images.lock - what was taken, by digest
+#          ./07-kubernetes.sh images-load [dir]  MACHINE: whatever reaches Harbor with the
+#                                                layouts on disk - stage-01 in the lab while the
+#                                                gap cable is in; svc-harbor-01 in production,
+#                                                after fetching svc-repo-01's /oci/ (runbook 4.5c)
+#          ./07-kubernetes.sh images-check [dir] read-only, NO login: Harbor's digest for every
+#                                                image in images.lock, read the way containerd
+#                                                will read it
+#
+# WHERE THE IMAGES GO, AND WHY THE PROJECT IS NOT A PARAMETER
+#
+#   containerd on each node is told (hosts.d/ghcr.io/hosts.toml, Canonical's air-gap guide)
+#   that ghcr.io is served by Harbor. It then asks Harbor for the SAME path it would have asked
+#   ghcr.io for: ghcr.io/canonical/cilium:1.19.4-ck1 becomes a request for
+#   /v2/canonical/cilium/manifests/1.19.4-ck1. Harbor reads the first path component as the
+#   project. So the project is "canonical" because the snap's images say so - a different
+#   name would need override_path on every node to undo it. Derived, not chosen.
+#
+#   The project is PUBLIC for reads (decided 2026-10-14): hosts.toml has no place for a
+#   credential, and these are Canonical's public images. Pushing still needs the Harbor admin.
+#
+# WHY ONE PLATFORM (K8S_IMAGE_PLATFORM, decided 2026-10-14)
+#
+#   Upstream tags are multi-platform indexes (amd64 + arm64). Copying one platform keeps that
+#   platform's manifest byte for byte - its digest is Canonical's own amd64 digest, proven on
+#   stage-01 2026-10-14 against pause:3.10 - and roughly halves the transfer (~1 GB for the
+#   twelve images of rev 5526). Empty copies every platform, and the digest is then the index's.
+#
+# THE CHAIN OF CUSTODY
+#
+#   export   records each upstream digest in images.lock as it copies
+#   load     refuses a layout whose digest is not the one in images.lock, pushes, reads back
+#   check    reads every image back from Harbor WITHOUT credentials and compares to the lock
+#   Blobs are content-addressed, so a corrupted layer fails the push itself.
+#
+# CREDENTIALS: the Harbor admin password - environment HARBOR_ADMIN_PASSWORD > the site
+#   credentials file (credentials.sh) > asked at the terminal. It is never on a command line:
+#   regctl takes it on stdin and keeps its login in a private temporary HOME that is deleted
+#   on exit, and curl reads it from a config on stdin.
+# =========================================================================================
+set -euo pipefail
+
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENC="$(cd "$SELF/../enclave" && pwd)"
+ADDRS="$ENC/enclave-addresses.env"
+TPARAMS="$SELF/../transfer/transfer-params.env"
+# shellcheck disable=SC1091
+. "$ENC/credentials.sh"
+
+say()  { printf '  %s\n' "$*"; }
+ok()   { printf '  [ok] %s\n' "$*"; }
+warn() { printf '  [!!] %s\n' "$*" >&2; }
+die()  { printf '\n  [x] %s\n\n' "$*" >&2; exit 1; }
+need_root() { [ "$(id -u)" -eq 0 ] || die "run with sudo"; }
+
+[ -r "$ADDRS" ] || die "no address file at $ADDRS"
+# shellcheck disable=SC1090
+. "$ADDRS"
+# MIRROR_BASE lives in the transfer parameters on stage-01; elsewhere the default is the same path.
+if [ -r "$TPARAMS" ]; then
+  # shellcheck disable=SC1090
+  . "$TPARAMS"
+fi
+
+# The revision is a DECISION (Q23, 2026-08-31: v1.36.4, rev 5526), not a discovery - side-loading
+# pins it, and the images are whatever THAT revision's images.txt names.
+K8S_SNAP_REV="${K8S_SNAP_REV:-5526}"
+K8S_SNAP_DIR="${K8S_SNAP_DIR:-${MIRROR_BASE:-/srv/apt-mirror}/snaps}"
+K8S_OCI_DIR="${K8S_OCI_DIR:-${MIRROR_BASE:-/srv/apt-mirror}/mirror/oci/k8s-${K8S_SNAP_REV}}"
+K8S_IMAGE_PLATFORM="${K8S_IMAGE_PLATFORM-linux/amd64}"
+K8S_UPSTREAM_REGISTRY="${K8S_UPSTREAM_REGISTRY:-ghcr.io}"   # the one registry hosts.d redirects
+K8S_REGISTRY="${K8S_REGISTRY:-svc-harbor-01.${ENCLAVE_DOMAIN:?}}"
+K8S_HARBOR_USER="${K8S_HARBOR_USER:-admin}"
+# 'yes' lets images-export replace a layout whose tag Canonical has since moved. Off by default:
+# a moved tag means the images in the gap are not the ones that were tested.
+K8S_EXPORT_REPLACE="${K8S_EXPORT_REPLACE:-}"
+
+LOCK_NAME='images.lock'
+
+# regctl gets a private HOME: its login lands there and dies with it, and root's or the
+# operator's own registry logins are never used by accident. A second, EMPTY home is the
+# anonymous reader for images-check - what containerd will be.
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+mkdir -m 700 "$WORK/home" "$WORK/anon"
+rc_auth() { HOME="$WORK/home" command regctl "$@"; }
+rc_anon() { HOME="$WORK/anon" command regctl "$@"; }
+
+need_tools() {
+  local t
+  for t in "$@"; do command -v "$t" >/dev/null || die "$t not found - it is Stage-B tooling (runbook 4.5c); in the gap, /bin/ on svc-repo-01"; done
+}
+
+# ghcr.io/canonical/cilium:1.19.4-ck1 -> canonical/cilium   (the path, no registry, no tag)
+img_path() { local r="${1#*/}"; printf '%s' "${r%:*}"; }
+img_tag()  { printf '%s' "${1##*:}"; }
+img_reg()  { printf '%s' "${1%%/*}"; }
+
+plat_args() { [ -n "$K8S_IMAGE_PLATFORM" ] && printf -- '--platform\n%s\n' "$K8S_IMAGE_PLATFORM"; return 0; }
+
+# The lock, as "ref digest" lines. Refuses a missing or empty one - a load with nothing to
+# compare against is not a load.
+read_lock() {
+  local dir="$1" body
+  [ -r "$dir/$LOCK_NAME" ] || die "no $LOCK_NAME in $dir - was images-export run, and is this the directory it wrote?"
+  body="$(grep -vE '^[[:space:]]*(#|$)' "$dir/$LOCK_NAME" || true)"
+  [ -n "$body" ] || die "$dir/$LOCK_NAME lists no images"
+  printf '%s\n' "$body" | awk 'NF!=2 {exit 1}' || die "$dir/$LOCK_NAME has a line that is not 'image digest'"
+  printf '%s\n' "$body"
+}
+
+# ---- images-export ------------------------------------------------------------------------
+cmd_images_export() {
+  need_root
+  need_tools regctl unsquashfs sha256sum
+  # WHERE: the staging machine, by address - the same rule as 06a: never a typed name.
+  local mine; mine="$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1)"
+  printf '%s\n' "$mine" | grep -qx "${STAGE_01:?no STAGE_01 in $ADDRS}" \
+    || die "this machine ($(hostname -s)) does not hold STAGE_01 ($STAGE_01) - images-export runs on the online staging machine only"
+
+  local snap="$K8S_SNAP_DIR/k8s_${K8S_SNAP_REV}.snap"
+  [ -r "$snap" ] || die "no $snap - the pinned snap is not staged here"
+  [ -r "${snap%.snap}.assert" ] || die "no ${snap%.snap}.assert beside the snap - it would not side-load in the gap either"
+
+  local list; list="$(unsquashfs -cat "$snap" images.txt)" || die "could not read images.txt from $snap"
+  local n; n="$(printf '%s\n' "$list" | grep -c .)"
+  local snapsum; snapsum="$(sha256sum "$snap" | cut -c1-64)"
+  say "snap        k8s rev $K8S_SNAP_REV  sha256 ${snapsum:0:16}...  ($n images in its images.txt)"
+  say "platform    ${K8S_IMAGE_PLATFORM:-all (whole index)}"
+  say "into        $K8S_OCI_DIR"
+  echo
+
+  local r bad=""
+  for r in $list; do
+    [ "$(img_reg "$r")" = "$K8S_UPSTREAM_REGISTRY" ] \
+      || bad="$bad $r"
+  done
+  [ -z "$bad" ] || die "image(s) not on $K8S_UPSTREAM_REGISTRY:$bad
+      Each upstream registry needs its own hosts.d entry on every node and its own path rule
+      here. Neither exists - extend both before carrying these."
+
+  mkdir -p "$K8S_OCI_DIR"
+  local lock="$WORK/lock" up have dst copied=0 kept=0 moved=""
+  : > "$lock"
+  # shellcheck disable=SC2046
+  for r in $list; do
+    dst="ocidir://$K8S_OCI_DIR/$(img_path "$r"):$(img_tag "$r")"
+    up="$(rc_auth image digest $(plat_args) "$r")" || die "could not read $r from $K8S_UPSTREAM_REGISTRY"
+    have=""
+    # A layout that is not there yet is the normal first run; one that IS there and cannot
+    # be read is a fault, and its error is shown rather than mistaken for "not there".
+    if [ -e "$K8S_OCI_DIR/$(img_path "$r")/index.json" ]; then
+      have="$(rc_auth image digest "$dst" 2>&1)" || die "$r: a layout exists but cannot be read: $have"
+    fi
+    if [ "$have" = "$up" ]; then
+      printf '  %-58s %s  already exported - unchanged\n' "$r" "${up:7:12}"
+      kept=$((kept + 1))
+    else
+      if [ -n "$have" ] && [ "$K8S_EXPORT_REPLACE" != yes ]; then
+        moved="$moved
+      $r  local ${have:7:12}  upstream now ${up:7:12}"
+        continue
+      fi
+      rc_auth image copy $(plat_args) "$r" "$dst" >/dev/null || die "copy failed: $r"
+      have="$(rc_auth image digest "$dst")"
+      [ "$have" = "$up" ] || die "$r: the layout's digest ${have:7:12} is not upstream's ${up:7:12} - not recording it"
+      printf '  %-58s %s  exported\n' "$r" "${up:7:12}"
+      copied=$((copied + 1))
+    fi
+    printf '%s %s\n' "$r" "$up" >> "$lock"
+  done
+  [ -z "$moved" ] || die "Canonical has MOVED these tags since they were exported:$moved
+      The images in the gap would no longer be the ones tested. Find out why before replacing
+      them; to take the new ones: sudo K8S_EXPORT_REPLACE=yes $0 images-export"
+
+  { printf '# %s - 07-kubernetes.sh images-export, %s on %s\n' "$LOCK_NAME" "$(date -u +%FT%TZ)" "$(hostname -s)"
+    printf '# snap k8s rev %s (sha256 %s), platform %s, %s images\n' "$K8S_SNAP_REV" "$snapsum" "${K8S_IMAGE_PLATFORM:-all}" "$n"
+    printf '# Each line: the image as the snap names it, then the manifest digest exported for it.\n'
+    cat "$lock"; } > "$K8S_OCI_DIR/$LOCK_NAME.new"
+  mv "$K8S_OCI_DIR/$LOCK_NAME.new" "$K8S_OCI_DIR/$LOCK_NAME"
+  # nginx on svc-repo-01 serves this tree as www-data; root-only files would be a 403 there.
+  chmod -R a+rX "$K8S_OCI_DIR"
+
+  echo
+  ok "$n images: $copied exported, $kept already there  ($(du -sh "$K8S_OCI_DIR" | cut -f1) on disk)"
+  ok "$K8S_OCI_DIR/$LOCK_NAME written"
+  say "the mirror's oci/ tree crosses with every transfer (restore-mirror.sh) - nothing new to carry"
+}
+
+# ---- Harbor: login and the project --------------------------------------------------------
+HPW=""
+harbor_password() {
+  [ -n "$HPW" ] && return 0
+  HPW="${HARBOR_ADMIN_PASSWORD:-}"
+  if [ -z "$HPW" ]; then
+    cred_require_safe
+    HPW="$(cred_get HARBOR_ADMIN_PASSWORD)"
+  fi
+  if [ -z "$HPW" ]; then
+    [ -r /dev/tty ] || die "no HARBOR_ADMIN_PASSWORD in the environment or the credentials file, and no terminal to ask on"
+    read -rsp "  Harbor password for $K8S_HARBOR_USER@$K8S_REGISTRY: " HPW < /dev/tty; echo
+  fi
+  [ -n "$HPW" ] || die "no Harbor password given"
+}
+
+# harbor_api METHOD PATH [JSON] -> HTTP code on stdout, body in $WORK/api.out. The credential
+# goes to curl as a config on stdin, never as an argument.
+harbor_api() {
+  local m="$1" p="$2" d="${3:-}" pw="${HPW//\\/\\\\}"
+  pw="${pw//\"/\\\"}"
+  local args=(-sS -K - -X "$m" -o "$WORK/api.out" -w '%{http_code}' -H 'Content-Type: application/json'
+              -H 'X-Is-Resource-Name: true')
+  [ -n "$d" ] && args+=(--data "$d")
+  printf 'user = "%s:%s"\n' "$K8S_HARBOR_USER" "$pw" | curl "${args[@]}" "https://$K8S_REGISTRY/api/v2.0$p"
+}
+
+ensure_project() {
+  local proj="$1" code pub
+  code="$(harbor_api GET "/projects/$proj")" || die "Harbor API unreachable at $K8S_REGISTRY"
+  case "$code" in
+    200) ;;
+    404)
+      code="$(harbor_api POST /projects "{\"project_name\":\"$proj\",\"metadata\":{\"public\":\"true\",\"auto_scan\":\"true\"}}")"
+      [ "$code" = 201 ] || die "creating project $proj: HTTP $code - $(head -c 300 "$WORK/api.out")"
+      ok "project $proj created - public read, scan on push"
+      return 0 ;;
+    401) die "Harbor refused the login for $K8S_HARBOR_USER (HTTP 401)" ;;
+    *)   die "looking up project $proj: HTTP $code - $(head -c 300 "$WORK/api.out")" ;;
+  esac
+  pub="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("metadata",{}).get("public",""))' "$WORK/api.out")"
+  if [ "$pub" = true ]; then
+    ok "project $proj already public - unchanged"
+  else
+    code="$(harbor_api PUT "/projects/$proj" '{"metadata":{"public":"true"}}')"
+    [ "$code" = 200 ] || die "making project $proj public: HTTP $code - $(head -c 300 "$WORK/api.out")"
+    ok "project $proj made public (it was: ${pub:-unset}) - containerd has no credential to offer"
+  fi
+}
+
+# ---- images-load --------------------------------------------------------------------------
+cmd_images_load() {
+  local dir="${1:-$K8S_OCI_DIR}"
+  need_tools regctl curl python3
+  local entries; entries="$(read_lock "$dir")"
+  local projects; projects="$(printf '%s\n' "$entries" | awk '{print $1}' | while read -r r; do img_path "$r" | cut -d/ -f1; done | sort -u)"
+  say "from        $dir  ($(printf '%s\n' "$entries" | grep -c .) images in $LOCK_NAME)"
+  say "into        $K8S_REGISTRY  project(s): $(printf '%s' "$projects" | tr '\n' ' ')"
+  echo
+
+  # Every layout is checked against the lock BEFORE anything is pushed: a half-loaded
+  # registry is worse than an unloaded one.
+  local r want have
+  while read -r r want; do
+    have="$(rc_anon image digest "ocidir://$dir/$(img_path "$r"):$(img_tag "$r")" 2>&1)" \
+      || die "$r: no readable layout in $dir ($have)"
+    [ "$have" = "$want" ] || die "$r: the layout on disk is ${have:7:12}, $LOCK_NAME says ${want:7:12} - refusing to load any of it"
+  done <<< "$entries"
+  ok "all layouts match $LOCK_NAME"
+
+  harbor_password
+  printf '%s' "$HPW" | rc_auth registry login "$K8S_REGISTRY" -u "$K8S_HARBOR_USER" --pass-stdin >/dev/null \
+    || die "regctl could not log in to $K8S_REGISTRY as $K8S_HARBOR_USER"
+  local p
+  for p in $projects; do ensure_project "$p"; done
+
+  local tgt now pushed=0 kept=0
+  while read -r r want; do
+    tgt="$K8S_REGISTRY/$(img_path "$r"):$(img_tag "$r")"
+    # Not there yet is normal; the reason is kept so a push that then fails can show it.
+    now="$(rc_auth image digest "$tgt" 2>"$WORK/err" || true)"
+    if [ "$now" = "$want" ]; then
+      printf '  %-58s %s  already in Harbor - unchanged\n' "$tgt" "${want:7:12}"
+      kept=$((kept + 1)); continue
+    fi
+    rc_auth image copy "ocidir://$dir/$(img_path "$r"):$(img_tag "$r")" "$tgt" >/dev/null \
+      || die "push failed: $tgt (before it, Harbor said: $(tail -1 "$WORK/err"))"
+    now="$(rc_auth image digest "$tgt")"
+    [ "$now" = "$want" ] || die "$tgt: Harbor now serves ${now:7:12}, not ${want:7:12}"
+    printf '  %-58s %s  pushed\n' "$tgt" "${want:7:12}"
+    pushed=$((pushed + 1))
+  done <<< "$entries"
+  rc_auth registry logout "$K8S_REGISTRY" >/dev/null 2>&1 || true
+  echo
+  ok "$pushed pushed, $kept already there - next: $0 images-check${1:+ $1}"
+}
+
+# ---- images-check -------------------------------------------------------------------------
+cmd_images_check() {
+  local dir="${1:-$K8S_OCI_DIR}"
+  need_tools regctl
+  local entries; entries="$(read_lock "$dir")"
+  say "reading $K8S_REGISTRY with NO credentials - the way containerd will"
+  echo
+  local r want have tgt fail=0 n=0
+  while read -r r want; do
+    n=$((n + 1))
+    tgt="$K8S_REGISTRY/$(img_path "$r"):$(img_tag "$r")"
+    if ! have="$(rc_anon image digest "$tgt" 2>&1)"; then
+      printf '  [x] %-58s NOT READABLE: %s\n' "$tgt" "$(printf '%s' "$have" | tail -1)"; fail=$((fail + 1))
+    elif [ "$have" != "$want" ]; then
+      printf '  [x] %-58s %s  lock says %s\n' "$tgt" "${have:7:12}" "${want:7:12}"; fail=$((fail + 1))
+    else
+      printf '  [ok] %-57s %s\n' "$tgt" "${have:7:12}"
+    fi
+  done <<< "$entries"
+  echo
+  [ "$fail" -eq 0 ] || die "$fail of $n images missing or different in Harbor"
+  ok "all $n images in Harbor, readable anonymously, digests match $LOCK_NAME"
+}
+
+case "${1:-}" in
+  images-export) shift; cmd_images_export "$@" ;;
+  images-load)   shift; cmd_images_load "$@" ;;
+  images-check)  shift; cmd_images_check "$@" ;;
+  *) sed -n '2,16p' "$0"; exit 2 ;;
+esac

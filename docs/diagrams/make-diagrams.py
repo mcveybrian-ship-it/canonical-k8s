@@ -315,12 +315,13 @@ def page_networks():
             "pg-01..03 %s - %s<br>"
             "<b>Kubernetes API VIP %s</b> (keepalived) · control planes %s - %s · workers %s - %s<br>"
             "<b>LoadBalancer pool %s - %s</b> (built-in, layer-2) - the Gateway VIP and *.apps come from here<br>"
-            "pods 10.1.0.0/16 · services 10.152.183.0/24 (Canonical defaults, set at bootstrap)<br>"
+            "pods %s + %s · services %s + %s (set at bootstrap, never changeable)<br>"
             "DNS: enclave.internal on svc-mgmt-01 · *.apps.enclave.internal → the Gateway VIP (today a placeholder on the API VIP)"
             % (addr("HOST_1"), addr("HOST_4"), addr("SVC_MGMT_01"), addr("SVC_REPO_01"), addr("SVC_HARBOR_01"),
                addr("SVC_OBS_01"), addr("PG_01"), addr("PG_03"), addr("K8S_API_VIP"), addr("K8S_CP_01"),
                addr("K8S_CP_03"), addr("K8S_WK_01"), addr("K8S_WK_04"), addr("K8S_LB_POOL_START"),
-               addr("K8S_LB_POOL_END")))
+               addr("K8S_LB_POOL_END"), addr("K8S_POD_CIDR_V4"), addr("K8S_POD_CIDR_V6"),
+               addr("K8S_SERVICE_CIDR_V4"), addr("K8S_SERVICE_CIDR_V6")))
     p.box(30, 680, 1000, 170, plan, "note")
     stor = ("<b>Storage network</b> (backlog 3.16)<br>"
             "hosts %s - %s (STORAGE_HOST_n) · lab: vault 10.2.30.170, NAS 10.2.30.171<br>"
@@ -330,11 +331,13 @@ def page_networks():
             % (addr("STORAGE_HOST_1"), addr("STORAGE_HOST_4")))
     p.box(1060, 680, 590, 170, stor, "note")
     p.box(30, 880, 1620, 110,
-          "<b>Dual-stack (required, B-07 - not designed):</b> one private IPv6 ULA prefix (RFC 4193) generated once; "
-          "a /64 for the node network with static addresses (no router, no DHCPv6 - 3.54); IPv6 pod, service and "
-          "LoadBalancer ranges; node IPs explicit for both families. Must be in the bootstrap config - the ranges "
-          "cannot change afterwards.<br><b>Geo-diverse sites (option):</b> both VIPs are layer-2 announcements, so "
-          "they need one layer-2 network across locations, or a different mechanism.", "planned", 11)
+          "<b>Dual-stack (B-07, plan approved 2026-10-14):</b> ULA %s (RFC 4193, generated once) · node network %s, "
+          "static, a node's host part = the digits of its IPv4 last octet (10.2.20.171 → %s171) · "
+          "LoadBalancer %s - %s · ONLY the seven k8s nodes get IPv6; the API VIP, the storage network and every "
+          "other machine stay IPv4. No router, no DHCPv6, no RAs (3.54, 3.55).<br><b>Geo-diverse sites (option):</b> both VIPs are layer-2 announcements, so "
+          "they need one layer-2 network across locations, or a different mechanism."
+          % (addr("ENCLAVE_ULA"), addr("K8S_NODE_V6_NET"), addr("K8S_NODE_V6_NET").split("/")[0],
+             addr("K8S_LB_POOL_V6_START"), addr("K8S_LB_POOL_V6_END")), "planned", 11)
     return p
 
 

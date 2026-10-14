@@ -539,8 +539,11 @@ def page_backup():
     pb3 = p.box(470, 430, 380, 60, "<b>pgBackRest store 2</b> - host-3", "pg", 11)
     p.edge(pgs, pb4, "WAL + backups", FLOW)
     p.edge(pgs, pb3, "", FLOW)
-    p.box(950, 360, 700, 130, "<b>3.50:</b> pgBackRest's repositories are NOT copied to the lab stores until repository "
-          "encryption is on - they hold real records. Point-in-time restore proven from both stores (2026-09-28).", "note")
+    pgn = p.box(950, 360, 330, 80, "<b>pgBackRest copy → NAS</b><br>store 1, nightly · ciphertext only (lab only)", "lab", 11)
+    p.edge(pb4, pgn, "nightly · lab only", FLOW_LAB)
+    p.box(1320, 360, 330, 130, "<b>3.50 (2026-10-13):</b> both stores encrypted by pgBackRest (aes-256-cbc), restore proven "
+          "from each. A copy leaves a store only as ciphertext - the copy refuses anything else; the passphrase is "
+          "in the sealed envelope.", "note")
     k = p.box(40, 540, 330, 80, "<b>Kubernetes etcd</b><br>(planned)", "k8s", 11)
     ks = p.box(470, 540, 380, 80, "nightly etcd snapshot → the backup volume (rides the copies) + a cluster restore drill", "planned", 11)
     p.edge(k, ks, "", FLOW_DASH)
@@ -553,7 +556,8 @@ def page_backup():
     p.box(40, 800, 1610, 120,
           "<b>Records destruction (3.27, go-live gate):</b> backups must age out within ~60 days - an age-based full every 30 days, two "
           "chains kept, a legal-hold switch, a disposal log - and every copy follows the source (--delete). Measured 2026-09-24: "
-          "retention is currently UNBOUNDED (nightly runs are incremental, so no chain ever retires). Build owed.", "note")
+          "retention was UNBOUNDED (nightly runs are incremental, so no chain ever retired). Live 2026-10-13 - contingency plan "
+          "4.7 is the admin guide.", "note")
     return p
 
 

@@ -274,7 +274,8 @@ reasons: `usb-storage` is STIG-blocked, LUKS is locked, and nothing types the pa
 **Both off-host copies share one family, labelled `copy="second"` / `copy="third"` and `target`, and
 it reports even when a copy is not configured.** The third copy may name several stores
 (`BACKUP_THIRD_ADDR` became a list on 2026-10-13 - in the lab the vault and the NAS), so every copy
-metric carries the target, and both alerts match on `instance, copy, target`. `enclave_backup_copy_configured{copy,target}` is emitted as
+metric carries the target, and both alerts match on `instance, copy, target`. The lab's copy of the
+pgBackRest store reports the same way as `copy="pgbackrest"` (`vm-backup.sh pgbackrest-copy`). `enclave_backup_copy_configured{copy,target}` is emitted as
 `0` when no target is set, because a *missing* series reads as "no data" on a dashboard and that
 is indistinguishable from silence — the same trap as the unmounted destination above. Once a copy
 has run: `enclave_backup_copy_last_run_seconds`, `enclave_backup_copy_last_rc` (0 = clean),

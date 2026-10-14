@@ -19,6 +19,8 @@
 #     sudo ./vm-backup.sh third-copy [--target A] the same, to each store the site names in
 #                                                BACKUP_THIRD_ADDR - a list; in the lab the Dell vault
 #                                                and the NAS; off (a no-op) when that is empty
+#     sudo ./vm-backup.sh pgbackrest-copy [-n]   this host's ENCRYPTED pgBackRest store, mirrored to
+#                                                BACKUP_PGBR_COPY - the NAS in the lab; off when empty
 #     sudo ./vm-backup.sh restore-test <vm>      REHEARSE one: rebuild the chain into its own
 #                                                directory, boot it as restore-test-<vm> with
 #                                                no NIC, prove it, remove it. Touches nothing live
@@ -107,6 +109,12 @@ THIRD_DIR="${BACKUP_THIRD_DIR:-/srv/cold/backup-copy}"
 THIRD_KEY="${BACKUP_THIRD_KEY:-/etc/enclave/backup-third.key}"
 THIRD_STATE="${BACKUP_THIRD_STATE:-/var/lib/enclave-backup-third.state}"
 THIRD_SKIP="${BACKUP_THIRD_SKIP:-$SECOND_SKIP}"
+# THE pgBackRest STORE COPY - LAB ONLY (2026-10-13). This host's pgBackRest repository - encrypted by
+# pgBackRest itself (3.50) - pushed nightly to ONE target, [user@]address:directory. Empty = off, and
+# off everywhere but the lab. See cmd_pgbackrest_copy.
+PGBR_COPY="${BACKUP_PGBR_COPY:-}"
+PGBR_COPY_KEY="${BACKUP_PGBR_COPY_KEY:-/etc/enclave/backup-pgbackrest.key}"
+PGBR_COPY_STATE="${BACKUP_PGBR_COPY_STATE:-/var/lib/enclave-backup-pgbackrest.state}"
 # RECORDS DESTRUCTION (backlog 3.27) - see vm-specs.env and cmd_hold below.
 FULL_MAX_DAYS="${BACKUP_FULL_MAX_DAYS:-30}"
 HOLD_FILE="${RECORDS_HOLD_FILE:-/etc/enclave/records-hold}"
@@ -1369,13 +1377,16 @@ ExecStart=${self} incr
 # question - see ${VERIFY_SVC}.timer, installed alongside this one.
 ExecStart=${self} verify
 ExecStart=${self} prune
-# The off-host copy, LAST and non-fatal: a network or a far-end problem must not make the
-# night's backup look failed when the backup itself succeeded. It reports through
-# enclave_backup_second_* - an ageing timestamp there is the signal, not this unit's status.
+# The off-host copies, LAST and non-fatal: a network or a far-end problem must not make the
+# night's backup look failed when the backup itself succeeded. Each reports through
+# enclave_backup_copy_* and its alerts (3.58) - that is the signal, not this unit's status.
 ExecStart=-${self} second-copy
-# A third copy where the site names one (BACKUP_THIRD_ADDR - the Dell vault in the lab). Also
-# non-fatal, and a no-op when the address is empty.
+# The third copy where the site names stores (BACKUP_THIRD_ADDR - the vault and the NAS in the lab).
+# Also non-fatal, and a no-op when it is empty.
 ExecStart=-${self} third-copy
+# The pgBackRest store's copy (BACKUP_PGBR_COPY - the NAS in the lab), hours after this host's 01:30
+# UTC database backup. Non-fatal; a no-op when empty, and on a host that is no pgBackRest store.
+ExecStart=-${self} pgbackrest-copy
 EOF
 
   cat > "/etc/systemd/system/${SVC_NAME}.timer" <<EOF
@@ -1867,11 +1878,16 @@ copy_rows() {
   local h u a d k st
   h="$(second_host)"
   printf 'second %s %s\n' "${h:-none}" "$( [ -n "$h" ] && echo "$SECOND_STATE" || echo - )"
-  if [ -z "$THIRD_ADDR" ]; then printf 'third none -\n'; return 0; fi
-  while read -r u a d; do
-    read -r k st <<<"$(third_paths "$a")"
-    printf 'third %s %s\n' "$a" "$st"
-  done < <(third_targets)
+  if [ -z "$THIRD_ADDR" ]; then
+    printf 'third none -\n'
+  else
+    while read -r u a d; do
+      read -r k st <<<"$(third_paths "$a")"
+      printf 'third %s %s\n' "$a" "$st"
+    done < <(third_targets)
+  fi
+  if [ -z "$PGBR_COPY" ]; then printf 'pgbackrest none -\n'
+  else read -r u a d <<<"$(pgbr_copy_target)"; printf 'pgbackrest %s %s\n' "$a" "$PGBR_COPY_STATE"; fi
 }
 
 # third_targets -> one line per target, "USER ADDRESS DIRECTORY". BACKUP_THIRD_ADDR is a LIST since
@@ -1900,10 +1916,11 @@ third_paths() {
   printf '%s %s\n' "$k" "$s"
 }
 
-# third_setup USER ADDRESS DIRECTORY KEY - make the target's own key, print what to authorise there
-third_setup() {
-  local u="$1" a="$2" d="$3" k="$4" myaddr line
-  copy_key "$k" "vm-backup third copy from $(hostname -s) to $a"
+# copy_setup USER ADDRESS DIRECTORY KEY LABEL NEXT - make a target's own key, print what to authorise
+# there, then the command to run next (third-copy and pgbackrest-copy both use it)
+copy_setup() {
+  local u="$1" a="$2" d="$3" k="$4" label="$5" next="$6" myaddr line
+  copy_key "$k" "vm-backup $label from $(hostname -s) to $a"
   # The address this host connects FROM - asked of the kernel, as second-copy does. For the lab
   # stores that is the storage NIC's address (3.16), and that is correct.
   myaddr="$(ip -4 route get "$a" 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1)"
@@ -1911,7 +1928,7 @@ third_setup() {
   say "this host reaches $a from $myaddr"
   line="from=\"$myaddr\",restrict,command=\"/usr/bin/rrsync -wo $d\" $(cut -d" " -f1-2 "$k.pub")"
   if [ "$u" = root ]; then
-    printf '\n  ON THE THIRD-COPY STORE (%s), run this ONCE - it authorises a WRITE-ONLY rsync into one directory:\n\n' "$a"
+    printf '\n  ON THE %s STORE (%s), run this ONCE - it authorises a WRITE-ONLY rsync into one directory:\n\n' "${label^^}" "$a"
     printf '    ls -l /usr/bin/rsync /usr/bin/rrsync\n'
     printf '    sudo install -d -m 0750 -o root -g root %s\n' "$d"
     printf '    sudo install -d -m 0700 /root/.ssh\n'
@@ -1919,13 +1936,13 @@ third_setup() {
     printf '    sudo chmod 600 /root/.ssh/authorized_keys\n\n'
   else
     # A STORE THAT LOGS THE COPY IN AS ITS OWN USER (the lab NAS - TrueNAS refuses root over ssh).
-    printf '\n  ON THE THIRD-COPY STORE (%s), ONCE, as its administrator - a WRITE-ONLY rsync for user %s:\n\n' "$a" "$u"
+    printf '\n  ON THE %s STORE (%s), ONCE, as its administrator - a WRITE-ONLY rsync for user %s:\n\n' "${label^^}" "$a" "$u"
     printf '    1. the directory must exist and belong to %s:   install -d -m 0700 -o %s -g %s %s\n' "$u" "$u" "$u" "$d"
     printf '    2. this ONE line goes in %s'"'"'s authorized keys - on TrueNAS: Credentials > Users > %s >\n' "$u" "$u"
     printf '       Edit > SSH Access > Public SSH Key (the whole line, restrictions and all):\n\n'
     printf '    %s\n\n' "$line"
   fi
-  say "then:  sudo $0 third-copy -n --target $a"
+  say "then:  sudo $0 $next"
 }
 
 cmd_third_copy() {
@@ -1954,7 +1971,7 @@ cmd_third_copy() {
     read -r k st <<<"$(third_paths "$a")"
     # </dev/null ON EVERY CALL: this loop reads its targets from stdin, and ssh reads stdin too - the
     # first target's ssh would swallow the rest of the list, and they would silently never run.
-    if [ "$setup" -eq 1 ]; then third_setup "$u" "$a" "$d" "$k" </dev/null; continue; fi
+    if [ "$setup" -eq 1 ]; then copy_setup "$u" "$a" "$d" "$k" "third copy" "third-copy -n --target $a" </dev/null; continue; fi
     # EACH TARGET IN ITS OWN SUBSHELL: push_sets dies on a failure, and one store failing must not
     # stop the next - the vault and the NAS are independent.
     ( push_sets "third copy" "$k" "$a" "$a" "$d" "$THIRD_SKIP" "$st" \
@@ -1962,6 +1979,140 @@ cmd_third_copy() {
   done < <(third_targets)
   [ "$n" -gt 0 ] || die "no third-copy target is '$only' (BACKUP_THIRD_ADDR: $THIRD_ADDR)"
   [ -z "$failed" ] || die "third copy FAILED for:$failed - every other target ran; each one's section is above"
+}
+
+# ---------------------------------------------------------------- the pgBackRest store copy
+# A NIGHTLY COPY OF THIS HOST'S pgBackRest REPOSITORY - LAB ONLY (2026-10-13, after 3.50): to the
+# target in BACKUP_PGBR_COPY, so the lab can rebuild its database as well as its VMs. The repository
+# is pgBackRest's own ciphertext since 3.50, and this REFUSES to send one that is not - real records
+# never leave the store in the clear. The passphrase never goes with it: a restore from the copy needs
+# the sealed envelope (airgap-media.md 9.6).
+#
+#     sudo ./vm-backup.sh pgbackrest-copy --setup     its OWN key, and what to authorise on the target
+#     sudo ./vm-backup.sh pgbackrest-copy [-n]        mirror (--delete: expiry follows), then re-read
+#
+# The repository is LIVE - WAL keeps arriving - so a file vanishing mid-copy (rsync exit 24) is normal,
+# and the re-read covers the files that existed when the copy began, not ones that landed since.
+# Reports as copy="pgbackrest" through the same facts and alerts as the VM copies.
+
+# pgbr_copy_target -> "USER ADDRESS DIRECTORY" from BACKUP_PGBR_COPY
+pgbr_copy_target() {
+  local a="$PGBR_COPY" u=root d=""
+  case "$a" in *@*) u="${a%%@*}"; a="${a#*@}" ;; esac
+  case "$a" in *:*) d="${a#*:}"; a="${a%%:*}" ;; esac
+  printf '%s %s %s\n' "$u" "$a" "$d"
+}
+
+# pgbr_store_path -> this host's repository path from PG_BACKUP_STORES (vm-specs.env), or nothing
+pgbr_store_path() {
+  local st me; me="$(hostname -s)"
+  for st in ${PG_BACKUP_STORES:-}; do
+    [ "${st%%=*}" = "$me" ] && { printf '%s\n' "${st#*=}"; return 0; }
+  done
+  return 0
+}
+
+# pgbr_repo_encrypted PATH -> true only when it holds info files and EVERY one is pgBackRest ciphertext
+# (each begins "Salted__", CIPHER_BLOCK_MAGIC in pgBackRest 2.50's cipherBlock.c)
+pgbr_repo_encrypted() {
+  local f n=0
+  for f in "$1"/backup/*/backup.info "$1"/archive/*/archive.info; do
+    [ -e "$f" ] || continue
+    n=$((n + 1))
+    [ "$(head -c 8 "$f")" = "Salted__" ] || return 1
+  done
+  [ "$n" -gt 0 ]
+}
+
+cmd_pgbackrest_copy() {
+  local setup=0 dry=0 u a d src
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --setup) setup=1; shift ;;
+      -n|--dry-run) dry=1; shift ;;
+      *) die "pgbackrest-copy: unknown argument $1" ;;
+    esac
+  done
+  need_root
+  if [ -z "$PGBR_COPY" ]; then
+    say "pgBackRest copy not configured (BACKUP_PGBR_COPY is empty) - nothing to do"
+    return 0
+  fi
+  read -r u a d <<<"$(pgbr_copy_target)"
+  [[ "$a" =~ ^[A-Za-z0-9.-]+$ ]] || die "BACKUP_PGBR_COPY address '$a' is not an address"
+  [[ "$u" =~ ^[a-z_][a-z0-9_-]*$ ]] || die "BACKUP_PGBR_COPY user '$u' is not a user name"
+  [ -n "$d" ] || die "BACKUP_PGBR_COPY needs a directory: [user@]address:directory"
+  src="$(pgbr_store_path)"
+  [ -n "$src" ] || die "$(hostname -s) is not a pgBackRest store in PG_BACKUP_STORES - nothing to copy"
+  [ -d "$src" ] || die "no repository at $src"
+  # THE 3.50 RULE, IN CODE - checked before setup too, so no key is made for a store it would refuse.
+  pgbr_repo_encrypted "$src" || die "REFUSING: $src has an info file that is NOT pgBackRest ciphertext, or none at all.
+       Real records never leave the store unencrypted (backlog 3.50). Nothing was sent."
+  if [ "$setup" -eq 1 ]; then copy_setup "$u" "$a" "$d" "$PGBR_COPY_KEY" "pgbackrest copy" "pgbackrest-copy -n"; return 0; fi
+  push_dir "pgBackRest copy" "$PGBR_COPY_KEY" "$u" "$a" "$d" "$src" "$PGBR_COPY_STATE" "$dry"
+}
+
+# push_dir LABEL KEY USER ADDRESS DIRECTORY SOURCE STATE DRY - one directory tree, mirrored with
+# --delete to a far end whose key is confined to a write-only rrsync, over ONE ssh connection (the
+# ufw rate limit - see push_sets), then re-read with --checksum. The whole tree every run: it is
+# small (the repository of a 0.4 GB database), and a ledger would be complexity to save seconds.
+push_dir() {
+  local label="$1" key="$2" ruser="$3" addr="$4" rdir="$5" src="$6" state="$7" dry="$8"
+  local ctl lst out xrc=0 vout vrc=0 diff rc=0 t0 t1 now prev_ok bytes delpath ndel=0
+  [ -r "$key" ] || die "no key at $key - run: sudo $0 pgbackrest-copy --setup"
+  say "$label: $(hostname -s):$src -> $ruser@$addr:$rdir"
+  ctl="$(mktemp -d /run/vm-backup-ssh.XXXXXX)" || die "cannot create an ssh control directory under /run"
+  local SSH=(ssh -i "$key" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o LogLevel=ERROR -o IdentitiesOnly=yes
+             -o ControlMaster=auto -o "ControlPath=$ctl/%C" -o ControlPersist=120)
+  # pgBackRest writes each file under a temporary name and renames it: never copy a half-written one
+  local -a RS=(rsync -a --partial --delete --exclude='*.pgbackrest.tmp' -e "${SSH[*]}")
+  t0="$(date +%s)"
+  # what exists NOW: the re-read checks these files, not WAL that lands while the copy runs
+  lst="$(mktemp)"; (cd "$src" && find . -type f ! -name '*.pgbackrest.tmp' -printf '%P\n') > "$lst"
+  if [ "$dry" -eq 1 ]; then
+    "${RS[@]}" --dry-run --itemize-changes "$src/" "$ruser@$addr:./" || xrc=$?
+  else
+    out="$("${RS[@]}" --info=del1 "$src/" "$ruser@$addr:./" 2>&1)" || xrc=$?
+    [ -z "$out" ] || printf '%s\n' "$out" | sed 's/^/     /'
+    # THE COPY FOLLOWS pgBackRest's EXPIRY (3.27): every directory it removes at the far end is a
+    # disposal record; the files inside are counted, not listed one by one.
+    while IFS= read -r delpath; do
+      [ -n "$delpath" ] || continue
+      ndel=$((ndel + 1))
+      case "$delpath" in */) disposal_log "COPY-DELETED copy=pgbackrest target=$addr path=$delpath" ;; esac
+    done < <(printf '%s\n' "$out" | sed -n 's|^deleting \(.*\)$|\1|p')
+    [ "$ndel" -eq 0 ] || say "  the far end followed the source: $ndel path(s) deleted, each directory in the disposal log"
+  fi
+  # 24 = "some files vanished before they could be transferred": WAL being archived, normal here
+  case "$xrc" in 0) ;; 24) warn "some files vanished while copying - WAL arriving on a live repository; the next run takes them" ;;
+    *) warn "rsync FAILED (exit $xrc) - see the error above"; rc=1 ;; esac
+  if [ "$dry" -eq 0 ] && [ "$rc" -eq 0 ]; then
+    vout="$(rsync -a --dry-run --itemize-changes --checksum --files-from="$lst" -e "${SSH[*]}" "$src/" "$ruser@$addr:./" 2>&1)" || vrc=$?
+    diff="$(printf '%s\n' "$vout" | grep -vE '^$|^sending|^total|^sent |^\.d' || true)"
+    if [ "$vrc" -ne 0 ] && [ "$vrc" -ne 24 ]; then
+      warn "could NOT verify the copy - rsync exited $vrc before comparing anything:"; printf '%s\n' "$vout" | head -5 >&2; rc=1
+    elif [ -n "$diff" ]; then
+      warn "the copy DIFFERS from the source after transfer:"; printf '%s\n' "$diff" | head -5 >&2; rc=1
+    else
+      ok "$(wc -l < "$lst") file(s) verified byte-for-byte at the far end"
+    fi
+  fi
+  rm -f "$lst"
+  ssh -o "ControlPath=$ctl/%C" -O exit "$ruser@$addr" >/dev/null 2>&1 || true
+  for _ in 1 2 3 4 5 6 7 8 9 10; do [ -z "$(ls -A "$ctl" 2>/dev/null)" ] && break; sleep 0.2; done
+  rmdir "$ctl" 2>/dev/null || true
+  t1="$(date +%s)"
+  if [ "$dry" -eq 1 ]; then
+    [ "$rc" -eq 0 ] || die "$label dry run FAILED - see the errors above"
+    say "DRY RUN - nothing was transferred"; return 0
+  fi
+  now="$(date +%s)"; prev_ok="$(state_last_ok "$state")"; [ "$rc" -ne 0 ] || prev_ok="$now"
+  bytes="$(du -sb "$src" 2>/dev/null | cut -f1)"
+  printf 'host=%s\nseconds=%s\nbytes=%s\ndomains=%s\nrc=%s\nduration=%s\nlast_ok=%s\n' \
+    "$addr" "$now" "${bytes:-0}" 1 "$rc" "$((t1-t0))" "$prev_ok" > "$state"
+  chmod 0644 "$state"
+  [ "$rc" -eq 0 ] || die "$label finished WITH ERRORS in $((t1-t0))s"
+  ok "$label complete: $(numfmt --to=iec "${bytes:-0}" 2>/dev/null || echo "$bytes")B, $((t1-t0))s"
 }
 
 # ---------------------------------------------------------------- restore TEST
@@ -2439,6 +2590,7 @@ case "${1:-status}" in
   restore-test) shift || true; cmd_restore_test "$@" ;;
   second-copy)  shift || true; cmd_second_copy "$@" ;;
   third-copy)   shift || true; cmd_third_copy "$@" ;;
+  pgbackrest-copy) shift || true; cmd_pgbackrest_copy "$@" ;;
   hold)         shift || true; cmd_hold "$@" ;;
-  *) printf 'usage: %s {status|facts|full [vm]|incr [vm]|progress|verify [--all]|prune [--dry-run]|keyfile|reattach|schedule [HH:MM]|unschedule|restore-plan <vm>|restore-test <vm> [--set S] [--keep] [-n]|second-copy [--setup] [-n] [--all] [--verify-all]|third-copy [--setup] [-n] [--all] [--verify-all]|hold {status|set "<reason>" --review YYYY-MM-DD|release}}\n' "$0" >&2; exit 2 ;;
+  *) printf 'usage: %s {status|facts|full [vm]|incr [vm]|progress|verify [--all]|prune [--dry-run]|keyfile|reattach|schedule [HH:MM]|unschedule|restore-plan <vm>|restore-test <vm> [--set S] [--keep] [-n]|second-copy [--setup] [-n] [--all] [--verify-all]|third-copy [--setup] [-n] [--all] [--verify-all]|pgbackrest-copy [--setup] [-n]|hold {status|set "<reason>" --review YYYY-MM-DD|release}}\n' "$0" >&2; exit 2 ;;
 esac

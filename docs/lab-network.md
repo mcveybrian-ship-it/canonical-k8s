@@ -525,6 +525,15 @@ makes the NAS's own key and prints the one line for the user's Public SSH Key fi
 storage address only, forced to a write-only `rrsync` into `vm/`. The vault keeps its key and its
 ledger; each target runs on its own (one failing does not stop the other).
 
+**The encrypted database backups go to the NAS too (2026-10-13).** `vm-backup.sh pgbackrest-copy`,
+a step of host-4's nightly unit, mirrors host-4's pgBackRest store (`/srv/pgbackrest/repo`) to
+`enclave-copy@10.2.30.171:/mnt/bulk/backups/enclave/pgbackrest` (`BACKUP_PGBR_COPY`), with its own
+key confined to a write-only `rrsync` into that folder. The store is pgBackRest's own ciphertext since
+3.50, and the copy **refuses to send one that is not**. Expiry follows (`--delete`, each removed backup
+in the disposal log); the whole copy is re-read byte for byte each night (it is small). To rebuild the
+database from it: point pgBackRest at the copied folder as a repository and give it the passphrase
+from the sealed envelope (`airgap-media.md` §9.6) - without the envelope the copy is unreadable.
+
 **Monitored since 2026-10-13** (backlog 3.58): its facts carry `copy="third"` and the target, and
 `BackupCopyFailed` / `BackupCopyStale` fire for it as for the second copy. `vm-backup.sh status`
 shows its last run and last clean run. **A difference found by `--verify-all` is reported, not

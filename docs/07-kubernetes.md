@@ -284,8 +284,8 @@ test workload running — namespace `enclave-verify`, the cluster's own CoreDNS 
 
 ## 6. Owed — the rest of B-07
 
-1. ~~**Verify**~~ ✅ **done 2026-10-14** — §3.9, §4. `verify --fips-only` on the workers still to run, so the
-   worker-side processes (kubelet, containerd, k8sd, k8s-apiserver-proxy) are measured as well.
+1. ~~**Verify**~~ ✅ **done 2026-10-14** — §3.9, §4. `verify --fips-only` on all four workers **ok** the same
+   day — kubelet, containerd, k8sd and k8s-apiserver-proxy on core22's `fips.so` too.
 2. **The API VIP** — keepalived on the control planes, VRRP unicast (the ufw rows exist).
 3. **K-B** — sshd disabled on the workers.
 4. **Survivability (C):** a control plane off, a worker off, a whole host off; an etcd snapshot

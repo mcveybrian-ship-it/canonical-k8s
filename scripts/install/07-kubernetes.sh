@@ -31,6 +31,8 @@
 #     sudo ./07-kubernetes.sh join-token <node>  on a control plane: ONE token, printed - by hand only
 #          ./07-kubernetes.sh render             print the config THIS node would use; changes
 #                                                nothing (needs the snap installed)
+#     sudo ./07-kubernetes.sh vip                each control plane: keepalived holds the API VIP
+#                                                (K8S_API_VIP) on whichever answers, VRRP unicast
 #     sudo ./07-kubernetes.sh verify             on a control plane: the cluster, FIPS in the
 #                                                running processes, DNS, a dual-stack LoadBalancer
 #                                                Service, the K-A audit policy. Leaves the test
@@ -695,6 +697,110 @@ cmd_join() {
   ok "$ME joined as a $kind"
 }
 
+# ===================================================================== the API VIP
+# keepalived, VRRP UNICAST between the three control planes (runbook 3.0a: keepalived, not kube-vip;
+# the ufw rows for VRRP exist since A3). The VIP is for clients OUTSIDE the cluster - kubectl from
+# svc-mgmt-01, Prometheus on svc-obs-01. Inside, each worker's k8s-apiserver-proxy already spreads
+# over all three API servers, so the cluster does not depend on the VIP.
+K8S_VRRP_ID="${K8S_VRRP_ID:-${K8S_API_VIP##*.}}"     # 1-255, unique on the segment; default the VIP's last octet
+KA_CONF="${KA_CONF:-/etc/keepalived/keepalived.conf}"
+KA_CHECK="${KA_CHECK:-/etc/keepalived/k8s-api-check.sh}"
+
+# THE HEALTH CHECK HAS NO CREDENTIALS, deliberately. Anonymous access is off (STIG), so a healthy
+# API server answers an unauthenticated /livez with 401; 401 or 200 is "up", a refused or timed-out
+# connection is "down" - what a crashed API server looks like. Handing keepalived the admin
+# kubeconfig would put the cluster's strongest credential in use every 3 s and write every probe
+# to the audit log at RequestResponse. What it does not catch: an API server that runs but has
+# lost etcd - which is a cluster-wide event that moving the VIP would not fix.
+ka_check() {
+cat <<'EOF'
+#!/bin/sh
+# 07-kubernetes.sh vip - keepalived holds the API VIP only on a node whose own API server answers.
+code="$(curl -sk --max-time 2 -o /dev/null -w '%{http_code}' https://127.0.0.1:6443/livez)"
+[ "$code" = 401 ] || [ "$code" = 200 ]
+EOF
+}
+
+ka_conf() {  # IFACE PRIO PEERS...
+  local iface="$1" prio="$2"; shift 2
+  local p
+  cat <<EOF
+# keepalived.conf - written by 07-kubernetes.sh vip on $ME (backlog B-07). The Kubernetes API VIP.
+global_defs {
+    router_id $ME
+    enable_script_security
+    script_user root
+}
+vrrp_script k8s_api {
+    script "$KA_CHECK"
+    interval 3
+    timeout 3
+    fall 2
+    rise 2
+}
+vrrp_instance K8S_API {
+    state BACKUP
+    nopreempt
+    interface $iface
+    virtual_router_id $K8S_VRRP_ID
+    priority $prio
+    advert_int 1
+    unicast_src_ip $ME_ADDR
+    unicast_peer {
+EOF
+  for p in "$@"; do printf '        %s\n' "$p"; done
+  cat <<EOF
+    }
+    virtual_ipaddress {
+        $K8S_API_VIP/24 dev $iface
+    }
+    track_script {
+        k8s_api
+    }
+}
+EOF
+}
+
+cmd_vip() {
+  need_root
+  whoami_k8s
+  [ "$ME_ROLE" = cp ] || die "the API VIP lives on the control planes - this is $ME"
+  [ -n "${K8S_API_VIP:-}" ] || die "no K8S_API_VIP in $ADDRS"
+  case "$K8S_VRRP_ID" in ''|*[!0-9]*) die "K8S_VRRP_ID='$K8S_VRRP_ID' is not 1-255" ;; esac
+  if [ "$K8S_VRRP_ID" -lt 1 ] || [ "$K8S_VRRP_ID" -gt 255 ]; then die "K8S_VRRP_ID=$K8S_VRRP_ID is not 1-255"; fi
+  # The interface that holds this node's address - found, never named.
+  local iface; iface="$(ip -o -4 addr show | awk -v a="$ME_ADDR" '{split($4, x, "/"); if (x[1] == a) print $2}' | head -1)"
+  [ -n "$iface" ] || die "no interface holds $ME_ADDR"
+  # Priority by control-plane number: cp-01 130, cp-02 120, cp-03 110. With nopreempt the holder
+  # keeps the VIP when a higher one returns - one move per failure, not two.
+  local n prio peers=() k
+  n="${ME##*-}"; n=$((10#$n)); prio=$((140 - 10 * n))
+  for k in $(grep -oE '^K8S_CP_[0-9]+=' "$ADDRS" | tr -d '=' | sort); do [ "${!k}" = "$ME_ADDR" ] || peers+=("${!k}"); done
+  [ "${#peers[@]}" -ge 1 ] || die "no other control planes in $ADDRS"
+  say "vip         $K8S_API_VIP on $iface - VRRP id $K8S_VRRP_ID, priority $prio, unicast to ${peers[*]}"
+
+  if ! command -v keepalived >/dev/null 2>&1; then
+    DEBIAN_FRONTEND=noninteractive apt-get install -y keepalived >/dev/null || die "apt-get install keepalived failed - is apt pointed at the mirror?"
+    ok "keepalived installed ($(keepalived --version 2>&1 | head -1))"
+  else ok "keepalived already installed ($(keepalived --version 2>&1 | head -1))"; fi
+  ka_check | install_if_changed "$KA_CHECK" 0755
+  local before=""; [ -f "$KA_CONF" ] && before="$(sha256sum "$KA_CONF")"
+  ka_conf "$iface" "$prio" "${peers[@]}" | install_if_changed "$KA_CONF" 0644
+  keepalived -t -f "$KA_CONF" >/dev/null 2>"$WORK/ka.err" || die "keepalived rejects the config: $(cat "$WORK/ka.err")"
+  systemctl enable keepalived >/dev/null 2>&1
+  if [ "$before" != "$(sha256sum "$KA_CONF")" ] || ! systemctl is-active --quiet keepalived; then
+    systemctl restart keepalived || die "keepalived did not start - journalctl -u keepalived"
+    ok "keepalived (re)started"
+  else ok "keepalived running, config unchanged"; fi
+  if "$KA_CHECK"; then ok "health check: the local API server answers"; else warn "health check FAILS here - this node will not take the VIP"; fi
+  sleep 5
+  if ip -o -4 addr show dev "$iface" | grep -q " $K8S_API_VIP/"; then ok "THIS node holds the VIP $K8S_API_VIP"
+  else say "this node is standby - the VIP is on another control plane (or none yet: run vip on all three)"; fi
+  local code; code="$(curl -sk --max-time 3 -o /dev/null -w '%{http_code}' "https://$K8S_API_VIP:6443/livez" 2>&1 || true)"
+  case "$code" in 401|200) ok "the API answers on the VIP: https://$K8S_API_VIP:6443 (HTTP $code - anonymous is off)" ;;
+                  *) warn "no API answer on the VIP yet (HTTP ${code:-none}) - expected until a control plane holds it" ;; esac
+}
+
 # ===================================================================== B3 - verify
 # Every check prints [ok] or [x]; the run fails if any [x] was printed. Re-runnable.
 V_NS="${V_NS:-enclave-verify}"
@@ -896,6 +1002,7 @@ print(seen[-1] if seen else "")' "$log")"
 }
 
 case "${1:-}" in
+  vip)           shift; cmd_vip "$@" ;;
   verify)        shift; cmd_verify "$@" ;;
   node-prep)     shift; cmd_node_prep "$@" ;;
   render)        shift; cmd_render "$@" ;;
@@ -906,5 +1013,5 @@ case "${1:-}" in
   images-export) shift; cmd_images_export "$@" ;;
   images-load)   shift; cmd_images_load "$@" ;;
   images-check)  shift; cmd_images_check "$@" ;;
-  *) sed -n '2,39p' "$0"; exit 2 ;;
+  *) sed -n '2,41p' "$0"; exit 2 ;;
 esac

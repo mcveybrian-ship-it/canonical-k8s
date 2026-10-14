@@ -23,9 +23,12 @@
 #                                                control plane the API audit policy (K-A)
 #     sudo ./07-kubernetes.sh bootstrap          k8s-cp-01 ONLY: the cluster, from a generated
 #                                                config (Canonical's STIG file + this enclave)
-#     sudo ./07-kubernetes.sh join-token <node>  on a control plane: the one-time token for <node>
-#     sudo ./07-kubernetes.sh join <token>       on the joining node: control plane or worker,
-#                                                decided by its address
+#     sudo ./07-kubernetes.sh join-tokens        k8s-cp-01: one token FILE per other node, in the
+#                                                operator's ~/k8s-join-tokens (0600, never printed)
+#     sudo ./07-kubernetes.sh join               on the joining node: reads ~/k8s-join.token (copied
+#                                                from cp-01 by stage-01, scp -3), joins as control
+#                                                plane or worker by its address, shreds the file
+#     sudo ./07-kubernetes.sh join-token <node>  on a control plane: ONE token, printed - by hand only
 #          ./07-kubernetes.sh render             print the config THIS node would use; changes
 #                                                nothing (needs the snap installed)
 #
@@ -125,6 +128,14 @@ K8S_API_NAME="${K8S_API_NAME:-k8s-api.${ENCLAVE_DOMAIN}}"
 # is systemd-resolved's 127.0.0.53 - a loopback address that means nothing inside a pod.
 K8S_UPSTREAM_DNS="${K8S_UPSTREAM_DNS:-${SVC_MGMT_01:-}}"
 K8S_WAIT="${K8S_WAIT:-15m}"
+# JOIN TOKENS TRAVEL AS FILES (Brian, 2026-10-14): printed tokens land in terminal scrollback and
+# the clipboard, and a pasted placeholder was once sent as a token. cp-01 writes one file per node
+# into the operator's home (the operator's own ownership, so stage-01 can scp -3 it straight to
+# the node); the node reads its file, joins, and shreds it. Single-use and bound to a node name.
+K8S_OPERATOR="${SUDO_USER:-$(id -un)}"
+K8S_OPERATOR_HOME="$(getent passwd "$K8S_OPERATOR" | cut -d: -f6)"
+K8S_TOKEN_DIR="${K8S_TOKEN_DIR:-$K8S_OPERATOR_HOME/k8s-join-tokens}"
+K8S_TOKEN_FILE="${K8S_TOKEN_FILE:-$K8S_OPERATOR_HOME/k8s-join.token}"
 CA_ROOT="${CA_ROOT:-$ENC/trust-anchors/enclave-root.crt}"
 
 # regctl gets a private HOME: its login lands there and dies with it, and root's or the
@@ -604,6 +615,41 @@ cmd_bootstrap() {
   ok "cluster bootstrapped on $ME - next, for each other node: sudo $0 join-token <node> HERE, then join THERE"
 }
 
+# A join token, checked for shape before k8s sees it: one line, no spaces, long. A pasted
+# placeholder reached k8s on 2026-10-14 and came back as an unexplained "EOF" from k8sd.
+token_ok() { [ "${#1}" -ge 40 ] && [[ "$1" =~ ^[A-Za-z0-9+/=_.-]+$ ]]; }
+
+# Every node but this one, from the address file - so a fifth worker needs no edit here.
+other_nodes() {
+  local k n
+  for k in $(grep -oE '^K8S_(CP|WK)_[0-9]+=' "$ADDRS" | tr -d '=' | sort); do
+    n="$(printf '%s' "$k" | tr 'A-Z_' 'a-z-')"
+    [ "$n" = "$ME" ] || printf '%s\n' "$n"
+  done
+}
+
+cmd_join_tokens() {
+  need_root
+  whoami_k8s
+  [ "$ME_ROLE" = cp ] || die "join tokens are issued by a control plane"
+  if [ -z "$K8S_OPERATOR_HOME" ] || [ ! -d "$K8S_OPERATOR_HOME" ]; then die "no home directory for $K8S_OPERATOR"; fi
+  install -d -m 0700 -o "$K8S_OPERATOR" -g "$K8S_OPERATOR" "$K8S_TOKEN_DIR"
+  local n t f made=0
+  for n in $(other_nodes); do
+    f="$K8S_TOKEN_DIR/$n.token"
+    case "$n" in k8s-wk-*) t="$(/snap/bin/k8s get-join-token "$n" --worker)" ;; *) t="$(/snap/bin/k8s get-join-token "$n")" ;; esac \
+      || die "k8s get-join-token $n failed"
+    t="$(printf '%s' "$t" | tr -d '[:space:]')"
+    token_ok "$t" || die "k8s returned something that is not a token for $n - nothing written for it"
+    printf '%s\n' "$t" > "$WORK/token"
+    install -m 0600 -o "$K8S_OPERATOR" -g "$K8S_OPERATOR" "$WORK/token" "$f"
+    ok "$f  (${#t} characters, 0600 $K8S_OPERATOR)"
+    made=$((made + 1))
+  done
+  echo
+  ok "$made token file(s) in $K8S_TOKEN_DIR - not printed. Next, from stage-01: copy each to its node (scp -3), then shred this directory"
+}
+
 cmd_join_token() {
   need_root
   whoami_k8s
@@ -619,8 +665,12 @@ cmd_join_token() {
 cmd_join() {
   need_root
   whoami_k8s
-  local token="${1:-}" kind cfg
-  [ -n "$token" ] || die "usage: join <token> - from 'sudo $0 join-token $ME' on k8s-cp-01"
+  local token="${1:-}" kind cfg from=""
+  if [ -z "$token" ]; then
+    [ -r "$K8S_TOKEN_FILE" ] || die "no token given and no $K8S_TOKEN_FILE - copy it from cp-01 first (stage-01, scp -3)"
+    token="$(tr -d '[:space:]' < "$K8S_TOKEN_FILE")"; from="$K8S_TOKEN_FILE"
+  fi
+  token_ok "$token" || die "that is not a join token (${#token} characters) - a placeholder, or a truncated copy?"
   [ "$ME" != k8s-cp-01 ] || die "k8s-cp-01 bootstraps; it does not join"
   [ -x /snap/bin/k8s ] || die "no k8s snap - run node-prep first"
   if /snap/bin/k8s status >/dev/null 2>&1; then ok "$ME is already in a cluster - nothing to do"; return 0; fi
@@ -631,8 +681,11 @@ cmd_join() {
   cfg="$K8S_CONF_DIR/enclave-$kind.yaml"
   render_config "$kind" | install_if_changed "$cfg" 0600
   say "the config:"; sed 's/^/      /' "$cfg"; echo
-  /snap/bin/k8s join-cluster --file "$cfg" --address "$ME_ADDR" --timeout "$K8S_WAIT" "$token" || die "k8s join-cluster failed - read the output above"
+  /snap/bin/k8s join-cluster --file "$cfg" --address "$ME_ADDR" --timeout "$K8S_WAIT" "$token" \
+    || die "k8s join-cluster failed - read the output above${from:+ ($from kept for the retry)}"
   check_containerd_path
+  # Single-use and spent now: the file goes, so no copy of a cluster credential is left lying about.
+  if [ -n "$from" ]; then shred -u "$from" && ok "$from shredded - the token is spent"; fi
   ok "$ME joined as a $kind"
 }
 
@@ -641,9 +694,10 @@ case "${1:-}" in
   render)        shift; cmd_render "$@" ;;
   bootstrap)     shift; cmd_bootstrap "$@" ;;
   join-token)    shift; cmd_join_token "$@" ;;
+  join-tokens)   shift; cmd_join_tokens "$@" ;;
   join)          shift; cmd_join "$@" ;;
   images-export) shift; cmd_images_export "$@" ;;
   images-load)   shift; cmd_images_load "$@" ;;
   images-check)  shift; cmd_images_check "$@" ;;
-  *) sed -n '2,30p' "$0"; exit 2 ;;
+  *) sed -n '2,33p' "$0"; exit 2 ;;
 esac

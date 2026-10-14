@@ -18,7 +18,7 @@
 #   THE CLUSTER - MACHINE: the k8s guests (k8s-cp-01..03, k8s-wk-01..04), each hardened and
 #   finished (03-compose-vm.sh --harden, then --finish), with this repo pushed to it:
 #     sudo ./07-kubernetes.sh node-prep          EVERY node, first: kubelet's kernel settings,
-#                                                the FIPS base then k8s side-loaded from the
+#                                                snapd (FIPS), the FIPS base, then k8s side-loaded from the
 #                                                mirror, containerd pointed at Harbor, and on a
 #                                                control plane the API audit policy (K-A)
 #     sudo ./07-kubernetes.sh bootstrap          k8s-cp-01 ONLY: the cluster, from a generated
@@ -103,6 +103,12 @@ LOCK_NAME='images.lock'
 # The base snap is the FIPS one: core22 from fips-updates/stable (Q8, backlog 3.25). Its revision
 # is pinned beside the k8s revision, and node-prep refuses a core22 that is not this one.
 K8S_CORE22_REV="${K8S_CORE22_REV:-2383}"
+# The snapd SNAP. Installing the first app snap on a newer base makes snapd install itself as a
+# snap first - from the store, which the gap does not have (found on k8s-cp-01, 2026-10-14). Pinned
+# like the others, and the FIPS build (decided by Brian 2026-10-14): snapd checks the signature on
+# every snap it installs. fips-updates/stable was EMPTY that day; rev 28333 is 2.78+fips from
+# fips-updates/candidate - the same channel class k8s rev 5526 came from. Q-CORE asks when stable.
+K8S_SNAPD_REV="${K8S_SNAPD_REV:-28333}"
 # Where the in-gap mirror serves the snaps and their assertions (runbook 4.1; direct URLs - the
 # mirror lists no directories).
 K8S_SNAP_URL="${K8S_SNAP_URL:-https://svc-repo-01.${ENCLAVE_DOMAIN}/snaps}"
@@ -478,9 +484,15 @@ cmd_node_prep() {
   [ -z "$bad" ] || die "kernel settings kubelet requires are overridden:$bad"
   ok "kubelet's six kernel settings live"
 
-  # 2. the FIPS base FIRST - k8s takes its cryptography from it (3.25); installing k8s first would
-  #    send snapd to the store for a plain core22, and there is no store.
+  # 2. snapd as a snap (FIPS), then the FIPS base, then k8s. Each missing one would otherwise send
+  #    snapd to the store, and there is no store: k8s needs the snapd snap (found 2026-10-14) and
+  #    takes its cryptography from core22 (3.25).
   [ -r "$CA_ROOT" ] || die "no enclave root at $CA_ROOT"
+  side_load snapd "$K8S_SNAPD_REV"
+  case "$(snap_ver snapd)" in
+    *fips*) ok "snapd is the FIPS build: $(snap_ver snapd), rev $(snap_rev snapd)" ;;
+    *) die "snapd rev $(snap_rev snapd) is version $(snap_ver snapd) - not a +fips build (decided 2026-10-14)" ;;
+  esac
   side_load core22 "$K8S_CORE22_REV"
   case "$(snap_ver core22)" in
     *fips*) ok "core22 is the FIPS build: $(snap_ver core22), rev $(snap_rev core22)" ;;
@@ -488,7 +500,7 @@ cmd_node_prep() {
   esac
   side_load k8s "$K8S_SNAP_REV" --classic
   # No store to refresh from, and a revision that moved by itself would not be the one tested.
-  if snap refresh --hold core22 k8s >/dev/null 2>&1; then ok "refresh held for core22 and k8s"
+  if snap refresh --hold snapd core22 k8s >/dev/null 2>&1; then ok "refresh held for snapd, core22 and k8s"
   else warn "snap refresh --hold failed - check 'snap refresh --time'"; fi
 
   # 3. containerd: ghcr.io from Harbor, trusting the enclave root.

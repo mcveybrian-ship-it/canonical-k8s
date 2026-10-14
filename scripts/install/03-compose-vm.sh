@@ -513,6 +513,19 @@ KEY_NAME="$(echo "$VM" | tr 'a-z-' 'A-Z_')"
 ADDRESS="${!KEY_NAME:-}"
 SPEC_VAR="VM_$KEY_NAME"; SPEC="${!SPEC_VAR:-}"
 [ -n "$ADDRESS" ] || die "$VM has no address. Add $KEY_NAME to enclave-addresses.env."
+# IPv6 - THE SEVEN K8S NODES ONLY (the cluster is dual-stack, B-07 A2, 2026-10-14). DERIVED,
+# not looked up: the host part is the digits of the IPv4 last octet on the node /64, so
+# 10.2.20.171 -> fd6e:32f0:f4b3:20::171 (enclave-addresses.env says why there is no per-node key).
+# Every other guest stays IPv4-only by design, and gets no address here.
+ADDRESS6=""
+case "$KEY_NAME" in
+  K8S_CP_[0-9]*|K8S_WK_[0-9]*)
+    case "${K8S_NODE_V6_NET:-}" in
+      *::/64) ADDRESS6="${K8S_NODE_V6_NET%::/64}::${ADDRESS##*.}" ;;
+      '') die "$VM is a Kubernetes node and K8S_NODE_V6_NET is not set - the cluster is dual-stack (B-07), and a node without its IPv6 address cannot join it as designed" ;;
+      *)  die "K8S_NODE_V6_NET='$K8S_NODE_V6_NET' is not of the form <prefix>::/64 - the node rule (prefix::<IPv4 last octet>) needs exactly that" ;;
+    esac ;;
+esac
 [ -n "$SPEC" ]    || die "$VM has no spec. Add $SPEC_VAR to vm-specs.env."
 # vcpus:ram_mb:disk_gb[:data_gb] - the 4th field is OPTIONAL and reads as empty when absent,
 # so every spec written before 2026-09-16 behaves exactly as it did.
@@ -948,7 +961,7 @@ ethernets:
       name: "en*"
     dhcp4: false
     dhcp6: false
-    addresses: [$ADDRESS/24]
+    addresses: [$ADDRESS/24${ADDRESS6:+, $ADDRESS6/64}]
 EOF
 
 cat > "$TMP/user-data" <<EOF

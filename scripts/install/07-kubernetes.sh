@@ -15,6 +15,20 @@
 #                                                image in images.lock, read the way containerd
 #                                                will read it
 #
+#   THE CLUSTER - MACHINE: the k8s guests (k8s-cp-01..03, k8s-wk-01..04), each hardened and
+#   finished (03-compose-vm.sh --harden, then --finish), with this repo pushed to it:
+#     sudo ./07-kubernetes.sh node-prep          EVERY node, first: kubelet's kernel settings,
+#                                                the FIPS base then k8s side-loaded from the
+#                                                mirror, containerd pointed at Harbor, and on a
+#                                                control plane the API audit policy (K-A)
+#     sudo ./07-kubernetes.sh bootstrap          k8s-cp-01 ONLY: the cluster, from a generated
+#                                                config (Canonical's STIG file + this enclave)
+#     sudo ./07-kubernetes.sh join-token <node>  on a control plane: the one-time token for <node>
+#     sudo ./07-kubernetes.sh join <token>       on the joining node: control plane or worker,
+#                                                decided by its address
+#          ./07-kubernetes.sh render             print the config THIS node would use; changes
+#                                                nothing (needs the snap installed)
+#
 # WHERE THE IMAGES GO, AND WHY THE PROJECT IS NOT A PARAMETER
 #
 #   containerd on each node is told (hosts.d/ghcr.io/hosts.toml, Canonical's air-gap guide)
@@ -84,6 +98,28 @@ K8S_HARBOR_USER="${K8S_HARBOR_USER:-admin}"
 K8S_EXPORT_REPLACE="${K8S_EXPORT_REPLACE:-}"
 
 LOCK_NAME='images.lock'
+
+# ---- the cluster (B2) ------------------------------------------------------------------------
+# The base snap is the FIPS one: core22 from fips-updates/stable (Q8, backlog 3.25). Its revision
+# is pinned beside the k8s revision, and node-prep refuses a core22 that is not this one.
+K8S_CORE22_REV="${K8S_CORE22_REV:-2383}"
+# Where the in-gap mirror serves the snaps and their assertions (runbook 4.1; direct URLs - the
+# mirror lists no directories).
+K8S_SNAP_URL="${K8S_SNAP_URL:-https://svc-repo-01.${ENCLAVE_DOMAIN}/snaps}"
+# containerd's registry directory. /etc/containerd is what Canonical's STIG audit names
+# (V-242405); bootstrap and join read containerd's ACTUAL config_path afterwards and refuse a
+# mismatch rather than trust the documentation, which gives two different paths.
+K8S_HOSTS_D="${K8S_HOSTS_D:-/etc/containerd/hosts.d}"
+K8S_CONF_DIR="${K8S_CONF_DIR:-/var/snap/k8s/common/etc/configurations}"
+K8S_AUDIT_POLICY="${K8S_AUDIT_POLICY:-$K8S_CONF_DIR/enclave-audit-policy.yaml}"
+# Pod Security (K-C, 2026-10-14): Canonical's baseline file, shipped in the snap.
+K8S_PSA_FILE="${K8S_PSA_FILE:-$K8S_CONF_DIR/pod-security-admission-baseline.yaml}"
+K8S_API_NAME="${K8S_API_NAME:-k8s-api.${ENCLAVE_DOMAIN}}"
+# The enclave DNS (svc-mgmt-01). CoreDNS would otherwise forward to the node's resolv.conf, which
+# is systemd-resolved's 127.0.0.53 - a loopback address that means nothing inside a pod.
+K8S_UPSTREAM_DNS="${K8S_UPSTREAM_DNS:-${SVC_MGMT_01:-}}"
+K8S_WAIT="${K8S_WAIT:-15m}"
+CA_ROOT="${CA_ROOT:-$ENC/trust-anchors/enclave-root.crt}"
 
 # regctl gets a private HOME: its login lands there and dies with it, and root's or the
 # operator's own registry logins are never used by accident. A second, EMPTY home is the
@@ -316,9 +352,281 @@ cmd_images_check() {
   ok "all $n images in Harbor, readable anonymously, digests match $LOCK_NAME"
 }
 
+# ===================================================================== B2 - the cluster
+# WHICH k8s node this is, from its address - never a typed name (the 05/06a rule).
+ME=""; ME_ADDR=""; ME_ROLE=""; ME_ADDR6=""
+whoami_k8s() {
+  local k a mine
+  mine="$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1)"
+  for k in $(grep -oE '^K8S_(CP|WK)_[0-9]+=' "$ADDRS" | tr -d '='); do
+    a="${!k:-}"
+    if [ -n "$a" ] && printf '%s\n' "$mine" | grep -qx "$a"; then
+      ME="$(printf '%s' "$k" | tr 'A-Z_' 'a-z-')"; ME_ADDR="$a"
+      case "$k" in K8S_CP_*) ME_ROLE='cp' ;; *) ME_ROLE='wk' ;; esac
+      ME_ADDR6="$(node_v6 "$a")"
+      return 0
+    fi
+  done
+  die "this machine ($(hostname -s)) holds no K8S_CP_*/K8S_WK_* address in $ADDRS - this runs on the k8s nodes only"
+}
+# The IPv6 rule, the same one 03-compose-vm.sh writes into the guest: prefix + the IPv4 last octet.
+node_v6() {
+  case "${K8S_NODE_V6_NET:-}" in
+    *::/64) printf '%s::%s' "${K8S_NODE_V6_NET%::/64}" "${1##*.}" ;;
+    *) die "K8S_NODE_V6_NET='${K8S_NODE_V6_NET:-}' is not <prefix>::/64 - the cluster is dual-stack (B-07 A2)" ;;
+  esac
+}
+
+# Kubelet's --protect-kernel-defaults REFUSES to start unless these are already set (Canonical's
+# STIG how-to, fetched 2026-10-14). The values are kubelet's, not a tuning choice.
+KUBELET_SYSCTL="vm.overcommit_memory=1
+vm.panic_on_oom=0
+kernel.keys.root_maxbytes=25000000
+kernel.keys.root_maxkeys=1000000
+kernel.panic=10
+kernel.panic_on_oops=1"
+KUBELET_SYSCTL_FILE="${KUBELET_SYSCTL_FILE:-/etc/sysctl.d/99-kubelet.conf}"
+
+# K-A (decided 2026-10-14): a NARROW, DOCUMENTED deviation from V-242403. The STIG's check wants
+# exactly `- level: RequestResponse` for everything, which writes every Secret's VALUE into the
+# API audit log - and that log is offloaded to svc-obs-01 and backed up from there to the vault
+# and the NAS. So: Secrets, token requests and token reviews at Metadata (who, what, when, the
+# result - not the value); everything else at RequestResponse, as the STIG asks. First match wins.
+audit_policy() {
+cat <<'EOF'
+# enclave-audit-policy.yaml - written by 07-kubernetes.sh node-prep (backlog B-07, decision K-A).
+# V-242403 deviation, documented: Secrets and service-account tokens at Metadata, so their
+# values never reach the audit log or its copies; every other request at RequestResponse.
+apiVersion: audit.k8s.io/v1
+kind: Policy
+rules:
+  - level: Metadata
+    resources:
+      - group: ""
+        resources: ["secrets", "serviceaccounts/token"]
+      - group: "authentication.k8s.io"
+        resources: ["tokenreviews"]
+  - level: RequestResponse
+EOF
+}
+
+# containerd: ghcr.io is served by Harbor, over TLS from the enclave CA. No credential - the
+# project is public for reads (decided 2026-10-14).
+hosts_toml() {
+cat <<EOF
+# written by 07-kubernetes.sh node-prep (B-07) - ghcr.io's images come from Harbor, never the internet
+[host."https://${K8S_REGISTRY}"]
+  capabilities = ["pull", "resolve"]
+  ca = "${K8S_HOSTS_D}/${K8S_UPSTREAM_REGISTRY}/ca.crt"
+EOF
+}
+
+# install_if_changed DEST MODE - stdin to DEST, only when the content differs; says which.
+install_if_changed() {
+  local dest="$1" mode="$2" tmp="$WORK/install.new"
+  cat > "$tmp"
+  if [ -f "$dest" ] && cmp -s "$tmp" "$dest"; then ok "$dest already in place - unchanged"; return 0; fi
+  install -D -o root -g root -m "$mode" "$tmp" "$dest"; ok "$dest written"
+}
+
+snap_rev() { snap list "$1" 2>/dev/null | awk 'NR==2 {print $3}'; }
+snap_ver() { snap list "$1" 2>/dev/null | awk 'NR==2 {print $2}'; }
+
+# side_load NAME REV [--classic] - from the mirror, verified by snapd against Canonical's signed
+# assertion (snap ack, then the install of a file whose hash that assertion names). Downloaded
+# into this run's private WORK directory, which the EXIT trap removes.
+side_load() {
+  local name="$1" rev="$2" extra="${3:-}" f have
+  have="$(snap_rev "$name")"
+  if [ "$have" = "$rev" ]; then ok "$name rev $rev already installed - unchanged"; return 0; fi
+  [ -z "$have" ] || die "$name is installed at rev $have, not $rev - refusing to replace it here; remove it deliberately first"
+  mkdir -p "$WORK/snaps"
+  for f in "${name}_${rev}.assert" "${name}_${rev}.snap"; do
+    curl -fsS --cacert "$CA_ROOT" -o "$WORK/snaps/$f" "$K8S_SNAP_URL/$f" || die "could not fetch $K8S_SNAP_URL/$f"
+  done
+  snap ack "$WORK/snaps/${name}_${rev}.assert" || die "snap ack refused ${name}_${rev}.assert"
+  # shellcheck disable=SC2086  # $extra is empty or exactly --classic
+  snap install "$WORK/snaps/${name}_${rev}.snap" $extra || die "snap install of ${name}_${rev}.snap failed"
+  have="$(snap_rev "$name")"
+  [ "$have" = "$rev" ] || die "$name installed, but as rev $have, not $rev - the assertion did not match"
+  ok "$name rev $rev side-loaded, verified against its signed assertion"
+}
+
+cmd_node_prep() {
+  need_root
+  whoami_k8s
+  say "node        $ME ($ME_ADDR, $ME_ADDR6) - $( [ "$ME_ROLE" = cp ] && echo control plane || echo worker)"
+  echo
+  [ "$(cat /proc/sys/crypto/fips_enabled 2>/dev/null)" = 1 ] \
+    || die "the kernel is not in FIPS mode (/proc/sys/crypto/fips_enabled != 1) - this node was not hardened (05 fips)"
+  ip -6 -o addr show scope global | grep -q " ${ME_ADDR6}/64 " \
+    || die "$ME does not hold $ME_ADDR6/64 - composed before the dual-stack change? (03-compose-vm.sh, B-07 B1)"
+  ok "FIPS kernel, and both addresses present"
+
+  # 1. kubelet's kernel settings, then READ BACK: a later file in sysctl.d silently wins.
+  printf '%s\n' "# kubelet --protect-kernel-defaults (Canonical's DISA STIG how-to) - 07-kubernetes.sh node-prep" "$KUBELET_SYSCTL" \
+    | install_if_changed "$KUBELET_SYSCTL_FILE" 0644
+  sysctl --system >/dev/null
+  local kv k v now bad=""
+  while IFS= read -r kv; do
+    k="${kv%%=*}"; v="${kv#*=}"; now="$(sysctl -n "$k")"
+    [ "$now" = "$v" ] || bad="$bad $k=$now (want $v; set by: $(grep -ls "^[[:space:]]*$k" /etc/sysctl.d/* /run/sysctl.d/* /usr/lib/sysctl.d/* /etc/sysctl.conf 2>/dev/null | tr '\n' ' '))"
+  done <<< "$KUBELET_SYSCTL"
+  [ -z "$bad" ] || die "kernel settings kubelet requires are overridden:$bad"
+  ok "kubelet's six kernel settings live"
+
+  # 2. the FIPS base FIRST - k8s takes its cryptography from it (3.25); installing k8s first would
+  #    send snapd to the store for a plain core22, and there is no store.
+  [ -r "$CA_ROOT" ] || die "no enclave root at $CA_ROOT"
+  side_load core22 "$K8S_CORE22_REV"
+  case "$(snap_ver core22)" in
+    *fips*) ok "core22 is the FIPS build: $(snap_ver core22), rev $(snap_rev core22)" ;;
+    *) die "core22 rev $(snap_rev core22) is version $(snap_ver core22) - not a +fips build (backlog 3.25)" ;;
+  esac
+  side_load k8s "$K8S_SNAP_REV" --classic
+  # No store to refresh from, and a revision that moved by itself would not be the one tested.
+  if snap refresh --hold core22 k8s >/dev/null 2>&1; then ok "refresh held for core22 and k8s"
+  else warn "snap refresh --hold failed - check 'snap refresh --time'"; fi
+
+  # 3. containerd: ghcr.io from Harbor, trusting the enclave root.
+  install_if_changed "$K8S_HOSTS_D/$K8S_UPSTREAM_REGISTRY/ca.crt" 0644 < "$CA_ROOT"
+  hosts_toml | install_if_changed "$K8S_HOSTS_D/$K8S_UPSTREAM_REGISTRY/hosts.toml" 0644
+  local code
+  code="$(curl -sS --cacert "$CA_ROOT" -o /dev/null -w '%{http_code}' "https://$K8S_REGISTRY/v2/" 2>&1)" || true
+  case "$code" in
+    200|401) ok "Harbor answers over TLS with the enclave root (/v2/ -> $code)" ;;
+    *) die "cannot reach https://$K8S_REGISTRY/v2/ over TLS with the enclave root: $code" ;;
+  esac
+
+  # 4. control planes: the API audit policy (K-A) - it must exist before the API server starts.
+  if [ "$ME_ROLE" = cp ]; then
+    audit_policy | install_if_changed "$K8S_AUDIT_POLICY" 0600
+    [ -r "$K8S_PSA_FILE" ] || die "no Pod Security file at $K8S_PSA_FILE - is this snap rev $K8S_SNAP_REV?"
+  fi
+  echo
+  if [ "$ME" = k8s-cp-01 ]; then ok "$ME prepared - next: sudo $0 bootstrap"
+  else ok "$ME prepared - next: a token from k8s-cp-01 (sudo $0 join-token $ME), then sudo $0 join <token>"; fi
+}
+
+# The STIG arguments come from the SNAP'S OWN file for this revision (Canonical's
+# k8s/resources/configurations/disa-stig/<file>), so a new revision brings its own. Two of them are
+# REPLACED by enclave decisions: --audit-policy-file (K-A) and --admission-control-config-file
+# (K-C, the same baseline file, named explicitly). Everything else is taken as Canonical wrote it.
+stig_file() { printf '/snap/k8s/current/k8s/resources/configurations/disa-stig/%s.yaml' "$1"; }
+
+# render_config KIND -> the config for this node. KIND: bootstrap | control-plane | worker
+render_config() {
+  local kind="$1" src; src="$(stig_file "$kind")"
+  [ -r "$src" ] || die "no $src - node-prep first (it installs the snap)"
+  printf '# %s - generated by 07-kubernetes.sh for %s, %s\n' "$kind" "$ME" "$(date -u +%FT%TZ)"
+  printf '# STIG arguments from %s (snap rev %s); enclave decisions marked.\n' "$src" "$K8S_SNAP_REV"
+  if [ "$kind" = bootstrap ]; then
+    # Both families, set ONCE here and never changeable (enclave-addresses.env, B-07 A2).
+    printf 'pod-cidr: "%s,%s"\n' "${K8S_POD_CIDR_V4:?}" "${K8S_POD_CIDR_V6:?}"
+    printf 'service-cidr: "%s,%s"\n' "${K8S_SERVICE_CIDR_V4:?}" "${K8S_SERVICE_CIDR_V6:?}"
+    printf 'extra-sans:\n  - "%s"\n  - "%s"\n' "${K8S_API_VIP:?}" "$K8S_API_NAME"
+    printf 'control-plane-taints:\n  - "node-role.kubernetes.io/control-plane:NoSchedule"   # H3: no app pods on control planes\n'
+    printf 'cluster-config:\n'
+    printf '  network:\n    enabled: true\n'
+    printf '  dns:\n    enabled: true\n    upstream-nameservers:\n      - "%s"   # the enclave DNS, not the node resolver 127.0.0.53\n' "${K8S_UPSTREAM_DNS:?}"
+    printf '  local-storage:\n    enabled: false   # node-local volumes do not survive their node; Ceph is B-08\n'
+    printf '  gateway:\n    enabled: true    # Gateway API, decided 2026-10-02\n'
+    printf '  ingress:\n    enabled: false\n'
+    printf '  load-balancer:\n    enabled: true\n    l2-mode: true\n    cidrs:\n      - "%s-%s"\n      - "%s-%s"\n' \
+      "${K8S_LB_POOL_START:?}" "${K8S_LB_POOL_END:?}" "${K8S_LB_POOL_V6_START:?}" "${K8S_LB_POOL_V6_END:?}"
+    printf '  metrics-server:\n    enabled: true\n'
+  fi
+  # The per-node argument blocks: Canonical's lines, two replaced, and --node-ip added.
+  awk -v audit="$K8S_AUDIT_POLICY" -v psa="$K8S_PSA_FILE" -v nodeip="$ME_ADDR,$ME_ADDR6" '
+    /^extra-node-[a-z-]+-args:/ { blk = $1; print
+                                  if (blk == "extra-node-kubelet-args:") print "  --node-ip: \"" nodeip "\"   # both families (B-07 A2)"
+                                  next }
+    /^[^ ]/ { blk = ""; next }
+    blk != "" && /^  --audit-policy-file:/ { print "  --audit-policy-file: " audit "   # K-A: the enclave policy"; next }
+    blk != "" && /^  --admission-control-config-file:/ { print "  --admission-control-config-file: " psa "   # K-C: baseline"; next }
+    blk != "" { print }' "$src"
+}
+
+cmd_render() {
+  whoami_k8s
+  local kind
+  if [ "$ME" = k8s-cp-01 ]; then kind=bootstrap; elif [ "$ME_ROLE" = cp ]; then kind=control-plane; else kind=worker; fi
+  render_config "$kind"
+}
+
+# After bootstrap or join: where containerd ACTUALLY reads registry config, against where
+# node-prep wrote it. A mismatch means every pull goes to ghcr.io - which fails in the gap.
+check_containerd_path() {
+  local f got=""
+  for f in /etc/containerd/config.toml /var/snap/k8s/common/etc/containerd/config.toml; do
+    [ -r "$f" ] || continue
+    got="$(sed -n 's/^[[:space:]]*config_path[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' "$f" | head -1)"
+    [ -z "$got" ] || break
+  done
+  [ -n "$got" ] || die "found no containerd config_path - cannot prove images come from Harbor. Look: sudo grep -rn config_path /etc/containerd /var/snap/k8s/common/etc"
+  [ "$got" = "$K8S_HOSTS_D" ] || die "containerd reads registry config from $got, node-prep wrote $K8S_HOSTS_D - set K8S_HOSTS_D=$got and re-run node-prep"
+  ok "containerd reads registry config from $got - where node-prep wrote ghcr.io -> Harbor"
+}
+
+cmd_bootstrap() {
+  need_root
+  whoami_k8s
+  [ "$ME" = k8s-cp-01 ] || die "bootstrap runs on k8s-cp-01 only - every other node joins (sudo $0 join <token>)"
+  [ -x /snap/bin/k8s ] || die "no k8s snap - run node-prep first"
+  if /snap/bin/k8s status >/dev/null 2>&1; then ok "a cluster is already bootstrapped here - nothing to do"; /snap/bin/k8s status; return 0; fi
+  [ -r "$K8S_AUDIT_POLICY" ] || die "no audit policy at $K8S_AUDIT_POLICY - run node-prep first"
+  local cfg="$K8S_CONF_DIR/enclave-bootstrap.yaml"
+  render_config bootstrap | install_if_changed "$cfg" 0600
+  say "the config:"; sed 's/^/      /' "$cfg"; echo
+  # --address: these guests have NO default route, so "the IP of the default-route interface"
+  # has nothing to find. Always explicit.
+  /snap/bin/k8s bootstrap --file "$cfg" --address "$ME_ADDR" --timeout "$K8S_WAIT" || die "k8s bootstrap failed - read the output above"
+  /snap/bin/k8s status --wait-ready --timeout "$K8S_WAIT" || die "the cluster did not become ready within $K8S_WAIT"
+  check_containerd_path
+  echo
+  ok "cluster bootstrapped on $ME - next, for each other node: sudo $0 join-token <node> HERE, then join THERE"
+}
+
+cmd_join_token() {
+  need_root
+  whoami_k8s
+  [ "$ME_ROLE" = cp ] || die "join tokens are issued by a control plane"
+  local node="${1:-}"
+  case "$node" in
+    k8s-cp-0[0-9]) /snap/bin/k8s get-join-token "$node" ;;
+    k8s-wk-0[0-9]) /snap/bin/k8s get-join-token "$node" --worker ;;
+    *) die "usage: join-token <k8s-cp-0N|k8s-wk-0N> - the node's hostname, which the token is bound to" ;;
+  esac
+}
+
+cmd_join() {
+  need_root
+  whoami_k8s
+  local token="${1:-}" kind cfg
+  [ -n "$token" ] || die "usage: join <token> - from 'sudo $0 join-token $ME' on k8s-cp-01"
+  [ "$ME" != k8s-cp-01 ] || die "k8s-cp-01 bootstraps; it does not join"
+  [ -x /snap/bin/k8s ] || die "no k8s snap - run node-prep first"
+  if /snap/bin/k8s status >/dev/null 2>&1; then ok "$ME is already in a cluster - nothing to do"; return 0; fi
+  if [ "$ME_ROLE" = cp ]; then
+    kind=control-plane
+    [ -r "$K8S_AUDIT_POLICY" ] || die "no audit policy at $K8S_AUDIT_POLICY - run node-prep first"
+  else kind=worker; fi
+  cfg="$K8S_CONF_DIR/enclave-$kind.yaml"
+  render_config "$kind" | install_if_changed "$cfg" 0600
+  say "the config:"; sed 's/^/      /' "$cfg"; echo
+  /snap/bin/k8s join-cluster --file "$cfg" --address "$ME_ADDR" --timeout "$K8S_WAIT" "$token" || die "k8s join-cluster failed - read the output above"
+  check_containerd_path
+  ok "$ME joined as a $kind"
+}
+
 case "${1:-}" in
+  node-prep)     shift; cmd_node_prep "$@" ;;
+  render)        shift; cmd_render "$@" ;;
+  bootstrap)     shift; cmd_bootstrap "$@" ;;
+  join-token)    shift; cmd_join_token "$@" ;;
+  join)          shift; cmd_join "$@" ;;
   images-export) shift; cmd_images_export "$@" ;;
   images-load)   shift; cmd_images_load "$@" ;;
   images-check)  shift; cmd_images_check "$@" ;;
-  *) sed -n '2,16p' "$0"; exit 2 ;;
+  *) sed -n '2,30p' "$0"; exit 2 ;;
 esac

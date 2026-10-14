@@ -429,16 +429,16 @@ cmd_status() {
   local which tgt sf when lok
   while read -r which tgt sf; do
     if [ "$tgt" = none ]; then
-      printf '     %-7s not configured%s\n' "$which" "$( [ "$which" = third ] && echo ' (BACKUP_THIRD_ADDR empty - lab only)')"
+      printf '     %-10s not configured%s\n' "$which" "$( case "$which" in third) echo ' (BACKUP_THIRD_ADDR empty - lab only)' ;; pgbackrest) echo ' (BACKUP_PGBR_COPY empty - lab only)' ;; esac)"
     elif [ -r "$sf" ]; then
       when="$(awk -F= '/^seconds=/{print $2}' "$sf")"
       lok="$(state_last_ok "$sf")"
-      printf '     %-7s -> %-14s %s  rc=%s  %s  last clean run: %s\n' "$which" "$tgt" \
+      printf '     %-10s -> %-14s %s  rc=%s  %s  last clean run: %s\n' "$which" "$tgt" \
         "$(date -d "@${when:-0}" '+%Y-%m-%d %H:%M %Z' 2>/dev/null)" "$(awk -F= '/^rc=/{print $2}' "$sf")" \
         "$(human "$(awk -F= '/^bytes=/{print $2}' "$sf")")" \
         "$( [ -n "$lok" ] && date -d "@$lok" '+%Y-%m-%d %H:%M %Z' 2>/dev/null || echo 'none recorded')"
     else
-      printf '     %-7s -> %-14s never run\n' "$which" "$tgt"
+      printf '     %-10s -> %-14s never run\n' "$which" "$tgt"
     fi
   done < <(copy_rows)
   printf '\n'
@@ -1478,12 +1478,12 @@ EOF
   ok "scheduled: ${SVC_NAME}.timer at ${at} ${BACKUP_TZ} daily -> ${DEST}"
   ok "scheduled: ${VERIFY_SVC}.timer '${weekly_cal}' - deep verify, reads every byte"
   say ""
-  say "   nightly: incr + verify (changed sets only) + prune + second-copy + third-copy (if set)   - minutes"
+  say "   nightly: incr + verify (changed sets only) + prune + second-copy + third-copy + pgbackrest-copy (each if set)   - minutes"
   say "   weekly : verify --all, then both copies --verify-all  - reads the whole volume"
   say ""
   systemctl list-timers "${SVC_NAME}.timer" "${VERIFY_SVC}.timer" --no-pager | sed 's/^/       /'
   printf '\n'
-  say "each run does: incr (falls back to full with no checkpoint), verify, prune, second-copy, third-copy"
+  say "each run does: incr (falls back to full with no checkpoint), verify, prune, second-copy, third-copy, pgbackrest-copy"
   say "watch it with:   journalctl -u ${SVC_NAME}.service -n 50"
 
   # SAY THE REBOOT PROBLEM OUT LOUD, EVERY TIME, IF IT APPLIES.

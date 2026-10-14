@@ -476,6 +476,34 @@ running enclave; that is `vm-backup.sh` and pgBackRest.
    web UI listens on every interface by default — to keep it off the storage network, set
    System → General → GUI → Web Interface IPv4 Address to `10.0.20.10`.
 
+**The NAS AS BUILT — read from the machine 2026-10-14** (hostname `lab-nas`, TrueNAS 25.10,
+smartctl 7.4). It differs from the plan above; this is what is there:
+
+| pool | disks | size | holds |
+|---|---|---|---|
+| `Fast` | 6 NVMe — 4 × PM9A1 2 TB + 2 × Samsung MZVL22T0 2 TB — 3 mirrors | 5.58 TB | the TrueNAS system dataset; otherwise empty |
+| `bulk` | 2 × Samsung MZ7LH3T8HMLT 3.84 TB **SATA SSD** — mirror | 3.48 TB | `bulk/backups/enclave` (encrypted): the nightly VM and pgBackRest copies |
+| `scratch` | 2 × Seagate ST2000DM001 2 TB — mirror | 1.81 TB | nothing. **Desktop drives** with ~19,700 h and 44–46 k head-park cycles: healthy, scratch only |
+| `archive` | 2 × Seagate **Exos X18 ST18000NM003D 18 TB**, recertified — mirror | 16.4 TB | **created 2026-10-14, empty — its use not yet decided** |
+| `boot-pool` | X12 SSD 240 GB | | TrueNAS |
+| — | Intel SSDSC2BB800G7R 800 GB (`sdf`) | | not in any pool — spare |
+
+**The two Exos, checked 2026-10-14** (`ZVTB17W8`, `ZVTB4MC2`): SMART `PASSED`; reallocated, pending,
+uncorrectable and CRC all **0**; **power-on hours in the FARM log equal SMART's** (10,601 and 10,588)
+— the counter has not been reset, which is the check that matters for a recertified Seagate (used
+drives were sold as new in 2025 with SMART reset; FARM is the record that reset does not touch:
+`smartctl -l farm`). ~14.7 months of runtime, 37–47 spin-ups. The **long self-test ran ~20 h to 80%
+with no error** and was then aborted (misread as finished); **not repeated, by decision** — the weekly
+scrub reads everything written to the pool, so a weak area that ever holds data will surface there.
+
+Also measured: scrubs weekly on every pool (Sunday 00:00); **HDD standby is `ALWAYS ON` on every hard
+disk** — step 6's 60 minutes is not applied; TrueNAS 25.10 has no `smart.test.query` API method, so
+whether periodic SMART tests are scheduled is a UI check (Data Protection).
+
+**The TrueNAS Shell is zsh**, which does not treat `#` as a comment at an interactive prompt — a
+pasted `### MACHINE:` line fails with `missing end of string`. Type **`bash`** first; every block in
+this repository then behaves as it does elsewhere.
+
 **The Dell R7515 — `lab-vault`, built 2026-10-01.** Its RAID 10 (`D:`, 7.4 TB) is the second
 recovery store.
 

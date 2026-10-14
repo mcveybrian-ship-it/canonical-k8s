@@ -31,6 +31,12 @@
 #     sudo ./07-kubernetes.sh join-token <node>  on a control plane: ONE token, printed - by hand only
 #          ./07-kubernetes.sh render             print the config THIS node would use; changes
 #                                                nothing (needs the snap installed)
+#     sudo ./07-kubernetes.sh verify             on a control plane: the cluster, FIPS in the
+#                                                running processes, DNS, a dual-stack LoadBalancer
+#                                                Service, the K-A audit policy. Leaves the test
+#                                                workload (namespace enclave-verify) running
+#     sudo ./07-kubernetes.sh verify --fips-only any node: only this node's processes' crypto
+#     sudo ./07-kubernetes.sh verify --cleanup   remove the test workload
 #
 # WHERE THE IMAGES GO, AND WHY THE PROJECT IS NOT A PARAMETER
 #
@@ -689,7 +695,206 @@ cmd_join() {
   ok "$ME joined as a $kind"
 }
 
+# ===================================================================== B3 - verify
+# Every check prints [ok] or [x]; the run fails if any [x] was printed. Re-runnable.
+V_NS="${V_NS:-enclave-verify}"
+V_PASS=0; V_FAIL=0
+vok()  { printf '  [ok] %s\n' "$*"; V_PASS=$((V_PASS + 1)); }
+vbad() { printf '  [x]  %s\n' "$*"; V_FAIL=$((V_FAIL + 1)); }
+kc()   { /snap/bin/k8s kubectl "$@"; }
+
+# FIPS IN THE RUNNING PROCESSES - what Canonical's FIPS guide does not check (it reads only
+# /proc/sys/crypto/fips_enabled). The FIPS base snap carries libcrypto.so.3 and the OpenSSL FIPS
+# provider, ossl-modules-3/fips.so. A process using the validated module has BOTH mapped, from
+# /snap/core22/<rev>. Read from /proc/<pid>/maps, which needs root.
+verify_fips_node() {
+  local name pid maps lib fips
+  if [ "$(cat /proc/sys/crypto/fips_enabled 2>/dev/null)" = 1 ]; then vok "kernel in FIPS mode"; else vbad "kernel NOT in FIPS mode"; fi
+  case "$(snap_ver core22)" in *fips*) vok "core22 $(snap_ver core22) rev $(snap_rev core22)" ;; *) vbad "core22 is $(snap_ver core22) - not +fips" ;; esac
+  for name in kube-apiserver kube-controller-manager kube-scheduler kubelet etcd k8sd containerd k8s-apiserver-proxy; do
+    pid="$(pgrep -f "^/snap/k8s/[^ ]*/bin/$name( |$)" | head -1 || true)"
+    [ -n "$pid" ] || continue
+    maps="$(awk '$6 ~ /libcrypto|fips\.so/ {print $6}' "/proc/$pid/maps" 2>/dev/null | sort -u)"
+    lib="$(printf '%s\n' "$maps" | grep libcrypto | head -1 || true)"
+    fips="$(printf '%s\n' "$maps" | grep 'fips\.so' | head -1 || true)"
+    if [ -n "$fips" ] && [ "${fips#/snap/core22/}" != "$fips" ]; then
+      vok "$name (pid $pid): $lib + $fips - the core22 FIPS provider is loaded"
+    elif [ -n "$lib" ]; then
+      vbad "$name (pid $pid): $lib mapped, but NO FIPS provider - OpenSSL without fips.so"
+    else
+      vbad "$name (pid $pid): no libcrypto mapped - Go's own crypto, not the validated module (Q-CORE)"
+    fi
+  done
+  # Container processes bring their own userland: reported, not judged - which OpenSSL an image
+  # loads, and whether it is a validated one, is Q-CORE (ssp-inputs 1.3).
+  for name in cilium-agent coredns metallb-speaker metallb-controller metrics-server; do
+    pid="$(pgrep -x "$name" | head -1 || true)"
+    [ -n "$pid" ] || continue
+    maps="$(awk '$6 ~ /libcrypto|fips\.so/ {print $6}' "/proc/$pid/maps" 2>/dev/null | sort -u | tr '\n' ' ')"
+    say "     info: container $name (pid $pid): ${maps:-no libcrypto mapped}"
+  done
+}
+
+# The test workload: the CoreDNS image the cluster already runs (so nothing new is carried in),
+# answering "whoami" on a dual-stack LoadBalancer Service, spread over the workers. It stays up
+# as the target for the survivability tests; verify --cleanup removes it.
+verify_manifest() {
+  kc -n kube-system get deployment coredns -o json | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+c = d["spec"]["template"]["spec"]["containers"][0]
+ns = sys.argv[1]
+ct = {"name": "whoami", "image": c["image"],
+      "volumeMounts": [{"name": "corefile", "mountPath": "/etc/coredns"}],
+      "ports": [{"containerPort": 1053, "protocol": "UDP"}, {"containerPort": 1053, "protocol": "TCP"}],
+      "readinessProbe": {"tcpSocket": {"port": 1053}, "periodSeconds": 5}}
+for k in ("command", "args"):
+    if c.get(k): ct[k] = c[k]
+items = [
+ {"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": ns}},
+ {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "whoami", "namespace": ns},
+  "data": {"Corefile": ".:1053 {\n    whoami\n}\n"}},
+ {"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": "whoami", "namespace": ns},
+  "spec": {"replicas": 4, "selector": {"matchLabels": {"app": "whoami"}},
+   "template": {"metadata": {"labels": {"app": "whoami"}},
+    "spec": {"topologySpreadConstraints": [{"maxSkew": 1, "topologyKey": "kubernetes.io/hostname",
+               "whenUnsatisfiable": "ScheduleAnyway", "labelSelector": {"matchLabels": {"app": "whoami"}}}],
+             "containers": [ct],
+             "volumes": [{"name": "corefile", "configMap": {"name": "whoami"}}]}}}},
+ {"apiVersion": "v1", "kind": "Service", "metadata": {"name": "whoami", "namespace": ns},
+  "spec": {"type": "LoadBalancer", "ipFamilyPolicy": "RequireDualStack", "ipFamilies": ["IPv4", "IPv6"],
+           "selector": {"app": "whoami"},
+           "ports": [{"name": "dns-udp", "port": 53, "targetPort": 1053, "protocol": "UDP"},
+                     {"name": "dns-tcp", "port": 53, "targetPort": 1053, "protocol": "TCP"}]}}]
+print(json.dumps({"apiVersion": "v1", "kind": "List", "items": items}))
+' "$V_NS"
+}
+
+cmd_verify() {
+  need_root
+  whoami_k8s
+  local mode="${1:-}"
+  say "verify on $ME ($ME_ADDR, $ME_ADDR6) - $(date -u +%FT%TZ)"
+  echo
+  if [ "$mode" = --fips-only ]; then
+    say "== FIPS in this node's processes"; verify_fips_node
+    echo; [ "$V_FAIL" -eq 0 ] || die "$V_FAIL check(s) failed on $ME"; ok "$V_PASS checks passed on $ME"; return 0
+  fi
+  [ "$ME_ROLE" = cp ] || die "verify runs on a control plane (it needs the cluster's admin access); on a worker: verify --fips-only"
+  if [ "$mode" = --cleanup ]; then
+    kc delete namespace "$V_NS" --ignore-not-found --wait=true && ok "test workload removed ($V_NS)"; return 0
+  fi
+  [ -z "$mode" ] || die "unknown option: $mode (none, --fips-only or --cleanup)"
+
+  # ---- 1. the cluster
+  say "== 1. the cluster"
+  local st cps want
+  st="$(/snap/bin/k8s status 2>&1)" || true
+  if printf '%s\n' "$st" | grep -q 'high availability: *yes'; then vok "high availability: yes"; else vbad "high availability is not yes"; fi
+  cps="$(grep -cE '^K8S_CP_[0-9]+=' "$ADDRS")"
+  if [ "$(printf '%s\n' "$st" | grep -o '(voter)' | wc -l)" -eq "$cps" ]; then vok "$cps etcd voters"; else vbad "voters: $(printf '%s\n' "$st" | grep -o '(voter)' | wc -l), want $cps"; fi
+  want=""
+  local k a
+  for k in $(grep -oE '^K8S_(CP|WK)_[0-9]+=' "$ADDRS" | tr -d '=' | sort); do
+    a="${!k}"; want="$want $(printf '%s' "$k" | tr 'A-Z_' 'a-z-')=$a,$(node_v6 "$a")"
+  done
+  local nodes_out line
+  nodes_out="$(kc get nodes -o json | WANT="$want" python3 -c '
+import json, os, sys
+want = dict(x.split("=") for x in os.environ["WANT"].split())
+nodes = {n["metadata"]["name"]: n for n in json.load(sys.stdin)["items"]}
+for name, addrs in sorted(want.items()):
+    n = nodes.get(name)
+    if not n: print("BAD %s is not in the cluster" % name); continue
+    ready = any(c["type"] == "Ready" and c["status"] == "True" for c in n["status"]["conditions"])
+    ips = sorted(a["address"] for a in n["status"]["addresses"] if a["type"] == "InternalIP")
+    taint = any(t["key"] == "node-role.kubernetes.io/control-plane" for t in n["spec"].get("taints") or [])
+    cp = name.startswith("k8s-cp-")
+    ok = ready and ips == sorted(addrs.split(",")) and taint == cp
+    print("%s %s: %s, InternalIP %s, %s" % ("OK" if ok else "BAD", name, "Ready" if ready else "NOT READY",
+          " + ".join(ips), ("tainted" if taint else "untainted") + ("" if taint == cp else " - WRONG for its role")))
+')"
+  # counted in THIS shell - a pipe into 'while' would run in a subshell and lose the tally
+  while IFS= read -r line; do case "$line" in OK*) vok "${line#OK }" ;; *) vbad "${line#BAD }" ;; esac; done <<< "$nodes_out"
+  local stuck; stuck="$(kc get pods -A --field-selector=status.phase!=Running,status.phase!=Succeeded -o name 2>&1)"
+  if [ -z "$stuck" ]; then vok "every pod Running"; else vbad "pods not Running: $(printf '%s' "$stuck" | tr '\n' ' ')"; fi
+
+  # ---- 2. FIPS in this node's processes
+  echo; say "== 2. FIPS in this node's processes (repeat on any node: verify --fips-only)"
+  verify_fips_node
+
+  # ---- 3. DNS - CoreDNS answers, and its forward to the enclave DNS (pod traffic) gets through
+  echo; say "== 3. DNS"
+  local dnsip r
+  dnsip="$(printf '%s\n' "$st" | sed -n 's/^dns: *enabled at //p' | awk '{print $1}')"
+  if [ -z "$dnsip" ]; then vbad "no DNS address in k8s status"; else
+    r="$(dig +short +time=3 +tries=2 @"$dnsip" kubernetes.default.svc.cluster.local A 2>&1 | head -1)"
+    if [ "$r" = "${K8S_SERVICE_CIDR_V4%.*}.1" ]; then vok "CoreDNS $dnsip: kubernetes.default -> $r"; else vbad "CoreDNS $dnsip: kubernetes.default -> '${r:-no answer}'"; fi
+    r="$(dig +short +time=3 +tries=2 @"$dnsip" "svc-mgmt-01.$ENCLAVE_DOMAIN" A 2>&1 | head -1)"
+    if [ "$r" = "${SVC_MGMT_01:-}" ]; then vok "CoreDNS forwards enclave names: svc-mgmt-01.$ENCLAVE_DOMAIN -> $r"
+    else vbad "CoreDNS did not resolve svc-mgmt-01.$ENCLAVE_DOMAIN: '${r:-no answer}' (want ${SVC_MGMT_01:-?}) - CoreDNS -> enclave DNS is routed pod traffic"; fi
+  fi
+
+  # ---- 4. a dual-stack LoadBalancer Service
+  echo; say "== 4. dual-stack LoadBalancer (test workload: namespace $V_NS)"
+  verify_manifest | kc apply -f - >/dev/null || die "could not apply the test workload"
+  if kc -n "$V_NS" rollout status deployment/whoami --timeout=180s >/dev/null 2>"$WORK/rollout.err"; then
+    vok "whoami: $(kc -n "$V_NS" get pods -l app=whoami -o jsonpath='{range .items[*]}{.spec.nodeName}{" "}{end}')"
+  else vbad "whoami did not roll out: $(tail -1 "$WORK/rollout.err")"; fi
+  local ips="" v4="" v6=""
+  for _ in $(seq 1 30); do
+    ips="$(kc -n "$V_NS" get svc whoami -o jsonpath='{.status.loadBalancer.ingress[*].ip}')"
+    [ "$(printf '%s' "$ips" | wc -w)" -ge 2 ] && break; sleep 2
+  done
+  for a in $ips; do case "$a" in *:*) v6="$a" ;; *) v4="$a" ;; esac; done
+  if [ -n "$v4" ]; then vok "IPv4 LoadBalancer address $v4"; else vbad "no IPv4 LoadBalancer address (got: ${ips:-none})"; fi
+  if [ -n "$v6" ]; then vok "IPv6 LoadBalancer address $v6"; else vbad "no IPv6 LoadBalancer address (got: ${ips:-none})"; fi
+  if [ -n "$v4" ]; then
+    r="$(dig +noall +additional +time=3 +tries=2 @"$v4" whoami.verify 2>&1 | head -2 | tr -s ' \t\n' ' ')"
+    if [ -n "$r" ]; then vok "answers on $v4: $r"; else vbad "no answer on $v4"; fi
+  fi
+  if [ -n "$v6" ]; then
+    r="$(dig -6 +noall +additional +time=3 +tries=2 @"$v6" whoami.verify 2>&1 | head -2 | tr -s ' \t\n' ' ')"
+    if [ -n "$r" ]; then vok "answers on $v6 (IPv6): $r"; else vbad "no answer on $v6"; fi
+  fi
+
+  # ---- 5. the audit policy (K-A): a Secret's VALUE never reaches the log; the event does
+  echo; say "== 5. the API audit policy (K-A)"
+  local log=/var/log/kubernetes/audit.log marker b64 since
+  marker="enclave-verify-$(date +%s)-$RANDOM"; b64="$(printf '%s' "$marker" | base64 -w0)"
+  since="$(date -u +%FT%T)"
+  kc -n "$V_NS" create secret generic enclave-verify-audit --from-literal=probe="$marker" >/dev/null 2>&1 \
+    || { kc -n "$V_NS" delete secret enclave-verify-audit >/dev/null 2>&1; kc -n "$V_NS" create secret generic enclave-verify-audit --from-literal=probe="$marker" >/dev/null; }
+  sleep 3
+  if [ ! -r "$log" ]; then vbad "no audit log at $log"; else
+    if grep -qF -e "$marker" -e "$b64" "$log"; then vbad "the Secret's value IS in $log - K-A is not in force"
+    else vok "the Secret's value (plain and base64) is NOT in $log"; fi
+    r="$(SINCE="$since" NS="$V_NS" python3 -c '
+import json, os, sys
+seen = []
+for line in open(sys.argv[1], errors="replace"):
+    try: e = json.loads(line)
+    except ValueError: continue
+    o = e.get("objectRef") or {}
+    if o.get("resource") == "secrets" and o.get("name") == "enclave-verify-audit" and e.get("verb") == "create" \
+       and e.get("requestReceivedTimestamp", "") >= os.environ["SINCE"]:
+        seen.append("%s body=%s" % (e.get("level"), "yes" if "requestObject" in e else "no"))
+print(seen[-1] if seen else "")' "$log")"
+    case "$r" in
+      "Metadata body=no") vok "the create was logged at Metadata, no request body" ;;
+      "") vbad "no create event for the probe Secret in this node's log - another API server may have served it; run verify on that control plane" ;;
+      *) vbad "the create was logged as: $r - want Metadata with no body" ;;
+    esac
+  fi
+  kc -n "$V_NS" delete secret enclave-verify-audit >/dev/null 2>&1 || true
+
+  echo
+  [ "$V_FAIL" -eq 0 ] || die "$V_FAIL check(s) failed - read the [x] lines above"
+  ok "all $V_PASS checks passed - the test workload stays up in $V_NS (verify --cleanup removes it)"
+}
+
 case "${1:-}" in
+  verify)        shift; cmd_verify "$@" ;;
   node-prep)     shift; cmd_node_prep "$@" ;;
   render)        shift; cmd_render "$@" ;;
   bootstrap)     shift; cmd_bootstrap "$@" ;;
@@ -699,5 +904,5 @@ case "${1:-}" in
   images-export) shift; cmd_images_export "$@" ;;
   images-load)   shift; cmd_images_load "$@" ;;
   images-check)  shift; cmd_images_check "$@" ;;
-  *) sed -n '2,33p' "$0"; exit 2 ;;
+  *) sed -n '2,39p' "$0"; exit 2 ;;
 esac

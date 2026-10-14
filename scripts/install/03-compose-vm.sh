@@ -628,9 +628,13 @@ fi
 # root's umask 077 is 0700 - found 2026-09-27 on host-1, where /var/lib/libvirt was 0700 and
 # virt-install failed on the data disk only after the admin password had been typed.
 QEMU_USER="${QEMU_USER:-libvirt-qemu}"
+# THE DATA POOL ONLY FOR A GUEST THAT HAS A DATA DISK (found 2026-10-14 composing k8s-wk-04 on
+# host-4): checking it for every guest refused a worker with no data disk, on a host with no
+# data pool at all, and told the operator to chmod a directory that does not exist.
 if [ "$DRY" -eq 0 ] && id "$QEMU_USER" >/dev/null 2>&1; then
   _blocked=""
-  for _d in "$POOL" ${DATA_POOL:+"$DATA_POOL"}; do
+  for _d in "$POOL" ${DATA_DISK:+"$DATA_POOL"}; do
+    [ -d "$_d" ] || die "$_d does not exist on $(hostname -s) - ${_d##*/} is a pool this guest needs (03-host-services.sh prepares it)"
     runuser -u "$QEMU_USER" -- test -x "$_d" 2>/dev/null || _blocked="$_blocked $_d"
   done
   [ -z "$_blocked" ] || die "$QEMU_USER cannot reach:$_blocked
@@ -639,7 +643,7 @@ if [ "$DRY" -eq 0 ] && id "$QEMU_USER" >/dev/null 2>&1; then
        On host-1/host-2 it was /var/lib/libvirt (0700 from root's umask 077; the package ships 0755):
          sudo chmod 0755 /var/lib/libvirt
        03-host-services.sh datavg now sets it; this host was prepared before that fix."
-  ok "qemu ($QEMU_USER) can reach:$( printf ' %s' "$POOL" ${DATA_POOL:+"$DATA_POOL"})"
+  ok "qemu ($QEMU_USER) can reach:$( printf ' %s' "$POOL" ${DATA_DISK:+"$DATA_POOL"})"
 fi
 # ---- the admin password -------------------------------------------------------------------
 # ASKED BEFORE ANYTHING IS CREATED (3.38). It used to be asked after the OS and data disks were

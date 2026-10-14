@@ -429,8 +429,11 @@ install_if_changed() {
   install -D -o root -g root -m "$mode" "$tmp" "$dest"; ok "$dest written"
 }
 
-snap_rev() { snap list "$1" 2>/dev/null | awk 'NR==2 {print $3}'; }
-snap_ver() { snap list "$1" 2>/dev/null | awk 'NR==2 {print $2}'; }
+# `snap list NAME` EXITS 1 for a snap that is not installed - the normal first-run case. Under
+# set -e and pipefail that ended node-prep SILENTLY on k8s-cp-01 (2026-10-14), so "not installed"
+# is an empty answer here, never a failure.
+snap_rev() { { snap list "$1" 2>/dev/null || true; } | awk 'NR==2 {print $3}'; }
+snap_ver() { { snap list "$1" 2>/dev/null || true; } | awk 'NR==2 {print $2}'; }
 
 # side_load NAME REV [--classic] - from the mirror, verified by snapd against Canonical's signed
 # assertion (snap ack, then the install of a file whose hash that assertion names). Downloaded
@@ -470,7 +473,7 @@ cmd_node_prep() {
   local kv k v now bad=""
   while IFS= read -r kv; do
     k="${kv%%=*}"; v="${kv#*=}"; now="$(sysctl -n "$k")"
-    [ "$now" = "$v" ] || bad="$bad $k=$now (want $v; set by: $(grep -ls "^[[:space:]]*$k" /etc/sysctl.d/* /run/sysctl.d/* /usr/lib/sysctl.d/* /etc/sysctl.conf 2>/dev/null | tr '\n' ' '))"
+    [ "$now" = "$v" ] || bad="$bad $k=$now (want $v; set by: $({ grep -ls "^[[:space:]]*$k" /etc/sysctl.d/* /run/sysctl.d/* /usr/lib/sysctl.d/* /etc/sysctl.conf 2>/dev/null || true; } | tr '\n' ' '))"
   done <<< "$KUBELET_SYSCTL"
   [ -z "$bad" ] || die "kernel settings kubelet requires are overridden:$bad"
   ok "kubelet's six kernel settings live"

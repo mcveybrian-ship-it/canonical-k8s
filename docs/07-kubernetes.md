@@ -2,8 +2,8 @@
 
 **Status: 🔄 IN PROGRESS. The cluster has been running since 2026-10-14 (03:15–04:00 UTC):** seven nodes
 `Ready`, `high availability: yes` (three etcd voters), every pod Running, load balancer enabled.
-**Verified 2026-10-14 15:10 UTC — `07-kubernetes.sh verify`, all 28 checks passed** (§4). **Still owed, in order:**
-the API VIP (keepalived), ssh off on the workers (K-B), and the survivability tests. The live list is `docs/backlog.md` row B-07; this document is
+**Verified 2026-10-14 15:10 UTC — `07-kubernetes.sh verify`, all 28 checks passed** (§4); **the API VIP live the
+same day** (§3.10). **Still owed:** the survivability tests (K-B was reversed — ssh stays on the workers, §2). The live list is `docs/backlog.md` row B-07; this document is
 the procedure and the record of how it was built.
 
 The script is [`scripts/install/07-kubernetes.sh`](../scripts/install/07-kubernetes.sh). Every
@@ -33,7 +33,7 @@ the digits of its IPv4 last octet (the address file says why there is no per-nod
 | pods | 10.1.0.0/16 | fd6e:32f0:f4b3:1::/108 | set at bootstrap, never changeable |
 | services | 10.152.183.0/24 | fd6e:32f0:f4b3:152::/108 | /108 is Canonical's maximum |
 | LoadBalancer pool | .200 – .250 | :20::200 – :20::250 | layer-2 announcement, on the node network |
-| API VIP | 10.2.20.170 | — | keepalived — **not yet configured** |
+| API VIP | 10.2.20.170 | — | keepalived on cp-01..03, VRRP unicast — **live 2026-10-14** |
 
 **What runs:** Canonical Kubernetes **v1.36.4, snap rev 5526** (Q23), on base **`core22`
 20260125+fips, rev 2383**, installed by **`snapd` 2.78+fips, rev 28333** — all three side-loaded
@@ -52,7 +52,7 @@ nodes have IPv6**; every other machine, the API VIP and the storage network stay
 | — | **Four workers in the lab too, wk-04 on host-4** | 2026-10-14, Brian | Ceph at replica-3 on three OSD nodes cannot self-heal — but see backlog 3.48 |
 | A3 | A ufw table for every node, sources narrowed; **routed rules for the pod ranges only** once measured (§5, trap 7) | 2026-10-14, Brian | Canonical's narrower option, never `DEFAULT_FORWARD_POLICY=ACCEPT` |
 | K-A | **API audit policy: a narrow, documented deviation from V-242403** — Secrets, `serviceaccounts/token` and `tokenreviews` at `Metadata`; everything else `RequestResponse` | 2026-10-14, Brian | the STIG's exact policy writes every Secret's value into a log that is offloaded to svc-obs-01 and copied to the vault and the NAS |
-| K-B | **sshd off on the workers** (V-242393/242394) once joined and verified; maintenance by serial console | 2026-10-14, Brian | complies; every guest has a console through its host |
+| K-B | ~~sshd off on the workers~~ → **REVERSED the same day: sshd stays ON on the workers** | 2026-10-14, Brian | the only other way in is `virsh console` from each host — and everything run on a worker (the repo push, `verify --fips-only`, patching, the rebuild tooling) goes over ssh. The STIGs conflict anyway: the Ubuntu 24.04 STIG's **UBTU-24-100810 requires sshd enabled**, the Kubernetes STIG's **V-242393/242394 require it off** on workers — so V-242393/394 stay **open, accepted** (POA&M AO-21). ssh on a worker is key-only, FIPS ciphers, `ufw limit`, the DoD banner — as on every machine |
 | K-C | **Pod Security `baseline`** (Canonical's default, V-254800) | 2026-10-14, Brian | the vendor's images are unmeasured; revisit `restricted` once they run |
 | — | **snapd: the FIPS build** from `fips-updates/candidate` | 2026-10-14, Brian | `fips-updates/stable` was empty; snapd verifies every snap's signature. Q-CORE asks when stable carries it |
 | — | local-storage **off**; CoreDNS forwards to the **enclave DNS**; `--address` always explicit | 2026-10-14 | node-local volumes do not survive their node; the node resolver 127.0.0.53 means nothing in a pod; there is no default route to find |
@@ -242,6 +242,21 @@ test workload running — namespace `enclave-verify`, the cluster's own CoreDNS 
 `whoami` on four replicas, one per worker — as the target for the survivability tests;
 `verify --cleanup` removes it. `verify --fips-only` checks one node's processes, on any node.
 
+### 3.10 The API VIP
+
+```bash
+### MACHINE: k8s-cp-01, k8s-cp-02, k8s-cp-03 — the same block on each ###
+case "$(hostname -s)" in k8s-cp-0[1-3]) sudo ~/canonical-k8s/scripts/install/07-kubernetes.sh vip ;; *) echo "WRONG MACHINE: $(hostname -s)" ;; esac
+```
+
+keepalived from the mirror (`--no-install-recommends`; its net-snmp dependency still brings Perl —
+1–2 min), VRRP unicast to the other two, id = the VIP's last octet, priority 130/120/110 by node
+number with `nopreempt` (one move per failure). The health check carries **no credentials**:
+anonymous access is off, so a healthy API server answers `/livez` with 401 — that or 200 is "up".
+It does not notice an API server that runs but has lost etcd, a cluster-wide event a VIP move would
+not fix. The VIP serves clients outside the cluster (svc-mgmt-01, svc-obs-01); inside, each worker's
+`k8s-apiserver-proxy` spreads over all three API servers already.
+
 ## 4. What has been verified (2026-10-14)
 
 | | how |
@@ -257,6 +272,7 @@ test workload running — namespace `enclave-verify`, the cluster's own CoreDNS 
 | ✅ DNS | CoreDNS answers `kubernetes.default` → 10.152.183.1, and forwards `svc-mgmt-01.enclave.internal` → 10.2.20.161 (the routed path of trap 7) |
 | ✅ **dual-stack LoadBalancer** | the test Service got `10.2.20.200` **and** `fd6e:32f0:f4b3:20::200`; answers over both from cp-01, and over UDP and TCP **from stage-01, outside the cluster** — no ufw rule for it exists, so Cilium's eBPF path is confirmed ahead of ufw (POA&M ENG-75) |
 | ✅ **audit policy K-A** | a probe Secret's value — plain and base64 — absent from `/var/log/kubernetes/audit.log`; its create logged at `Metadata`, no request body |
+| ✅ **API VIP** | cp-01 holds `10.2.20.170`, cp-02/03 standby; from svc-mgmt-01 the API answers on it (HTTP 401) and `k8s-api.enclave.internal` resolves to it; stage-01 is dropped — not an allowed source |
 | ✅ Harbor as the image source | Harbor's own pull counts (`/api/v2.0/projects/canonical/repositories`, anonymous): 9 for `cilium`, `pause` and `metallb-speaker` — the seven nodes plus the two read-backs of `images-check`; 2 for the CSI images, which nothing runs (local-storage off) |
 
 ## 5. Traps hit — each fixed in a script
@@ -286,8 +302,8 @@ test workload running — namespace `enclave-verify`, the cluster's own CoreDNS 
 
 1. ~~**Verify**~~ ✅ **done 2026-10-14** — §3.9, §4. `verify --fips-only` on all four workers **ok** the same
    day — kubelet, containerd, k8sd and k8s-apiserver-proxy on core22's `fips.so` too.
-2. **The API VIP** — keepalived on the control planes, VRRP unicast (the ufw rows exist).
-3. **K-B** — sshd disabled on the workers.
+2. ~~**The API VIP**~~ ✅ live 2026-10-14 (§3.10).
+3. ~~**K-B** — sshd disabled on the workers~~ — **reversed 2026-10-14: ssh stays on** (§2, POA&M AO-21).
 4. **Survivability (C):** a control plane off, a worker off, a whole host off; an etcd snapshot
    and restore; a full planned shutdown in the 3.57 order.
 5. Then **B-08 Ceph** — blocked on backlog 3.48 (wk-04 has no OSD device).

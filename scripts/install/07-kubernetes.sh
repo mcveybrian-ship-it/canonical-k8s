@@ -780,7 +780,9 @@ cmd_vip() {
   say "vip         $K8S_API_VIP on $iface - VRRP id $K8S_VRRP_ID, priority $prio, unicast to ${peers[*]}"
 
   if ! command -v keepalived >/dev/null 2>&1; then
-    DEBIAN_FRONTEND=noninteractive apt-get install -y keepalived >/dev/null || die "apt-get install keepalived failed - is apt pointed at the mirror?"
+    # --no-install-recommends: nothing optional on a hardened guest. keepalived still DEPENDS on
+    # net-snmp's libraries, which bring Perl (~1-2 min to unpack here) - seen on cp-01 2026-10-14.
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends keepalived >/dev/null || die "apt-get install keepalived failed - is apt pointed at the mirror?"
     ok "keepalived installed ($(keepalived --version 2>&1 | head -1))"
   else ok "keepalived already installed ($(keepalived --version 2>&1 | head -1))"; fi
   ka_check | install_if_changed "$KA_CHECK" 0755

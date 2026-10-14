@@ -126,6 +126,10 @@ def parse_live_rule(rule):
     if m:
         return {"action": m.group(1), "port": m.group(3), "proto": m.group(4) or "any",
                 "source": m.group(2)}
+    # A portless protocol - keepalived's VRRP (B-07). The design table writes it "-/vrrp".
+    m = re.match(r"^(allow|deny|reject|limit)\s+(?:in\s+)?from\s+(\S+)\s+to\s+\S+\s+proto\s+(vrrp|gre|esp|ah|igmp|ipv6)$", rule)
+    if m:
+        return {"action": m.group(1), "port": "-", "proto": m.group(3), "source": m.group(2)}
     return {"action": "?", "port": "?", "proto": "?", "source": "?", "raw": rule}
 
 

@@ -126,6 +126,11 @@ def parse_live_rule(rule):
     if m:
         return {"action": m.group(1), "port": m.group(3), "proto": m.group(4) or "any",
                 "source": m.group(2)}
+    # A ROUTED rule (B-07): pods leaving through a k8s node. Not a listener, so it is recorded
+    # and never compared with the listening ports.
+    m = re.match(r"^route\s+(allow|deny|reject|limit)\s+(?:in\s+|out\s+)?from\s+(\S+)\s+to\s+(\S+)", rule)
+    if m:
+        return {"action": "route-" + m.group(1), "port": "-", "proto": "routed", "source": m.group(2), "dest": m.group(3)}
     # A portless protocol - keepalived's VRRP (B-07). The design table writes it "-/vrrp".
     m = re.match(r"^(allow|deny|reject|limit)\s+(?:in\s+)?from\s+(\S+)\s+to\s+\S+\s+proto\s+(vrrp|gre|esp|ah|igmp|ipv6)$", rule)
     if m:
@@ -467,6 +472,8 @@ def main():
         for r in rules_by.get(m, []):
             if r["action"] == "?":
                 finding("UNPARSED RULE", m, "could not read ufw rule %r" % r.get("raw"))
+            elif r["proto"] == "routed":
+                continue
             elif (m, r["port"], r["proto"]) not in listening and not (r["proto"] == "any" and any((m, r["port"], p) in listening for p in ("tcp", "udp"))):
                 finding("RULE WITHOUT SERVICE", m, "live ufw rule %s %s/%s from %s - nothing listens on it" % (r["action"], r["port"], r["proto"], r["source"]))
 

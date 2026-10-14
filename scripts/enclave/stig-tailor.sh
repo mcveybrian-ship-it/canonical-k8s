@@ -4297,6 +4297,47 @@ k8s-wk-04	8472/udp	allow	__K8S_CP_01__,__K8S_CP_02__,__K8S_CP_03__,__K8S_WK_01__
 EOF
 }
 
+# ROUTED TRAFFIC - THE KUBERNETES NODES ONLY (B-07, measured 2026-10-14). ufw's default for routed
+# packets is deny, and a pod's connection that leaves through the node's own NIC is ROUTED
+# (IN=lxc... OUT=enp1s0). Measured after bootstrap, the way A3 said it would be: wk-01 dropped the
+# MetalLB controller's calls to the API (10.1.3.89 -> 10.2.20.171:6443), so it crash-looped, and
+# cp-02 dropped CoreDNS forwarding to the enclave DNS (10.1.1.71 -> 10.2.20.161:53). This is
+# Canonical's narrower ufw option - routes for the POD RANGES only, not DEFAULT_FORWARD_POLICY=ACCEPT.
+# Replies need no rule (ufw's before-forward accepts ESTABLISHED). One rule per row; no commas.
+#   machine <TAB> from <TAB> to <TAB> why        applied as: ufw route allow from <from> to <to>
+ufw_route_rules() {
+cat <<'EOF'
+k8s-cp-01	__K8S_POD_CIDR_V4__	__ENCLAVE_CIDR__	pods to the enclave subnet - the API servers through the kubernetes Service, the enclave DNS (CoreDNS forwards there), PostgreSQL on pg-01..03. Each destination's own ufw still decides what it accepts
+k8s-cp-01	__K8S_POD_CIDR_V4__	__K8S_POD_CIDR_V4__	pod to pod across nodes (Canonical's ufw how-to, option B)
+k8s-cp-01	__K8S_POD_CIDR_V6__	__K8S_POD_CIDR_V6__	pod to pod, IPv6 - the cluster is dual-stack (B-07 A2)
+k8s-cp-01	__K8S_POD_CIDR_V6__	__K8S_NODE_V6_NET__	pods to the node network's IPv6 half - the same reach as IPv4, nothing wider
+k8s-cp-02	__K8S_POD_CIDR_V4__	__ENCLAVE_CIDR__	pods to the enclave subnet - the API servers through the kubernetes Service, the enclave DNS (CoreDNS forwards there), PostgreSQL on pg-01..03. Each destination's own ufw still decides what it accepts
+k8s-cp-02	__K8S_POD_CIDR_V4__	__K8S_POD_CIDR_V4__	pod to pod across nodes (Canonical's ufw how-to, option B)
+k8s-cp-02	__K8S_POD_CIDR_V6__	__K8S_POD_CIDR_V6__	pod to pod, IPv6 - the cluster is dual-stack (B-07 A2)
+k8s-cp-02	__K8S_POD_CIDR_V6__	__K8S_NODE_V6_NET__	pods to the node network's IPv6 half - the same reach as IPv4, nothing wider
+k8s-cp-03	__K8S_POD_CIDR_V4__	__ENCLAVE_CIDR__	pods to the enclave subnet - the API servers through the kubernetes Service, the enclave DNS (CoreDNS forwards there), PostgreSQL on pg-01..03. Each destination's own ufw still decides what it accepts
+k8s-cp-03	__K8S_POD_CIDR_V4__	__K8S_POD_CIDR_V4__	pod to pod across nodes (Canonical's ufw how-to, option B)
+k8s-cp-03	__K8S_POD_CIDR_V6__	__K8S_POD_CIDR_V6__	pod to pod, IPv6 - the cluster is dual-stack (B-07 A2)
+k8s-cp-03	__K8S_POD_CIDR_V6__	__K8S_NODE_V6_NET__	pods to the node network's IPv6 half - the same reach as IPv4, nothing wider
+k8s-wk-01	__K8S_POD_CIDR_V4__	__ENCLAVE_CIDR__	pods to the enclave subnet - the API servers through the kubernetes Service, the enclave DNS (CoreDNS forwards there), PostgreSQL on pg-01..03. Each destination's own ufw still decides what it accepts
+k8s-wk-01	__K8S_POD_CIDR_V4__	__K8S_POD_CIDR_V4__	pod to pod across nodes (Canonical's ufw how-to, option B)
+k8s-wk-01	__K8S_POD_CIDR_V6__	__K8S_POD_CIDR_V6__	pod to pod, IPv6 - the cluster is dual-stack (B-07 A2)
+k8s-wk-01	__K8S_POD_CIDR_V6__	__K8S_NODE_V6_NET__	pods to the node network's IPv6 half - the same reach as IPv4, nothing wider
+k8s-wk-02	__K8S_POD_CIDR_V4__	__ENCLAVE_CIDR__	pods to the enclave subnet - the API servers through the kubernetes Service, the enclave DNS (CoreDNS forwards there), PostgreSQL on pg-01..03. Each destination's own ufw still decides what it accepts
+k8s-wk-02	__K8S_POD_CIDR_V4__	__K8S_POD_CIDR_V4__	pod to pod across nodes (Canonical's ufw how-to, option B)
+k8s-wk-02	__K8S_POD_CIDR_V6__	__K8S_POD_CIDR_V6__	pod to pod, IPv6 - the cluster is dual-stack (B-07 A2)
+k8s-wk-02	__K8S_POD_CIDR_V6__	__K8S_NODE_V6_NET__	pods to the node network's IPv6 half - the same reach as IPv4, nothing wider
+k8s-wk-03	__K8S_POD_CIDR_V4__	__ENCLAVE_CIDR__	pods to the enclave subnet - the API servers through the kubernetes Service, the enclave DNS (CoreDNS forwards there), PostgreSQL on pg-01..03. Each destination's own ufw still decides what it accepts
+k8s-wk-03	__K8S_POD_CIDR_V4__	__K8S_POD_CIDR_V4__	pod to pod across nodes (Canonical's ufw how-to, option B)
+k8s-wk-03	__K8S_POD_CIDR_V6__	__K8S_POD_CIDR_V6__	pod to pod, IPv6 - the cluster is dual-stack (B-07 A2)
+k8s-wk-03	__K8S_POD_CIDR_V6__	__K8S_NODE_V6_NET__	pods to the node network's IPv6 half - the same reach as IPv4, nothing wider
+k8s-wk-04	__K8S_POD_CIDR_V4__	__ENCLAVE_CIDR__	pods to the enclave subnet - the API servers through the kubernetes Service, the enclave DNS (CoreDNS forwards there), PostgreSQL on pg-01..03. Each destination's own ufw still decides what it accepts
+k8s-wk-04	__K8S_POD_CIDR_V4__	__K8S_POD_CIDR_V4__	pod to pod across nodes (Canonical's ufw how-to, option B)
+k8s-wk-04	__K8S_POD_CIDR_V6__	__K8S_POD_CIDR_V6__	pod to pod, IPv6 - the cluster is dual-stack (B-07 A2)
+k8s-wk-04	__K8S_POD_CIDR_V6__	__K8S_NODE_V6_NET__	pods to the node network's IPv6 half - the same reach as IPv4, nothing wider
+EOF
+}
+
 # RUNBOOK 6.0 STEP 12b (05-harden-host.sh step_tailor runs it LAST, then stops for an off-box
 # reachability check). usg rules check_ufw_active, set_ufw_default_rule, ufw_rate_limit;
 # the DISA side is V-270754. No flag = plan (read-only); --apply = root, rebuilds the whole
@@ -4348,6 +4389,18 @@ cmd_ufw() {
   done
   mine="$(printf '%s\n' "$mine" | awk -F'\t' 'BEGIN { OFS = "\t" }
       { n = split($4, s, ","); if (n == 0) { print; next } for (i = 1; i <= n; i++) { $4 = s[i]; print } }')"
+  # The routed rows (B-07), resolved the same way. An unresolved key REFUSES, as above: an empty
+  # field in a route rule would become "from anywhere" or "to anywhere".
+  local routes; routes="$(ufw_route_rules | sed -e "s|__ENCLAVE_CIDR__|${cidr}|g" | awk -F'\t' -v m="$me" '$1==m')"
+  for ph in $(printf '%s\n' "$routes" | grep -oE '__[A-Z0-9_]+__' | sort -u); do
+    key="${ph#__}"; key="${key%__}"
+    [ -n "${!key:-}" ] || die "the routed table for $me names $ph, and $key has no value in enclave-addresses.env.
+       Refusing: an empty field becomes 'anywhere'."
+    routes="$(printf '%s\n' "$routes" | sed "s|$ph|${!key}|g")"
+  done
+  if [ -n "$routes" ] && printf '%s\n' "$routes" | awk -F'\t' '$2=="" || $3=="" {f=1} END {exit !f}'; then
+    die "a routed rule for $me has an empty from or to - refusing"
+  fi
 
   # NO TABLE AT ALL IS CHECKED FIRST, and the order is load-bearing. `printf '%s\n' ""`
   # emits ONE EMPTY LINE, so awk sees a record whose $4 is empty and the source check below
@@ -4393,6 +4446,10 @@ cmd_ufw() {
   printf '\n  ufw plan for %s\n\n' "$me"
   printf '  %-10s %-7s %-14s %s\n' PORT ACTION FROM WHY
   printf '%s\n' "$mine" | awk -F'\t' '{printf "  %-10s %-7s %-14s %s\n", $2, $3, $4, $5}'
+  if [ -n "$routes" ]; then
+    printf '\n  ROUTED (pods leaving through this node)\n'
+    printf '%s\n' "$routes" | awk -F'\t' '{printf "  route allow from %-24s to %-24s %s\n", $2, $3, $4}'
+  fi
 
   # Anything EXTERNALLY BOUND that the table does not mention is either surface to remove or
   # a rule we forgot. Say which - do not silently firewall a service into the dark.
@@ -4487,6 +4544,13 @@ cmd_ufw() {
       ok "ufw $action $port from $src   ($why)"
     fi
   done < <(printf '%s\n' "$mine")
+
+  local rfrom rto rwhy
+  while IFS=$'\t' read -r _ rfrom rto rwhy; do
+    [ -n "${rfrom:-}" ] || continue
+    ufw route allow from "$rfrom" to "$rto" >/dev/null || die "ufw route allow from $rfrom to $rto failed"
+    ok "ufw route allow from $rfrom to $rto   ($rwhy)"
+  done < <(printf '%s\n' "$routes")
 
   # --force skips the "may disrupt existing ssh connections" prompt - safe only because the
   # 22/tcp rule was proven present above. check_ufw_active.

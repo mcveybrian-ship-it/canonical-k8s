@@ -64,8 +64,13 @@ it rested on 24.04 having no certificates. What an assessor can still ask, and w
 inventoried rather than assumed:
 
 - **Kubernetes** takes its cryptography from its `core22` base snap — **22.04**'s FIPS build, not
-  the host's 24.04 modules (backlog 3.25). Whether that build maps to an active 22.04 certificate
-  is **Canonical question Q-CORE (b)**; do not claim it until answered.
+  the host's 24.04 modules (backlog 3.25). **Measured 2026-10-14 (`07-kubernetes.sh verify`):**
+  kube-apiserver, controller-manager, scheduler, kubelet, etcd, k8sd and containerd each have
+  core22's `libcrypto.so.3` **and its FIPS provider `fips.so`** mapped in the running process — so
+  their crypto goes through that module. Whether that build maps to an active 22.04 certificate
+  (#4794, *interim*, is the candidate) is **Canonical question Q-CORE (b)**; claim "the core22 FIPS
+  provider, loaded and in use", not "validated", until answered. The **container images** (Cilium,
+  CoreDNS, metrics-server) load a `fips.so` from inside their own images — which build, Q-CORE.
 - **The PostgreSQL cluster's etcd** (pg-01..03, Patroni's consensus store) is Go 1.22.2 **without
   BoringCrypto** — its TLS is Go's own, not a validated module. Configured to approved algorithms
   only (TLS 1.2 ECDHE-RSA AES-GCM, mutual TLS), except TLS 1.3 ChaCha20, which Go cannot disable.

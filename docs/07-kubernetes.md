@@ -2,8 +2,8 @@
 
 **Status: 🔄 IN PROGRESS. The cluster has been running since 2026-10-14 (03:15–04:00 UTC):** seven nodes
 `Ready`, `high availability: yes` (three etcd voters), every pod Running, load balancer enabled.
-**Still owed, in order:** the verify step (§6), the API VIP (keepalived), ssh off on the workers
-(K-B), and the survivability tests. The live list is `docs/backlog.md` row B-07; this document is
+**Verified 2026-10-14 15:10 UTC — `07-kubernetes.sh verify`, all 28 checks passed** (§4). **Still owed, in order:**
+the API VIP (keepalived), ssh off on the workers (K-B), and the survivability tests. The live list is `docs/backlog.md` row B-07; this document is
 the procedure and the record of how it was built.
 
 The script is [`scripts/install/07-kubernetes.sh`](../scripts/install/07-kubernetes.sh). Every
@@ -226,6 +226,22 @@ fi
 may not run on a control plane (the H3 taint) and no worker exists yet. Re-apply once workers are
 in. Not yet scripted (backlog 3.60).
 
+### 3.9 Verify — repeatable, read-mostly
+
+```bash
+### MACHINE: k8s-cp-01 (any control plane) ###
+if [ "$(hostname -s)" != k8s-cp-01 ]; then echo "WRONG MACHINE: $(hostname -s)"; else
+  sudo ~/canonical-k8s/scripts/install/07-kubernetes.sh verify
+fi
+```
+
+Five sections, each line `[ok]` or `[x]`, failing if any `[x]`: the cluster; FIPS in this node's
+processes; DNS; a dual-stack LoadBalancer Service; the K-A audit policy (a probe Secret whose value
+must not appear in the log, plain or base64, while its create is logged at `Metadata`). It leaves a
+test workload running — namespace `enclave-verify`, the cluster's own CoreDNS image answering
+`whoami` on four replicas, one per worker — as the target for the survivability tests;
+`verify --cleanup` removes it. `verify --fips-only` checks one node's processes, on any node.
+
 ## 4. What has been verified (2026-10-14)
 
 | | how |
@@ -237,6 +253,11 @@ in. Not yet scripted (backlog 3.60).
 | ✅ HA | `k8s status`: three voters, `high availability: yes` |
 | ✅ images from Harbor | every pod Running; the speaker image (95 MB) pulled in 3.4 s; no other source exists in the gap |
 | ✅ taints | `node-role.kubernetes.io/control-plane` on cp-01..03 only |
+| ✅ **FIPS in the running processes** | `verify` §2 on cp-01, 15:10 UTC: kube-apiserver, kube-controller-manager, kube-scheduler, kubelet, etcd, k8sd and containerd **each have `/snap/core22/2383/…/libcrypto.so.3` AND `…/ossl-modules-3/fips.so` mapped** (`/proc/<pid>/maps`). The classic-confinement question of 3.25 answered by measurement. The container processes (cilium-agent, coredns, metrics-server) map a `fips.so` from **their own image** — which build that is, is Q-CORE |
+| ✅ DNS | CoreDNS answers `kubernetes.default` → 10.152.183.1, and forwards `svc-mgmt-01.enclave.internal` → 10.2.20.161 (the routed path of trap 7) |
+| ✅ **dual-stack LoadBalancer** | the test Service got `10.2.20.200` **and** `fd6e:32f0:f4b3:20::200`; answers over both from cp-01, and over UDP and TCP **from stage-01, outside the cluster** — no ufw rule for it exists, so Cilium's eBPF path is confirmed ahead of ufw (POA&M ENG-75) |
+| ✅ **audit policy K-A** | a probe Secret's value — plain and base64 — absent from `/var/log/kubernetes/audit.log`; its create logged at `Metadata`, no request body |
+| ✅ Harbor as the image source | Harbor's own pull counts (`/api/v2.0/projects/canonical/repositories`, anonymous): 9 for `cilium`, `pause` and `metallb-speaker` — the seven nodes plus the two read-backs of `images-check`; 2 for the CSI images, which nothing runs (local-storage off) |
 
 ## 5. Traps hit — each fixed in a script
 
@@ -263,10 +284,8 @@ in. Not yet scripted (backlog 3.60).
 
 ## 6. Owed — the rest of B-07
 
-1. **Verify:** Kubernetes processes load their crypto library from the FIPS base (process maps);
-   a dual-stack LoadBalancer Service gets an address from each pool (test target: the CoreDNS image
-   already in Harbor, as a `whoami` server); a pod resolves enclave names; Harbor's log shows it as
-   the only image source; the API audit log holds Secrets at `Metadata`.
+1. ~~**Verify**~~ ✅ **done 2026-10-14** — §3.9, §4. `verify --fips-only` on the workers still to run, so the
+   worker-side processes (kubelet, containerd, k8sd, k8s-apiserver-proxy) are measured as well.
 2. **The API VIP** — keepalived on the control planes, VRRP unicast (the ufw rows exist).
 3. **K-B** — sshd disabled on the workers.
 4. **Survivability (C):** a control plane off, a worker off, a whole host off; an etcd snapshot

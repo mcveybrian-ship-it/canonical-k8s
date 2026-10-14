@@ -728,7 +728,9 @@ verify_fips_node() {
   # Container processes bring their own userland: reported, not judged - which OpenSSL an image
   # loads, and whether it is a validated one, is Q-CORE (ssp-inputs 1.3).
   for name in cilium-agent coredns metallb-speaker metallb-controller metrics-server; do
-    pid="$(pgrep -x "$name" | head -1 || true)"
+    # -f on the command line, not -x on the name: the kernel keeps only 15 characters of a
+    # process name, so "metallb-controller" could never match -x (seen 2026-10-14)
+    pid="$(pgrep -f "(^|/)$name( |$)" | head -1 || true)"
     [ -n "$pid" ] || continue
     maps="$(awk '$6 ~ /libcrypto|fips\.so/ {print $6}' "/proc/$pid/maps" 2>/dev/null | sort -u | tr '\n' ' ')"
     say "     info: container $name (pid $pid): ${maps:-no libcrypto mapped}"

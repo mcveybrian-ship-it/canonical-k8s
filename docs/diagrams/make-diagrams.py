@@ -79,7 +79,7 @@ LAB = dict(PROD, **LABO)
 # The ONLY place the drawing learns what exists. Date a line when the thing is built, in the same
 # commit as the milestone; empty means planned. Everything that is not here comes from the env files.
 STATUS = {
-    "kubernetes": "",                               # B-07: date the cluster was bootstrapped
+    "kubernetes": "2026-10-14",                     # B-07: date the cluster was bootstrapped
     "ceph": "",                                     # B-08: date Ceph served its first volume
     "witness": "",                                  # 2.8: an OPTION until decided
     "storage_address": {"host-1": "2026-10-13", "host-2": "2026-10-13", "host-3": "2026-10-13", "host-4": "2026-10-01"},    # 3.16: `03-host-services.sh storage`, per host

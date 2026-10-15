@@ -484,7 +484,7 @@ columns only, because the audit policy records every response in full (K-A).
 | KubernetesAPIServerDown · KubernetesAPIServersMostlyDown | one API server not ready for 2 min · more than half | warning · critical |
 | KubernetesEtcdMemberDown · KubernetesEtcdQuorumLost | etcd stopped on a control plane · fewer than a majority running | critical |
 | KubernetesNotHighlyAvailable | `k8s status` not HA, or fewer voters than control planes | critical |
-| KubernetesAPIVIPNoHolder · KubernetesAPIVIPSplit · KubernetesAPIVIPMoved | nobody holds the VIP · two do · it moved in the last 30 min | critical · critical · warning |
+| KubernetesAPIVIPNoHolder · KubernetesAPIVIPSplit · KubernetesAPIVIPMoved | nobody holds the VIP for 3 min · two do for 3 min · it moved in the last 30 min | critical · critical · warning |
 | KeepalivedNotRunning | on a control plane, 2 min | warning |
 | KubernetesPodsUnhealthy | any pod not Running-and-ready (or Completed) for 15 min | warning |
 | KubernetesSecretsNotEncrypted | any of the three encryption checks fails on any control plane for 5 min — **the args-file check catches a rewritten file before the next restart would lose every Secret** | critical |
@@ -516,8 +516,12 @@ machine with no IPMI device.
   (`monitor_api_ok 0`, no cluster timestamp), never an API server down. The fake server saw only table
   requests with `includeObject=None`.
 - The published file passes `promtool check metrics`, and every dashboard query parses.
-- **Not yet verified:** the deployment, Canonical's `/readyz` for a ServiceAccount, the systemd unit
-  name `snap.k8s.etcd.service`, and the failure tests on the real cluster (below).
+- **Then on the cluster, 2026-10-15 04:30–05:05 UTC:** all seven exporters answered svc-obs-01. The
+  monitor's identity read every API server's `/readyz`, so Canonical allows it for a ServiceAccount.
+  `snap.k8s.etcd.service` was confirmed as the unit name, running on all three. The holder published 7
+  of 7 nodes Ready, 23 of 23 pods Running, and 9 of 9 encryption checks in place. Prometheus showed 7 of
+  7 new targets up and 16 rules loaded, none firing. The 3.56 fix held: no `openipmi`, `ipmitool`, `jq`,
+  `nvme-cli` or `smartmontools` on cp-01 or wk-01, both systemd `running`.
 
 **Deploy** (blocks in the session log; the order matters: checks before rules, so the stale alert does
 not fire on a check that was never started):
@@ -529,8 +533,8 @@ not fire on a check that was never started):
 
 | test | expect | measured |
 |---|---|---|
-| `sudo virsh shutdown k8s-wk-04` on host-4 | InstanceDown (wk-04) and KubernetesNodeNotReady within ~3 min; red band on the dashboard; both clear after `virsh start` | — |
-| `sudo systemctl stop keepalived` on the VIP holder | KubernetesAPIVIPMoved; KeepalivedNotRunning after 2 min; the holder stat changes name. `start` it again afterwards; the VIP stays (nopreempt) | — |
+| `sudo virsh shutdown k8s-wk-04` on host-4 | InstanceDown (wk-04) and KubernetesNodeNotReady; red band on the dashboard; both clear after `virsh start` | ✅ **2026-10-15**, shut down ~04:50:40 UTC: InstanceDown pending 04:50:58, **firing 04:52:52**; NodeNotReady pending 04:52:36, **firing 04:54:47 — about 4 min** (Kubernetes' ~40–50 s grace + up to a minute to the next check + the 2 min hold). Nothing else fired; the VIP stayed put. After `virsh start`: InstanceDown cleared 04:56:58, NodeNotReady 04:57:47 |
+| `sudo systemctl stop keepalived` on the VIP holder | KubernetesAPIVIPMoved; KeepalivedNotRunning after 2 min; the holder stat changes name. `start` it again afterwards; the VIP stays (nopreempt) | ✅ **2026-10-15**, cp-02 stopped ~05:00:05: VIP on cp-01 by 05:00:11; **VIPMoved firing 05:00:18**; KeepalivedNotRunning pending 05:00:33, **firing 05:02:38**. Restarted: cp-02 `active`, the VIP **stayed on cp-01**, KeepalivedNotRunning cleared 05:04:44. ⚠️ **It also caught a false alarm**: for ~15 s both planes' reports said "held" (the old holder's report is up to a minute old), and VIPSplit went pending on a clean move. VIPSplit and VIPNoHolder now hold **3 min**, not 1 (`AL_K8S_VIP_FOR`); an 11th rule test replays the case |
 
 ## 4. What has been verified (2026-10-14)
 
@@ -549,6 +553,7 @@ not fire on a check that was never started):
 | ✅ **dual-stack LoadBalancer** | the test Service got `10.2.20.200` **and** `fd6e:32f0:f4b3:20::200`; answers over both from cp-01, and over UDP and TCP **from stage-01, outside the cluster** — no ufw rule for it exists, so Cilium's eBPF path is confirmed ahead of ufw (POA&M ENG-75) |
 | ✅ **audit policy K-A** | a probe Secret's value — plain and base64 — absent from `/var/log/kubernetes/audit.log`; its create logged at `Metadata`, no request body |
 | ✅ **API VIP** | cp-01 holds `10.2.20.170`, cp-02/03 standby; from svc-mgmt-01 the API answers on it (HTTP 401) and `k8s-api.enclave.internal` resolves to it; stage-01 is dropped — not an allowed source |
+| ✅ **Cluster monitoring (G10)** | 2026-10-15: deployed, then proven by failure. wk-04 down raised InstanceDown and NodeNotReady and cleared both; keepalived stopped raised VIPMoved and KeepalivedNotRunning. §3.13 has the times |
 | ✅ **Secrets encrypted at rest — V-274882** (3.64) | 2026-10-15 03:10–03:35 UTC, §3.12 steps 0–4. **Step 0** (before any change): etcd held **23 Secrets, all 23 plain**, and the API listed 23 — the check seen failing first. **Stage** ×3: the key derived under each node's FIPS OpenSSL; the passphrase fingerprint and key `gen1:bd2bb8db` identical on all three. **Apply**: a canary written through cp-01 read back through cp-01, cp-02 and cp-03. **Rewrite**: a canary through each control plane stored as `k8s:enc:aesgcm:v1:gen1:` (read raw from etcd); 23 Secrets stored again; **etcd: 23 under `gen1`, 0 plain**. **Retire** ×3: each re-checked etcd first, then `plain=refused` and all 23 read with `gen1` alone. Each restart: API ready again in 5–8 s. **`verify` on cp-01 afterwards: 29 of 29**, section 6 included |
 | ✅ Harbor as the image source | Harbor's own pull counts (`/api/v2.0/projects/canonical/repositories`, anonymous): 9 for `cilium`, `pause` and `metallb-speaker` — the seven nodes plus the two read-backs of `images-check`; 2 for the CSI images, which nothing runs (local-storage off) |
 
@@ -615,10 +620,10 @@ on the host the guest lives on (`vm-specs.env` placement: cp-0N and wk-0N on hos
 | test | do this, on the guest's host | read |
 |---|---|---|
 | **C1** a control plane | `sudo virsh destroy k8s-cp-0N` — the one the api probe names as VIP holder | api probe: the gap and the new holder. Then on another control plane, the write test below. Restore: `sudo virsh start k8s-cp-0N`; the VIP must **stay** where it went (`nopreempt`) |
-| **C2** a worker | `sudo virsh destroy k8s-wk-0N` — one with test pods (`kubectl -n enclave-verify get pods -o wide`) | service probe: partial failures for ~50 s (3.63); on a control plane, `kubectl get node k8s-wk-0N -o jsonpath='{.spec.taints}'` — `unreachable:NoExecute` and its time; the pod replaced 5 min later |
-| **C2b** the announcer | `sudo virsh destroy` the node the service probe names | service probe: should not fail; on its restart, the address moves back (~7 s, 3.63) |
-| **C3** a whole host | `for v in k8s-cp-0N k8s-wk-0N pg-0N; do sudo virsh destroy $v; done` | all three probes; the database write test below on the Patroni leader |
-| **C3b** Postgres's sync standby, from inside | the write loop below on the **leader**, then `sudo virsh destroy pg-0N` on the **sync standby's** host ~15 s later | the loop: a write stall (~36 s, 3.62) and `synchronous_standby_names` going straight to the other standby — **it must never print `[]`** |
+| **C2** a worker | `sudo virsh destroy k8s-wk-0N` — one with test pods (`kubectl -n enclave-verify get pods -o wide`) | service probe: partial failures for ~50 s (3.63); on a control plane, `kubectl get node k8s-wk-0N -o jsonpath='{.spec.taints}'` — `unreachable:NoExecute` and its time; the pod replaced 5 min later. **Restore:** `sudo virsh start k8s-wk-0N`; Ready again in about a minute |
+| **C2b** the announcer | `sudo virsh destroy` the node the service probe names | service probe: should not fail; on its restart, the address moves back (~7 s, 3.63). **Restore:** `sudo virsh start` it — that restart is the measurement |
+| **C3** a whole host | `for v in k8s-cp-0N k8s-wk-0N pg-0N; do sudo virsh destroy $v; done` | all three probes; the database write test below on the Patroni leader. **Restore:** `for v in k8s-cp-0N k8s-wk-0N pg-0N; do sudo virsh start $v; done`; then `patronictl list` until pg-0N is `streaming` |
+| **C3b** Postgres's sync standby, from inside | the write loop below on the **leader**, then `sudo virsh destroy pg-0N` on the **sync standby's** host ~15 s later | the loop: a write stall (~36 s, 3.62) and `synchronous_standby_names` going straight to the other standby — **it must never print `[]`**. **Restore:** `sudo virsh start pg-0N`; then `patronictl list` until it is `streaming` again — **on 2026-10-15 this step was missing and pg-03 stayed off for ~3 h** (§5, trap 8c) |
 | **C4** etcd | `sudo …/07-kubernetes.sh etcd-drill` on a control plane (§3.11) | `etcd drill passed` |
 | **C5** cold start | the stop block, then the start block, below — then `verify` | `verify` 28/28 |
 
@@ -675,7 +680,7 @@ if [ -z "$W" ]; then echo "WRONG MACHINE: $(hostname -s)"; else
 fi
 ```
 
-**After the tests:** `verify` (28/28), then `verify --cleanup` only if the test workload is no longer
+**After the tests — nothing left down:** on each host `sudo virsh list --all` shows no guest `shut off`, Patroni lists three members, and the dashboards show no `InstanceDown`. Then `verify`, then `verify --cleanup` only if the test workload is no longer
 wanted. Record each result in §4.1 with its times — measured, never "it seemed fine".
 
 ## 5. Traps hit — each fixed in a script
@@ -714,6 +719,7 @@ wanted. Record each result in §4.1 with its times — measured, never "it seeme
    it. **Fixed:** `stage`, `apply` and `retire` now refuse to change anything while another control plane's
    API server is not ready. The canary retries a server that does not answer for 30 s and reports only a
    *decryption* error as a key failure. **One control plane at a time** is the rule; the script now enforces it.
+8c. **A test left a database node off for three hours** (found 2026-10-15 ~04:20 UTC, deploying G10). C3b powers off Postgres's sync standby, and pg-03 was never started again: Patroni ran pg-01 and pg-02 only, still protected, with no spare. `InstanceDown` fired at 01:12:59 and stayed firing. The alert path worked, and nobody was looking. The C3b row had no restore step; only C1's did. **Fixed:** every row in §4.2 now says how to restore, and *After the tests* checks that no guest is left off.
 8. **No default route** turns "service has no backend" into an instant `network is unreachable` /
    `no route to host` instead of a timeout — read it as "nothing behind that Service yet".
 
@@ -728,7 +734,7 @@ wanted. Record each result in §4.1 with its times — measured, never "it seeme
 5. ✅ **Secrets at rest — V-274882, CAT I (backlog 3.64)** — found unencrypted 2026-10-15, **encrypted the same day**: `aesgcm`,
    keys from a sealed passphrase; etcd holds every Secret under `gen1`, none plain, no API server reads plain (§3.12, §4).
    Left: `encrypt check` in the nightly check; the lab passphrase's envelope; a re-key procedure (POA&M ENG-76).
-6. 🔄 **Cluster monitoring (G10)** — **built and tested offline 2026-10-15 (§3.13, option A); deploy and prove by failure next.** Before: Prometheus scraped none of the seven nodes: no alert for a `NotReady` node, etcd, the VIP
+6. ✅ **Cluster monitoring (G10)** — **deployed and proven by failure 2026-10-15 (§3.13, option A).** What option B would add: backlog 3.66. Before: Prometheus scraped none of the seven nodes: no alert for a `NotReady` node, etcd, the VIP
    moving or a certificate expiring.
 7. ⬜ **Routine etcd backups (G9)** — the drill (§3.11) is one-off; a nightly snapshot needs a home. Its Secrets are now
    ciphertext (3.64), readable only with the passphrase envelope. Run `encrypt check` with it each night.

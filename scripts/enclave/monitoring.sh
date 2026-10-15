@@ -461,6 +461,11 @@ AL_K8S_PODS_FOR="${AL_K8S_PODS_FOR:-15m}"
 AL_K8S_ENC_FOR="${AL_K8S_ENC_FOR:-5m}"
 AL_K8S_FACTS_STALE="${AL_K8S_FACTS_STALE:-300}"
 AL_K8S_VIP_WINDOW="${AL_K8S_VIP_WINDOW:-30m}"
+# VIP no-holder / two-holders wait 3 min, not 1 (measured 2026-10-15 05:00, G10 test 2): each control
+# plane reports once a minute, so during a GOOD failover the old holder's last report still says
+# "held" while the new holder's first says the same - two holders for up to ~75 s. VIPSplit went
+# pending on a clean move; one minute was a coin-toss away from a false critical.
+AL_K8S_VIP_FOR="${AL_K8S_VIP_FOR:-3m}"
 
 # Set an ARGS= line, exactly once. Appending works - the file is sourced and the last wins -
 # and leaves two lines that disagree, so someone edits the first and nothing changes.
@@ -2043,7 +2048,7 @@ groups:
             'sudo k8s status' on a control plane - the datastore voters list.
       - alert: KubernetesAPIVIPNoHolder
         expr: sum(enclave_k8s_vip_held) == 0
-        for: 1m
+        for: ${AL_K8S_VIP_FOR}
         labels:
           severity: critical
         annotations:
@@ -2054,7 +2059,7 @@ groups:
             plane; ufw's VRRP rule ('sudo ufw status | grep -i vrrp').
       - alert: KubernetesAPIVIPSplit
         expr: sum(enclave_k8s_vip_held) > 1
-        for: 1m
+        for: ${AL_K8S_VIP_FOR}
         labels:
           severity: critical
         annotations:

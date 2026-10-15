@@ -466,6 +466,8 @@ AL_K8S_VIP_WINDOW="${AL_K8S_VIP_WINDOW:-30m}"
 # "held" while the new holder's first says the same - two holders for up to ~75 s. VIPSplit went
 # pending on a clean move; one minute was a coin-toss away from a false critical.
 AL_K8S_VIP_FOR="${AL_K8S_VIP_FOR:-3m}"
+# G9 (2026-10-16): the nightly etcd snapshot - 26 h, not 24, so a run a little late does not page.
+AL_K8S_ETCD_BACKUP_STALE="${AL_K8S_ETCD_BACKUP_STALE:-93600}"
 
 # Set an ARGS= line, exactly once. Appending works - the file is sourced and the last wins -
 # and leaves two lines that disagree, so someone edits the first and nothing changes.
@@ -2113,6 +2115,47 @@ groups:
           action: >-
             'sudo 07-kubernetes.sh encrypt status' on {{ \$labels.machine }}; docs/07-kubernetes.md 3.12.
             Do NOT restart that API server until the args file is right.
+      - alert: KubernetesEtcdBackupMissed
+        expr: ((time() - max(enclave_k8s_etcd_backup_last_success_seconds)) > ${AL_K8S_ETCD_BACKUP_STALE}) or absent(enclave_k8s_etcd_backup_last_success_seconds)
+        for: 30m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No etcd snapshot has been made and restore-tested in over 26 h"
+          description: "This is the ONLY backup of the cluster's state (backlog 3.68: hosts 1-3 run no VM backups). Lose the three control planes now and every Deployment, Service, ConfigMap and Secret since the last good snapshot is gone."
+          action: >-
+            On the control plane holding the VIP: 'sudo journalctl -u enclave-etcd-backup --since yesterday',
+            then 'sudo 07-kubernetes.sh etcd-backup --force'. docs/07-kubernetes.md 3.14.
+      - alert: KubernetesEtcdBackupStoreStale
+        expr: (time() - max by (store) (enclave_k8s_etcd_backup_store_last_success_seconds)) > ${AL_K8S_ETCD_BACKUP_STALE}
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The etcd snapshot store on {{ \$labels.store }} has received nothing in over 26 h"
+          description: "The snapshots are still made and kept on the control plane, and the other store may be current - but this copy has stopped."
+          action: >-
+            The holder's 'journalctl -u enclave-etcd-backup' names the store's error. Usually the store's volume
+            is not mounted (host-4's backup drive), or its authorized_keys line is missing ('etcd-backup --setup').
+      - alert: KubernetesSecretsStoredPlain
+        expr: max(enclave_k8s_secrets_plain_in_etcd) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ \$value }} Secret(s) stored in etcd NOT encrypted - V-274882"
+          description: "The nightly scan read etcd raw and found Secrets without the k8s:enc: prefix. Since 3.64 retired the plain-text reader, a plain Secret should be impossible - so something wrote around the API servers, or the encryption was undone."
+          action: >-
+            'sudo 07-kubernetes.sh encrypt status' on each control plane, then 'encrypt check'. docs/07-kubernetes.md 3.12.
+      - alert: KubernetesSecretsScanBroken
+        expr: min(enclave_k8s_secrets_check_ok) == 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Last night's Secrets-at-rest scan did not work - it proves nothing either way"
+          description: "etcd returned nothing readable, or its count disagreed with the API's. V-274882 is unwatched until it works."
+          action: >-
+            'sudo 07-kubernetes.sh encrypt check' on the VIP holder - it prints why.
       - alert: KubernetesClusterChecksStale
         expr: (time() - max(enclave_k8s_cluster_facts_timestamp_seconds) > ${AL_K8S_FACTS_STALE}) or absent(enclave_k8s_cluster_facts_timestamp_seconds)
         for: 2m

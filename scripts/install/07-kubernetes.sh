@@ -36,6 +36,12 @@
 #     sudo ./07-kubernetes.sh etcd-drill         a control plane: snapshot the cluster's etcd, check
 #                                                it, restore it into a SCRATCH directory (never the
 #                                                live data), shred both - proves a restore would work
+#     sudo ./07-kubernetes.sh etcd-backup --setup   EACH control plane: its key, and what to run on each
+#                                                store to authorise it (write-only, one directory)
+#     sudo ./07-kubernetes.sh etcd-backup [--force] the nightly job (G9): on the VIP holder a snapshot,
+#                                                restore-tested, kept, pushed to the stores; the
+#                                                Secrets scan; published for Prometheus
+#     sudo ./07-kubernetes.sh etcd-backup --timer   EACH control plane: that job nightly at K8S_ETCD_BACKUP_AT
 #     sudo ./07-kubernetes.sh encrypt check      a control plane: every Secret in etcd, by how it is stored -
 #                                                under the current key, an older one, or PLAIN (STIG
 #                                                V-274882, backlog 3.64). Read-only
@@ -844,20 +850,37 @@ etcd_tools() {
   local f
   for f in "$K8S_ETCD_CA" "$K8S_ETCD_CERT" "$K8S_ETCD_KEY"; do [ -r "$f" ] || die "missing $f"; done
 
-  # the tools, from the mirror, checked against its SHA256SUMS
-  install -d -m 0700 "$WORK/bin"
-  curl -fsS --cacert "$CA_ROOT" -o "$WORK/bin/SHA256SUMS" "$K8S_BIN_URL/SHA256SUMS" || die "could not fetch $K8S_BIN_URL/SHA256SUMS"
+  # the tools, from the mirror, checked against its SHA256SUMS. With a CACHE directory (the nightly
+  # backup, G9) they are kept root-only between runs and re-checked against the kept SHA256SUMS each
+  # time - so a backup does not need svc-repo-01 up; without one they live in this run's WORK only.
+  ETCD_BIN="${1:-$WORK/bin}"
+  install -d -m 0700 -o root -g root "$ETCD_BIN"
+  if [ -n "${1:-}" ] && etcd_tools_ok "$ETCD_BIN"; then
+    ok "etcdctl and etcdutl $K8S_ETCD_TOOLS_VER from $ETCD_BIN - checksums match"; return 0
+  fi
+  curl -fsS --cacert "$CA_ROOT" -o "$ETCD_BIN/SHA256SUMS" "$K8S_BIN_URL/SHA256SUMS" || die "could not fetch $K8S_BIN_URL/SHA256SUMS"
   local t want got
   for t in etcdctl etcdutl; do
-    curl -fsS --cacert "$CA_ROOT" -o "$WORK/bin/$t" "$K8S_BIN_URL/$t-v$K8S_ETCD_TOOLS_VER" || die "could not fetch $K8S_BIN_URL/$t-v$K8S_ETCD_TOOLS_VER - staged on the mirror?"
-    want="$(awk -v n="$t-v$K8S_ETCD_TOOLS_VER" '$2 == n {print $1}' "$WORK/bin/SHA256SUMS")"
-    got="$(sha256sum "$WORK/bin/$t" | cut -c1-64)"
+    curl -fsS --cacert "$CA_ROOT" -o "$ETCD_BIN/$t" "$K8S_BIN_URL/$t-v$K8S_ETCD_TOOLS_VER" || die "could not fetch $K8S_BIN_URL/$t-v$K8S_ETCD_TOOLS_VER - staged on the mirror?"
+    want="$(awk -v n="$t-v$K8S_ETCD_TOOLS_VER" '$2 == n {print $1}' "$ETCD_BIN/SHA256SUMS")"
+    got="$(sha256sum "$ETCD_BIN/$t" | cut -c1-64)"
     if [ -z "$want" ] || [ "$want" != "$got" ]; then die "$t-v$K8S_ETCD_TOOLS_VER does not match the mirror's SHA256SUMS (want ${want:-none}, got $got)"; fi
-    chmod 0700 "$WORK/bin/$t"
+    chmod 0700 "$ETCD_BIN/$t"
   done
-  ok "etcdctl and etcdutl $K8S_ETCD_TOOLS_VER fetched and checksum-verified (this run only)"
+  ok "etcdctl and etcdutl $K8S_ETCD_TOOLS_VER fetched and checksum-verified$( [ -n "${1:-}" ] && echo ", kept in $ETCD_BIN" || echo " (this run only)")"
 }
-ectl() { "$WORK/bin/etcdctl" --endpoints=https://127.0.0.1:2379 --cacert "$K8S_ETCD_CA" --cert "$K8S_ETCD_CERT" --key "$K8S_ETCD_KEY" "$@"; }
+etcd_tools_ok() {   # <dir> - both tools present and matching the SHA256SUMS kept beside them
+  local t want got
+  [ -s "$1/SHA256SUMS" ] || return 1
+  for t in etcdctl etcdutl; do
+    [ -x "$1/$t" ] || return 1
+    want="$(awk -v n="$t-v$K8S_ETCD_TOOLS_VER" '$2 == n {print $1}' "$1/SHA256SUMS")"
+    got="$(sha256sum "$1/$t" | cut -c1-64)"
+    [ -n "$want" ] && [ "$want" = "$got" ] || return 1
+  done
+}
+ETCD_BIN=""
+ectl() { "$ETCD_BIN/etcdctl" --endpoints=https://127.0.0.1:2379 --cacert "$K8S_ETCD_CA" --cert "$K8S_ETCD_CERT" --key "$K8S_ETCD_KEY" "$@"; }
 
 cmd_etcd_drill() {
   need_root
@@ -867,18 +890,18 @@ cmd_etcd_drill() {
 
   # 1. the snapshot
   local snap="$WORK/snapshot.db" out
-  out="$("$WORK/bin/etcdctl" --endpoints=https://127.0.0.1:2379 --cacert "$K8S_ETCD_CA" --cert "$K8S_ETCD_CERT" --key "$K8S_ETCD_KEY" \
+  out="$("$ETCD_BIN/etcdctl" --endpoints=https://127.0.0.1:2379 --cacert "$K8S_ETCD_CA" --cert "$K8S_ETCD_CERT" --key "$K8S_ETCD_KEY" \
          snapshot save "$snap" 2>&1)" || die "snapshot failed: $(printf '%s' "$out" | tail -3)"
   chmod 0600 "$snap"
   ok "snapshot taken: $(du -h "$snap" | cut -f1)"
 
   # 2. what is in it
-  out="$("$WORK/bin/etcdutl" snapshot status "$snap" -w json 2>&1)" || die "snapshot status failed: $out"
+  out="$("$ETCD_BIN/etcdutl" snapshot status "$snap" -w json 2>&1)" || die "snapshot status failed: $out"
   printf '%s' "$out" | python3 -c 'import json,sys; d=json.loads(sys.stdin.read().strip().splitlines()[-1]); print("  [ok] snapshot status: hash %s, revision %s, %s keys, %.1f MB" % (d.get("hash"), d.get("revision"), d.get("totalKey"), d.get("totalSize", 0) / 1e6))' \
     || die "could not read the snapshot status: $out"
 
   # 3. restore it - into SCRATCH, with a throwaway member name; the live data dir is never named
-  out="$("$WORK/bin/etcdutl" snapshot restore "$snap" --data-dir "$WORK/restore" --name drill \
+  out="$("$ETCD_BIN/etcdutl" snapshot restore "$snap" --data-dir "$WORK/restore" --name drill \
          --initial-cluster drill=http://127.0.0.1:12380 --initial-advertise-peer-urls http://127.0.0.1:12380 2>&1)" \
     || die "RESTORE FAILED - the snapshot is not usable: $(printf '%s' "$out" | tail -3)"
   [ -s "$WORK/restore/member/snap/db" ] || die "the restore reported success but wrote no member/snap/db"
@@ -1185,6 +1208,7 @@ if not kvs:
     print("  [x] no Secrets under /registry/secrets/ - the wrong prefix or the wrong etcd: this proves nothing"); sys.exit(2)
 if abs(len(kvs) - api) > 5:
     print("  [x] etcd and the API disagree by more than churn - this is not reading what the API serves"); sys.exit(2)
+print("RESULT total=%d plain=%d current=%d" % (len(kvs), len(plain), by.get(want, 0)))   # read by etcd-backup (G9)
 sys.exit(0 if not plain and set(by) == {want} else 1)
 PYEOF
 )"
@@ -1194,7 +1218,7 @@ enc_scan() {
   want="k8s:enc:$K8S_SECRETS_PROVIDER:v1:gen$K8S_SECRETS_GEN:"
   api="$( { kc get secrets -A -o name 2>/dev/null || true; } | wc -l)"
   say "every Secret in etcd, by how it is stored (the current key: $want)"
-  ectl get /registry/secrets/ --prefix -w json 2>"$WORK/etcd.err" | python3 -c "$ENC_SCAN_PY" "$want" "$api" || rc=$?
+  ectl get /registry/secrets/ --prefix -w json 2>"$WORK/etcd.err" | python3 -c "$ENC_SCAN_PY" "$want" "$api" | grep -v '^RESULT ' || rc=$?
   case "$rc" in
     0) ok "V-274882: every Secret in etcd is encrypted with the current key" ;;
     1) die "V-274882: OPEN - Secrets above are plain or under an older key" ;;
@@ -1289,6 +1313,236 @@ cmd_encrypt() {
     enc_canary || die "read the lines above. CANNOT DECRYPT: run 'encrypt stage' on that control plane NOW - until then it cannot read Secrets written here. DID NOT ANSWER: it was restarting; when it is ready, run 'encrypt apply' here again (no restart - it repeats the canary)"
     ok "$ME writes with $w. Next: 'encrypt apply' on the other control planes, then 'encrypt rewrite' on one"
   fi
+}
+
+# ===================================================================== nightly etcd backups (G9)
+# THE CLUSTER'S STATE, OFF THE CLUSTER, EVERY NIGHT (backlog B-07 G9; decided 2026-10-16, Brian).
+# Nothing else backs etcd up: hosts 1-3 run no VM backups at all (backlog 3.68), so without this the
+# loss of the three control planes would lose every Deployment, Service, ConfigMap and Secret.
+#
+#   WHO: every control plane's timer fires; the one holding the API VIP backs up, the others only keep
+#     their record - once a night, and it moves with the VIP (the same rule as G10's cluster check).
+#   WHAT: etcdctl snapshot save -> etcdutl snapshot status -> RESTORED into a scratch directory, so
+#     every night proves the snapshot is usable -> the newest K8S_ETCD_BACKUP_KEEP kept here -> pushed
+#     to EACH store in K8S_ETCD_STORES (D1 A: two stores, like pgBackRest's) -> the Secrets-at-rest
+#     scan of 3.64 -> the result published for Prometheus.
+#   NO EXTRA ENCRYPTION (D2 A): the Secrets inside are AES-GCM with a key that never leaves the control
+#     planes (3.64), both stores are LUKS, and the rest is cluster configuration, not records.
+#   THE TOOLS (D3, accepted): etcd's own etcdctl/etcdutl, upstream Go, NOT FIPS - Canonical ships none.
+#     Nightly use makes the drill's tool a routine one (POA&M ENG-77). etcdctl speaks only to
+#     127.0.0.1; the snapshot leaves over ssh (FIPS). Verified once from the mirror, then kept root-only
+#     in K8S_ETCD_TOOLS_CACHE and re-checked against their checksums every night, so a backup does not
+#     depend on svc-repo-01 being up.
+#   THE STORES authorise this node's key for a WRITE-ONLY rsync into ONE directory, <dir>/<this node>
+#     (`etcd-backup --setup` prints exactly what to run there) - one node's retention can never delete
+#     another's snapshots. A store whose volume is not mounted has no such directory, so the push fails
+#     loudly instead of filling the root filesystem.
+K8S_ETCD_BACKUP_DIR="${K8S_ETCD_BACKUP_DIR:-/var/backups/etcd}"
+K8S_ETCD_BACKUP_KEEP="${K8S_ETCD_BACKUP_KEEP:-14}"
+K8S_ETCD_BACKUP_AT="${K8S_ETCD_BACKUP_AT:-06:00}"     # UTC; before host-4's 07:00 VM backup, which uses the same volume
+# The stores are declared once, in vm-specs.env (ETCD_BACKUP_STORES, from BACKUP_DEST). Only those two
+# lines are read: sourcing the whole file here would run its profile detection, which warns falsely on
+# a control plane (it has /etc/enclave and no profile).
+if [ -z "${K8S_ETCD_STORES:-}" ] && [ -r "$ENC/vm-specs.env" ]; then
+  # shellcheck disable=SC2034  # BACKUP_DEST is read by the eval'd ETCD_BACKUP_STORES line
+  K8S_ETCD_STORES="$(BACKUP_DEST=""; eval "$(sed -n -e '/^BACKUP_DEST=/p' -e '/^ETCD_BACKUP_STORES=/p' "$ENC/vm-specs.env")"; printf '%s' "${ETCD_BACKUP_STORES:-}")"
+fi
+[ -n "${K8S_ETCD_STORES:-}" ] || K8S_ETCD_STORES="host-4:/mnt/vmbackup/etcd host-3:/var/lib/libvirt/images/etcd-backup"
+K8S_ETCD_BACKUP_KEY="${K8S_ETCD_BACKUP_KEY:-/etc/enclave/etcd-backup.key}"
+K8S_ETCD_TOOLS_CACHE="${K8S_ETCD_TOOLS_CACHE:-/var/lib/enclave-etcd-tools}"
+K8S_TEXTFILE_DIR="${K8S_TEXTFILE_DIR:-/var/lib/node_exporter/textfile}"
+EB_FACTS="$K8S_TEXTFILE_DIR/k8s-etcd-backup.prom"
+
+eb_store_addr() {   # <store host name> -> its address from enclave-addresses.env
+  local k; k="$(printf '%s' "$1" | tr 'a-z-' 'A-Z_')"
+  [[ "$k" =~ ^[A-Z0-9_]+$ ]] || return 0
+  printf '%s' "${!k:-}"
+}
+
+# eb_carry NAME [LABELS] -> the value this node last published for a metric, or nothing
+eb_carry() {
+  local key="$1"; [ -z "${2:-}" ] || key="$1{$2}"
+  [ -r "$EB_FACTS" ] && awk -v n="$key" '$1 == n {print $2; exit}' "$EB_FACTS" || true
+}
+
+# eb_facts KEY=VALUE... -> rewrite this node's facts file whole, atomically. Values not given are
+# CARRIED (last success times), so a night as a non-holder, or a failed night, keeps the history and
+# drops nothing but the current-state numbers it does not have.
+eb_m() {   # NAME VALUE HELP - one gauge with its HELP and TYPE; nothing when the value is empty
+  [ -n "$2" ] || return 0
+  printf '# HELP %s %s\n# TYPE %s gauge\n%s %s\n' "$1" "$3" "$1" "$1" "$2"
+}
+eb_facts() {
+  [ -d "$K8S_TEXTFILE_DIR" ] || { warn "no $K8S_TEXTFILE_DIR - node-exporter not installed (monitoring.sh exporter); nothing published"; return 0; }
+  local -A v=(); local kv s ls
+  for kv in "$@"; do v["${kv%%=*}"]="${kv#*=}"; done
+  ls="${v[last_success]:-$(eb_carry enclave_k8s_etcd_backup_last_success_seconds)}"
+  {
+    printf '# HELP enclave_k8s_etcd_backup_last_success_seconds when this node last made a snapshot that restored (G9)\n'
+    printf '# TYPE enclave_k8s_etcd_backup_last_success_seconds gauge\n'
+    [ -z "$ls" ] || printf 'enclave_k8s_etcd_backup_last_success_seconds %s\n' "$ls"
+    printf '# HELP enclave_k8s_etcd_backup_store_last_success_seconds when this node last pushed its snapshots to a store\n'
+    printf '# TYPE enclave_k8s_etcd_backup_store_last_success_seconds gauge\n'
+    for s in $K8S_ETCD_STORES; do
+      s="${s%%:*}"
+      ls="${v[store_ok_$s]:-$(eb_carry enclave_k8s_etcd_backup_store_last_success_seconds "store=\"$s\"")}"
+      [ -z "$ls" ] || printf 'enclave_k8s_etcd_backup_store_last_success_seconds{store="%s"} %s\n' "$s" "$ls"
+    done
+    # CURRENT STATE - only from the node that ran tonight, so a former holder's stale numbers vanish
+    if [ -n "${v[run]:-}" ]; then
+      eb_m enclave_k8s_etcd_backup_last_run_seconds "${v[run]}" "when this node last ran the backup as the VIP holder"
+      eb_m enclave_k8s_etcd_backup_last_run_ok "${v[ok]:-0}" "1 when that run reached every store"
+      eb_m enclave_k8s_etcd_backup_revision "${v[revision]:-}" "etcd revision in the newest snapshot"
+      eb_m enclave_k8s_etcd_backup_keys "${v[keys]:-}" "keys in the newest snapshot"
+      eb_m enclave_k8s_etcd_backup_bytes "${v[bytes]:-}" "size of the newest snapshot"
+      eb_m enclave_k8s_etcd_backup_local_snapshots "${v[local_count]:-}" "snapshots kept on this node"
+      if [ -n "${v[sec_ok]:-}" ]; then
+        eb_m enclave_k8s_secrets_check_ok "${v[sec_ok]}" "1 when the nightly scan of etcd could be trusted (3.64)"
+        eb_m enclave_k8s_secrets_in_etcd "${v[sec_total]:-}" "Secrets in etcd at the nightly scan"
+        [ -z "${v[sec_plain]:-}" ] || printf '# HELP enclave_k8s_secrets_plain_in_etcd Secrets stored NOT encrypted - V-274882\n# TYPE enclave_k8s_secrets_plain_in_etcd gauge\nenclave_k8s_secrets_plain_in_etcd %s\n' "${v[sec_plain]}"
+      fi
+    fi
+  } > "$EB_FACTS.tmp"
+  chmod 0644 "$EB_FACTS.tmp"; mv -f "$EB_FACTS.tmp" "$EB_FACTS"
+}
+
+etcd_backup_setup() {
+  local s name dir addr myaddr line kb
+  [ -s "$K8S_ETCD_BACKUP_KEY" ] || {
+    install -d -m 0700 "$(dirname "$K8S_ETCD_BACKUP_KEY")"
+    # RSA, not ed25519: FIPS ssh-keygen refuses ed25519 (measured on host-4, 2026-09-20).
+    ssh-keygen -t rsa -b 4096 -N '' -C "etcd-backup from $ME" -f "$K8S_ETCD_BACKUP_KEY" >/dev/null || die "ssh-keygen failed"
+    ok "created $K8S_ETCD_BACKUP_KEY"; }
+  kb="$(cut -d' ' -f2 "$K8S_ETCD_BACKUP_KEY.pub")"
+  say "this node's backup key: $(ssh-keygen -lf "$K8S_ETCD_BACKUP_KEY.pub" | awk '{print $2}')"
+  for s in $K8S_ETCD_STORES; do
+    name="${s%%:*}"; dir="${s#*:}/$ME"; addr="$(eb_store_addr "$name")"
+    [ -n "$addr" ] || die "no address for store $name in $ADDRS"
+    myaddr="$(ip -4 route get "$addr" 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1)"
+    [ -n "$myaddr" ] || die "cannot tell which address $ME uses to reach $addr"
+    line="from=\"$myaddr\",restrict,command=\"/usr/bin/rrsync -wo $dir\" $(cut -d' ' -f1-2 "$K8S_ETCD_BACKUP_KEY.pub")"
+    printf '\n  ON %s - authorise %s'"'"'s etcd backups, ONCE (a WRITE-ONLY rsync into %s):\n\n' "$name" "$ME" "$dir"
+    printf '### MACHINE: %s (%s) ###\n' "$name" "$addr"
+    printf 'if [ "$(hostname -s)" != %s ]; then echo "WRONG MACHINE: $(hostname -s)"; else\n' "$name"
+    # THE PARENT, which exists mounted or not: the store directory itself does not exist yet, and
+    # findmnt on a missing path prints nothing - which must read as NOT mounted, never as mounted.
+    printf '  t="$(findmnt -no TARGET --target %s 2>/dev/null)"\n' "$(dirname "${s#*:}")"
+    printf '  if [ -z "$t" ] || [ "$t" = / ]; then echo "%s is not on its own mounted volume - nothing done"; else\n' "$(dirname "${s#*:}")"
+    printf '    ls -l /usr/bin/rrsync && sudo install -d -m 0700 -o root -g root %s %s \\\n' "${s#*:}" "$dir"
+    printf '    && { sudo grep -qF %s /root/.ssh/authorized_keys 2>/dev/null || echo %s | sudo tee -a /root/.ssh/authorized_keys >/dev/null; } \\\n' "'$kb'" "'$line'"
+    printf '    && sudo chmod 600 /root/.ssh/authorized_keys && echo "authorised %s -> %s"\n' "$ME" "$dir"
+    printf '  fi\nfi\n'
+  done
+  printf '\n'
+  say "then here: sudo $0 etcd-backup --force   (one backup now, whoever holds the VIP), then sudo $0 etcd-backup --timer"
+}
+
+etcd_backup_timer() {
+  "$ENC/install-runtime.sh" || die "could not install the root-owned runtime copy"
+  local rt; rt="$("$ENC/install-runtime.sh" --print-dir)"
+  [ -x "$rt/07-kubernetes.sh" ] || die "$rt/07-kubernetes.sh missing - install-runtime.sh must copy it (G9)"
+  case "$K8S_ETCD_BACKUP_AT" in [0-2][0-9]:[0-5][0-9]) ;; *) die "K8S_ETCD_BACKUP_AT wants HH:MM, got '$K8S_ETCD_BACKUP_AT'" ;; esac
+  cat > /etc/systemd/system/enclave-etcd-backup.service <<UNIT
+[Unit]
+Description=Nightly etcd snapshot, restore-tested and pushed off the cluster (B-07 G9)
+After=network-online.target snap.k8s.etcd.service
+
+[Service]
+Type=oneshot
+TimeoutStartSec=30min
+ExecStart=$rt/07-kubernetes.sh etcd-backup
+UNIT
+  # Calendar, like every enclave timer (a monotonic chain lost its place across a reboot, 2026-09-16).
+  # Persistent: a night missed while this node was down runs when it comes back - and re-creating
+  # the timer can start a run at once (measured on host-4's backup timer, 2026-10-15).
+  cat > /etc/systemd/system/enclave-etcd-backup.timer <<UNIT
+[Unit]
+Description=Nightly etcd backup at $K8S_ETCD_BACKUP_AT UTC (the VIP holder acts)
+
+[Timer]
+OnCalendar=*-*-* $K8S_ETCD_BACKUP_AT:00 UTC
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+  systemctl daemon-reload
+  systemctl enable --now enclave-etcd-backup.timer >/dev/null 2>&1 || die "could not enable enclave-etcd-backup.timer"
+  ok "enclave-etcd-backup.timer at $K8S_ETCD_BACKUP_AT UTC, running $rt/07-kubernetes.sh ($(head -1 "$rt/.source"))"
+  systemctl list-timers enclave-etcd-backup.timer --no-pager 2>/dev/null | sed -n 2p | sed 's/^/     /'
+}
+
+cmd_etcd_backup() {
+  need_root
+  whoami_k8s
+  [ "$ME_ROLE" = cp ] || die "etcd backups run on the control planes - this is $ME"
+  local mode="${1:-}"
+  case "$mode" in
+    --setup) etcd_backup_setup; return 0 ;;
+    --timer) etcd_backup_timer; return 0 ;;
+    ""|--force) ;;
+    *) die "usage: etcd-backup [--setup | --force | --timer]" ;;
+  esac
+  if [ "$mode" != --force ] && ! ip -4 -o addr show | grep -q " ${K8S_API_VIP:?}/"; then
+    eb_facts; ok "$ME does not hold the API VIP - the holder backs up tonight; this node's record kept"; return 0
+  fi
+  [ -s "$K8S_ETCD_BACKUP_KEY" ] || die "no key at $K8S_ETCD_BACKUP_KEY - run: sudo $0 etcd-backup --setup"
+  local run; run="$(date +%s)"
+  local failed=""
+
+  etcd_tools "$K8S_ETCD_TOOLS_CACHE"   # dies if no verified tools - the stale-backup alert then says so
+  install -d -m 0700 -o root -g root "$K8S_ETCD_BACKUP_DIR"
+  local f out rev keys bytes
+  f="$K8S_ETCD_BACKUP_DIR/etcd-$(date -u +%Y%m%dT%H%M%SZ)-$ME.db"
+  # 1. the snapshot - written as .part, renamed only when whole
+  out="$(ectl snapshot save "$f.part" 2>&1)" || { rm -f "$f.part"; eb_facts run="$run" ok=0; die "snapshot failed: $(printf '%s' "$out" | tail -2)"; }
+  chmod 0600 "$f.part"; mv -f "$f.part" "$f"
+  # 2. what is in it
+  out="$("$ETCD_BIN/etcdutl" snapshot status "$f" -w json 2>&1 | tail -1)" || { eb_facts run="$run" ok=0; die "snapshot status failed: $out"; }
+  read -r rev keys bytes <<<"$(printf '%s' "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["revision"], d["totalKey"], d["totalSize"])' 2>/dev/null)" \
+    || { eb_facts run="$run" ok=0; die "could not read the snapshot status: $out"; }
+  ok "snapshot $(basename "$f"): revision $rev, $keys keys, $(( bytes / 1048576 )) MB"
+  # 3. RESTORED - into scratch, with a throwaway member; the live data directory is never named
+  out="$("$ETCD_BIN/etcdutl" snapshot restore "$f" --data-dir "$WORK/restore" --name g9-test \
+         --initial-cluster g9-test=http://127.0.0.1:12380 --initial-advertise-peer-urls http://127.0.0.1:12380 2>&1)" \
+    || { eb_facts run="$run" ok=0; die "THE SNAPSHOT DOES NOT RESTORE: $(printf '%s' "$out" | tail -2)"; }
+  [ -s "$WORK/restore/member/snap/db" ] || { eb_facts run="$run" ok=0; die "restore reported success but wrote no member/snap/db"; }
+  shred -u "$WORK/restore/member/snap/db"
+  ok "restored into scratch and discarded - tonight's snapshot is usable"
+  # 4. keep the newest K8S_ETCD_BACKUP_KEEP here; half-written ones from a crash go too
+  find "$K8S_ETCD_BACKUP_DIR" -maxdepth 1 -name 'etcd-*.db.part' -mmin +60 -delete
+  local n=0 old
+  while IFS= read -r old; do
+    n=$((n + 1)); [ "$n" -le "$K8S_ETCD_BACKUP_KEEP" ] || rm -f "$old"
+  done < <(find "$K8S_ETCD_BACKUP_DIR" -maxdepth 1 -name 'etcd-*.db' | sort -r)
+  local count; count="$(find "$K8S_ETCD_BACKUP_DIR" -maxdepth 1 -name 'etcd-*.db' | wc -l)"
+  # 5. off the cluster - each store on its own; one failing does not stop the other
+  local -a sargs=(); local s name addr rc
+  for s in $K8S_ETCD_STORES; do
+    name="${s%%:*}"; addr="$(eb_store_addr "$name")"
+    if [ -z "$addr" ]; then warn "store $name: no address in $ADDRS"; failed="$failed $name"; continue; fi
+    rc=0
+    out="$(rsync -a --delete --include='etcd-*.db' --exclude='*' \
+           -e "ssh -i $K8S_ETCD_BACKUP_KEY -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o LogLevel=ERROR" \
+           "$K8S_ETCD_BACKUP_DIR/" "root@$addr:" 2>&1 </dev/null)" || rc=$?
+    if [ "$rc" -eq 0 ]; then ok "store $name ($addr): $count snapshot(s) in place"; sargs+=("store_ok_$name=$(date +%s)")
+    else warn "store $name ($addr) FAILED (rsync rc $rc): $(printf '%s' "$out" | tail -2 | tr '\n' ' ')"; failed="$failed $name"; fi
+  done
+  # 6. the Secrets-at-rest scan of 3.64, every night - V-274882 watched, not assumed
+  local want sec_ok=0 sec_total="" sec_plain="" res
+  want="k8s:enc:$K8S_SECRETS_PROVIDER:v1:gen$K8S_SECRETS_GEN:"
+  res="$( { ectl get /registry/secrets/ --prefix -w json 2>/dev/null \
+           | python3 -c "$ENC_SCAN_PY" "$want" "$( { kc get secrets -A -o name 2>/dev/null || true; } | wc -l)" || true; } | sed -n 's/^RESULT //p')"
+  if [ -n "$res" ]; then
+    sec_ok=1; sec_total="$(printf '%s\n' "$res" | tr ' ' '\n' | sed -n 's/^total=//p')"; sec_plain="$(printf '%s\n' "$res" | tr ' ' '\n' | sed -n 's/^plain=//p')"
+    if [ "${sec_plain:-1}" -eq 0 ]; then ok "Secrets at rest: $sec_total in etcd, none plain"; else warn "Secrets at rest: $sec_plain of $sec_total stored PLAIN - V-274882"; fi
+  else warn "the Secrets scan did not work tonight - it proves nothing either way"; fi
+  local good=1; [ -z "$failed" ] || good=0
+  eb_facts run="$run" ok="$good" last_success="$run" revision="$rev" keys="$keys" bytes="$bytes" local_count="$count" \
+           sec_ok="$sec_ok" sec_total="$sec_total" sec_plain="$sec_plain" "${sargs[@]}"
+  [ -z "$failed" ] || die "the snapshot is good and kept here, but did not reach:$failed"
+  ok "etcd backup done on $ME - $count kept here, and on every store"
 }
 
 # ===================================================================== the API VIP
@@ -1609,6 +1863,7 @@ case "${1:-}" in
   probe)         shift; cmd_probe "$@" ;;
   etcd-drill)    shift; cmd_etcd_drill "$@" ;;
   encrypt)       shift; cmd_encrypt "$@" ;;
+  etcd-backup)   shift; cmd_etcd_backup "$@" ;;
   verify)        shift; cmd_verify "$@" ;;
   node-prep)     shift; cmd_node_prep "$@" ;;
   render)        shift; cmd_render "$@" ;;
@@ -1619,5 +1874,5 @@ case "${1:-}" in
   images-export) shift; cmd_images_export "$@" ;;
   images-load)   shift; cmd_images_load "$@" ;;
   images-check)  shift; cmd_images_check "$@" ;;
-  *) sed -n '2,61p' "$0"; exit 2 ;;
+  *) sed -n '2,67p' "$0"; exit 2 ;;
 esac

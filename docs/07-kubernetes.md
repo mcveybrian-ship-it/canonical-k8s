@@ -536,6 +536,71 @@ not fire on a check that was never started):
 | `sudo virsh shutdown k8s-wk-04` on host-4 | InstanceDown (wk-04) and KubernetesNodeNotReady; red band on the dashboard; both clear after `virsh start` | ✅ **2026-10-15**, shut down ~04:50:40 UTC: InstanceDown pending 04:50:58, **firing 04:52:52**; NodeNotReady pending 04:52:36, **firing 04:54:47 — about 4 min** (Kubernetes' ~40–50 s grace + up to a minute to the next check + the 2 min hold). Nothing else fired; the VIP stayed put. After `virsh start`: InstanceDown cleared 04:56:58, NodeNotReady 04:57:47 |
 | `sudo systemctl stop keepalived` on the VIP holder | KubernetesAPIVIPMoved; KeepalivedNotRunning after 2 min; the holder stat changes name. `start` it again afterwards; the VIP stays (nopreempt) | ✅ **2026-10-15**, cp-02 stopped ~05:00:05: VIP on cp-01 by 05:00:11; **VIPMoved firing 05:00:18**; KeepalivedNotRunning pending 05:00:33, **firing 05:02:38**. Restarted: cp-02 `active`, the VIP **stayed on cp-01**, KeepalivedNotRunning cleared 05:04:44. ⚠️ **It also caught a false alarm**: for ~15 s both planes' reports said "held" (the old holder's report is up to a minute old), and VIPSplit went pending on a clean move. VIPSplit and VIPNoHolder now hold **3 min**, not 1 (`AL_K8S_VIP_FOR`); an 11th rule test replays the case |
 
+### 3.14 Nightly etcd backups (G9)
+
+**Why.** etcd holds the whole cluster's state: every Deployment, Service, ConfigMap and Secret. Nothing
+else backs it up. Hosts 1–3, which run all three control planes, have **no VM backups** (backlog 3.68),
+so before G9 the loss of the three control planes would have lost the cluster.
+
+**Decided 2026-10-16 (Brian):** D1 **two stores**, pushed to directly like pgBackRest's; D2 **no extra
+encryption**, because the Secrets inside are AES-GCM (§3.12), both stores are LUKS and the rest is
+configuration; D3 **`etcdctl` accepted**. It is etcd's own upstream build, not FIPS, and Canonical
+ships none. It talks only to 127.0.0.1 (POA&M ENG-77).
+
+**Each night at 06:00 UTC** (`K8S_ETCD_BACKUP_AT`, before host-4's 07:00 VM backup on the same volume),
+every control plane's `enclave-etcd-backup.timer` fires and **the one holding the API VIP acts**. That
+means once a night, moving with the VIP, as G10's cluster check does:
+
+1. `etcdctl snapshot save`, written as `.part` and renamed only when whole; `etcdutl snapshot status`;
+2. **restored into a scratch directory and discarded**, so every night proves the snapshot is usable;
+3. the newest `K8S_ETCD_BACKUP_KEEP` (14) kept in `/var/backups/etcd` (root 0700);
+4. **pushed to each store** in `ETCD_BACKUP_STORES` (`vm-specs.env`), into its own `<dir>/<node>`, by a
+   **write-only** rsync with this node's own key. One node's cleanup can never touch another's snapshots;
+5. the **Secrets-at-rest scan** of §3.12 (V-274882 watched every night, not assumed);
+6. everything published for Prometheus: `k8s-etcd-backup.prom` on the node.
+
+The tools are fetched once from the mirror, checksum-verified, then kept root-only in
+`/var/lib/enclave-etcd-tools` and re-checked every night, so a backup does not need svc-repo-01 up.
+
+**Where the copies are — with a NAS and without one.** The control planes push to **host-4's backup
+volume** (`${BACKUP_DEST}/etcd`) and **host-3** (`/var/lib/libvirt/images/etcd-backup`). That is the
+same in every environment, and needs no firewall change. **A site with a NAS or SAN** gets a further
+copy without the control planes reaching it (they cannot: it sits on the storage network):
+host-4's nightly third copy carries the `etcd` folder beside the VM backups (`BACKUP_THIRD_EXTRA`).
+**A site without one** has the two stores. Nothing is configured or fails for the absence. A site
+whose `BACKUP_DEST` is its own LUN has host-4's store on that LUN automatically.
+
+**Set up — once.** First push the repository to the three control planes, host-4, host-3 and
+svc-obs-01. Then:
+
+```bash
+### MACHINE: k8s-cp-01, k8s-cp-02, k8s-cp-03 — each prints the blocks its stores must run ###
+case "$(hostname -s)" in k8s-cp-0[1-3]) sudo ~/canonical-k8s/scripts/install/07-kubernetes.sh etcd-backup --setup ;; *) echo "WRONG MACHINE: $(hostname -s)" ;; esac
+```
+
+Each prints one **guarded block for host-4 and one for host-3**: run them there. Each authorises that
+node's key for a write-only rsync into its own folder. It **refuses if the store's volume is not
+mounted**, so a missing drive never fills a root filesystem. Then on the VIP holder
+`etcd-backup --force` (the first backup, now) and on every control plane `etcd-backup --timer`.
+On host-4 refresh the runtime copy so its third copy carries the folder: `sudo
+./scripts/enclave/install-runtime.sh` — **not** `vm-backup.sh schedule`, which re-creates the timer
+and starts a full backup run at once (3.67).
+
+**Watch** (`monitoring.sh rules`): **KubernetesEtcdBackupMissed** (no snapshot that restored in 26 h,
+critical — it is the only backup), **KubernetesEtcdBackupStoreStale** (one store not refreshed in
+26 h), **KubernetesSecretsStoredPlain** (critical), **KubernetesSecretsScanBroken**. Tested with
+promtool against simulated failures, 14 scenarios. The *Enclave Kubernetes* dashboard has a row for it.
+
+**Restore from a store** — the cluster lost, or a majority of control planes:
+1. take the newest `etcd-*.db` from host-4's `${BACKUP_DEST}/etcd/<node>/` or host-3's store;
+   `etcdutl snapshot status` it;
+2. follow Canonical's quorum-loss procedure (§3.11) with that file as the snapshot;
+3. the Secrets inside are readable only by API servers holding the key. Survivors have it; a rebuilt
+   control plane derives it from the passphrase envelope at `node-prep` (§3.12).
+
+Not rehearsed on this cluster: the nightly restore into scratch proves the file, and rehearsing the
+whole procedure needs a cluster it is safe to break.
+
 ## 4. What has been verified (2026-10-14)
 
 | | how |
@@ -736,8 +801,8 @@ wanted. Record each result in §4.1 with its times — measured, never "it seeme
    Left: `encrypt check` in the nightly check; the lab passphrase's envelope; a re-key procedure (POA&M ENG-76).
 6. ✅ **Cluster monitoring (G10)** — **deployed and proven by failure 2026-10-15 (§3.13, option A).** What option B would add: backlog 3.66. Before: Prometheus scraped none of the seven nodes: no alert for a `NotReady` node, etcd, the VIP
    moving or a certificate expiring.
-7. ⬜ **Routine etcd backups (G9)** — the drill (§3.11) is one-off; a nightly snapshot needs a home. Its Secrets are now
-   ciphertext (3.64), readable only with the passphrase envelope. Run `encrypt check` with it each night.
+7. 🔄 **Nightly etcd backups (G9)** — **built and tested offline 2026-10-16 (§3.14)**: two stores, restore-tested every night,
+   with the Secrets scan; the only backup of the cluster's state (3.68). Deploy next.
 8. ⬜ **Kubernetes in the whole-enclave power-down order** (3.57, contingency plan §5.3) — the blocks exist (§4.2, C5).
 9. ⬜ **The application front door** — the gateway is enabled but unexercised, `*.apps` points at a placeholder, and Q-CORE (i)
    (is the gateway's TLS FIPS?) is open. With the vendor's application.

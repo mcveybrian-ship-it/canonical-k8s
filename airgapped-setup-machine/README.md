@@ -32,8 +32,10 @@ encrypted at rest (3.64, V-274882 closed) and it is monitored (G10, proven by fa
    retirement clears the `FilesystemFillingWarning` on host-1 (firing since 2026-10-14 07:01).
 2. **Envelopes:** seal the lab Kubernetes Secrets passphrase (its fingerprint is in HANDOFF §3 — never in
    git) and confirm the pgBackRest one (3.50).
-3. **G9 — nightly etcd backups**, with `07-kubernetes.sh encrypt check` in the same nightly run
-   (07-kubernetes.md §6 item 7). Plan first, then build.
+3. **G9 — nightly etcd backups: BUILT 2026-10-16, tested offline** (07-kubernetes.md §3.14; D1 two stores, D2 no
+   extra encryption, D3 etcdctl accepted). Deploy: push; `etcd-backup --setup` on each control plane and its
+   printed blocks on host-4 and host-3; `--force` on the VIP holder; `--timer` on all three; host-4
+   `install-runtime.sh`; svc-obs-01 `rules` + `dashboards`. Then 3.68 (no VM backups on hosts 1–3) to decide.
 4. Then 3.57 (Kubernetes in the whole-enclave power-down order) and the front door (needs the vendor).
 
 Firing on the dashboard and known: `KubernetesAPIVIPMoved` (the 05:00 keepalived test, clears ~05:30),

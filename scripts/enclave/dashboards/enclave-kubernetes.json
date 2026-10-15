@@ -1463,6 +1463,336 @@
      "mode": "multi"
     }
    }
+  },
+  {
+   "type": "row",
+   "title": "etcd backups (G9) - the cluster's only backup (backlog 3.68) - and Secrets at rest",
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 64
+   },
+   "id": 27,
+   "panels": []
+  },
+  {
+   "type": "stat",
+   "title": "Last etcd backup",
+   "description": "Since the newest snapshot that restored. Nightly at 06:00 UTC, by the control plane holding the VIP. Alert: KubernetesEtcdBackupMissed (26 h).",
+   "id": 28,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "enclave-prometheus"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 0,
+    "y": 65
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "enclave-prometheus"
+     },
+     "expr": "time() - max(enclave_k8s_etcd_backup_last_success_seconds)",
+     "instant": true
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "orange",
+        "value": 86400
+       },
+       {
+        "color": "red",
+        "value": 93600
+       }
+      ]
+     },
+     "color": {
+      "mode": "thresholds"
+     },
+     "noValue": "NEVER"
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "value",
+    "colorMode": "background",
+    "graphMode": "none",
+    "justifyMode": "center"
+   }
+  },
+  {
+   "type": "stat",
+   "title": "Newest snapshot",
+   "description": "Size of the newest snapshot (55 MB measured 2026-10-15).",
+   "id": 29,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "enclave-prometheus"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 4,
+    "y": 65
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "enclave-prometheus"
+     },
+     "expr": "max(enclave_k8s_etcd_backup_bytes)",
+     "instant": true
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "bytes",
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "blue",
+        "value": null
+       }
+      ]
+     },
+     "color": {
+      "mode": "thresholds"
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "value",
+    "colorMode": "background",
+    "graphMode": "none",
+    "justifyMode": "center"
+   }
+  },
+  {
+   "type": "stat",
+   "title": "Snapshots kept on the node",
+   "description": "Kept on the control plane that made them, and mirrored to every store.",
+   "id": 30,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "enclave-prometheus"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 8,
+    "y": 65
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "enclave-prometheus"
+     },
+     "expr": "max(enclave_k8s_etcd_backup_local_snapshots)",
+     "instant": true
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "none",
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "orange",
+        "value": null
+       },
+       {
+        "color": "green",
+        "value": 2
+       }
+      ]
+     },
+     "color": {
+      "mode": "thresholds"
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "value",
+    "colorMode": "background",
+    "graphMode": "none",
+    "justifyMode": "center"
+   }
+  },
+  {
+   "type": "stat",
+   "title": "Secrets stored plain",
+   "description": "From the nightly scan of etcd, read raw. Anything but 0 is V-274882 failing again (alert KubernetesSecretsStoredPlain).",
+   "id": 31,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "enclave-prometheus"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 12,
+    "y": 65
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "enclave-prometheus"
+     },
+     "expr": "max(enclave_k8s_secrets_plain_in_etcd)",
+     "instant": true
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "none",
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "red",
+        "value": 1
+       }
+      ]
+     },
+     "color": {
+      "mode": "thresholds"
+     },
+     "noValue": "not scanned yet"
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "value",
+    "colorMode": "background",
+    "graphMode": "none",
+    "justifyMode": "center"
+   }
+  },
+  {
+   "type": "bargauge",
+   "title": "Age of each store's last copy",
+   "id": 32,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "enclave-prometheus"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 8,
+    "x": 16,
+    "y": 65
+   },
+   "description": "host-4's backup volume and host-3, each pushed to directly. A site's NAS or SAN gets a further copy through host-4's third copy. Alert: KubernetesEtcdBackupStoreStale (26 h).",
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "enclave-prometheus"
+     },
+     "expr": "time() - max by (store) (enclave_k8s_etcd_backup_store_last_success_seconds)",
+     "instant": true,
+     "legendFormat": "{{store}}"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "min": 0,
+     "max": 172800,
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "orange",
+        "value": 86400
+       },
+       {
+        "color": "red",
+        "value": 93600
+       }
+      ]
+     },
+     "color": {
+      "mode": "thresholds"
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "orientation": "horizontal",
+    "displayMode": "basic",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    }
+   }
   }
  ]
 }

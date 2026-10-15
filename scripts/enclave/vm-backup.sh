@@ -1829,6 +1829,15 @@ push_sets() {
     fi
   done
   # The ledger keeps only files that still exist as recorded - pruned chains leave it.
+  # FOLDERS THAT ARE NOT GUESTS (BACKUP_THIRD_EXTRA, set by third-copy only): mirrored as they stand, over
+  # the same connection - today the etcd snapshot store (B-07 G9). One that does not exist here is
+  # skipped and said; one that fails to arrive fails the copy like a domain would.
+  local x
+  for x in ${PUSH_EXTRA:-}; do
+    case "$x" in */*|.*|"") warn "$label: '$x' is not a plain folder name - skipped"; continue ;; esac
+    if [ ! -d "$DEST/$x" ]; then say "$label: no $DEST/$x here - nothing to carry"; continue; fi
+    "${RS[@]}" "$DEST/$x/" "$ruser@$addr:$x/" </dev/null && ok "$label: $x/ carried" || { warn "$label: $x/ FAILED"; rc=1; }
+  done
   if [ "$dry" -eq 0 ] && [ -f "$ledger" ]; then
     LC_ALL=C comm -12 \
       <(for d in "${doms[@]}"; do find "$DEST/$d" -type f -printf "$d/%P\t%s\t%T@\n"; done | LC_ALL=C sort) \
@@ -1981,7 +1990,7 @@ cmd_third_copy() {
     if [ "$setup" -eq 1 ]; then copy_setup "$u" "$a" "$d" "$k" "third copy" "third-copy -n --target $a" </dev/null; continue; fi
     # EACH TARGET IN ITS OWN SUBSHELL: push_sets dies on a failure, and one store failing must not
     # stop the next - the vault and the NAS are independent.
-    ( push_sets "third copy" "$k" "$a" "$a" "$d" "$THIRD_SKIP" "$st" \
+    ( PUSH_EXTRA="${BACKUP_THIRD_EXTRA:-}"; push_sets "third copy" "$k" "$a" "$a" "$d" "$THIRD_SKIP" "$st" \
                 "${BACKUP_THIRD_DELETE:-1}" "$dry" "$all" "$vall" "$u" ) </dev/null || failed="$failed $a"
   done < <(third_targets)
   [ "$n" -gt 0 ] || die "no third-copy target is '$only' (BACKUP_THIRD_ADDR: $THIRD_ADDR)"

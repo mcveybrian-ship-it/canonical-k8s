@@ -19,7 +19,7 @@
 #   needs sudo - which is the point: changing what root runs on a schedule is a privileged
 #   act and should leave the same record as any other.
 #
-# WHAT IS COPIED: the scripts, the tracked .env files and the dashboards - what the timers
+# WHAT IS COPIED: the scripts, the tracked .env files, the dashboards, and 07-kubernetes.sh (G9) - what the timers
 # load relative to their own location. NOT *-params.env: those are gitignored, may hold
 # secrets, and no timer reads them.
 #
@@ -70,6 +70,10 @@ done
 for d in dashboards trust-anchors csr-profiles; do
   [ -d "$HERE/$d" ] && cp -rp "$HERE/$d" "$stage/"
 done
+# AND ONE STEP SCRIPT A TIMER RUNS - 07-kubernetes.sh, for the nightly etcd backup (B-07 G9). Named, not
+# globbed: a step script travels here only when a timer needs it. It finds its siblings through
+# ../enclave, which from here is this same directory.
+[ -f "$HERE/../install/07-kubernetes.sh" ] && cp -p "$HERE/../install/07-kubernetes.sh" "$stage/"
 shopt -u nullglob
 
 # .source line 1 answers "which code is root running": the push stamp by default, the

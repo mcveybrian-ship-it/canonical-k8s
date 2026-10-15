@@ -476,6 +476,7 @@ backup within about 60 days** (`ssp-inputs.md` §2.8, acting AO, 2026-09-24).
 |---|---|---|
 | VM backups | host-4, nightly 02:00 Central | the nightly incremental becomes a **full** for any VM whose newest full is `BACKUP_FULL_MAX_DAYS` (30) old. When a third chain starts, `prune` destroys the oldest, so 2 chains kept means ~60 days |
 | off-host copies | host-1 (second), lab-vault (third, lab only) | they mirror the source with `--delete` the same night, so a set pruned on host-4 is deleted there too |
+| Kubernetes cluster state (etcd) | the control plane holding the API VIP, nightly 06:00 UTC (G9): a snapshot, restore-tested, pushed to host-4 and host-3; carried to network storage by host-4's third copy where the site has any | the newest 14 kept on the node, mirrored with `--delete` to each store: 14 nights. Holds Secrets as AES-GCM ciphertext only (3.64); no application records |
 | database backups | pgBackRest: host-4 (repo1) and host-3 (repo2), full on Sunday, differential daily | 2 fulls kept. Each backup ends with pgBackRest's own expiry, which deletes the oldest full, its differentials and older WAL: ~14 days |
 | evidence | `/var/log/enclave/records-disposal.log` on host-4 and host-3, plus syslog tag `records-disposal` | one line per destroyed set, copy deletion, pgBackRest expiry and hold event |
 | watch | the alert rules on svc-obs-01 | `BackupRetentionExceeded` and `RecordsHoldReviewOverdue`; for the copies, `BackupCopyFailed` and `BackupCopyStale` (3.58) — a copy that stops running stops following the source |

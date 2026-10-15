@@ -17,6 +17,27 @@ outstanding and this section wins for what order to do it in.
 
 ### ⏭ NEXT SESSION — start here, in this order
 
+**2026-10-15 05:15 UTC — B-07: the cluster is HA, verified, survivable (C1–C5), its Secrets are
+encrypted at rest (3.64, V-274882 closed) and it is monitored (G10, proven by failure).** Morning, in order:
+
+1. ~~After the 07:00 UTC nightly, confirm host-4's copy landed on host-3, then retire host-1's.~~ **Checked
+   2026-10-15 23:20 UTC: the 07:01 copy went to host-1 AGAIN** (rc=0). The timer runs host-4's root-owned
+   runtime copy, installed 2026-10-14 00:33 from `537a65b` — before 3.61's override (`ef46955`). It was
+   never refreshed (backlog 3.67). **Do now:** push the repo to host-4, then on host-4
+   `sudo ./scripts/enclave/vm-backup.sh schedule --at 07:00` (refreshes the copy, keeps the time) and
+   `cat /usr/local/lib/enclave/.source`. **Then after the 10-16 07:00 UTC run**, confirm the copy is on
+   host-3, and only then retire host-1's (`/var/lib/libvirt/images/backup-copy`, and host-4's key line
+   in host-1's `/root/.ssh/authorized_keys`) — host-1's is host-4's ONLY second copy until then. That
+   retirement clears the `FilesystemFillingWarning` on host-1 (firing since 2026-10-14 07:01).
+2. **Envelopes:** seal the lab Kubernetes Secrets passphrase (its fingerprint is in HANDOFF §3 — never in
+   git) and confirm the pgBackRest one (3.50).
+3. **G9 — nightly etcd backups**, with `07-kubernetes.sh encrypt check` in the same nightly run
+   (07-kubernetes.md §6 item 7). Plan first, then build.
+4. Then 3.57 (Kubernetes in the whole-enclave power-down order) and the front door (needs the vendor).
+
+Firing on the dashboard and known: `KubernetesAPIVIPMoved` (the 05:00 keepalived test, clears ~05:30),
+`FilesystemFillingWarning` host-1 (item 1), `AptMetadataStale` (3.53), `TrivyDatabaseStale` (3.2).
+
 **2026-10-14 16:00 UTC — B-07: verified (28/28) and the API VIP live; next are the survivability tests** ([`docs/07-kubernetes.md`](../docs/07-kubernetes.md) §6). ssh stays on the workers (K-B reversed). Also owed: the 07:00 UTC nightly backup check → close 3.58. The rest of this section is the 2026-09-18 state, kept for its history.
 
 **2026-09-18 01:30 UTC — `host-1/2/3` are done and identical: USG 213/3, V1R6 171/9/9/5.**

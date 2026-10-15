@@ -625,7 +625,7 @@ on the host the guest lives on (`vm-specs.env` placement: cp-0N and wk-0N on hos
 | **C3** a whole host | `for v in k8s-cp-0N k8s-wk-0N pg-0N; do sudo virsh destroy $v; done` | all three probes; the database write test below on the Patroni leader. **Restore:** `for v in k8s-cp-0N k8s-wk-0N pg-0N; do sudo virsh start $v; done`; then `patronictl list` until pg-0N is `streaming` |
 | **C3b** Postgres's sync standby, from inside | the write loop below on the **leader**, then `sudo virsh destroy pg-0N` on the **sync standby's** host ~15 s later | the loop: a write stall (~36 s, 3.62) and `synchronous_standby_names` going straight to the other standby — **it must never print `[]`**. **Restore:** `sudo virsh start pg-0N`; then `patronictl list` until it is `streaming` again — **on 2026-10-15 this step was missing and pg-03 stayed off for ~3 h** (§5, trap 8c) |
 | **C4** etcd | `sudo …/07-kubernetes.sh etcd-drill` on a control plane (§3.11) | `etcd drill passed` |
-| **C5** cold start | the stop block, then the start block, below — then `verify` | `verify` 28/28 |
+| **C5** cold start | the stop block, then the start block, below — then `verify` | `verify` all pass — 28 then, 29 since 2026-10-15 (section 6, Secrets at rest) |
 
 The **cluster write test** (C1, C3), on a surviving control plane:
 
@@ -680,7 +680,7 @@ if [ -z "$W" ]; then echo "WRONG MACHINE: $(hostname -s)"; else
 fi
 ```
 
-**After the tests — nothing left down:** on each host `sudo virsh list --all` shows no guest `shut off`, Patroni lists three members, and the dashboards show no `InstanceDown`. Then `verify`, then `verify --cleanup` only if the test workload is no longer
+**After the tests — nothing left down:** on each host `sudo virsh list --all` shows no guest `shut off`, Patroni lists three members, and the dashboards show no `InstanceDown`. Then `verify` (29 checks since 2026-10-15), then `verify --cleanup` only if the test workload is no longer
 wanted. Record each result in §4.1 with its times — measured, never "it seemed fine".
 
 ## 5. Traps hit — each fixed in a script

@@ -275,7 +275,19 @@ not fix. The VIP serves clients outside the cluster (svc-mgmt-01, svc-obs-01); i
 | ✅ **API VIP** | cp-01 holds `10.2.20.170`, cp-02/03 standby; from svc-mgmt-01 the API answers on it (HTTP 401) and `k8s-api.enclave.internal` resolves to it; stage-01 is dropped — not an allowed source |
 | ✅ Harbor as the image source | Harbor's own pull counts (`/api/v2.0/projects/canonical/repositories`, anonymous): 9 for `cilium`, `pause` and `metallb-speaker` — the seven nodes plus the two read-backs of `images-check`; 2 for the CSI images, which nothing runs (local-storage off) |
 
-## 5. Traps hit — each fixed in a script
+### 4.1 Survivability — measured, one failure at a time
+
+Probes, one sample per second throughout: the whoami LoadBalancer address (`10.2.20.200`) from
+stage-01, and the API on the VIP from svc-mgmt-01 — with which control plane holds the VIP, read
+from svc-mgmt-01's neighbour table. "Down" means no answer within 1 s.
+
+| test | what was done | measured |
+|---|---|---|
+| ✅ **C1 — a control plane lost** (2026-10-14) | `virsh destroy k8s-cp-01` (hard power-off) on host-1 — the VIP holder | **API unreachable 4 s** (15:52:42 → 15:52:46): the VIP moved to cp-02 in 2 s, the API answered through it 2 s later. **The test service never missed a probe.** With cp-01 down: etcd `ok` on 2 of 3, a write created, read back and deleted. **Rejoin:** `virsh start`, Ready in ~2 min, etcd caught up, no pod stuck; the VIP **stayed on cp-02** (`nopreempt`); two API blips of 1 s and 2 s while cp-01's etcd member resynced — slow answers, the VIP never moved |
+| ✅ **C2 — a worker lost** (2026-10-14) | `virsh destroy k8s-wk-01` (~16:14:40) — one of the four whoami pods on it | **The test service never missed a probe.** wk-01 `unreachable` + `NoExecute` taint at 16:15:30 (the ~50 s grace); its pod **evicted at ~16:20:31, exactly the 5-minute toleration**, a replacement Running on wk-02 by 16:22 — no operator action (a Deployment needs no fencing; a StatefulSet would — decision H2). One 1 s API blip at 16:17:45, VIP unmoved. **Rejoin:** `virsh start`, Ready with no taints in ~2 min, the stale pod cleared. Running pods are not rebalanced back (wk-02 keeps two) |
+| ✅ **C2b — the node announcing the service address lost** (2026-10-14) | `virsh destroy k8s-wk-01` while it answered for `10.2.20.200` (read from stage-01's neighbour table) | **The test service never missed a probe:** the address moved to wk-04 — MetalLB's L2 failover took **under ~2 s** (the probe's resolution). The announcer also moves when a node *joins*: cp-01 took it on rejoining after C1, wk-01 after C2 — with no probe missed either time |
+| ⚠️ unprompted API blips | — | Between the tests, 18:30–18:44 UTC: **four blips of 1–2 s** on the VIP with no failure injected and the VIP unmoved. "Down" is "no answer within 1 s", so most likely a slow API server on these 4-thread hosts, not an outage. Measured, not explained — worth chasing if it appears on production hardware |
+
 
 1. **New scripts went in as mode 644** (the file was created by a tool, not `cp`) — `sudo` said
    "command not found". Every step script is tracked 100755.

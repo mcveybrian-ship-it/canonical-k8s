@@ -321,6 +321,32 @@ between machines. The config, `/var/snap/k8s/common/etc/configurations/enclave-e
 (root 0600), holds the derived keys — **never print it**. Its `# enclave-state:` line says which key
 writes and lists each key's fingerprint, not the key.
 
+**Two fingerprints, two rules.** `stage` prints the **passphrase fingerprint** (sha256 of the passphrase,
+first 8 hex — the same scheme as pgBackRest's). It goes on the envelope and the custody register, and
+**never into git**: it is an unsalted fast hash, so a published one lets anyone test guesses at speed.
+The **key fingerprint** (`fingerprints=gen1:…` in the state line) is sha256 of the *derived* key, so
+testing one guess costs 600,000 PBKDF2 rounds. It is safe to record, and it is what proves all three
+control planes hold the same key.
+
+**What it changes on each control plane — nothing else:**
+
+| | what | undone by |
+|---|---|---|
+| a file | `/var/snap/k8s/common/etc/configurations/enclave-encryption.yaml`, root 0600 — the keys | never deleted while Secrets are encrypted (below) |
+| one line | `--encryption-provider-config=<that file>` appended to `/var/snap/k8s/common/args/kube-apiserver`; the file before it kept as `kube-apiserver.pre-3.64` | copying `.pre-3.64` back |
+| a restart | `snap restart k8s.kube-apiserver` at each step that changes the file — the API server is back in 5–8 s (measured); if it held the VIP, the VIP moves | — |
+
+etcd itself is not restarted, nothing is installed, and `etcdctl` lives only in each run's temporary
+directory. Each Secret in etcd changes from plain to `k8s:enc:aesgcm:v1:gen1:` + ciphertext.
+
+**How to see it at any time** — all read-only:
+
+| question | command, on a control plane | the answer that means "fine" |
+|---|---|---|
+| does this API server encrypt? | `sudo …/07-kubernetes.sh encrypt status` | `write=gen1`, `plain=refused`, `running API server: yes` |
+| what does etcd actually hold? | `sudo …/07-kubernetes.sh encrypt check` | every Secret under the current key, `plain - NOT encrypted 0`, etcd's count = the API's |
+| part of the routine check | `sudo …/07-kubernetes.sh verify` | section 6, `this API server writes Secrets with gen1` |
+
 **Steps, because there are three API servers** (Kubernetes' procedure): a Secret written by an API
 server holding the new key cannot be read by one without it. So **stage** gives every API server the
 key without using it; **apply** makes each write with it; **rewrite** stores every existing Secret
@@ -347,18 +373,27 @@ etcd and the API disagreeing, is reported as *the check did not work*, never as 
 case "$(hostname -s)" in k8s-cp-0[1-3]) sudo ~/canonical-k8s/scripts/install/07-kubernetes.sh encrypt stage ;; *) echo "WRONG MACHINE: $(hostname -s)" ;; esac
 ```
 
-Asks for the passphrase twice (unless the credentials file holds it) and prints its **fingerprint —
-it must be the same on all three**. Writes the config with `identity` still first, adds the argument,
-restarts, and proves the restarted API server still reads every Secret.
+Asks for the passphrase twice (unless the credentials file holds it), then prints the passphrase
+fingerprint and the state line. **`fingerprints=gen1:…` must be identical on all three.** It writes
+the config with `identity` still first, so this server still writes plain. Then it adds the argument,
+restarts, and proves the restarted API server still reads every Secret. **One control plane at a
+time**: the script refuses to change anything while another control plane's API server is not ready
+(trap 8b).
 
 ```bash
 ### MACHINE: k8s-cp-01, then k8s-cp-02, then k8s-cp-03 — 2. APPLY, only after all three are staged ###
 case "$(hostname -s)" in k8s-cp-0[1-3]) sudo ~/canonical-k8s/scripts/install/07-kubernetes.sh encrypt apply ;; *) echo "WRONG MACHINE: $(hostname -s)" ;; esac
 ```
 
-No passphrase: it reorders the keys already staged. Then a **canary** Secret is written through this
-API server and read back through all three by address — the proof that every API server holds the
-same key. A control plane that cannot read it was not staged: stage it **at once**.
+No passphrase: it reorders the keys already staged. Then a **canary**, a throwaway Secret, is written
+through this API server and read back through all three by address. That proves every API server
+holds the same key. A failed read means one of two things:
+
+- **`CANNOT DECRYPT`** — that control plane lacks the key: run `encrypt stage` there **at once**. Until
+  then, it cannot read anything this one writes.
+- **`did not answer`** — that control plane was restarting, which is not a key result. When it is
+  ready, run `encrypt apply` here again: the config is unchanged, so there is no restart, only the
+  canary again.
 
 ```bash
 ### MACHINE: k8s-cp-01 (10.2.20.171) — 3. REWRITE, once, after all three apply ###
@@ -381,6 +416,9 @@ Runs `encrypt check` itself and refuses unless every Secret is under the current
 keeps only that key: the older one goes, and so does `identity`, so this API server can no longer
 serve a Secret stored in the clear. It restarts and proves it still reads every Secret. Then `verify`:
 section 6 checks this node's API server.
+
+**As run on the lab cluster, 2026-10-15 03:10–03:35 UTC:** §4 has the numbers. Step 0 showed all 23
+Secrets plain; after step 4, all 23 were under `gen1` and none plain.
 
 **A new cluster** needs no stage, apply or rewrite. `node-prep` writes the config, with the key
 writing, on each control plane before its API server first starts. `render_config` adds the argument
@@ -426,6 +464,7 @@ unreadable without it. Going back to plain means `identity` first and another re
 | ✅ **dual-stack LoadBalancer** | the test Service got `10.2.20.200` **and** `fd6e:32f0:f4b3:20::200`; answers over both from cp-01, and over UDP and TCP **from stage-01, outside the cluster** — no ufw rule for it exists, so Cilium's eBPF path is confirmed ahead of ufw (POA&M ENG-75) |
 | ✅ **audit policy K-A** | a probe Secret's value — plain and base64 — absent from `/var/log/kubernetes/audit.log`; its create logged at `Metadata`, no request body |
 | ✅ **API VIP** | cp-01 holds `10.2.20.170`, cp-02/03 standby; from svc-mgmt-01 the API answers on it (HTTP 401) and `k8s-api.enclave.internal` resolves to it; stage-01 is dropped — not an allowed source |
+| ✅ **Secrets encrypted at rest — V-274882** (3.64) | 2026-10-15 03:10–03:35 UTC, §3.12 steps 0–4. **Step 0** (before any change): etcd held **23 Secrets, all 23 plain**, and the API listed 23 — the check seen failing first. **Stage** ×3: the key derived under each node's FIPS OpenSSL; the passphrase fingerprint and key `gen1:bd2bb8db` identical on all three. **Apply**: a canary written through cp-01 read back through cp-01, cp-02 and cp-03. **Rewrite**: a canary through each control plane stored as `k8s:enc:aesgcm:v1:gen1:` (read raw from etcd); 23 Secrets stored again; **etcd: 23 under `gen1`, 0 plain**. **Retire** ×3: each re-checked etcd first, then `plain=refused` and all 23 read with `gen1` alone. Each restart: API ready again in 5–8 s |
 | ✅ Harbor as the image source | Harbor's own pull counts (`/api/v2.0/projects/canonical/repositories`, anonymous): 9 for `cilium`, `pause` and `metallb-speaker` — the seven nodes plus the two read-backs of `images-check`; 2 for the CSI images, which nothing runs (local-storage off) |
 
 ### 4.1 Survivability — measured, one failure at a time
@@ -584,6 +623,12 @@ wanted. Record each result in §4.1 with its times — measured, never "it seeme
    **Proven 2026-10-15 01:58 UTC:** 40 queries from stage-01 to the service's NodePort on each of wk-02 (2 local
    pods — the failing case), wk-03 (1) and wk-01 (0): **120 of 120 answered**; the LoadBalancer address 40 of 40.
    Re-applying ufw on a live node drops traffic for a few seconds (the reset) — a maintenance-window step.
+8b. **`encrypt apply` run on cp-02 and cp-03 at the same time** (2026-10-15). Both API servers restarted together,
+   and each one's canary, read through the other, hit a server mid-restart. That was reported as a key failure,
+   but the keys were fine: `encrypt status` showed both writing with `gen1`, and `rewrite`'s preflight proved
+   it. **Fixed:** `stage`, `apply` and `retire` now refuse to change anything while another control plane's
+   API server is not ready. The canary retries a server that does not answer for 30 s and reports only a
+   *decryption* error as a key failure. **One control plane at a time** is the rule; the script now enforces it.
 8. **No default route** turns "service has no backend" into an instant `network is unreachable` /
    `no route to host` instead of a timeout — read it as "nothing behind that Service yet".
 
@@ -595,13 +640,13 @@ wanted. Record each result in §4.1 with its times — measured, never "it seeme
 3. ~~**K-B** — sshd disabled on the workers~~ — **reversed 2026-10-14: ssh stays on** (§2, POA&M AO-21).
 4. ✅ **Survivability (C)** — C1–C5 passed 2026-10-14/15, service continuity re-measured with the fixed probe and two
    firewall gaps fixed (§4.1, §4.2, §5 trap 8a).
-5. 🔴 **Secrets at rest — V-274882, CAT I (backlog 3.64).** Checked 2026-10-15: **not encrypted**. Decided the same day:
-   `aesgcm`, keys from a sealed passphrase. **Built** (`encrypt`, §3.12) and tested off the cluster — the snap's own v1.36.4
-   API server parses all three config forms, and rejects a bad key. **Not yet applied** to the cluster.
+5. ✅ **Secrets at rest — V-274882, CAT I (backlog 3.64)** — found unencrypted 2026-10-15, **encrypted the same day**: `aesgcm`,
+   keys from a sealed passphrase; etcd holds every Secret under `gen1`, none plain, no API server reads plain (§3.12, §4).
+   Left: `encrypt check` in the nightly check; the lab passphrase's envelope; a re-key procedure (POA&M ENG-76).
 6. ⬜ **Cluster monitoring (G10)** — Prometheus scrapes none of the seven nodes: no alert for a `NotReady` node, etcd, the VIP
    moving or a certificate expiring.
-7. ⬜ **Routine etcd backups (G9)** — the drill (§3.11) is one-off; a nightly snapshot needs encryption (it holds every Secret)
-   and a home.
+7. ⬜ **Routine etcd backups (G9)** — the drill (§3.11) is one-off; a nightly snapshot needs a home. Its Secrets are now
+   ciphertext (3.64), readable only with the passphrase envelope. Run `encrypt check` with it each night.
 8. ⬜ **Kubernetes in the whole-enclave power-down order** (3.57, contingency plan §5.3) — the blocks exist (§4.2, C5).
 9. ⬜ **The application front door** — the gateway is enabled but unexercised, `*.apps` points at a placeholder, and Q-CORE (i)
    (is the gateway's TLS FIPS?) is open. With the vendor's application.

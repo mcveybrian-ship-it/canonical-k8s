@@ -1079,6 +1079,20 @@ enc_running() {
 # THIS node's API server, by its own address - not the VIP, not another control plane.
 enc_ready() { kc --server="https://$ME_ADDR:6443" get --raw=/readyz >/dev/null 2>&1; }
 
+# ONE CONTROL PLANE AT A TIME (found 2026-10-15): apply was run on cp-02 and cp-03 at once, both API
+# servers restarted together, and each one's canary read through the other hit a server mid-restart -
+# reported as a key failure that was not one. So nothing changes here while another control plane's
+# API server is not ready: that is what a concurrent run on another node looks like from this one.
+enc_peers_ready() {
+  local k a n
+  for k in $(grep -oE '^K8S_CP_[0-9]+=' "$ADDRS" | tr -d '=' | sort); do
+    a="${!k}"; n="$(printf '%s' "$k" | tr 'A-Z_' 'a-z-')"
+    [ "$a" != "$ME_ADDR" ] || continue
+    kc --server="https://$a:6443" get --raw=/readyz >/dev/null 2>&1 \
+      || die "the API server on $n is not ready - it may be restarting for this same step. One control plane at a time: wait for it, then run this again. Nothing changed here"
+  done
+}
+
 enc_restart() {
   local i
   say "restarting the API server on $ME - if it holds the VIP, the VIP moves (3-4 s, measured in C1)"
@@ -1105,9 +1119,18 @@ enc_canary() {
     || die "could not write the canary Secret through $ME"
   for k in $(grep -oE '^K8S_CP_[0-9]+=' "$ADDRS" | tr -d '=' | sort); do
     a="${!k}"; n="$(printf '%s' "$k" | tr 'A-Z_' 'a-z-')"
-    got="$(kc --server="https://$a:6443" -n kube-system get secret "$name" -o jsonpath='{.data.v}' 2>&1 || true)"
+    # A server that does not ANSWER is not a key failure: retried for up to 30 s. A decryption error
+    # is the real thing and is reported at once.
+    for _ in $(seq 1 30); do
+      got="$(kc --server="https://$a:6443" -n kube-system get secret "$name" -o jsonpath='{.data.v}' 2>&1 || true)"
+      [ "$(printf '%s' "$got" | base64 -d 2>/dev/null || true)" = "$val" ] && break
+      printf '%s' "$got" | grep -qiE 'transform|decrypt|authentication failed|matching prefix' && break
+      sleep 1
+    done
     if [ "$(printf '%s' "$got" | base64 -d 2>/dev/null || true)" = "$val" ]; then ok "$n reads it"
-    else warn "$n CANNOT read it: $(printf '%s' "$got" | tail -1 | cut -c1-200)"; bad=1; fi
+    elif printf '%s' "$got" | grep -qiE 'transform|decrypt|authentication failed|matching prefix'; then
+      warn "$n CANNOT DECRYPT it - a different key, or not staged: $(printf '%s' "$got" | tail -1 | cut -c1-200)"; bad=1
+    else warn "$n did not answer for 30 s - not a key result either way: $(printf '%s' "$got" | tail -1 | cut -c1-160)"; bad=1; fi
   done
   kc --server="https://$ME_ADDR:6443" -n kube-system delete secret "$name" >/dev/null 2>&1 || true
   return "$bad"
@@ -1230,6 +1253,7 @@ cmd_encrypt() {
   esac
   /snap/bin/k8s status >/dev/null 2>&1 || die "$ME is not in a running cluster - a NEW control plane gets its config from node-prep"
   enc_ready || die "cannot read https://$ME_ADDR:6443/readyz with the admin kubeconfig BEFORE changing anything - the check this relies on does not work here; nothing changed"
+  enc_peers_ready
   st="$(enc_state)"; cur="$(enc_field "$st" write)"
   ENC_CHANGED=0
   if [ "$act" = stage ]; then
@@ -1262,7 +1286,7 @@ cmd_encrypt() {
     fi
   else
     say "canary: a Secret written through $ME, read back through every control plane"
-    enc_canary || die "a control plane cannot read what $ME now writes - run 'encrypt stage' THERE NOW (until then it cannot read Secrets written here)"
+    enc_canary || die "read the lines above. CANNOT DECRYPT: run 'encrypt stage' on that control plane NOW - until then it cannot read Secrets written here. DID NOT ANSWER: it was restarting; when it is ready, run 'encrypt apply' here again (no restart - it repeats the canary)"
     ok "$ME writes with $w. Next: 'encrypt apply' on the other control planes, then 'encrypt rewrite' on one"
   fi
 }

@@ -76,6 +76,19 @@ plan_guests_on() {  # guests the map places on $1
     [ -n "${!v}" ] && printf '%s\n' "$g"
   done | sort
 }
+# plan_second_target <host> - where that host's second backup copy goes: an exception in
+# BACKUP_SECOND_OVERRIDE (3.61), else the ring's next host running guests, else the named host.
+plan_second_target() {
+  local h="$1" o x i; local -a ring=()
+  for o in ${BACKUP_SECOND_OVERRIDE:-}; do [ "${o%%=*}" = "$h" ] && { printf '%s' "${o#*=}"; return; }; done
+  case "${PLACE_BACKUP_SECOND:-}" in
+    ring) while read -r x; do [ -n "$(plan_guests_on "$x")" ] && ring+=("$x"); done < <(plan_hosts)
+          for i in "${!ring[@]}"; do [ "${ring[$i]}" = "$h" ] && { printf '%s' "${ring[$(( (i+1) % ${#ring[@]} ))]}"; return; }; done ;;
+    "")   ;;
+    *)    [ "$PLACE_BACKUP_SECOND" = "$h" ] || printf '%s' "$PLACE_BACKUP_SECOND" ;;
+  esac
+}
+
 plan_sum() {  # <host> -> "vcpu ram_mb disk_gb data_gb count", from the specs
   local host="$1" g sv vc rm dk dt; local tv=0 tr=0 td=0 tdd=0 n=0
   for g in $(plan_guests_on "$host"); do
@@ -304,12 +317,18 @@ cmd_plan() {
     if [ "${#ring[@]}" -lt 2 ]; then
       warn "PLACE_BACKUP_SECOND=ring needs at least two hosts running guests - name a host instead"; fail=1
     else
-      local i nxt line=""
+      local i nxt line="" o known
       for i in "${!ring[@]}"; do
-        nxt="${ring[$(( (i+1) % ${#ring[@]} ))]}"
+        nxt="$(plan_second_target "${ring[$i]}")"
         line="$line ${ring[$i]}->$nxt"
+        case " ${BACKUP_SECOND_OVERRIDE:-} " in *" ${ring[$i]}="*) line="$line(override)" ;; esac
       done
       ok "backup ring:$line"
+      # an override must name another host the map knows
+      for o in ${BACKUP_SECOND_OVERRIDE:-}; do
+        known="$(plan_hosts | grep -cx "${o#*=}" || true)"
+        if [ "${o%%=*}" = "${o#*=}" ] || [ "$known" -eq 0 ]; then warn "BACKUP_SECOND_OVERRIDE '$o' names the host itself or a host the map does not know"; fail=1; fi
+      done
     fi
   else
     local stranded; stranded="$(plan_guests_on "$second" | tr '\n' ' ')"
@@ -405,9 +424,15 @@ cmd_plan() {
     [ "${st%%=*}" = "$me" ] || continue
     case "${st#*=}" in "$POOL"/*) reserve_pg="${PG_BACKUP_RESERVE_GB:-100}" ;; esac
   done
-  if { [ "${PLACE_BACKUP_SECOND:-}" = ring ] || [ "$reserve_pg" -gt 0 ]; } && [ -n "$pool_avail" ]; then
+  # HOW MANY COPIES LAND HERE - counted from the map and its exceptions, not assumed one per host:
+  # with host-4's copy sent to host-3 (3.61), host-1 receives none and host-3 receives it.
+  local incoming=0 x
+  while read -r x; do
+    [ -n "$(plan_guests_on "$x")" ] && [ "$x" != "$me" ] && [ "$(plan_second_target "$x")" = "$me" ] && incoming=$((incoming + 1))
+  done < <(plan_hosts)
+  if { [ "$incoming" -gt 0 ] || [ "$reserve_pg" -gt 0 ]; } && [ -n "$pool_avail" ]; then
     local psize reserve_copy=0
-    [ "${PLACE_BACKUP_SECOND:-}" = ring ] && reserve_copy="${BACKUP_COPY_RESERVE_GB:-200}"
+    reserve_copy=$(( incoming * ${BACKUP_COPY_RESERVE_GB:-200} ))
     psize="$(df -BG --output=size "$POOL" 2>/dev/null | tail -1 | tr -dc 0-9 || true)"
     if [ -n "$psize" ] && [ $(( dk + reserve_copy + reserve_pg )) -le "$psize" ]; then
       ok "pool $POOL: ${psize} GB holds ${dk} GB of OS-disk ceilings + ${reserve_copy} GB backup-copy reserve + ${reserve_pg} GB database-backup reserve"

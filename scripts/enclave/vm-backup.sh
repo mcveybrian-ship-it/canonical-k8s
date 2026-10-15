@@ -1605,7 +1605,14 @@ state_last_ok() {
 }
 
 second_host() {   # the host the placement map sends this machine's copies to
-  local want="${BACKUP_SECOND_HOST:-${PLACE_BACKUP_SECOND:-}}" me; me="$(hostname -s)"
+  local want="${BACKUP_SECOND_HOST:-${PLACE_BACKUP_SECOND:-}}" me o; me="$(hostname -s)"
+  # BACKUP_SECOND_OVERRIDE (vm-specs.env, 3.61): from=to exceptions to the ring - after an explicit
+  # BACKUP_SECOND_HOST, before everything else.
+  if [ -z "${BACKUP_SECOND_HOST:-}" ]; then
+    for o in ${BACKUP_SECOND_OVERRIDE:-}; do
+      if [ "${o%%=*}" = "$me" ] && [ "${o#*=}" != "$me" ]; then printf '%s' "${o#*=}"; return; fi
+    done
+  fi
   case "$want" in
     "")   printf '' ;;
     ring) # next host in the map that runs guests, wrapping - see vm-specs.env

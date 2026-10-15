@@ -475,7 +475,7 @@ wanted. Record each result in §4.1 with its times — measured, never "it seeme
    adding Kubernetes to the whole-enclave power-down order (3.57) is owed. ⬜ **Re-measure service continuity** with the
    fixed probe (the retraction in §4.1). ⬜ **Routine etcd backups** (G9) — the drill is one-off; nightly
    snapshots need a home and encryption, since a snapshot holds every Secret.
-5. Then **B-08 Ceph** — blocked on backlog 3.48 (wk-04 has no OSD device).
+5. Then **B-08 Ceph** — 3.48 decided 2026-10-14 (option A: wk-04's lab OSD is an LV on host-4's OS disk, a dedicated drive in production — START-HERE's lab-vs-production table); still waits on 3.61 (host-1's pool).
 
 ## 7. Known gaps carried elsewhere
 

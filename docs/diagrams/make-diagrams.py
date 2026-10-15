@@ -261,8 +261,8 @@ def page_hosts():
             p.box(30, 1160, 1620, 90,
                   "<b>Lab differences (vm-specs.env, profile lab):</b> the four service VMs stay on host-4 - the only "
                   "machine with the memory (125 GiB against 30 on host-1..3) - and k8s-wk-04 joins them there, as in "
-                  "production (decided 2026-10-14). It has <b>no OSD device yet</b>: host-4's spare NVMe became the pgBackRest "
-                  "store, so until backlog 3.48 is decided the lab's Ceph has three OSD nodes, the no-self-heal case." + ("" if built("kubernetes") else " Kubernetes guests are planned only - none is composed yet (B-07)."),
+                  "production (decided 2026-10-14). Its Ceph OSD is a <b>500 GB volume on host-4's OS disk</b> (lab only, 3.48 option A): "
+                  "host-4's spare NVMe holds the pgBackRest store. Production gives wk-04 a dedicated drive (backlog 2.8)." + ("" if built("kubernetes") else " Kubernetes guests are planned only - none is composed yet (B-07)."),
                   "note")
     return p
 

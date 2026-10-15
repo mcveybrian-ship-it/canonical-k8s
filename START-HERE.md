@@ -59,6 +59,29 @@ template needs, so one trip to the pathfinder feeds the next step.
 
 **→ [`docs/01-pathfinder.md`](docs/01-pathfinder.md)**
 
+## Lab vs production — every difference
+
+**Read this before building production from this repository.** The lab proves the procedure on
+smaller hardware; everything below is built differently there, and each lab value is declared in
+one place — the `lab` profile of `scripts/enclave/vm-specs.env`, selected by `/etc/enclave-profile`
+on the machine — so that a production build, with no profile file, gets the production value or a
+refusal. **A difference that is not in this table is a defect: add it here the day it is made.**
+
+| what | lab | production | where it is declared |
+|---|---|---|---|
+| Host hardware | host-1/2: Ryzen 3 4300U, 4 threads, 30 GiB · host-3: Ryzen Embedded R2544, 8 threads, 31 GiB · host-4: 16 threads, 125 GiB (`vm-specs.env`, measured 2026-09-18) | the hardware spec, backlog 2.8 (~6 drives per host) | backlog 2.8 |
+| Guest sizes | control plane 2 vCPU · 6 GiB · 60 GB; worker 4 · 12 · 60; pg 2 · 4 · 40 | 4 · 16 · 100; 8 · 32 · 100; pg per `vm-specs.env` | `vm-specs.env` `VM_*`, lab profile |
+| Service VM placement | all four on host-4 (no room on hosts 1–3) | one per host (`PLACE_SVC_*`) | `vm-specs.env`, lab profile |
+| Data disk device | the same NVMe as the VM pool — a **written waiver** | a different physical device, or the composer refuses | `vm-specs.env` (the waiver comment) |
+| **Ceph OSD, k8s-wk-04** | **a 500 GB logical volume on host-4's OS disk** (`lv:vg0/k8s-wk-04-osd`) — host-4's spare NVMe holds the pgBackRest store | **a dedicated raw drive** — one more drive in host-4's spec | `vm-specs.env` `OSD_K8S_WK_04`: **empty in production, so B-08 refuses** until it is named (backlog 3.48, decided 2026-10-14) |
+| Ceph OSD, k8s-wk-01..03 | the ~450 GB left unpartitioned on host-1..3's NVMe | a dedicated raw drive per worker | `vm-specs.env` `OSD_K8S_WK_0N` (empty in production) |
+| Backup copies to the vault and the NAS | the Dell's vault (`10.2.30.170`) and the NAS (`10.2.30.171`), nightly | **none** — a real offsite store, if any, is the site's (backlog 3.29) | `vm-specs.env` `BACKUP_THIRD_ADDR`, `BACKUP_PGBR_COPY`: **set only in the lab profile** (moved there 2026-10-15) |
+| Lab-only machines and network | `lab-vault`, `lab-nas`, the storage switch, the FortiGate | none of them | `docs/lab-network.md` |
+| Site credentials | `make-credentials.sh --any-dir` on stage-01, a copy per host over ssh, shredded after use | the registered `enclave-cred` stick, attached read-only | `docs/airgap-media.md` §9 |
+| Cluster images into Harbor | `images-load` from stage-01 over the gap cable | on svc-harbor-01 from svc-repo-01's `/oci/` — **the in-gap fetch is not built yet** (directory listing is off) | `docs/07-kubernetes.md` §3.1, §7 |
+| stage-01's enclave address | `10.2.20.160`, temporary, for the build | removed at cutover — nothing inside depends on stage-01 | `enclave-addresses.env` |
+| Dead-worker fencing (H2) | a documented manual step — no BMCs | automatic, through each host's BMC | backlog B-07 (H2), 2.8 |
+
 ## Before you start, gather
 
 - An Ubuntu Pro token — <https://ubuntu.com/pro/dashboard>, free personal tier is fine

@@ -71,6 +71,8 @@ inventoried rather than assumed:
   (#4794, *interim*, is the candidate) is **Canonical question Q-CORE (b)**; claim "the core22 FIPS
   provider, loaded and in use", not "validated", until answered. The **container images** (Cilium,
   CoreDNS, metrics-server) load a `fips.so` from inside their own images — which build, Q-CORE.
+  **They fail closed:** Canonical's etcd binary, run without the snap's environment on a FIPS node,
+  refuses to start (`FIPS mode requested … but not available`) rather than fall back (2026-10-15).
 - **The PostgreSQL cluster's etcd** (pg-01..03, Patroni's consensus store) is Go 1.22.2 **without
   BoringCrypto** — its TLS is Go's own, not a validated module. Configured to approved algorithms
   only (TLS 1.2 ECDHE-RSA AES-GCM, mutual TLS), except TLS 1.3 ChaCha20, which Go cannot disable.

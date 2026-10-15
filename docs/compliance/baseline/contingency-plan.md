@@ -148,12 +148,17 @@ so the decision is now defensible.
 test C3: pg-02, the synchronous standby, powered off with the rest of host-2). pg-01 stayed leader
 throughout; Patroni reported **no synchronous standby for 12 s** (00:58:39 → 00:58:51, about 15 s after
 the loss) before naming pg-03; a write afterwards committed in milliseconds; pg-02 rejoined as a
-replica by itself on restart, same timeline, no rewind. **Not yet established:** whether PostgreSQL
-itself committed without a standby in that window — Patroni's record and PostgreSQL's
-`synchronous_standby_names` can differ for a moment — and how long a write issued *at* the moment of
-loss waits. The test that settles both: sample `synchronous_standby_names` and `pg_stat_replication`
-on the leader every second during the failure, with a write loop running. Until then, state the
-window as *Patroni-reported*, not as an acknowledged-transaction exposure.
+replica by itself on restart, same timeline, no rewind. **Settled the same night (C3b, 01:12 UTC — pg-03, then the synchronous standby,
+powered off with a write loop on pg-01 sampling PostgreSQL itself):** `synchronous_standby_names`
+went **straight from `"pg-03"` to `"pg-02"` and never empty** — so **no acknowledged transaction was
+ever exposed**; Patroni's 12 s "no synchronous standby" in C3 was its own bookkeeping lagging, not
+PostgreSQL committing unprotected. **The real cost is a write STALL:** a write issued just after the
+loss waited **36.4 s**, released the moment pg-02 became synchronous. That is Patroni's `ttl: 30` plus
+up to `loop_wait: 10` — the time it takes to declare a member dead. **So on losing the synchronous
+standby, writes pause for 30–40 s and lose nothing.** Options (backlog 3.62): accept it; shorten
+`ttl`/`loop_wait` (risks spurious elections on slow hosts); or quorum mode (`synchronous_mode:
+quorum`, Patroni ≥ 4.0.0, 2024-08-29), where losing one of two standbys stalls nothing — not in
+Ubuntu 24.04's Patroni 3.2.2.
 
 Applications find the primary with no load balancer at all, using `libpq`'s native multi-host
 support with `target_session_attrs=read-write` — which resolves to the Patroni leader by

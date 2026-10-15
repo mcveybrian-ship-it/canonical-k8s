@@ -314,13 +314,26 @@ from svc-mgmt-01's neighbour table. "Down" means no answer within 1 s.
 
 | test | what was done | measured |
 |---|---|---|
-| ✅ **C1 — a control plane lost** (2026-10-14) | `virsh destroy k8s-cp-01` (hard power-off) on host-1 — the VIP holder | **API unreachable 4 s** (15:52:42 → 15:52:46): the VIP moved to cp-02 in 2 s, the API answered through it 2 s later. **The test service never missed a probe.** With cp-01 down: etcd `ok` on 2 of 3, a write created, read back and deleted. **Rejoin:** `virsh start`, Ready in ~2 min, etcd caught up, no pod stuck; the VIP **stayed on cp-02** (`nopreempt`); two API blips of 1 s and 2 s while cp-01's etcd member resynced — slow answers, the VIP never moved |
-| ✅ **C2 — a worker lost** (2026-10-14) | `virsh destroy k8s-wk-01` (~16:14:40) — one of the four whoami pods on it | **The test service never missed a probe.** wk-01 `unreachable` + `NoExecute` taint at 16:15:30 (the ~50 s grace); its pod **evicted at ~16:20:31, exactly the 5-minute toleration**, a replacement Running on wk-02 by 16:22 — no operator action (a Deployment needs no fencing; a StatefulSet would — decision H2). One 1 s API blip at 16:17:45, VIP unmoved. **Rejoin:** `virsh start`, Ready with no taints in ~2 min, the stale pod cleared. Running pods are not rebalanced back (wk-02 keeps two) |
-| ✅ **C2b — the node announcing the service address lost** (2026-10-14) | `virsh destroy k8s-wk-01` while it answered for `10.2.20.200` (read from stage-01's neighbour table) | **The test service never missed a probe:** the address moved to wk-04 — MetalLB's L2 failover took **under ~2 s** (the probe's resolution). The announcer also moves when a node *joins*: cp-01 took it on rejoining after C1, wk-01 after C2 — with no probe missed either time |
-| ✅ **C3 — a whole host lost** (2026-10-15) | `virsh destroy` of host-2's three guests at once, ~00:58:24: **cp-02 (the VIP holder), wk-02 (two of the four test pods), pg-02 (Postgres's synchronous standby)** | **API back in ~3 s** (VIP to cp-01, 00:58:25 → 00:58:28). **The test service never missed a probe** — with half its pods on a dead node. Kubernetes writable on 2 of 3 etcd. **Postgres:** pg-01 leader throughout; Patroni reported no synchronous standby for 12 s (00:58:39 → 00:58:51) then named pg-03; a write after committed in ms — **C3b settled it: PostgreSQL never committed unprotected** — the 12 s was Patroni's bookkeeping. **Rejoin:** pg-02 back as a replica at 01:03:35, lag 0, same timeline, no rewind; pg-03 kept the sync role; cp-02/wk-02 Ready, no pod stuck; VIP stayed on cp-01; two 1–2 s API blips during etcd resync, as in C1 |
+| ✅ **C1 — a control plane lost** (2026-10-14) | `virsh destroy k8s-cp-01` (hard power-off) on host-1 — the VIP holder | **API unreachable 4 s** (15:52:42 → 15:52:46): the VIP moved to cp-02 in 2 s, the API answered through it 2 s later. ⚠️ *service continuity NOT measured — see the probe retraction below*. With cp-01 down: etcd `ok` on 2 of 3, a write created, read back and deleted. **Rejoin:** `virsh start`, Ready in ~2 min, etcd caught up, no pod stuck; the VIP **stayed on cp-02** (`nopreempt`); two API blips of 1 s and 2 s while cp-01's etcd member resynced — slow answers, the VIP never moved |
+| ✅ **C2 — a worker lost** (2026-10-14) | `virsh destroy k8s-wk-01` (~16:14:40) — one of the four whoami pods on it | ⚠️ *service continuity NOT measured — see the probe retraction below*. wk-01 `unreachable` + `NoExecute` taint at 16:15:30 (the ~50 s grace); its pod **evicted at ~16:20:31, exactly the 5-minute toleration**, a replacement Running on wk-02 by 16:22 — no operator action (a Deployment needs no fencing; a StatefulSet would — decision H2). One 1 s API blip at 16:17:45, VIP unmoved. **Rejoin:** `virsh start`, Ready with no taints in ~2 min, the stale pod cleared. Running pods are not rebalanced back (wk-02 keeps two) |
+| ⚠️ **C2b — the node announcing the service address lost** (2026-10-14) | `virsh destroy k8s-wk-01` while it answered for `10.2.20.200` (read from stage-01's neighbour table) | the address moved to wk-04 (stage-01's neighbour table) — ⚠️ *service continuity NOT measured — see the probe retraction below*; the "under ~2 s" failover time first reported is **withdrawn**. The announcer also moves when a node *joins*: cp-01 took it on rejoining after C1, wk-01 after C2 |
+| ✅ **C3 — a whole host lost** (2026-10-15) | `virsh destroy` of host-2's three guests at once, ~00:58:24: **cp-02 (the VIP holder), wk-02 (two of the four test pods), pg-02 (Postgres's synchronous standby)** | **API back in ~3 s** (VIP to cp-01, 00:58:25 → 00:58:28). ⚠️ *service continuity NOT measured — see the probe retraction below*. Kubernetes writable on 2 of 3 etcd. **Postgres:** pg-01 leader throughout; Patroni reported no synchronous standby for 12 s (00:58:39 → 00:58:51) then named pg-03; a write after committed in ms — **C3b settled it: PostgreSQL never committed unprotected** — the 12 s was Patroni's bookkeeping. **Rejoin:** pg-02 back as a replica at 01:03:35, lag 0, same timeline, no rewind; pg-03 kept the sync role; cp-02/wk-02 Ready, no pod stuck; VIP stayed on cp-01; two 1–2 s API blips during etcd resync, as in C1 |
 | ✅ **C3b — Postgres's synchronous standby lost, measured inside PostgreSQL** (2026-10-15) | `virsh destroy pg-03` (then the sync standby) with a loop on pg-01 sampling `synchronous_standby_names` and timing a write twice a second | **No unprotected window:** the setting went straight `"pg-03"` → `"pg-02"`, never empty. **A write stalled 36.4 s** (01:12:32 → 01:13:09), released the moment pg-02 became synchronous — Patroni's `ttl` 30 + `loop_wait` 10. Writes pause, nothing is lost (backlog 3.62) |
 | ✅ **C4 — etcd snapshot and restore drill** (2026-10-15) | `etcd-drill` on cp-01 | tools matched the cluster (etcd v3.6.13), checksum-verified; **snapshot 55 MB — revision 2,206,250, 755 keys**; checked (`etcdutl snapshot status`); **restored into a scratch directory** (its hash checked by the restore); both copies shredded. Proves a snapshot of this cluster restores with these tools; the full quorum-loss procedure (§3.11) is documented, not rehearsed |
+| ✅ **C5 — the whole cluster cold-started** (2026-10-15) | all seven nodes shut down cleanly (`virsh shutdown`, worker then control plane on each host), then started — the three control planes together, the workers 90 s later | **The cluster came back by itself, to exactly where it was: `verify` 28 of 28 at 01:31:46.** API (the only sound probe): unreachable from 01:27:37 (last control plane stopping) — first answer **01:29:35** on cp-02 — then 1–4 s blips while etcd and the nodes settled, steady from **01:31:01**. etcd formed quorum from cold with no intervention. Postgres and the hosts were not stopped; the whole-enclave power-down is 3.57's order, with Kubernetes to be added to it |
 | ⚠️ unprompted API blips | — | Between the tests, 18:30–18:44 UTC: **four blips of 1–2 s** on the VIP with no failure injected and the VIP unmoved. "Down" is "no answer within 1 s", so most likely a slow API server on these 4-thread hosts, not an outage. Measured, not explained — worth chasing if it appears on production hardware |
+
+**⚠️ RETRACTION, 2026-10-15 01:33 UTC — the test-service probe could not see an outage.** It counted any output from `dig` as an answer, and on a timeout `dig` prints `;; communications error … timed out` to the same output — found when it logged *no* outage during C5 with every node off, and proven against an address nothing answers. So the claims "the test service never missed a probe" in C1, C2, C2b and C3 are **unproven**, and C2b's "under ~2 s" is withdrawn. The **API** probe (HTTP code) and the **Patroni** probe (parsed JSON) were sound: their gaps and the Postgres findings stand. The service probe now requires an actual `IN A`/`IN AAAA` answer and has been run against a known-down address before use.
+
+**Re-measured with the fixed probe, 2026-10-15 01:34–01:42 UTC** (one sample every 1–2 s from stage-01):
+
+| event | measured |
+|---|---|
+| **the announcing node dies** (wk-01, no test pod on it) | **no failed sample** — MetalLB moved `10.2.20.200` to cp-02 faster than the probe samples |
+| **a node rejoins** (wk-01 back) | **7 s outage** (01:38:56 → 01:39:03) — MetalLB moves the address back to the rejoining node and the hand-over is not clean |
+| **a worker holding half the backends dies** (wk-02, 2 of 4 pods) | **~51 s of intermittent failures**, about every other request (01:40:27 → 01:41:18): the dead pods stay in rotation until Kubernetes marks the node `NotReady` (~50 s grace) and removes their endpoints |
+
+**So a worker loss is not seamless for clients:** for ~50 s the share of requests aimed at that worker's pods fails. Backlog 3.63 holds the options.
 
 
 1. **New scripts went in as mode 644** (the file was created by a tool, not `cp`) — `sudo` said
@@ -341,6 +354,13 @@ from svc-mgmt-01's neighbour table. "Down" means no answer within 1 s.
    (`10.1.1.71 → 10.2.20.161:53`). Reverse-path filtering ruled out first (counter 0).
    `stig-tailor.sh ufw_route_rules()`: per node, pods → enclave subnet and pods → pods, both
    families. A node built before 2026-10-14 needs `sudo stig-tailor.sh ufw --apply` once.
+8a. **ufw dropped service traffic to a pod on the announcing node, and MetalLB's gossip** (found with the fixed
+   probe, 2026-10-15): when wk-02 both announced `10.2.20.200` and ran two of the four pods, half the requests
+   failed for minutes while Kubernetes showed everything Ready — `[UFW BLOCK] IN=enp1s0 OUT=cilium_host
+   SRC=10.2.20.160 DST=10.1.4.x DPT=1053`: traffic redirected to a *local* pod takes the kernel's routed path.
+   And `DPT=7946` from the other nodes: MetalLB's memberlist, in neither of Canonical's port lists. Fixed in
+   `stig-tailor.sh`: a routed rule enclave subnet → pod ranges (both families), and 7946/tcp+udp from the seven
+   nodes, registered in the PPSM register first. Every node needs `sudo stig-tailor.sh ufw --apply` once.
 8. **No default route** turns "service has no backend" into an instant `network is unreachable` /
    `no route to host` instead of a timeout — read it as "nothing behind that Service yet".
 
@@ -350,8 +370,9 @@ from svc-mgmt-01's neighbour table. "Down" means no answer within 1 s.
    day — kubelet, containerd, k8sd and k8s-apiserver-proxy on core22's `fips.so` too.
 2. ~~**The API VIP**~~ ✅ live 2026-10-14 (§3.10).
 3. ~~**K-B** — sshd disabled on the workers~~ — **reversed 2026-10-14: ssh stays on** (§2, POA&M AO-21).
-4. **Survivability (C):** ✅ C1, C2, C2b, C3, C3b, C4 passed 2026-10-14/15 (§4.1). ⬜ **C5** — a full planned
-   shutdown and restart in the 3.57 order. ⬜ **Routine etcd backups** (G9) — the drill is one-off; nightly
+4. **Survivability (C):** ✅ C1, C2, C2b, C3, C3b, C4 passed 2026-10-14/15 (§4.1). ✅ **C5** — the cluster cold-started, `verify` 28/28 (§4.1);
+   adding Kubernetes to the whole-enclave power-down order (3.57) is owed. ⬜ **Re-measure service continuity** with the
+   fixed probe (the retraction in §4.1). ⬜ **Routine etcd backups** (G9) — the drill is one-off; nightly
    snapshots need a home and encryption, since a snapshot holds every Secret.
 5. Then **B-08 Ceph** — blocked on backlog 3.48 (wk-04 has no OSD device).
 

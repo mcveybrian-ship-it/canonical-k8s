@@ -36,6 +36,16 @@
 #     sudo ./07-kubernetes.sh etcd-drill         a control plane: snapshot the cluster's etcd, check
 #                                                it, restore it into a SCRATCH directory (never the
 #                                                live data), shred both - proves a restore would work
+#     sudo ./07-kubernetes.sh encrypt check      a control plane: every Secret in etcd, by how it is stored -
+#                                                under the current key, an older one, or PLAIN (STIG
+#                                                V-274882, backlog 3.64). Read-only
+#     sudo ./07-kubernetes.sh encrypt stage      EACH control plane in turn: the key held, not yet used
+#     sudo ./07-kubernetes.sh encrypt apply      EACH control plane in turn, once ALL are staged: the key
+#                                                writes; a canary proves every API server can read it
+#     sudo ./07-kubernetes.sh encrypt rewrite    ONE control plane, once all apply: every Secret stored again
+#     sudo ./07-kubernetes.sh encrypt retire     EACH control plane, once 'check' passes: older keys and the
+#                                                plain-text reader removed (Kubernetes' last two steps)
+#     sudo ./07-kubernetes.sh encrypt status     this node: the config, the argument, the running process
 #          ./07-kubernetes.sh probe service|api|patroni [minutes]
 #                                                the failover-test probes, one sample a second,
 #                                                printing only changes: service and api ON
@@ -44,7 +54,8 @@
 #                                                report DOWN against a target known to be dead
 #     sudo ./07-kubernetes.sh verify             on a control plane: the cluster, FIPS in the
 #                                                running processes, DNS, a dual-stack LoadBalancer
-#                                                Service, the K-A audit policy. Leaves the test
+#                                                Service, the K-A audit policy, Secrets encrypted
+#                                                by this API server (V-274882). Leaves the test
 #                                                workload (namespace enclave-verify) running
 #     sudo ./07-kubernetes.sh verify --fips-only any node: only this node's processes' crypto
 #     sudo ./07-kubernetes.sh verify --cleanup   remove the test workload
@@ -140,6 +151,15 @@ K8S_CONF_DIR="${K8S_CONF_DIR:-/var/snap/k8s/common/etc/configurations}"
 K8S_AUDIT_POLICY="${K8S_AUDIT_POLICY:-$K8S_CONF_DIR/enclave-audit-policy.yaml}"
 # Pod Security (K-C, 2026-10-14): Canonical's baseline file, shipped in the snap.
 K8S_PSA_FILE="${K8S_PSA_FILE:-$K8S_CONF_DIR/pod-security-admission-baseline.yaml}"
+# SECRETS AT REST (backlog 3.64, STIG V-274882; decided 2026-10-15: aesgcm). The keys derive from
+# K8S_SECRETS_PASS in the site credentials; K8S_SECRETS_GEN is the generation that WRITES - raise it to
+# rotate (07-kubernetes.md 3.12), and commit the change: a control plane rebuilt later reads it here.
+K8S_SECRETS_PROVIDER="${K8S_SECRETS_PROVIDER:-aesgcm}"
+K8S_SECRETS_GEN="${K8S_SECRETS_GEN:-1}"
+K8S_SECRETS_MIN_LEN="${K8S_SECRETS_MIN_LEN:-32}"
+K8S_ENC_CONFIG="${K8S_ENC_CONFIG:-$K8S_CONF_DIR/enclave-encryption.yaml}"
+K8S_APISERVER_ARGS="${K8S_APISERVER_ARGS:-/var/snap/k8s/common/args/kube-apiserver}"
+K8S_ENC_WAIT="${K8S_ENC_WAIT:-180}"
 K8S_API_NAME="${K8S_API_NAME:-k8s-api.${ENCLAVE_DOMAIN}}"
 # The enclave DNS (svc-mgmt-01). CoreDNS would otherwise forward to the node's resolv.conf, which
 # is systemd-resolved's 127.0.0.53 - a loopback address that means nothing inside a pod.
@@ -545,6 +565,15 @@ cmd_node_prep() {
   if [ "$ME_ROLE" = cp ]; then
     audit_policy | install_if_changed "$K8S_AUDIT_POLICY" 0600
     [ -r "$K8S_PSA_FILE" ] || die "no Pod Security file at $K8S_PSA_FILE - is this snap rev $K8S_SNAP_REV?"
+    # 5. Secrets at rest (3.64). A NEW control plane gets the final config here, before its API server
+    #    first starts. On a running member it changes only through 'encrypt stage' then 'apply' -
+    #    writing the final config onto one live API server first is the failure those two steps avoid.
+    if /snap/bin/k8s status >/dev/null 2>&1; then
+      if [ -n "$(enc_state)" ]; then ok "Secrets encryption: $(enc_state | cut -d' ' -f1-3) - changed only by 'encrypt'"
+      else warn "no Secrets encryption config on this running control plane - 'encrypt stage' then 'encrypt apply' (07-kubernetes.md 3.12)"; fi
+    else
+      enc_write_config derive "gen$K8S_SECRETS_GEN"
+    fi
   fi
   echo
   if [ "$ME" = k8s-cp-01 ]; then ok "$ME prepared - next: sudo $0 bootstrap"
@@ -580,9 +609,10 @@ render_config() {
     printf '  metrics-server:\n    enabled: true\n'
   fi
   # The per-node argument blocks: Canonical's lines, two replaced, and --node-ip added.
-  awk -v audit="$K8S_AUDIT_POLICY" -v psa="$K8S_PSA_FILE" -v nodeip="$ME_ADDR,$ME_ADDR6" '
+  awk -v audit="$K8S_AUDIT_POLICY" -v psa="$K8S_PSA_FILE" -v nodeip="$ME_ADDR,$ME_ADDR6" -v enc="$K8S_ENC_CONFIG" '
     /^extra-node-[a-z-]+-args:/ { blk = $1; print
                                   if (blk == "extra-node-kubelet-args:") print "  --node-ip: \"" nodeip "\"   # both families (B-07 A2)"
+                                  if (blk == "extra-node-kube-apiserver-args:") print "  --encryption-provider-config: " enc "   # 3.64: Secrets encrypted at rest (V-274882)"
                                   next }
     /^[^ ]/ { blk = ""; next }
     blk != "" && /^  --audit-policy-file:/ { print "  --audit-policy-file: " audit "   # K-A: the enclave policy"; next }
@@ -618,6 +648,7 @@ cmd_bootstrap() {
   [ -x /snap/bin/k8s ] || die "no k8s snap - run node-prep first"
   if /snap/bin/k8s status >/dev/null 2>&1; then ok "a cluster is already bootstrapped here - nothing to do"; /snap/bin/k8s status; return 0; fi
   [ -r "$K8S_AUDIT_POLICY" ] || die "no audit policy at $K8S_AUDIT_POLICY - run node-prep first"
+  [ -r "$K8S_ENC_CONFIG" ] || die "no Secrets encryption config at $K8S_ENC_CONFIG - run node-prep first (3.64)"
   local cfg="$K8S_CONF_DIR/enclave-bootstrap.yaml"
   render_config bootstrap | install_if_changed "$cfg" 0600
   say "the config:"; sed 's/^/      /' "$cfg"; echo
@@ -694,6 +725,7 @@ cmd_join() {
   if [ "$ME_ROLE" = cp ]; then
     kind=control-plane
     [ -r "$K8S_AUDIT_POLICY" ] || die "no audit policy at $K8S_AUDIT_POLICY - run node-prep first"
+    [ -r "$K8S_ENC_CONFIG" ] || die "no Secrets encryption config at $K8S_ENC_CONFIG - run node-prep first (3.64)"
   else kind=worker; fi
   cfg="$K8S_CONF_DIR/enclave-$kind.yaml"
   render_config "$kind" | install_if_changed "$cfg" 0600
@@ -800,10 +832,10 @@ K8S_ETCD_CA="${K8S_ETCD_CA:-/etc/kubernetes/pki/etcd/ca.crt}"
 K8S_ETCD_CERT="${K8S_ETCD_CERT:-/etc/kubernetes/pki/apiserver-etcd-client.crt}"   # Canonical's restore-quorum how-to
 K8S_ETCD_KEY="${K8S_ETCD_KEY:-/etc/kubernetes/pki/apiserver-etcd-client.key}"
 
-cmd_etcd_drill() {
-  need_root
-  whoami_k8s
-  [ "$ME_ROLE" = cp ] || die "etcd runs on the control planes - this is $ME"
+# etcd_tools - etcdctl and etcdutl at the cluster's own etcd version, from the mirror, checksum-verified,
+# into this run's WORK directory only. Then ectl talks to this node's etcd with the API server's client
+# certificate.
+etcd_tools() {
   # THE TOOLS MUST MATCH THE CLUSTER - read the running snap's own bill of materials.
   local have; have="$(python3 -c 'import json; print(json.load(open("/snap/k8s/current/bom.json"))["components"]["etcd"]["version"])' 2>&1)" \
     || die "could not read the etcd version from /snap/k8s/current/bom.json: $have"
@@ -824,6 +856,14 @@ cmd_etcd_drill() {
     chmod 0700 "$WORK/bin/$t"
   done
   ok "etcdctl and etcdutl $K8S_ETCD_TOOLS_VER fetched and checksum-verified (this run only)"
+}
+ectl() { "$WORK/bin/etcdctl" --endpoints=https://127.0.0.1:2379 --cacert "$K8S_ETCD_CA" --cert "$K8S_ETCD_CERT" --key "$K8S_ETCD_KEY" "$@"; }
+
+cmd_etcd_drill() {
+  need_root
+  whoami_k8s
+  [ "$ME_ROLE" = cp ] || die "etcd runs on the control planes - this is $ME"
+  etcd_tools
 
   # 1. the snapshot
   local snap="$WORK/snapshot.db" out
@@ -849,6 +889,382 @@ cmd_etcd_drill() {
   ok "the snapshot and the restored copy shredded"
   echo
   ok "etcd drill passed on $ME - a restore follows Canonical's quorum-loss procedure (docs/07-kubernetes.md)"
+}
+
+# ===================================================================== Secrets at rest (3.64)
+# Kubernetes STIG V-274882 (CAT I): "If the setting encryption-provider-config is not configured, this
+# is a finding." It was not (k8s-cp-01, 2026-10-15): every Secret plain in etcd, in every etcd snapshot
+# and in every disk copy of a control plane. Canonical's STIG configuration does not cover the rule.
+#
+# THE PROVIDER (decided 2026-10-15, Brian): aesgcm - AES through the API server's OpenSSL (the binary is
+# Go's opensslcrypto build, read from the snap 2026-10-15; the FIPS provider is loaded, verify 2).
+# Kubernetes wants its key replaced before 200,000 writes; K8S_SECRETS_GEN is that rotation. aescbc is
+# the alternative (no rotation; Kubernetes calls it weak) - K8S_SECRETS_PROVIDER, fixed for the life of
+# a cluster: switching provider on a live one is not built.
+#
+# THE KEYS DERIVE FROM ONE SEALED PASSPHRASE (K8S_SECRETS_PASS - the same custody as pgBackRest's).
+# Every control plane, and any rebuild, computes the same keys: no key is ever copied between
+# machines, and a lost control plane loses nothing. The passphrase is NOT kept on the host - only the
+# derived keys are - so 'retire' removing an old key from the file does protect something: the etcd
+# snapshots taken under it, against a later compromise of a control plane. Generations differ only
+# by their salt. Rotation serves AES-GCM's per-key write limit, NOT a compromise: a leaked passphrase
+# needs a new one, which is not built (07-kubernetes.md 3.12).
+#
+# TWO STEPS ON A RUNNING CLUSTER - Kubernetes' procedure for more than one API server: a Secret written
+# by an API server with the new key cannot be read by one without it. So every API server first learns
+# the key without using it (stage), then each starts writing with it (apply), then every Secret is
+# stored again (rewrite), and once etcd proves it, the old key and the plain-text reader go (retire).
+# A NEW control plane gets its config from node-prep, before its API server first starts, and the
+# argument through its bootstrap/join config - like the audit policy.
+#
+# THE ARGUMENT on a running node goes into Canonical's args file, which the snap's service wrapper reads
+# as shell words (k8s/lib.sh, rev 5526). The edit keeps the previous file as <file>.pre-3.64.
+ENC_CHANGED=0
+
+enc_state() { [ -f "$K8S_ENC_CONFIG" ] || return 0; sed -n 's/^# enclave-state: //p' "$K8S_ENC_CONFIG" | head -1; }
+enc_field() { printf '%s\n' "$1" | tr ' ' '\n' | sed -n "s/^$2=//p"; }
+
+enc_check_params() {
+  case "$K8S_SECRETS_PROVIDER" in aesgcm|aescbc) ;;
+    *) die "K8S_SECRETS_PROVIDER='$K8S_SECRETS_PROVIDER' - aesgcm or aescbc (secretbox is not FIPS-approved; kms needs a key service the enclave does not have)" ;; esac
+  case "$K8S_SECRETS_GEN" in ''|0|*[!0-9]*) die "K8S_SECRETS_GEN='$K8S_SECRETS_GEN' - a generation number, from 1" ;; esac
+}
+
+# enc_pass -> the passphrase on stdout: the environment, then the site credentials file, then the
+# terminal - asked twice, never echoed. The CALLER runs cred_require_safe first (credentials.sh says why).
+enc_pass() {
+  local p="${K8S_SECRETS_PASS:-}" b=""
+  [ -n "$p" ] || p="$(cred_get K8S_SECRETS_PASS)"
+  if [ -z "$p" ]; then
+    { : </dev/tty; } 2>/dev/null || { echo "  [x] no K8S_SECRETS_PASS in the environment or $ENCLAVE_CREDENTIALS, and no terminal to ask on" >&2; return 1; }
+    read -rsp "  Secrets-encryption passphrase (K8S_SECRETS_PASS): " p </dev/tty; echo >&2
+    read -rsp "  again: " b </dev/tty; echo >&2
+    [ "$p" = "$b" ] || { echo "  [x] the two entries differ" >&2; return 1; }
+    b=""
+  fi
+  [ "${#p}" -ge "$K8S_SECRETS_MIN_LEN" ] || { echo "  [x] the passphrase is shorter than $K8S_SECRETS_MIN_LEN characters" >&2; return 1; }
+  case "$p" in *"'"*|*$'\n'*) echo "  [x] the passphrase contains a ' or a newline" >&2; return 1 ;; esac
+  printf '%s' "$p"
+}
+
+# The config, always rebuilt WHOLE - never edited in place. derive: genN from the passphrase on stdin,
+# and every key this node already holds derived again and compared (a mistyped passphrase is refused,
+# not stored). reorder: the keys already in the file, a different one first. retire: only the key
+# that writes - no older key, no identity. Output has no timestamp, so an unchanged config compares
+# equal and causes no restart.
+ENC_PY="$(cat <<'PYEOF'
+import base64, hashlib, os, re, sys
+# PART OF EVERY KEY'S DEFINITION: changing either one changes every key, and the Secrets stored under
+# the old keys can no longer be read. Deliberately not parameters.
+ITER = 600000
+LABEL = "k8s-secrets-at-rest/gen%d"
+mode, out, provider, write, gens, existing = sys.argv[1:7]
+
+def fp(b): return hashlib.sha256(b).hexdigest()[:8]
+def fail(msg):
+    sys.stderr.write("  [x] %s\n" % msg); sys.exit(3)
+
+have, had_identity, had_write = {}, True, None
+if os.path.exists(existing):
+    t = open(existing).read()
+    had_identity = re.search(r"^ +- identity: \{\}$", t, re.M) is not None
+    mw = re.search(r"^# enclave-state: .* write=(\S+) ", t, re.M)
+    had_write = mw.group(1) if mw else None
+    m = re.search(r"^# enclave-state: provider=(\w+) ", t, re.M)
+    have = {int(n): base64.b64decode(s) for n, s in re.findall(r'- name: gen(\d+)\n\s+secret: "([A-Za-z0-9+/=]+)"', t)}
+    if not m or not have: fail("%s exists but was not written by this script - not touching it" % existing)
+    if m.group(1) != provider:
+        fail("%s uses %s, K8S_SECRETS_PROVIDER is %s - changing provider on a live cluster is not built" % (existing, m.group(1), provider))
+keys = dict(have)
+if mode == "derive":
+    pw = sys.stdin.buffer.read()
+    if not pw: fail("no passphrase")
+    print("passphrase fingerprint %s (sha256, first 8) - must match the envelope, and every control plane" % fp(pw))
+    for g in sorted(set(int(x) for x in gens.split()) | set(have)):
+        k = hashlib.pbkdf2_hmac("sha256", pw, (LABEL % g).encode(), ITER, 32)
+        if g in have and have[g] != k:
+            fail("this passphrase does not reproduce gen%d, which this node already holds - mistyped, or a different passphrase" % g)
+        keys[g] = k
+    pw = None
+elif mode not in ("reorder", "retire"):
+    fail("unknown mode %s" % mode)
+w = None if write == "identity" else int(write[3:])
+if w is not None and w not in keys: fail("gen%d is not in %s - stage it first" % (w, existing))
+if mode == "retire":
+    if w is None or had_write != "gen%d" % w:
+        fail("this node writes with %s, not %s - retire only the key that already writes" % (had_write, write))
+    keys, identity = {w: keys[w]}, False
+else:
+    identity = w is None or had_identity
+order = sorted(keys, reverse=True)
+if w is not None:
+    order.remove(w); order.insert(0, w)
+aes = ["      - %s:" % provider, "          keys:"]
+for g in order:
+    aes += ["            - name: gen%d" % g, '              secret: "%s"' % base64.b64encode(keys[g]).decode()]
+ident = ["      - identity: {}"]
+state = "provider=%s write=%s keys=%s plain=%s fingerprints=%s" % (
+    provider, "identity" if w is None else "gen%d" % w, ",".join("gen%d" % g for g in order),
+    "readable" if identity else "refused", ",".join("gen%d:%s" % (g, fp(keys[g])) for g in order))
+text = "\n".join([
+    "# enclave-encryption.yaml - written by 07-kubernetes.sh (backlog 3.64, Kubernetes STIG V-274882).",
+    "# SECRET-BEARING: these keys decrypt every Secret in etcd and in every etcd snapshot. Never print,",
+    "# copy or commit this file. Each key derives from K8S_SECRETS_PASS (site credentials, sealed envelope):",
+    "#   gen<N> = PBKDF2-HMAC-SHA256(passphrase, \"k8s-secrets-at-rest/gen<N>\", %d iterations, 32 bytes)" % ITER,
+    "# The FIRST provider below writes; the others only read. identity, while present, reads plain Secrets.",
+    "# enclave-state: " + state,
+    "apiVersion: apiserver.config.k8s.io/v1",
+    "kind: EncryptionConfiguration",
+    "resources:",
+    "  - resources:",
+    "      - secrets",
+    "    providers:"] + ((ident + aes) if w is None else (aes + (ident if identity else [])))) + "\n"
+fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+with os.fdopen(fd, "w") as f:
+    f.write(text)
+print("state: " + state)
+PYEOF
+)"
+
+# enc_write_config derive|reorder|retire WRITE  (WRITE: identity | genN) - ENC_CHANGED=1 if it changed
+enc_write_config() {
+  local mode="$1" write="$2" new="$K8S_ENC_CONFIG.new" pass="" out
+  enc_check_params
+  [ -d "$K8S_CONF_DIR" ] || install -d -m 0755 "$K8S_CONF_DIR"
+  rm -f "$new"
+  if [ "$mode" = derive ]; then
+    cred_require_safe
+    pass="$(enc_pass)" || die "no Secrets-encryption passphrase - nothing changed"
+    out="$(printf '%s' "$pass" | python3 -c "$ENC_PY" derive "$new" "$K8S_SECRETS_PROVIDER" "$write" "$K8S_SECRETS_GEN" "$K8S_ENC_CONFIG")" \
+      || { pass=""; rm -f "$new"; die "the encryption config was not written - nothing changed"; }
+    pass=""
+  else
+    out="$(python3 -c "$ENC_PY" "$mode" "$new" "$K8S_SECRETS_PROVIDER" "$write" "" "$K8S_ENC_CONFIG" </dev/null)" \
+      || { rm -f "$new"; die "the encryption config was not written - nothing changed"; }
+  fi
+  printf '%s\n' "$out" | sed 's/^/  /'
+  if [ -f "$K8S_ENC_CONFIG" ] && cmp -s "$new" "$K8S_ENC_CONFIG"; then rm -f "$new"; ok "$K8S_ENC_CONFIG unchanged"
+  else mv -f "$new" "$K8S_ENC_CONFIG"; ok "$K8S_ENC_CONFIG written (root 0600 - never print it)"; ENC_CHANGED=1; fi
+}
+
+# The argument, in Canonical's args file - added once, never duplicated.
+enc_args_ensure() {
+  local a="$K8S_APISERVER_ARGS" line="--encryption-provider-config=$K8S_ENC_CONFIG"
+  [ -f "$a" ] || die "no $a - the API server is not set up on $ME"
+  if grep -qxF -- "$line" "$a"; then ok "$a already names the config"; return 0; fi
+  [ -e "$a.pre-3.64" ] || cp -p "$a" "$a.pre-3.64"
+  { grep -v -- '^--encryption-provider-config=' "$a" || true; printf '%s\n' "$line"; } > "$a.new"
+  chmod --reference="$a" "$a.new"; chown --reference="$a" "$a.new"
+  mv -f "$a.new" "$a"
+  ok "$a: $line (the previous file kept as $a.pre-3.64)"
+  ENC_CHANGED=1
+}
+
+enc_apiserver_pid() { pgrep -f '^/snap/k8s/[^ ]*/bin/kube-apiserver( |$)' | head -1 || true; }
+
+# enc_running -> "yes" only when the RUNNING API server has the argument AND started after the config
+# was last written - a config on disk the process has not read is not in force.
+enc_running() {
+  local pid age
+  pid="$(enc_apiserver_pid)"
+  [ -n "$pid" ] || { printf 'not running'; return 0; }
+  tr '\0' '\n' < "/proc/$pid/cmdline" | grep -qxF -- "--encryption-provider-config=$K8S_ENC_CONFIG" \
+    || { printf 'running WITHOUT the argument'; return 0; }
+  [ -f "$K8S_ENC_CONFIG" ] || { printf 'running with the argument but NO config file'; return 0; }
+  age="$(ps -o etimes= -p "$pid" | tr -d ' ')"
+  if [ $(( $(date +%s) - age + 1 )) -lt "$(stat -c %Y "$K8S_ENC_CONFIG")" ]; then printf 'running an OLDER config - not restarted since'; return 0; fi
+  printf 'yes'
+}
+
+# THIS node's API server, by its own address - not the VIP, not another control plane.
+enc_ready() { kc --server="https://$ME_ADDR:6443" get --raw=/readyz >/dev/null 2>&1; }
+
+enc_restart() {
+  local i
+  say "restarting the API server on $ME - if it holds the VIP, the VIP moves (3-4 s, measured in C1)"
+  snap restart k8s.kube-apiserver >/dev/null || die "snap restart k8s.kube-apiserver failed"
+  for i in $(seq 1 "$K8S_ENC_WAIT"); do
+    sleep 1
+    if enc_ready; then ok "the API server on $ME is ready again after ~${i}s"; break; fi
+    [ "$i" -lt "$K8S_ENC_WAIT" ] || die "the API server on $ME is not ready after ${K8S_ENC_WAIT}s. Its log:
+         sudo journalctl -u snap.k8s.kube-apiserver -n 40 --no-pager
+       To back THIS NODE out - only while no Secret is stored under a key it would then lack (3.12):
+         sudo cp -p $K8S_APISERVER_ARGS.pre-3.64 $K8S_APISERVER_ARGS && sudo snap restart k8s.kube-apiserver"
+  done
+  [ "$(enc_running)" = yes ] || die "the API server restarted, but: $(enc_running)"
+  ok "the running API server has the argument and started after the config was written"
+}
+
+# A Secret written through THIS API server, read back through EVERY control plane's - proves each one
+# holds the same key. The value is a throwaway, never a real secret.
+enc_canary() {
+  local name="enclave-enc-canary-$ME" val k a n got bad=0
+  val="canary-$(date +%s)-$RANDOM"
+  kc --server="https://$ME_ADDR:6443" -n kube-system delete secret "$name" --ignore-not-found >/dev/null 2>&1 || true
+  kc --server="https://$ME_ADDR:6443" -n kube-system create secret generic "$name" --from-literal=v="$val" >/dev/null \
+    || die "could not write the canary Secret through $ME"
+  for k in $(grep -oE '^K8S_CP_[0-9]+=' "$ADDRS" | tr -d '=' | sort); do
+    a="${!k}"; n="$(printf '%s' "$k" | tr 'A-Z_' 'a-z-')"
+    got="$(kc --server="https://$a:6443" -n kube-system get secret "$name" -o jsonpath='{.data.v}' 2>&1 || true)"
+    if [ "$(printf '%s' "$got" | base64 -d 2>/dev/null || true)" = "$val" ]; then ok "$n reads it"
+    else warn "$n CANNOT read it: $(printf '%s' "$got" | tail -1 | cut -c1-200)"; bad=1; fi
+  done
+  kc --server="https://$ME_ADDR:6443" -n kube-system delete secret "$name" >/dev/null 2>&1 || true
+  return "$bad"
+}
+
+enc_status() {
+  local st cur run arg=no
+  st="$(enc_state)"; cur="$(enc_field "$st" write)"
+  if [ -n "$st" ]; then ok "config: $st"; else say "no config at $K8S_ENC_CONFIG"; fi
+  if [ -f "$K8S_APISERVER_ARGS" ] && grep -qxF -- "--encryption-provider-config=$K8S_ENC_CONFIG" "$K8S_APISERVER_ARGS"; then arg=yes; fi
+  say "argument in $K8S_APISERVER_ARGS: $arg"
+  run="$(enc_running)"; say "running API server: $run"
+  if [ "$run" = yes ] && [ -n "$cur" ] && [ "$cur" != identity ]; then
+    ok "V-274882 on $ME: this API server writes Secrets with $cur - what etcd holds: 'encrypt check'"
+    [ "$(enc_field "$st" plain)" = refused ] || say "plain Secrets are still readable here (identity last) - 'encrypt retire' once 'check' passes"
+  elif [ "$cur" = identity ]; then warn "V-274882 on $ME: OPEN - staged only, identity still writes"
+  elif [ -z "$st" ]; then warn "V-274882 on $ME: OPEN - no config"
+  else warn "V-274882 on $ME: OPEN - $run"; fi
+  if [ -n "$cur" ] && [ "$cur" != identity ] && [ "$cur" != "gen$K8S_SECRETS_GEN" ]; then
+    warn "this node writes with $cur, K8S_SECRETS_GEN is $K8S_SECRETS_GEN - a rotation in progress, or a stale parameter"
+  fi
+}
+
+# What etcd ACTUALLY holds - the only proof. Every Secret's stored value is read through a pipe (never
+# a file) and only its first bytes are looked at: k8s:enc:<provider>:v1:<key>: or plain. Exit 0 every
+# Secret under the current key; 1 any plain or older; 2 THE CHECK DID NOT WORK - which proves nothing,
+# so it is never reported as a pass (the lesson of the 2026-10-15 probe).
+ENC_SCAN_PY="$(cat <<'PYEOF'
+import base64, json, sys
+want, api = sys.argv[1], int(sys.argv[2])
+try:
+    d = json.loads(sys.stdin.read())
+except ValueError:
+    print("  [x] etcd returned nothing readable"); sys.exit(2)
+kvs = d.get("kvs") or []
+by, plain, ver = {}, [], 0
+for kv in kvs:
+    name = base64.b64decode(kv["key"]).decode("utf-8", "replace")[len("/registry/secrets/"):]
+    v = base64.b64decode(kv.get("value", ""))
+    ver += int(kv.get("version", 0))
+    if v.startswith(b"k8s:enc:"):
+        p = b":".join(v.split(b":", 5)[:5]).decode("ascii", "replace") + ":"
+        by[p] = by.get(p, 0) + 1
+    else:
+        plain.append(name)
+print("  etcd holds %d Secrets; the API lists %d" % (len(kvs), api))
+for p in sorted(by):
+    print("    %-36s %5d%s" % (p, by[p], "   <- the current key" if p == want else "   <- NOT the current key: 'encrypt rewrite'"))
+print("    %-36s %5d%s" % ("plain - NOT encrypted", len(plain), ("   e.g. " + ", ".join(plain[:4])) if plain else ""))
+print("  writes to the Secrets that exist now, all keys: %d (a lower bound; aesgcm wants a new key before 200,000)" % ver)
+if not kvs:
+    print("  [x] no Secrets under /registry/secrets/ - the wrong prefix or the wrong etcd: this proves nothing"); sys.exit(2)
+if abs(len(kvs) - api) > 5:
+    print("  [x] etcd and the API disagree by more than churn - this is not reading what the API serves"); sys.exit(2)
+sys.exit(0 if not plain and set(by) == {want} else 1)
+PYEOF
+)"
+
+enc_scan() {
+  local want api rc=0
+  want="k8s:enc:$K8S_SECRETS_PROVIDER:v1:gen$K8S_SECRETS_GEN:"
+  api="$( { kc get secrets -A -o name 2>/dev/null || true; } | wc -l)"
+  say "every Secret in etcd, by how it is stored (the current key: $want)"
+  ectl get /registry/secrets/ --prefix -w json 2>"$WORK/etcd.err" | python3 -c "$ENC_SCAN_PY" "$want" "$api" || rc=$?
+  case "$rc" in
+    0) ok "V-274882: every Secret in etcd is encrypted with the current key" ;;
+    1) die "V-274882: OPEN - Secrets above are plain or under an older key" ;;
+    *) die "the check itself did not work: $(tail -2 "$WORK/etcd.err" 2>/dev/null | tr '\n' ' ')- it proves nothing either way" ;;
+  esac
+}
+
+enc_rewrite() {
+  local w="gen$K8S_SECRETS_GEN" want k a n name p out try
+  want="k8s:enc:$K8S_SECRETS_PROVIDER:v1:$w:"
+  [ "$(enc_field "$(enc_state)" write)" = "$w" ] || die "$ME does not write with $w - 'encrypt apply' on every control plane first"
+  etcd_tools
+  # PREFLIGHT: EVERY API server must already write with the current key, or the rewrite would store
+  # part of the Secrets under the old one again - whichever server happened to take each write.
+  say "preflight: a canary written through each control plane, read RAW from etcd"
+  for k in $(grep -oE '^K8S_CP_[0-9]+=' "$ADDRS" | tr -d '=' | sort); do
+    a="${!k}"; n="$(printf '%s' "$k" | tr 'A-Z_' 'a-z-')"; name="enclave-enc-rewrite-$n"
+    kc --server="https://$a:6443" -n kube-system delete secret "$name" --ignore-not-found >/dev/null 2>&1 || true
+    kc --server="https://$a:6443" -n kube-system create secret generic "$name" --from-literal=v=canary >/dev/null \
+      || die "could not write a canary through $n - nothing was rewritten"
+    p="$(ectl get "/registry/secrets/kube-system/$name" -w json 2>/dev/null | python3 -c '
+import base64, json, sys
+kv = (json.load(sys.stdin).get("kvs") or [{}])[0]
+v = base64.b64decode(kv.get("value", ""))
+print((b":".join(v.split(b":", 5)[:5]).decode("ascii", "replace") + ":") if v.startswith(b"k8s:enc:") else ("plain" if v else "missing"))' || true)"
+    kc -n kube-system delete secret "$name" >/dev/null 2>&1 || true
+    [ "$p" = "$want" ] || die "$n stores '${p:-nothing}', not $want - 'encrypt apply' on $n first; nothing was rewritten"
+    ok "$n writes $want"
+  done
+  # THE REWRITE - Kubernetes' documented command: read every Secret and store it again. Through a pipe,
+  # never a file - it carries every value. A Secret changed in between is a conflict: run again.
+  for try in 1 2 3; do
+    say "rewriting every Secret (attempt $try)"
+    out="$(kc get secrets -A -o json | kc replace -f - 2>&1)" && break
+    [ "$try" -lt 3 ] || die "the rewrite kept failing: $(printf '%s\n' "$out" | grep '^Error' | head -3 | cut -c1-200)"
+    warn "$(printf '%s\n' "$out" | grep -c '^Error' || true) error(s), e.g. $(printf '%s\n' "$out" | grep '^Error' | head -1 | cut -c1-160) - again"
+  done
+  ok "$(printf '%s\n' "$out" | grep -c ' replaced$' || true) Secrets stored again"
+  echo
+  enc_scan
+  ok "next: 'encrypt retire' on each control plane - the older key and the plain-text reader go"
+}
+
+cmd_encrypt() {
+  need_root
+  whoami_k8s
+  [ "$ME_ROLE" = cp ] || die "Secrets are encrypted by the API servers - control planes only; this is $ME"
+  enc_check_params
+  local act="${1:-}" st cur w="gen$K8S_SECRETS_GEN"
+  case "$act" in
+    status)  enc_status; return 0 ;;
+    check)   etcd_tools; enc_scan; return 0 ;;
+    rewrite) enc_rewrite; return 0 ;;
+    stage|apply|retire) ;;
+    *) die "usage: encrypt status|check|stage|apply|rewrite|retire - the order is in docs/07-kubernetes.md 3.12" ;;
+  esac
+  /snap/bin/k8s status >/dev/null 2>&1 || die "$ME is not in a running cluster - a NEW control plane gets its config from node-prep"
+  enc_ready || die "cannot read https://$ME_ADDR:6443/readyz with the admin kubeconfig BEFORE changing anything - the check this relies on does not work here; nothing changed"
+  st="$(enc_state)"; cur="$(enc_field "$st" write)"
+  ENC_CHANGED=0
+  if [ "$act" = stage ]; then
+    if [ "$cur" = "$w" ]; then ok "$ME already writes with $w - nothing to stage"; enc_status; return 0; fi
+    enc_write_config derive "${cur:-identity}"
+  elif [ "$act" = retire ]; then
+    [ "$cur" = "$w" ] || die "$ME does not write with $w - 'apply' and 'rewrite' first"
+    # Removing the plain-text reader is safe ONLY if nothing plain is left - etcd, read raw, decides.
+    etcd_tools
+    enc_scan
+    enc_write_config retire "$w"
+  else
+    case ",$(enc_field "$st" keys)," in *",$w,"*) ;; *) die "$w is not staged on $ME - 'encrypt stage' first, on EVERY control plane" ;; esac
+    enc_write_config reorder "$w"
+  fi
+  enc_args_ensure
+  if [ "$ENC_CHANGED" = 1 ] || [ "$(enc_running)" != yes ]; then enc_restart
+  else ok "the running API server already has this config - no restart"; fi
+  echo
+  if [ "$act" = stage ] || [ "$act" = retire ]; then
+    # PROOF: a list fails outright if a single Secret cannot be decrypted. Names only, to a file.
+    kc --server="https://$ME_ADDR:6443" get secrets -A -o name > "$WORK/secrets.list" 2>"$WORK/list.err" \
+      || die "this API server cannot list the Secrets: $(tail -1 "$WORK/list.err")"
+    if [ "$act" = stage ]; then
+      ok "this API server reads all $(wc -l < "$WORK/secrets.list") Secrets; $w is held here, not yet used for writing"
+      ok "staged on $ME. Next: 'encrypt stage' on the other control planes - only when ALL are staged, 'encrypt apply' on each"
+    else
+      ok "this API server reads all $(wc -l < "$WORK/secrets.list") Secrets with $w alone - no older key, no plain-text reader"
+      ok "retired on $ME. Next: 'encrypt retire' on the other control planes"
+    fi
+  else
+    say "canary: a Secret written through $ME, read back through every control plane"
+    enc_canary || die "a control plane cannot read what $ME now writes - run 'encrypt stage' THERE NOW (until then it cannot read Secrets written here)"
+    ok "$ME writes with $w. Next: 'encrypt apply' on the other control planes, then 'encrypt rewrite' on one"
+  fi
 }
 
 # ===================================================================== the API VIP
@@ -1152,6 +1568,13 @@ print(seen[-1] if seen else "")' "$log")"
   fi
   kc -n "$V_NS" delete secret enclave-verify-audit >/dev/null 2>&1 || true
 
+  # ---- 6. Secrets at rest (V-274882, backlog 3.64) - this node's API server; what etcd holds: encrypt check
+  echo; say "== 6. Secrets encrypted at rest (V-274882)"
+  local est ew er
+  est="$(enc_state)"; ew="$(enc_field "$est" write)"; er="$(enc_running)"
+  if [ "$er" = yes ] && [ -n "$ew" ] && [ "$ew" != identity ]; then vok "this API server writes Secrets with $ew ($(enc_field "$est" provider)) - etcd itself: encrypt check"
+  else vbad "this API server does NOT encrypt Secrets: ${est:-no config at $K8S_ENC_CONFIG}; running: $er (07-kubernetes.md 3.12)"; fi
+
   echo
   [ "$V_FAIL" -eq 0 ] || die "$V_FAIL check(s) failed - read the [x] lines above"
   ok "all $V_PASS checks passed - the test workload stays up in $V_NS (verify --cleanup removes it)"
@@ -1161,6 +1584,7 @@ case "${1:-}" in
   vip)           shift; cmd_vip "$@" ;;
   probe)         shift; cmd_probe "$@" ;;
   etcd-drill)    shift; cmd_etcd_drill "$@" ;;
+  encrypt)       shift; cmd_encrypt "$@" ;;
   verify)        shift; cmd_verify "$@" ;;
   node-prep)     shift; cmd_node_prep "$@" ;;
   render)        shift; cmd_render "$@" ;;
@@ -1171,5 +1595,5 @@ case "${1:-}" in
   images-export) shift; cmd_images_export "$@" ;;
   images-load)   shift; cmd_images_load "$@" ;;
   images-check)  shift; cmd_images_check "$@" ;;
-  *) sed -n '2,50p' "$0"; exit 2 ;;
+  *) sed -n '2,61p' "$0"; exit 2 ;;
 esac

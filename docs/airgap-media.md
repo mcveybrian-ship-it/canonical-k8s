@@ -1130,6 +1130,13 @@ target data recovery infeasible using state-of-the-art laboratory techniques"*.
   outside them: lost, no database backup can ever be read** — a restore after losing the site needs
   this envelope. Kept with the others; it is never rotated casually, because existing backups stay
   encrypted with it.
+- **One for the Kubernetes Secrets-encryption passphrase** (`K8S_SECRETS_PASS`, backlog 3.64), marked
+  with its fingerprint — printed by `make-credentials.sh`, on REGISTER.txt, and by `07-kubernetes.sh`
+  on each control plane. The three API servers derive their keys from it and keep only the derived
+  keys; **lost, no etcd snapshot's Secrets can be read**, and a control plane rebuilt after all three
+  are gone cannot read the cluster's Secrets. Key rotation (`K8S_SECRETS_GEN`) derives the next key
+  from the same passphrase, so a rotation does not touch this envelope; a *compromised* passphrase
+  needs a new one, which is not yet a built procedure.
 - The second admin's password is that person's own and is not sealed. The guest admin, Harbor and
   Grafana passwords are working administrator credentials, held the way the site holds its other
   administrator passwords. A facility that wants them sealed too adds envelopes; nothing else

@@ -53,6 +53,7 @@ nodes have IPv6**; every other machine, the API VIP and the storage network stay
 | A3 | A ufw table for every node, sources narrowed; **routed rules for the pod ranges only** once measured (§5, trap 7) | 2026-10-14, Brian | Canonical's narrower option, never `DEFAULT_FORWARD_POLICY=ACCEPT` |
 | K-A | **API audit policy: a narrow, documented deviation from V-242403** — Secrets, `serviceaccounts/token` and `tokenreviews` at `Metadata`; everything else `RequestResponse` | 2026-10-14, Brian | the STIG's exact policy writes every Secret's value into a log that is offloaded to svc-obs-01 and copied to the vault and the NAS |
 | K-B | ~~sshd off on the workers~~ → **REVERSED the same day: sshd stays ON on the workers** | 2026-10-14, Brian | the only other way in is `virsh console` from each host — and everything run on a worker (the repo push, `verify --fips-only`, patching, the rebuild tooling) goes over ssh. The STIGs conflict anyway: the Ubuntu 24.04 STIG's **UBTU-24-100810 requires sshd enabled**, the Kubernetes STIG's **V-242393/242394 require it off** on workers — so V-242393/394 stay **open, accepted** (POA&M AO-21). ssh on a worker is key-only, FIPS ciphers, `ufw limit`, the DoD banner — as on every machine |
+| 3.64 | **Secrets encrypted at rest with `aesgcm`**, the keys derived on each control plane from one sealed passphrase (`K8S_SECRETS_PASS`), rotated by raising `K8S_SECRETS_GEN` | 2026-10-15, Brian | Kubernetes STIG **V-274882 (CAT I)** was open — every Secret plain in etcd. `aesgcm` over `aescbc`: Kubernetes calls CBC weak, and a rotation procedure is owed under either (§3.12) |
 | K-C | **Pod Security `baseline`** (Canonical's default, V-254800) | 2026-10-14, Brian | the vendor's images are unmeasured; revisit `restricted` once they run |
 | — | **snapd: the FIPS build** from `fips-updates/candidate` | 2026-10-14, Brian | `fips-updates/stable` was empty; snapd verifies every snap's signature. Q-CORE asks when stable carries it |
 | — | local-storage **off**; CoreDNS forwards to the **enclave DNS**; `--address` always explicit | 2026-10-14 | node-local volumes do not survive their node; the node resolver 127.0.0.53 means nothing in a pod; there is no default route to find |
@@ -61,7 +62,8 @@ The STIG arguments are **Canonical's own**, read from the pinned snap
 (`/snap/k8s/current/k8s/resources/configurations/disa-stig/{bootstrap,control-plane,worker}.yaml`).
 `render_config` takes them as written and replaces only `--audit-policy-file` (K-A) and
 `--admission-control-config-file` (K-C, the same baseline file named explicitly), and adds
-`--node-ip <v4>,<v6>`. Canonical's audit-policy file says *Metadata* in its comment while its one
+`--node-ip <v4>,<v6>` and, on control planes, `--encryption-provider-config` (3.64 — the file's name
+only; the keys never enter the bootstrap or join config, which is printed). Canonical's audit-policy file says *Metadata* in its comment while its one
 rule is `RequestResponse` — the rule is what applies, and is what V-242403 demands.
 
 ## 3. The sequence — as run 2026-10-14
@@ -166,7 +168,9 @@ In order: FIPS kernel and both addresses present → kubelet's six kernel settin
 read back** (`/etc/sysctl.d/99-kubelet.conf`) → snapd, core22, k8s side-loaded (each refused if not
 the pinned revision; snapd and core22 refused if not `+fips`) → refresh held → containerd's
 `ghcr.io` pointed at Harbor with the enclave root (`/etc/containerd/hosts.d/ghcr.io/`) → on control
-planes, the K-A audit policy. Safe to repeat.
+planes, the K-A audit policy and — on a control plane **not yet in a cluster** — the Secrets
+encryption config (§3.12; it asks for `K8S_SECRETS_PASS` unless the credentials file holds it). Safe to
+repeat: on a running control plane it never touches that config.
 
 ### 3.6 Bootstrap the first control plane
 
@@ -286,6 +290,124 @@ survivor into `/var/snap/k8s/common/var/lib/etcd/data` with each node's own `--n
 `/var/snap/k8s/common/args/etcd`; `sudo snap start k8s`; `k8s status --wait-ready`. It recovers k8sd's
 store and etcd only — **not persistent volumes**. Not rehearsed here: the drill proves the snapshot and
 the tools; rehearsing the whole procedure needs a cluster it is safe to break.
+
+### 3.12 Secrets encrypted at rest (backlog 3.64, STIG V-274882)
+
+**Why.** On 2026-10-15 the API servers had no `--encryption-provider-config`: every Secret was plain
+in etcd, in every etcd snapshot and in every disk copy of a control plane. Kubernetes STIG V-274882
+(CAT I): *"If the setting encryption-provider-config is not configured, this is a finding … If the
+identity provider is specified as the first provider for the resource, this is also a finding."*
+Canonical's STIG configuration does not cover it. The STIG's check reads `/etc/kubernetes/manifests`;
+Canonical has no manifests — the equivalent is `/var/snap/k8s/common/args/kube-apiserver`, and the
+proof is what etcd holds (`encrypt check`).
+
+**The provider** — Kubernetes' own table (`encrypt-data.md`, kubernetes/website, read 2026-10-15):
+`aescbc` *"Weak"*, *"Not recommended due to CBC's vulnerability to padding oracle attacks"*; `aesgcm`
+*"Must be rotated every 200,000 writes"*, *"Not recommended for use except when an automated key
+rotation scheme is implemented"*; both *"Key material accessible from control plane host"*;
+`secretbox` is XSalsa20, **not FIPS-approved**; `kms v2` needs a key service the enclave does not
+have. **`aesgcm`, decided by Brian 2026-10-15.** The rotation here is **scripted, run by an operator
+on a schedule — not a timer**: whether that is the "automated scheme" Kubernetes means is a judgement
+for the assessor, recorded in POA&M ENG-76. The API server is Go's OpenSSL build
+(`GOEXPERIMENT=opensslcrypto`, calling `EVP_aes_256_gcm` — read from the snap's own binary) and runs
+with the FIPS provider loaded (§3.9). `K8S_SECRETS_PROVIDER=aescbc` is the one-line alternative for a
+new cluster; switching a live one is not built.
+
+**The keys** derive on each control plane from one passphrase, `K8S_SECRETS_PASS` —
+PBKDF2-HMAC-SHA256, 600,000 iterations, salt `k8s-secrets-at-rest/gen<N>` — held like the pgBackRest
+passphrase: the site credentials, a sealed envelope marked with its fingerprint (`airgap-media.md`
+§9.6). So the three API servers and any rebuild compute the **same** keys and no key is ever copied
+between machines. The config, `/var/snap/k8s/common/etc/configurations/enclave-encryption.yaml`
+(root 0600), holds the derived keys — **never print it**. Its `# enclave-state:` line says which key
+writes and lists each key's fingerprint, not the key.
+
+**Steps, because there are three API servers** (Kubernetes' procedure): a Secret written by an API
+server holding the new key cannot be read by one without it. So **stage** gives every API server the
+key without using it; **apply** makes each write with it; **rewrite** stores every existing Secret
+again; **retire** — once etcd proves every Secret is under the new key — removes the older key and the
+plain-text reader (`identity`), Kubernetes' last two steps. Each config change restarts that node's API server (`snap restart k8s.kube-apiserver`) — if it
+holds the VIP, the VIP moves (3–4 s, C1).
+
+**Run it — one block at a time, in this order.** First commit, then push the repository to the three
+control planes (`push-repo-to-host.sh` sends `HEAD`).
+
+```bash
+### MACHINE: k8s-cp-01 (10.2.20.171) — 0. the check, BEFORE anything changes: it must report every Secret PLAIN ###
+if [ "$(hostname -s)" != k8s-cp-01 ]; then echo "WRONG MACHINE: $(hostname -s)"; else
+  sudo ~/canonical-k8s/scripts/install/07-kubernetes.sh encrypt check
+fi
+```
+
+Expected: `V-274882: OPEN`, every Secret counted as plain, and etcd's count matching the API's. This
+is the check seen failing before it is trusted to pass — the 2026-10-15 probe lesson. A count of 0, or
+etcd and the API disagreeing, is reported as *the check did not work*, never as a pass.
+
+```bash
+### MACHINE: k8s-cp-01, then k8s-cp-02, then k8s-cp-03 — 1. STAGE, one at a time ###
+case "$(hostname -s)" in k8s-cp-0[1-3]) sudo ~/canonical-k8s/scripts/install/07-kubernetes.sh encrypt stage ;; *) echo "WRONG MACHINE: $(hostname -s)" ;; esac
+```
+
+Asks for the passphrase twice (unless the credentials file holds it) and prints its **fingerprint —
+it must be the same on all three**. Writes the config with `identity` still first, adds the argument,
+restarts, and proves the restarted API server still reads every Secret.
+
+```bash
+### MACHINE: k8s-cp-01, then k8s-cp-02, then k8s-cp-03 — 2. APPLY, only after all three are staged ###
+case "$(hostname -s)" in k8s-cp-0[1-3]) sudo ~/canonical-k8s/scripts/install/07-kubernetes.sh encrypt apply ;; *) echo "WRONG MACHINE: $(hostname -s)" ;; esac
+```
+
+No passphrase: it reorders the keys already staged. Then a **canary** Secret is written through this
+API server and read back through all three by address — the proof that every API server holds the
+same key. A control plane that cannot read it was not staged: stage it **at once**.
+
+```bash
+### MACHINE: k8s-cp-01 (10.2.20.171) — 3. REWRITE, once, after all three apply ###
+if [ "$(hostname -s)" != k8s-cp-01 ]; then echo "WRONG MACHINE: $(hostname -s)"; else
+  sudo ~/canonical-k8s/scripts/install/07-kubernetes.sh encrypt rewrite
+fi
+```
+
+Refuses unless a canary written through **each** control plane is stored under the current key, read
+raw from etcd. Then Kubernetes' documented `kubectl get secrets -A -o json | kubectl replace -f -`,
+piped, never to a file. A conflict, from a Secret changed in between, gets retried. It ends with
+`encrypt check`, which must now say every Secret is under the current key.
+
+```bash
+### MACHINE: k8s-cp-01, then k8s-cp-02, then k8s-cp-03 — 4. RETIRE, after the rewrite ###
+case "$(hostname -s)" in k8s-cp-0[1-3]) sudo ~/canonical-k8s/scripts/install/07-kubernetes.sh encrypt retire ;; *) echo "WRONG MACHINE: $(hostname -s)" ;; esac
+```
+
+Runs `encrypt check` itself and refuses unless every Secret is under the current key. Then the config
+keeps only that key: the older one goes, and so does `identity`, so this API server can no longer
+serve a Secret stored in the clear. It restarts and proves it still reads every Secret. Then `verify`:
+section 6 checks this node's API server.
+
+**A new cluster** needs no stage, apply or rewrite. `node-prep` writes the config, with the key
+writing, on each control plane before its API server first starts. `render_config` adds the argument
+to the bootstrap and join configs. After the build: `encrypt check`, then `encrypt retire` on each
+control plane.
+
+**Rotation** uses the same steps. Raise `K8S_SECRETS_GEN` in `07-kubernetes.sh` by one and commit it:
+a control plane rebuilt later reads it there. Then push, stage ×3, apply ×3, rewrite, retire ×3. Rotate
+at the annual review, or sooner if `encrypt check`'s write count nears 200,000. `stage` derives every
+key the node already holds again and compares it, so a mistyped passphrase is refused rather than
+stored. Retiring an old key **does** protect something. The passphrase never sits on the host, so a
+later compromise of a control plane cannot read etcd snapshots taken under a retired key. To read
+such a snapshot, derive its key again from the envelope with `K8S_SECRETS_GEN=<old> encrypt stage`.
+Rotation serves AES-GCM's per-key write limit, **not a compromise**: a leaked passphrase needs a new
+passphrase, and a re-key procedure that accepts one is **not built**.
+
+**What it protects, and what not** (Kubernetes says it plainly: a key held on the host *"fails to
+protect against a host compromise"*). Protected: etcd's data read through its client port, etcd
+snapshots and the G9 backups, as long as the passphrase is not with them. **Not** protected: anyone
+with root on a control plane, or with a disk copy of one — the key file sits beside etcd on the same
+disk. Against stolen drives, LUKS on the hosts covers both. KMS v2 with an external key service would
+close the gap; the enclave has none (§7).
+
+**Backing out** one node, while no Secret is yet stored under a key that node would lose:
+`sudo cp -p /var/snap/k8s/common/args/kube-apiserver.pre-3.64 /var/snap/k8s/common/args/kube-apiserver
+&& sudo snap restart k8s.kube-apiserver`. **After `rewrite`, never remove the config**: the Secrets are
+unreadable without it. Going back to plain means `identity` first and another rewrite.
 
 ## 4. What has been verified (2026-10-14)
 
@@ -471,11 +593,20 @@ wanted. Record each result in §4.1 with its times — measured, never "it seeme
    day — kubelet, containerd, k8sd and k8s-apiserver-proxy on core22's `fips.so` too.
 2. ~~**The API VIP**~~ ✅ live 2026-10-14 (§3.10).
 3. ~~**K-B** — sshd disabled on the workers~~ — **reversed 2026-10-14: ssh stays on** (§2, POA&M AO-21).
-4. **Survivability (C):** ✅ C1, C2, C2b, C3, C3b, C4 passed 2026-10-14/15 (§4.1). ✅ **C5** — the cluster cold-started, `verify` 28/28 (§4.1);
-   adding Kubernetes to the whole-enclave power-down order (3.57) is owed. ⬜ **Re-measure service continuity** with the
-   fixed probe (the retraction in §4.1). ⬜ **Routine etcd backups** (G9) — the drill is one-off; nightly
-   snapshots need a home and encryption, since a snapshot holds every Secret.
-5. Then **B-08 Ceph** — 3.48 decided 2026-10-14 (option A: wk-04's lab OSD is an LV on host-4's OS disk, a dedicated drive in production — START-HERE's lab-vs-production table); still waits on 3.61 (host-1's pool).
+4. ✅ **Survivability (C)** — C1–C5 passed 2026-10-14/15, service continuity re-measured with the fixed probe and two
+   firewall gaps fixed (§4.1, §4.2, §5 trap 8a).
+5. 🔴 **Secrets at rest — V-274882, CAT I (backlog 3.64).** Checked 2026-10-15: **not encrypted**. Decided the same day:
+   `aesgcm`, keys from a sealed passphrase. **Built** (`encrypt`, §3.12) and tested off the cluster — the snap's own v1.36.4
+   API server parses all three config forms, and rejects a bad key. **Not yet applied** to the cluster.
+6. ⬜ **Cluster monitoring (G10)** — Prometheus scrapes none of the seven nodes: no alert for a `NotReady` node, etcd, the VIP
+   moving or a certificate expiring.
+7. ⬜ **Routine etcd backups (G9)** — the drill (§3.11) is one-off; a nightly snapshot needs encryption (it holds every Secret)
+   and a home.
+8. ⬜ **Kubernetes in the whole-enclave power-down order** (3.57, contingency plan §5.3) — the blocks exist (§4.2, C5).
+9. ⬜ **The application front door** — the gateway is enabled but unexercised, `*.apps` points at a placeholder, and Q-CORE (i)
+   (is the gateway's TLS FIPS?) is open. With the vendor's application.
+10. Then **B-08 Ceph** — unblocked 2026-10-15: 3.48 (wk-04's lab OSD an LV on host-4's OS disk; production a dedicated
+   drive) and 3.61 (host-4's copy to host-3 in the lab) both decided — START-HERE's lab-vs-production table.
 
 ## 7. Known gaps carried elsewhere
 

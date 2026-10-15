@@ -21,7 +21,9 @@
 #   credentials.<machine>.env   every machine: GRUB_PASSWORD_HASH, ADMIN2_PASSWORD_HASH and ITS
 #                               OWN BREAKGLASS_PASSWORD_HASH_<MACHINE>; the hosts also get
 #                               VM_ADMIN_PASSWORD_HASH (they compose the guests); HARBOR_* goes
-#                               to HARBOR_MACHINE only, GRAFANA_* to OBS_MACHINE only.
+#                               to HARBOR_MACHINE only, GRAFANA_* to OBS_MACHINE only;
+#                               PGBACKREST_CIPHER_PASS to the pg nodes and stores, and
+#                               K8S_SECRETS_PASS to the Kubernetes control planes only.
 #   audit-offload.<machine>.key the machine's key for the weekly audit offload (RSA 4096 - FIPS
 #                               refuses ed25519). Every machine but the collector (OBS_MACHINE),
 #                               which delivers to itself. An OPERATIONAL key, not a one-time
@@ -72,6 +74,10 @@ OBS_MACHINE="${OBS_MACHINE:-SVC_OBS_01}"            # who gets GRAFANA_* (addres
 SPECS="$SELF/../enclave/vm-specs.env"
 PGBR_STORE_KEYS="$( [ -r "$SPECS" ] && sed -n "s/^PG_BACKUP_STORES='\([^']*\)'.*/\1/p" "$SPECS" | tr ' ' '\n' | sed 's/=.*//' | tr '[:lower:]-' '[:upper:]_' | tr '\n' ' ' || true)"
 PGBR_MIN_LEN="${PGBR_MIN_LEN:-32}"
+# Who gets K8S_SECRETS_PASS (backlog 3.64): the Kubernetes control planes - every API server derives
+# the same Secrets-encryption keys from it (07-kubernetes.sh). 32+ characters.
+K8SE_MIN_LEN="${K8SE_MIN_LEN:-32}"
+k8s_cp_machine() { [[ "$1" =~ ^K8S_CP_[0-9]+$ ]]; }
 # The collector's drop directory and forced command - must be EXACTLY what the collector runs
 # (audit-offload.sh DROP and rrsync), or `collector-trust` refuses the line.
 AUDIT_DROP_DIR="${AUDIT_DROP_DIR:-/srv/audit-offload}"
@@ -270,6 +276,22 @@ if [ "$pg" = 1 ]; then
     ok "pgBackRest passphrase taken - fingerprint $PGBR_FP (write it on the envelope)"
   fi
 fi
+# THE KUBERNETES SECRETS-ENCRYPTION PASSPHRASE (backlog 3.64). A REAL value, the SAME on every control
+# plane: each API server derives its keys from it, so no key is ever copied between machines. LOST,
+# NO etcd SNAPSHOT'S SECRETS CAN BE READ, and a control plane rebuilt from nothing cannot read the
+# cluster's Secrets. The custodians seal a copy - its FINGERPRINT (sha256, first 8 hex) is what
+# 07-kubernetes.sh prints on every control plane.
+K8SE_FP=""
+kc_=0; for k in "${KEYS[@]}"; do k8s_cp_machine "$k" && kc_=1; done
+if [ "$kc_" = 1 ]; then
+  say "the Kubernetes Secrets-encryption passphrase: $K8SE_MIN_LEN+ characters, the SAME on every control plane."
+  say "SEAL A COPY in its own envelope - without it no etcd snapshot's Secrets can ever be read."
+  ask "Kubernetes Secrets-encryption passphrase (stored as the REAL value)" 1 1 "$K8SE_MIN_LEN"
+  if [ -n "$SECRET" ]; then
+    V[K8S_SECRETS_PASS]="$SECRET"; K8SE_FP="$(printf '%s' "$SECRET" | sha256sum | cut -c1-8)"
+    ok "Kubernetes passphrase taken - fingerprint $K8SE_FP (write it on the envelope)"
+  fi
+fi
 SECRET=""
 
 # ---- which keys each machine gets ---------------------------------------------------------
@@ -282,6 +304,7 @@ keys_for() {   # MACHINE_KEY -> the credential keys that machine uses, one per l
   fi
   if [ "$m" = "$OBS_MACHINE" ] && [ -n "${V[GRAFANA_ADMIN_PASSWORD]:-}" ]; then printf '%s\n' GRAFANA_ADMIN_PASSWORD; fi
   if pgbr_machine "$m" && [ -n "${V[PGBACKREST_CIPHER_PASS]:-}" ]; then printf '%s\n' PGBACKREST_CIPHER_PASS; fi
+  if k8s_cp_machine "$m" && [ -n "${V[K8S_SECRETS_PASS]:-}" ]; then printf '%s\n' K8S_SECRETS_PASS; fi
   return 0
 }
 
@@ -398,6 +421,11 @@ reg="$OUT/REGISTER.txt"
     printf '\n  pgBackRest   the repository passphrase, SEALED in its own envelope marked with fingerprint %s\n' "$PGBR_FP"
     printf '               (sha256, first 8 - 06a-postgres-ha.sh prints the same on every machine it reaches).\n'
     printf '               LOST = every database backup unreadable. Signed: ______ / ______  location ____________\n'
+  fi
+  if [ -n "$K8SE_FP" ]; then
+    printf '\n  Kubernetes   the Secrets-encryption passphrase, SEALED in its own envelope marked with fingerprint %s\n' "$K8SE_FP"
+    printf '               (sha256, first 8 - 07-kubernetes.sh prints the same on every control plane).\n'
+    printf '               LOST = no etcd snapshot readable. Signed: ______ / ______  location ____________\n'
   fi
   printf '\n  envelopes    %s emergency passwords sealed, one per machine, signed across the seal\n' "${#KEYS[@]}"
   printf '               by both custodians: ______ / ______   location ____________________\n'

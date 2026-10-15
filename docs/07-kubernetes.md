@@ -361,6 +361,9 @@ from svc-mgmt-01's neighbour table. "Down" means no answer within 1 s.
    And `DPT=7946` from the other nodes: MetalLB's memberlist, in neither of Canonical's port lists. Fixed in
    `stig-tailor.sh`: a routed rule enclave subnet → pod ranges (both families), and 7946/tcp+udp from the seven
    nodes, registered in the PPSM register first. Every node needs `sudo stig-tailor.sh ufw --apply` once.
+   **Proven 2026-10-15 01:58 UTC:** 40 queries from stage-01 to the service's NodePort on each of wk-02 (2 local
+   pods — the failing case), wk-03 (1) and wk-01 (0): **120 of 120 answered**; the LoadBalancer address 40 of 40.
+   Re-applying ufw on a live node drops traffic for a few seconds (the reset) — a maintenance-window step.
 8. **No default route** turns "service has no backend" into an instant `network is unreachable` /
    `no route to host` instead of a timeout — read it as "nothing behind that Service yet".
 

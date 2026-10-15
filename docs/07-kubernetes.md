@@ -447,6 +447,91 @@ close the gap; the enclave has none (§7).
 && sudo snap restart k8s.kube-apiserver`. **After `rewrite`, never remove the config**: the Secrets are
 unreadable without it. Going back to plain means `identity` first and another rewrite.
 
+### 3.13 Cluster monitoring (G10)
+
+**Why.** Until now Prometheus scraped none of the seven nodes. Nothing alerted on a NotReady node,
+a dead etcd member, the VIP moving or Secrets encryption going missing, and every survivability
+test in §4.1 was watched by hand.
+
+**The design — option A, decided by Brian 2026-10-15.** Each control plane checks the cluster
+**itself, once a minute**, and writes the result to a file that node-exporter publishes on 9100.
+svc-obs-01 already scrapes that port, and the nodes' ufw already allows it from svc-obs-01. **Nothing
+new is installed, no port is opened, and no cluster credential leaves the control planes.** Option B
+was Prometheus reading the API servers with a token, plus kube-state-metrics. It was set aside because
+that image is upstream Go crypto with no FIPS setting, and it would store a token on svc-obs-01. What
+B would have added is recorded for later: backlog 3.66.
+
+| what | where it comes from |
+|---|---|
+| every node up, disk, memory, CPU, audit, clock, updates | node-exporter on all seven, the same alerts as every machine (`monitoring.sh exporter`, `facts-timer`) |
+| etcd running on each control plane | node-exporter's systemd collector, `snap.k8s.etcd.service` |
+| VIP holder, keepalived, the Secrets-encryption line in the args file **and** in the running process **and** writing, etcd voters and HA from `k8s status` | **every control plane**, locally — `monitoring.sh k8s-facts` |
+| every node Ready or not, every API server's `/readyz`, every pod healthy or not | **the VIP holder only**, so the cluster is asked once a minute, not three times — as the read-only identity below |
+
+**Its own identity.** The cluster part runs as ServiceAccount `kube-system/enclave-monitor`, which may
+**list nodes and pods, nothing else** — every API audit record it causes says *monitor*, apart from
+anything a person did. Root mints its token with the admin kubeconfig: valid 24 h, replaced after
+12 h, kept in `/run/enclave-k8s-monitor` (memory, root 0700) — never on disk, a command line or the
+screen. **It asks for summaries**: the server-side table with `includeObject=None`, names and status
+columns only, because the audit policy records every response in full (K-A).
+
+**Alerts** (`monitoring.sh rules`, group `enclave-kubernetes`, 16 rules — thresholds are `AL_K8S_*`):
+
+| alert | fires when | severity |
+|---|---|---|
+| KubernetesNodeNotReady | a node NotReady for 2 min — **in the lab, the cue for the manual fencing step (H2)** | critical |
+| KubernetesNodeMissing · KubernetesUnexpectedNode | a node from the address file not in the cluster · one in the cluster the file does not name | critical · warning |
+| KubernetesAPIServerDown · KubernetesAPIServersMostlyDown | one API server not ready for 2 min · more than half | warning · critical |
+| KubernetesEtcdMemberDown · KubernetesEtcdQuorumLost | etcd stopped on a control plane · fewer than a majority running | critical |
+| KubernetesNotHighlyAvailable | `k8s status` not HA, or fewer voters than control planes | critical |
+| KubernetesAPIVIPNoHolder · KubernetesAPIVIPSplit · KubernetesAPIVIPMoved | nobody holds the VIP · two do · it moved in the last 30 min | critical · critical · warning |
+| KeepalivedNotRunning | on a control plane, 2 min | warning |
+| KubernetesPodsUnhealthy | any pod not Running-and-ready (or Completed) for 15 min | warning |
+| KubernetesSecretsNotEncrypted | any of the three encryption checks fails on any control plane for 5 min — **the args-file check catches a rewritten file before the next restart would lose every Secret** | critical |
+| KubernetesClusterChecksStale · KubernetesLocalChecksStale | no cluster check for 5 min (blind) · one control plane's local checks stopped | critical · warning |
+
+Cluster certificates join the existing 30-day expiry alert; they all expire 2046-10-14 (backlog 3.65).
+
+**Dashboard:** Grafana → *Enclave Kubernetes*, `scripts/enclave/dashboards/enclave-kubernetes.json`
+(provisioned by `monitoring.sh dashboards`, never edited in the browser). It has seven numbers along
+the top, all green zeros except the VIP holder's name; every node's state; coloured history bands for
+node readiness, the VIP holder, the API servers and etcd; pods by status; the encryption checks; how
+old the checks are; and CPU, memory and disk for all seven nodes.
+
+**Also fixed here — backlog 3.56.** `monitoring.sh exporter` now installs without recommended packages,
+plus only the tools the machine's hardware uses. The old chain pulled in `ipmitool` → `openipmi`,
+which failed at every boot and left pg-01..03 `degraded`. It also warns if `openipmi` is enabled on a
+machine with no IPMI device.
+
+**Tested before deployment, on stage-01:**
+- The full rules file passes `promtool check rules` (81 rules) with the mirror's own Prometheus 2.45.3.
+- **`promtool test rules`, ten scenarios, all as expected.** A healthy cluster raises none of the 16.
+  The failures each raise their alert: a NotReady worker (and Missing does not), a missing worker (and
+  NotReady does not), the VIP moving and then nobody holding it, two holders, one and then two etcd
+  members down, one and then two API servers down, the encryption line gone, the check absent or frozen.
+  A deliberately wrong expectation **failed**, so the passes mean something.
+- **The check itself ran against a fake API server** serving the server-side table format. It got every
+  value right: NotReady, missing, `Ready,SchedulingDisabled` counted as Ready, an unknown node, three
+  unhealthy pods (Completed not counted). With a stale token it reported **itself** broken
+  (`monitor_api_ok 0`, no cluster timestamp), never an API server down. The fake server saw only table
+  requests with `includeObject=None`.
+- The published file passes `promtool check metrics`, and every dashboard query parses.
+- **Not yet verified:** the deployment, Canonical's `/readyz` for a ServiceAccount, the systemd unit
+  name `snap.k8s.etcd.service`, and the failure tests on the real cluster (below).
+
+**Deploy** (blocks in the session log; the order matters: checks before rules, so the stale alert does
+not fire on a check that was never started):
+1. Push the repository to the seven nodes and svc-obs-01.
+2. On each node: `monitoring.sh exporter`, then `facts-timer`; on each control plane also `k8s-facts-timer`.
+3. On svc-obs-01: `monitoring.sh scrape`, `rules`, `dashboards`.
+
+**Prove it by failure**, as every alert here has been:
+
+| test | expect | measured |
+|---|---|---|
+| `sudo virsh shutdown k8s-wk-04` on host-4 | InstanceDown (wk-04) and KubernetesNodeNotReady within ~3 min; red band on the dashboard; both clear after `virsh start` | — |
+| `sudo systemctl stop keepalived` on the VIP holder | KubernetesAPIVIPMoved; KeepalivedNotRunning after 2 min; the holder stat changes name. `start` it again afterwards; the VIP stays (nopreempt) | — |
+
 ## 4. What has been verified (2026-10-14)
 
 | | how |
@@ -643,7 +728,7 @@ wanted. Record each result in §4.1 with its times — measured, never "it seeme
 5. ✅ **Secrets at rest — V-274882, CAT I (backlog 3.64)** — found unencrypted 2026-10-15, **encrypted the same day**: `aesgcm`,
    keys from a sealed passphrase; etcd holds every Secret under `gen1`, none plain, no API server reads plain (§3.12, §4).
    Left: `encrypt check` in the nightly check; the lab passphrase's envelope; a re-key procedure (POA&M ENG-76).
-6. ⬜ **Cluster monitoring (G10)** — Prometheus scrapes none of the seven nodes: no alert for a `NotReady` node, etcd, the VIP
+6. 🔄 **Cluster monitoring (G10)** — **built and tested offline 2026-10-15 (§3.13, option A); deploy and prove by failure next.** Before: Prometheus scraped none of the seven nodes: no alert for a `NotReady` node, etcd, the VIP
    moving or a certificate expiring.
 7. ⬜ **Routine etcd backups (G9)** — the drill (§3.11) is one-off; a nightly snapshot needs a home. Its Secrets are now
    ciphertext (3.64), readable only with the passphrase envelope. Run `encrypt check` with it each night.

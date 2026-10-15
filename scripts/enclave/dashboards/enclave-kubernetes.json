@@ -1,0 +1,1468 @@
+{
+ "uid": "enclave-kubernetes",
+ "title": "Enclave Kubernetes - nodes, API, etcd, VIP, Secrets",
+ "description": "Generated for scripts/enclave/monitoring.sh (B-07 G10, option A). Every cluster number comes from the control planes' own once-a-minute checks (monitoring.sh k8s-facts) and node-exporter - no cluster credential leaves the control planes. API request rates, API-to-etcd latency and per-pod usage need option B, deferred: backlog 3.66.",
+ "tags": [
+  "enclave",
+  "kubernetes"
+ ],
+ "timezone": "utc",
+ "schemaVersion": 39,
+ "version": 1,
+ "refresh": "1m",
+ "time": {
+  "from": "now-24h",
+  "to": "now"
+ },
+ "editable": true,
+ "panels": [
+  {
+   "type": "row",
+   "title": "The cluster, right now - every number green is a zero, except the VIP holder's name",
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 0
+   },
+   "id": 1,
+   "panels": []
+  },
+  {
+   "type": "stat",
+   "title": "Nodes not Ready",
+   "description": "Nodes in enclave-addresses.env that are NotReady or missing. Alert: KubernetesNodeNotReady / KubernetesNodeMissing.",
+   "id": 2,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "enclave-prometheus"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 3,
+    "x": 0,
+    "y": 1
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "enclave-prometheus"
+     },
+     "expr": "count(max by (node) (enclave_k8s_node_ready) == 0) or vector(0)",
+     "instant": true,
+     "legendFormat": "__auto"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "none",
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "red",
+        "value": 1
+       }
+      ]
+     },
+     "color": {
+      "mode": "thresholds"
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "value",
+    "colorMode": "background",
+    "graphMode": "none",
+    "justifyMode": "center"
+   }
+  },
+  {
+   "type": "stat",
+   "title": "API servers not ready",
+   "description": "Control planes whose API server does not answer /readyz, asked from the VIP holder. One is survivable; two stop the API.",
+   "id": 3,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "enclave-prometheus"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 3,
+    "y": 1
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "enclave-prometheus"
+     },
+     "expr": "count(max by (node) (enclave_k8s_apiserver_ready) == 0) or vector(0)",
+     "instant": true,
+     "legendFormat": "__auto"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "none",
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "orange",
+        "value": 1
+       },
+       {
+        "color": "red",
+        "value": 2
+       }
+      ]
+     },
+     "color": {
+      "mode": "thresholds"
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "value",
+    "colorMode": "background",
+    "graphMode": "none",
+    "justifyMode": "center"
+   }
+  },
+  {
+   "type": "stat",
+   "title": "etcd members down",
+   "description": "Control planes minus running etcd members (systemd). One down keeps quorum with no margin; two lose it.",
+   "id": 4,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "enclave-prometheus"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 3,
+    "x": 7,
+    "y": 1
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "enclave-prometheus"
+     },
+     "expr": "max(enclave_k8s_etcd_voters_expected) - (count(node_systemd_unit_state{name=\"snap.k8s.etcd.service\",state=\"active\"} == 1) or vector(0))",
+     "instant": true,
+     "legendFormat": "__auto"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "none",
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "orange",
+        "value": 1
+       },
+       {
+        "color": "red",
+        "value": 2
+       }
+      ]
+     },
+     "color": {
+      "mode": "thresholds"
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "value",
+    "colorMode": "background",
+    "graphMode": "none",
+    "justifyMode": "center"
+   }
+  },
+  {
+   "type": "stat",
+   "title": "API VIP holder",
+   "description": "The control plane keepalived has given the API VIP to. NO HOLDER: nothing outside the cluster can reach the API.",
+   "id": 5,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "enclave-prometheus"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 10,
+    "y": 1
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "enclave-prometheus"
+     },
+     "expr": "max by (machine) (enclave_k8s_vip_held) == 1",
+     "instant": true,
+     "legendFormat": "{{machine}}"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "none",
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "red",
+        "value": null
+       },
+       {
+        "color": "green",
+        "value": 1
+       }
+      ]
+     },
+     "color": {
+      "mode": "thresholds"
+     },
+     "noValue": "NO HOLDER"
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "name",
+    "colorMode": "background",
+    "graphMode": "none",
+    "justifyMode": "center"
+   }
+  },
+  {
+   "type": "stat",
+   "title": "Secrets-encryption checks failing",
+   "description": "V-274882 (backlog 3.64): the args-file line, the running process and the writing key, on each control plane.",
+   "id": 6,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "enclave-prometheus"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 3,
+    "x": 14,
+    "y": 1
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "enclave-prometheus"
+     },
+     "expr": "count(enclave_k8s_secrets_encryption == 0) or vector(0)",
+     "instant": true,
+     "legendFormat": "__auto"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "none",
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "red",
+        "value": 1
+       }
+      ]
+     },
+     "color": {
+      "mode": "thresholds"
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "value",
+    "colorMode": "background",
+    "graphMode": "none",
+    "justifyMode": "center"
+   }
+  },
+  {
+   "type": "stat",
+   "title": "Pods unhealthy",
+   "description": "Pods neither Running-and-ready nor Completed. Alerts after 15 minutes.",
+   "id": 7,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "enclave-prometheus"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 3,
+    "x": 17,
+    "y": 1
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "enclave-prometheus"
+     },
+     "expr": "max(enclave_k8s_pods_unhealthy) or vector(0)",
+     "instant": true,
+     "legendFormat": "__auto"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "none",
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "orange",
+        "value": 1
+       }
+      ]
+     },
+     "color": {
+      "mode": "thresholds"
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "value",
+    "colorMode": "background",
+    "graphMode": "none",
+    "justifyMode": "center"
+   }
+  },
+  {
+   "type": "stat",
+   "title": "Kubernetes alerts firing",
+   "description": "Every firing alert from the enclave-kubernetes rule group.",
+   "id": 8,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "enclave-prometheus"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 20,
+    "y": 1
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "enclave-prometheus"
+     },
+     "expr": "count(ALERTS{alertstate=\"firing\",alertname=~\"Kubernetes.*|Keepalived.*\"}) or vector(0)",
+     "instant": true,
+     "legendFormat": "__auto"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "none",
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "red",
+        "value": 1
+       }
+      ]
+     },
+     "color": {
+      "mode": "thresholds"
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "value",
+    "colorMode": "background",
+    "graphMode": "none",
+    "justifyMode": "center"
+   }
+  },
+  {
+   "type": "table",
+   "title": "Kubernetes alerts firing now",
+   "id": 9,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "enclave-prometheus"
+   },
+   "gridPos": {
+    "h": 6,
+    "w": 24,
+    "x": 0,
+    "y": 5
+   },
+   "description": "Each alert's action annotation says what to do - Prometheus's Alerts page or Alertmanager shows it in full.",
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "enclave-prometheus"
+     },
+     "expr": "ALERTS{alertstate=\"firing\",alertname=~\"Kubernetes.*|Keepalived.*\"}",
+     "instant": true,
+     "format": "table"
+    }
+   ],
+   "transformations": [
+    {
+     "id": "organize",
+     "options": {
+      "excludeByName": {
+       "Time": true,
+       "Value": true,
+       "__name__": true,
+       "alertstate": true,
+       "enclave": true,
+       "job": true,
+       "instance": true
+      },
+      "indexByName": {
+       "alertname": 0,
+       "severity": 1,
+       "node": 2,
+       "machine": 3,
+       "check": 4
+      }
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {},
+    "overrides": []
+   },
+   "options": {
+    "showHeader": true,
+    "footer": {
+     "show": false
+    }
+   }
+  },
+  {
+   "type": "row",
+   "title": "Nodes",
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 11
+   },
+   "id": 10,
+   "panels": []
+  },
+  {
+   "type": "table",
+   "title": "Every node in enclave-addresses.env",
+   "id": 11,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "enclave-prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 24,
+    "x": 0,
+    "y": 12
+   },
+   "description": "Ready is the cluster's view (the VIP holder's check). Scraped is Prometheus reaching the node's own exporter - a node can be Ready and unscraped (firewall) or scraped and NotReady (kubelet).",
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "enclave-prometheus"
+     },
+     "expr": "max by (node, role) (enclave_k8s_node_ready)",
+     "instant": true,
+     "format": "table"
+    },
+    {
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "enclave-prometheus"
+     },
+     "expr": "max by (node) (label_replace(up{job=\"node\",role=~\"k8s-.*\"}, \"node\", \"$1\", \"machine\", \"(.*)\"))",
+     "instant": true,
+     "format": "table"
+    },
+    {
+     "refId": "C",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "enclave-prometheus"
+     },
+     "expr": "max by (node) (label_replace(time() - node_boot_time_seconds{role=~\"k8s-.*\"}, \"node\", \"$1\", \"machine\", \"(.*)\"))",
+     "instant": true,
+     "format": "table"
+    }
+   ],
+   "transformations": [
+    {
+     "id": "merge",
+     "options": {}
+    },
+    {
+     "id": "organize",
+     "options": {
+      "excludeByName": {
+       "Time": true
+      },
+      "renameByName": {
+       "Value #A": "Ready",
+       "Value #B": "Scraped",
+       "Value #C": "Up for"
+      },
+      "indexByName": {
+       "node": 0,
+       "role": 1,
+       "Value #A": 2,
+       "Value #B": 3,
+       "Value #C": 4
+      }
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "align": "left"
+     }
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Ready"
+      },
+      "properties": [
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "value",
+          "options": {
+           "1": {
+            "text": "Ready",
+            "color": "green"
+           },
+           "0": {
+            "text": "NOT READY",
+            "color": "red"
+           }
+          }
+         }
+        ]
+       },
+       {
+        "id": "custom.cellOptions",
+        "value": {
+         "type": "color-background"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Scraped"
+      },
+      "properties": [
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "value",
+          "options": {
+           "1": {
+            "text": "up",
+            "color": "green"
+           },
+           "0": {
+            "text": "DOWN",
+            "color": "red"
+           }
+          }
+         }
+        ]
+       },
+       {
+        "id": "custom.cellOptions",
+        "value": {
+         "type": "color-background"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Up for"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "s"
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "showHeader": true,
+    "footer": {
+     "show": false
+    },
+    "sortBy": [
+     {
+      "displayName": "node",
+      "desc": false
+     }
+    ]
+   }
+  },
+  {
+   "type": "row",
+   "title": "History - every outage and failover as a coloured band",
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 20
+   },
+   "id": 12,
+   "panels": []
+  },
+  {
+   "type": "state-timeline",
+   "title": "Node Ready",
+   "description": "Red bands are NotReady time. The C2 worker-loss test shows here as one red band on the stopped worker.",
+   "id": 13,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "enclave-prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 21
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "enclave-prometheus"
+     },
+     "expr": "max by (node) (enclave_k8s_node_ready)",
+     "legendFormat": "{{node}}"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "thresholds"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "transparent",
+        "value": null
+       }
+      ]
+     },
+     "mappings": [
+      {
+       "type": "value",
+       "options": {
+        "1": {
+         "text": "Ready",
+         "color": "green",
+         "index": 0
+        },
+        "0": {
+         "text": "NOT READY",
+         "color": "red",
+         "index": 1
+        }
+       }
+      }
+     ]
+    },
+    "overrides": []
+   },
+   "options": {
+    "showValue": "never",
+    "mergeValues": true,
+    "rowHeight": 0.8,
+    "legend": {
+     "showLegend": false
+    },
+    "tooltip": {
+     "mode": "single"
+    }
+   }
+  },
+  {
+   "type": "state-timeline",
+   "title": "API VIP holder",
+   "description": "Where the VIP was, minute by minute. A band jumping rows is a failover (alert KubernetesAPIVIPMoved).",
+   "id": 14,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "enclave-prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 21
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "enclave-prometheus"
+     },
+     "expr": "max by (machine) (enclave_k8s_vip_held)",
+     "legendFormat": "{{machine}}"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "thresholds"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "transparent",
+        "value": null
+       }
+      ]
+     },
+     "mappings": [
+      {
+       "type": "value",
+       "options": {
+        "1": {
+         "text": "holds the VIP",
+         "color": "blue",
+         "index": 0
+        },
+        "0": {
+         "text": "",
+         "color": "transparent",
+         "index": 1
+        }
+       }
+      }
+     ]
+    },
+    "overrides": []
+   },
+   "options": {
+    "showValue": "never",
+    "mergeValues": true,
+    "rowHeight": 0.8,
+    "legend": {
+     "showLegend": false
+    },
+    "tooltip": {
+     "mode": "single"
+    }
+   }
+  },
+  {
+   "type": "state-timeline",
+   "title": "API servers ready",
+   "description": "/readyz on each control plane, asked from the VIP holder.",
+   "id": 15,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "enclave-prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 29
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "enclave-prometheus"
+     },
+     "expr": "max by (node) (enclave_k8s_apiserver_ready)",
+     "legendFormat": "{{node}}"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "thresholds"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "transparent",
+        "value": null
+       }
+      ]
+     },
+     "mappings": [
+      {
+       "type": "value",
+       "options": {
+        "1": {
+         "text": "ready",
+         "color": "green",
+         "index": 0
+        },
+        "0": {
+         "text": "NOT READY",
+         "color": "red",
+         "index": 1
+        }
+       }
+      }
+     ]
+    },
+    "overrides": []
+   },
+   "options": {
+    "showValue": "never",
+    "mergeValues": true,
+    "rowHeight": 0.8,
+    "legend": {
+     "showLegend": false
+    },
+    "tooltip": {
+     "mode": "single"
+    }
+   }
+  },
+  {
+   "type": "state-timeline",
+   "title": "etcd members",
+   "description": "snap.k8s.etcd on each control plane, from node-exporter's systemd collector.",
+   "id": 16,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "enclave-prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 29
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "enclave-prometheus"
+     },
+     "expr": "max by (machine) (node_systemd_unit_state{name=\"snap.k8s.etcd.service\",state=\"active\"})",
+     "legendFormat": "{{machine}}"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "thresholds"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "transparent",
+        "value": null
+       }
+      ]
+     },
+     "mappings": [
+      {
+       "type": "value",
+       "options": {
+        "1": {
+         "text": "running",
+         "color": "green",
+         "index": 0
+        },
+        "0": {
+         "text": "DOWN",
+         "color": "red",
+         "index": 1
+        }
+       }
+      }
+     ]
+    },
+    "overrides": []
+   },
+   "options": {
+    "showValue": "never",
+    "mergeValues": true,
+    "rowHeight": 0.8,
+    "legend": {
+     "showLegend": false
+    },
+    "tooltip": {
+     "mode": "single"
+    }
+   }
+  },
+  {
+   "type": "row",
+   "title": "Pods",
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 37
+   },
+   "id": 17,
+   "panels": []
+  },
+  {
+   "type": "timeseries",
+   "title": "Pods by status",
+   "description": "The status column kubectl shows, counted. CrashLoopBackOff, ImagePullBackOff and Pending are the ones to read.",
+   "id": 18,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "enclave-prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 38
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "enclave-prometheus"
+     },
+     "expr": "max by (status) (enclave_k8s_pods_by_status)",
+     "legendFormat": "{{status}}"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "none",
+     "custom": {
+      "fillOpacity": 30,
+      "lineWidth": 1,
+      "stacking": {
+       "mode": "normal"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "title": "Pods unhealthy",
+   "description": "Unhealthy: not Running-and-ready, and not Completed.",
+   "id": 19,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "enclave-prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 38
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "enclave-prometheus"
+     },
+     "expr": "max(enclave_k8s_pods_unhealthy)",
+     "legendFormat": "unhealthy"
+    },
+    {
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "enclave-prometheus"
+     },
+     "expr": "max(enclave_k8s_pods)",
+     "legendFormat": "all pods"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "none",
+     "custom": {
+      "fillOpacity": 10,
+      "lineWidth": 1,
+      "stacking": {
+       "mode": "none"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   }
+  },
+  {
+   "type": "row",
+   "title": "The checks themselves - are they running, and is Secrets encryption in place",
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 46
+   },
+   "id": 20,
+   "panels": []
+  },
+  {
+   "type": "state-timeline",
+   "title": "Secrets encryption at rest (V-274882)",
+   "description": "args_file: the line in the API server's args; running: the live process; writes: the key, not identity, writes. Backlog 3.64.",
+   "id": 21,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "enclave-prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 47
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "enclave-prometheus"
+     },
+     "expr": "min by (machine, check) (enclave_k8s_secrets_encryption)",
+     "legendFormat": "{{machine}} {{check}}"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "thresholds"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "transparent",
+        "value": null
+       }
+      ]
+     },
+     "mappings": [
+      {
+       "type": "value",
+       "options": {
+        "1": {
+         "text": "in place",
+         "color": "green",
+         "index": 0
+        },
+        "0": {
+         "text": "MISSING",
+         "color": "red",
+         "index": 1
+        }
+       }
+      }
+     ]
+    },
+    "overrides": []
+   },
+   "options": {
+    "showValue": "never",
+    "mergeValues": true,
+    "rowHeight": 0.8,
+    "legend": {
+     "showLegend": false
+    },
+    "tooltip": {
+     "mode": "single"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "title": "Age of the checks",
+   "description": "Every check runs each minute; past 300 s the Kubernetes alerts are blind (KubernetesClusterChecksStale).",
+   "id": 22,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "enclave-prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 47
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "enclave-prometheus"
+     },
+     "expr": "time() - max(enclave_k8s_cluster_facts_timestamp_seconds)",
+     "legendFormat": "cluster check (VIP holder)"
+    },
+    {
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "enclave-prometheus"
+     },
+     "expr": "time() - enclave_k8s_facts_timestamp_seconds",
+     "legendFormat": "{{machine}} local checks"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "custom": {
+      "fillOpacity": 10,
+      "lineWidth": 1,
+      "stacking": {
+       "mode": "none"
+      },
+      "thresholdsStyle": {
+       "mode": "line"
+      }
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "red",
+        "value": 300
+       }
+      ]
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   }
+  },
+  {
+   "type": "row",
+   "title": "Node resources (node-exporter on every node)",
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 55
+   },
+   "id": 23,
+   "panels": []
+  },
+  {
+   "type": "timeseries",
+   "title": "CPU used",
+   "description": "",
+   "id": 24,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "enclave-prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 0,
+    "y": 56
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "enclave-prometheus"
+     },
+     "expr": "100 - avg by (machine) (rate(node_cpu_seconds_total{mode=\"idle\",role=~\"k8s-.*\"}[5m])) * 100",
+     "legendFormat": "{{machine}}"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percent",
+     "custom": {
+      "fillOpacity": 10,
+      "lineWidth": 1,
+      "stacking": {
+       "mode": "none"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "title": "Memory available",
+   "description": "",
+   "id": 25,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "enclave-prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 8,
+    "y": 56
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "enclave-prometheus"
+     },
+     "expr": "node_memory_MemAvailable_bytes{role=~\"k8s-.*\"} / node_memory_MemTotal_bytes{role=~\"k8s-.*\"} * 100",
+     "legendFormat": "{{machine}}"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percent",
+     "custom": {
+      "fillOpacity": 10,
+      "lineWidth": 1,
+      "stacking": {
+       "mode": "none"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "title": "Root filesystem free",
+   "description": "",
+   "id": 26,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "enclave-prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 16,
+    "y": 56
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "enclave-prometheus"
+     },
+     "expr": "node_filesystem_avail_bytes{role=~\"k8s-.*\",mountpoint=\"/\"} / node_filesystem_size_bytes{role=~\"k8s-.*\",mountpoint=\"/\"} * 100",
+     "legendFormat": "{{machine}}"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percent",
+     "custom": {
+      "fillOpacity": 10,
+      "lineWidth": 1,
+      "stacking": {
+       "mode": "none"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   }
+  }
+ ]
+}

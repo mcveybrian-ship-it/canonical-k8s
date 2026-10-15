@@ -16,10 +16,12 @@
 #     sudo ./monitoring.sh facts             publish the compliance facts as metrics, once
 #     sudo ./monitoring.sh facts-timer       the 15-minute timer that runs `facts`
 #     sudo ./monitoring.sh dashboards        provision the repo's Grafana dashboards
+#     sudo ./monitoring.sh k8s-facts         the Kubernetes checks, once (B-07 G10) - CONTROL PLANES
+#     sudo ./monitoring.sh k8s-facts-timer   the monitor's identity, then those checks every minute
 #
 #     WHICH MACHINE: exporter and facts-timer on EVERY in-gap machine; libvirt on each
-#     hypervisor (host-1..4); collector, scrape, alerting, alert-test, rules and dashboards on the
-#     collector, svc-obs-01. Build order: runbook 10a ("AS BUILT, 2026-09-14"). Controls:
+#     hypervisor (host-1..4); k8s-facts-timer on each Kubernetes control plane (k8s-cp-01..03);
+#     collector, scrape, alerting, alert-test, rules and dashboards on the collector, svc-obs-01. Build order: runbook 10a ("AS BUILT, 2026-09-14"). Controls:
 #     CA-7 and SI-4 (iscm-strategy.md). The alert path is backlog B-09a.
 #
 # WHY A SCRIPT FOR WHAT LOOKS LIKE ONE apt-get:
@@ -55,7 +57,7 @@ TEXTFILE_DIR="${TEXTFILE_DIR:-/var/lib/node_exporter/textfile}"
 # THE SYSTEMD COLLECTOR IS DELIBERATELY NARROWED. Unrestricted it emits several series for
 # every unit on the box - hundreds of them, most of which nobody will ever look at, on a
 # Prometheus with a 90d retention. Named units only: the ones a machine exists to run.
-SYSTEMD_UNITS="${SYSTEMD_UNITS:-(auditd|chrony|sshd|ssh|ufw|nginx|docker|containerd|grafana-server|prometheus|prometheus-alertmanager|prometheus-node-exporter|prometheus-libvirt-exporter|prometheus-postgres-exporter|etcd|patroni|libvirtd|virtqemud|postgresql.*|maas-.*|named|bind9|dailyaidecheck|vm-backup|enclave-facts)\\.(service|timer)}"
+SYSTEMD_UNITS="${SYSTEMD_UNITS:-(auditd|chrony|sshd|ssh|ufw|nginx|docker|containerd|grafana-server|prometheus|prometheus-alertmanager|prometheus-node-exporter|prometheus-libvirt-exporter|prometheus-postgres-exporter|etcd|patroni|libvirtd|virtqemud|postgresql.*|maas-.*|named|bind9|dailyaidecheck|vm-backup|enclave-facts|enclave-k8s-facts|keepalived|snap\\.k8s\\..*)\\.(service|timer)}"
 LV_PORT="${LIBVIRT_EXPORTER_PORT:-9177}"
 
 # THE DATASOURCE UID IS A CONTRACT between the provisioning file and every dashboard JSON.
@@ -125,8 +127,18 @@ cmd_exporter() {
   [ -n "$ip" ] || die "no enclave address for '$me' in enclave-addresses.env.
        Add it there first - this script will not guess an interface."
 
-  say "installing prometheus-node-exporter on $me"
-  DEBIAN_FRONTEND=noninteractive apt-get install -y prometheus-node-exporter 2>&1 | tail -3
+  # NO RECOMMENDS (backlog 3.56, found 2026-10-11). Recommends chain node-exporter -> its collectors
+  # -> ipmitool, jq, nvme-cli, smartmontools -> openipmi. On a VM openipmi fails at every boot and
+  # leaves the machine 'degraded' (pg-01..03), undoing stig-tailor.sh fixups item 0b - and Prometheus
+  # never showed it. So: the exporter and its collectors, plus a tool only where its hardware is -
+  # the same rule the timers below are pruned by. jq is used by no timer this script keeps.
+  local pkgs="prometheus-node-exporter prometheus-node-exporter-collectors"
+  have_nvme  && pkgs="$pkgs nvme-cli"
+  have_smart && pkgs="$pkgs smartmontools"
+  have_ipmi  && pkgs="$pkgs ipmitool"
+  say "installing on $me, no recommends: $pkgs"
+  # shellcheck disable=SC2086
+  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $pkgs 2>&1 | tail -3
 
   # ---- bind to THIS machine's enclave address -------------------------------------------
   [ -f "$NE_DEFAULTS" ] || die "no $NE_DEFAULTS - did the package install?"
@@ -198,6 +210,11 @@ cmd_exporter() {
   local page; page="$(curl -sf "http://$ip:$NE_PORT/metrics" 2>/dev/null)" \
     || { warn "bound but not serving"; return 1; }
   ok "serving metrics"
+  # 3.56's symptom, checked rather than assumed: openipmi enabled on a machine with no IPMI device.
+  if ! have_ipmi && systemctl is-enabled openipmi >/dev/null 2>&1; then
+    warn "openipmi is ENABLED and this machine has no IPMI device - it will fail at every boot (3.56)"
+    warn "  sudo ./stig-tailor.sh fixups --apply   (item 0b disables it)"
+  fi
 
   # ASK THE RUNNING EXPORTER WHICH COLLECTORS IT LOADED. A flag it rejects outright stops
   # the service and the bind check above catches that - but a flag it ACCEPTS and cannot
@@ -357,6 +374,9 @@ pg-01	database
 pg-02	database
 pg-03	database
 EOF
+# THE KUBERNETES NODES (B-07 G10), from the address file - so the "add it here in the same pass"
+# rule above cannot be forgotten for them: a fifth worker is scraped the day it is addressed.
+k8s_nodes
 }
 # The database nodes additionally serve Patroni's /metrics (8008, TLS) and postgres-exporter
 # (9187) - backlog B-06a slice 4. Derived from the role above, so a fourth node is one line.
@@ -433,6 +453,14 @@ AL_TRIVY_DB_GRACE_DAYS="${AL_TRIVY_DB_GRACE_DAYS:-3}"     # missed-cycle allowan
 AL_TRIVY_DB_STALE="${AL_TRIVY_DB_STALE:-$(( (AL_TRIVY_DB_POLICY_DAYS + AL_TRIVY_DB_GRACE_DAYS) * 86400 ))}"
 AL_APT_STALE="${AL_APT_STALE:-2592000}"                 # 30d - the mirror snapshot this machine sees
 AL_PRO_EXPIRY_DAYS="${AL_PRO_EXPIRY_DAYS:-90}"          # warn this far ahead of the Pro contract ending
+# KUBERNETES (B-07 G10). NotReady for 2 min is past a kubelet blip; the pod rule waits 15 min so a
+# rollout's Pending pods do not page; the checks run every minute, so 5 min without one is a stop.
+AL_K8S_NODE_FOR="${AL_K8S_NODE_FOR:-2m}"
+AL_K8S_API_FOR="${AL_K8S_API_FOR:-2m}"
+AL_K8S_PODS_FOR="${AL_K8S_PODS_FOR:-15m}"
+AL_K8S_ENC_FOR="${AL_K8S_ENC_FOR:-5m}"
+AL_K8S_FACTS_STALE="${AL_K8S_FACTS_STALE:-300}"
+AL_K8S_VIP_WINDOW="${AL_K8S_VIP_WINDOW:-30m}"
 
 # Set an ARGS= line, exactly once. Appending works - the file is sourced and the last wins -
 # and leaves two lines that disagree, so someone edits the first and nothing changes.
@@ -1918,6 +1946,191 @@ groups:
   # for V-270818/819 (Q26). A notification path that has never been seen to fire is an
   # assumption, so "monitoring.sh alert-test on|off" drives this rule end to end: a
   # textfile metric -> node-exporter -> Prometheus -> Alertmanager -> the dashboard.
+  # ---------------------------------------------------------------- kubernetes (B-07 G10)
+  # From the control planes' own checks (monitoring.sh k8s-facts) and node-exporter's systemd
+  # collector. The cluster series come from whichever control plane holds the VIP, so the rules
+  # aggregate across machines (max by node): a VIP move changes the reporter, not the answer.
+  - name: enclave-kubernetes
+    rules:
+      - alert: KubernetesNodeNotReady
+        expr: (max by (node, role) (enclave_k8s_node_ready) == 0) and on (node) (max by (node) (enclave_k8s_node_present) == 1)
+        for: ${AL_K8S_NODE_FOR}
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ \$labels.node }} is NotReady"
+          description: "The cluster has stopped trusting {{ \$labels.node }}. Its pods are replaced elsewhere about 5 minutes after it went NotReady; until then Services that route to them partly fail (measured in C2: about 50 s, backlog 3.63)."
+          action: >-
+            On its host: 'sudo virsh list --all' - is the VM running? On a control plane:
+            'sudo k8s kubectl describe node {{ \$labels.node }}' - its Conditions say why.
+            LAB: there is no BMC, so a node NotReady because it is DEAD is fenced by hand -
+            'sudo virsh destroy {{ \$labels.node }}' on its host (H2) - before anything that
+            depends on its storage is trusted.
+      - alert: KubernetesNodeMissing
+        expr: max by (node, role) (enclave_k8s_node_present) == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ \$labels.node }} is in enclave-addresses.env but not in the cluster"
+          description: "The node was removed, never joined, or rejoined under another name."
+          action: >-
+            'sudo k8s status' and 'sudo k8s kubectl get nodes' on a control plane. A node joins
+            with '07-kubernetes.sh join' (docs/07-kubernetes.md 3.7).
+      - alert: KubernetesUnexpectedNode
+        expr: max(enclave_k8s_nodes_unexpected) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ \$value }} node(s) in the cluster that enclave-addresses.env does not name"
+          description: "Every node is meant to come from the address file. An unknown one is a rebuild under a new name, or something that should not be there."
+          action: >-
+            'sudo k8s kubectl get nodes -o wide' on a control plane, against enclave-addresses.env.
+      - alert: KubernetesAPIServerDown
+        expr: max by (node) (enclave_k8s_apiserver_ready) == 0
+        for: ${AL_K8S_API_FOR}
+        labels:
+          severity: warning
+        annotations:
+          summary: "The API server on {{ \$labels.node }} is not ready"
+          description: "The cluster runs on the other API servers - the VIP and each worker's API proxy route around this one (C1: 3-4 s). Losing a second one stops the API."
+          action: >-
+            On {{ \$labels.node }}: 'sudo journalctl -u snap.k8s.kube-apiserver -n 40 --no-pager',
+            then 'sudo k8s kubectl get --raw=/readyz?verbose'.
+      - alert: KubernetesAPIServersMostlyDown
+        expr: count(max by (node) (enclave_k8s_apiserver_ready) == 0) > count(max by (node) (enclave_k8s_apiserver_ready)) / 2
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ \$value }} API servers are not ready - the cluster API is down or about to be"
+          description: "Fewer than a majority of API servers answer. Workloads already running continue; nothing can be deployed, scaled or changed, and failed pods are not replaced."
+          action: >-
+            The KubernetesAPIServerDown alerts name them. Check etcd first (KubernetesEtcdQuorumLost):
+            an API server with no etcd behind it is not ready either.
+      - alert: KubernetesEtcdMemberDown
+        expr: node_systemd_unit_state{name="snap.k8s.etcd.service", state="active", role="k8s-control-plane"} == 0
+        for: ${AL_K8S_API_FOR}
+        labels:
+          severity: critical
+        annotations:
+          summary: "etcd is not running on {{ \$labels.machine }}"
+          description: "The cluster keeps its quorum on the other members, but one more failure stops every write."
+          action: >-
+            On {{ \$labels.machine }}: 'sudo snap services k8s' and
+            'sudo journalctl -u snap.k8s.etcd -n 40 --no-pager'. Recovery: docs/07-kubernetes.md 3.11.
+      - alert: KubernetesEtcdQuorumLost
+        expr: count(node_systemd_unit_state{name="snap.k8s.etcd.service", state="active"} == 1) < scalar(floor(max(enclave_k8s_etcd_voters_expected) / 2) + 1)
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Only {{ \$value }} etcd member(s) running - below quorum"
+          description: "Without a majority of etcd members the cluster can write nothing and the API answers with errors. Running workloads continue; nothing can change."
+          action: >-
+            Bring control planes back first. If a majority is gone for good: Canonical's
+            quorum-loss recovery, docs/07-kubernetes.md 3.11.
+      - alert: KubernetesNotHighlyAvailable
+        expr: (max(enclave_k8s_ha) == 0) or (max(enclave_k8s_etcd_voters) < max(enclave_k8s_etcd_voters_expected))
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "'k8s status' no longer reports high availability with every control plane voting"
+          description: "A control plane has left the etcd membership - removed, or not rejoined after a rebuild. The cluster tolerates no further control-plane failure."
+          action: >-
+            'sudo k8s status' on a control plane - the datastore voters list.
+      - alert: KubernetesAPIVIPNoHolder
+        expr: sum(enclave_k8s_vip_held) == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No control plane holds the API VIP"
+          description: "Clients outside the cluster (svc-mgmt-01, svc-obs-01, kubectl) cannot reach the API. Inside, each worker's API proxy still works."
+          action: >-
+            'systemctl status keepalived' and 'sudo journalctl -u keepalived -n 30' on each control
+            plane; ufw's VRRP rule ('sudo ufw status | grep -i vrrp').
+      - alert: KubernetesAPIVIPSplit
+        expr: sum(enclave_k8s_vip_held) > 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ \$value }} control planes hold the API VIP at once"
+          description: "VRRP split brain: the control planes cannot hear each other's advertisements - usually ufw dropping VRRP, or a network partition. Clients reach whichever answered ARP last."
+          action: >-
+            'sudo journalctl -u keepalived -n 30' on each; 'sudo ufw status | grep -i vrrp'.
+      - alert: KubernetesAPIVIPMoved
+        expr: sum(changes(enclave_k8s_vip_held[${AL_K8S_VIP_WINDOW}])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "The API VIP moved within the last ${AL_K8S_VIP_WINDOW}"
+          description: "A failover worked - and this is the only notice it gives. keepalived moves the VIP when the holder's API server stops answering or the node goes down; with nopreempt it does not move back."
+          action: >-
+            Why the old holder lost it: the KubernetesAPIServerDown and InstanceDown alerts of the
+            same minutes, and 'sudo journalctl -u keepalived' on the old holder.
+      - alert: KeepalivedNotRunning
+        expr: enclave_k8s_keepalived_active == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "keepalived is not running on {{ \$labels.machine }}"
+          description: "That control plane can no longer take the API VIP - one fewer place for it to go."
+          action: >-
+            'sudo systemctl status keepalived' on {{ \$labels.machine }}; '07-kubernetes.sh vip' re-installs it.
+      - alert: KubernetesPodsUnhealthy
+        expr: max(enclave_k8s_pods_unhealthy) > 0
+        for: ${AL_K8S_PODS_FOR}
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ \$value }} pod(s) not Running-and-ready for ${AL_K8S_PODS_FOR}"
+          description: "Crash-looping, stuck pulling an image, Pending with nowhere to run, or Running but failing readiness. The MetalLB crash-loop of 2026-10-14 would have fired this."
+          action: >-
+            'sudo k8s kubectl get pods -A | grep -v Running' on a control plane, then
+            'kubectl describe pod'. The Grafana Kubernetes dashboard counts them by status.
+      - alert: KubernetesSecretsNotEncrypted
+        expr: enclave_k8s_secrets_encryption == 0
+        for: ${AL_K8S_ENC_FOR}
+        labels:
+          severity: critical
+        annotations:
+          summary: "Secrets encryption at rest is not in place on {{ \$labels.machine }} ({{ \$labels.check }})"
+          description: >-
+            args_file - the line is missing from the API server's args file: the running server may
+            still encrypt, but the NEXT RESTART starts without the key and cannot read any Secret.
+            running - the API server runs without the setting. writes - staged only, identity still
+            writes. Kubernetes STIG V-274882, backlog 3.64.
+          action: >-
+            'sudo 07-kubernetes.sh encrypt status' on {{ \$labels.machine }}; docs/07-kubernetes.md 3.12.
+            Do NOT restart that API server until the args file is right.
+      - alert: KubernetesClusterChecksStale
+        expr: (time() - max(enclave_k8s_cluster_facts_timestamp_seconds) > ${AL_K8S_FACTS_STALE}) or absent(enclave_k8s_cluster_facts_timestamp_seconds)
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No control plane has checked the cluster for over ${AL_K8S_FACTS_STALE} s - Kubernetes is unwatched"
+          description: "Every other Kubernetes alert depends on this check. It runs on whichever control plane holds the VIP; if none does, or its check cannot read the API, nothing here would fire."
+          action: >-
+            On the VIP holder: 'sudo journalctl -u enclave-k8s-facts -n 20 --no-pager'.
+            enclave_k8s_monitor_api_ok == 0 means the monitor's token or permissions failed.
+      - alert: KubernetesLocalChecksStale
+        expr: time() - enclave_k8s_facts_timestamp_seconds > ${AL_K8S_FACTS_STALE}
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ \$labels.machine }} has not run its Kubernetes checks for over ${AL_K8S_FACTS_STALE} s"
+          description: "Its VIP, keepalived and Secrets-encryption checks are frozen at their last values."
+          action: >-
+            'sudo systemctl status enclave-k8s-facts.timer' on {{ \$labels.machine }};
+            re-install with 'monitoring.sh k8s-facts-timer'.
+
   - name: enclave-alert-path
     rules:
       - alert: AlertPathTest
@@ -2249,7 +2462,10 @@ if csvs:
 certs = sorted(set(glob.glob("/etc/ssl/enclave/*.crt")
                    + glob.glob("/usr/local/share/ca-certificates/*.crt")
                    + [f for d in ("/etc/etcd/pki", "/etc/patroni/pki", "/etc/pgbackrest/pki")
-                      for f in glob.glob(d + "/*.crt") if os.path.basename(f) != "ca.crt"]))
+                      for f in glob.glob(d + "/*.crt") if os.path.basename(f) != "ca.crt"]
+                   # the Kubernetes nodes' own PKI, CA included - it is the cluster's, not the
+                   # enclave root (B-07 G10; all expire 2046-10-14 today, backlog 3.65)
+                   + glob.glob("/etc/kubernetes/pki/*.crt") + glob.glob("/etc/kubernetes/pki/etcd/*.crt")))
 if certs:
     ok_any = 0
     for f in certs:
@@ -2881,6 +3097,322 @@ UNIT
   systemctl list-timers enclave-facts.timer --no-pager 2>/dev/null | sed -n '2p' | sed 's/^/     /'
 }
 
+# ------------------------------------------------------------------------- KUBERNETES (G10)
+# THE CLUSTER, WATCHED FROM ITS OWN CONTROL PLANES (backlog B-07 G10, decided 2026-10-15: option A).
+#
+# Every control plane runs `k8s-facts` once a minute and writes what it sees to the textfile
+# directory; node-exporter serves it on 9100, which svc-obs-01 already scrapes. So nothing new is
+# installed, no port is opened, and no cluster credential leaves the control planes. Option B -
+# Prometheus reading the API servers with a token, plus kube-state-metrics - was set aside: its image
+# is upstream Go crypto with no FIPS setting. What B would add is recorded in backlog 3.66.
+#
+#   EVERY control plane, local facts: does it hold the API VIP; is keepalived running; is the
+#     Secrets-encryption line in the API server's args file AND in the running process AND writing
+#     (3.64 - a rewritten args file would lose every Secret at the next restart, silently until
+#     then); etcd's voters and HA, from `k8s status` (k8sd, not the API - no audit record).
+#   THE VIP HOLDER ONLY, the cluster: every node Ready or not, every API server's /readyz, every pod
+#     healthy or not. Exactly one machine holds the VIP, so the cluster is asked once a minute, not
+#     three times; when the VIP moves, the new holder takes over within a minute.
+#
+# ITS OWN IDENTITY, NOT THE ADMIN. The cluster part runs as ServiceAccount K8S_MON_SA, which can
+# LIST nodes and pods and nothing else - so every API audit record it causes says "monitor", apart
+# from anything a person did. Its token is minted by root with the admin kubeconfig, lives K8S_MON_
+# TOKEN_HOURS, is replaced after K8S_MON_RENEW_HOURS, and is kept in /run (memory, root 0700) -
+# never on disk, never on a command line, never printed.
+#
+# SUMMARIES, NOT OBJECTS. The audit policy records every response in full (K-A, V-242403), so a
+# careless check would write the whole node and pod list into the audit trail every minute. It asks
+# for the server-side table with includeObject=None: names and status columns only.
+K8S_FACTS_FILE="${K8S_FACTS_FILE:-$TEXTFILE_DIR/k8s.prom}"
+K8S_MON_SA="${K8S_MON_SA:-enclave-monitor}"
+K8S_MON_NS="${K8S_MON_NS:-kube-system}"
+K8S_MON_RUN="${K8S_MON_RUN:-/run/enclave-k8s-monitor}"
+K8S_MON_TOKEN_HOURS="${K8S_MON_TOKEN_HOURS:-24}"
+K8S_MON_RENEW_HOURS="${K8S_MON_RENEW_HOURS:-12}"
+K8S_CA="${K8S_CA:-/etc/kubernetes/pki/ca.crt}"
+K8S_APISERVER_ARGS="${K8S_APISERVER_ARGS:-/var/snap/k8s/common/args/kube-apiserver}"
+
+# The nodes, from the one file that owns addressing - a fifth worker needs no edit here.
+k8s_nodes() {   # -> "name<TAB>role" per node
+  local k
+  for k in $(grep -oE '^K8S_(CP|WK)_[0-9]+=' "$HERE/enclave-addresses.env" | tr -d '=' | sort); do
+    case "$k" in K8S_CP_*) printf '%s\tk8s-control-plane\n' "$(printf '%s' "$k" | tr 'A-Z_' 'a-z-')" ;;
+                 *)        printf '%s\tk8s-worker\n'        "$(printf '%s' "$k" | tr 'A-Z_' 'a-z-')" ;; esac
+  done
+}
+k8s_cp_pairs() {   # -> "name=address ..." for the control planes
+  local k
+  for k in $(grep -oE '^K8S_CP_[0-9]+=' "$HERE/enclave-addresses.env" | tr -d '=' | sort); do
+    printf '%s=%s ' "$(printf '%s' "$k" | tr 'A-Z_' 'a-z-')" "${!k:-}"
+  done
+}
+k8s_me_cp() {   # -> this machine's address if it is a control plane, else nothing
+  local p
+  for p in $(k8s_cp_pairs); do [ "${p%%=*}" = "$(hostname -s)" ] && { printf '%s' "${p#*=}"; return 0; }; done
+  return 0
+}
+
+k8s_rbac() {
+cat <<EOF
+# written by monitoring.sh k8s-facts-timer (backlog B-07 G10): the cluster check's own identity.
+# It can LIST nodes and pods and nothing else. /readyz needs no rule: Kubernetes opens it to every
+# authenticated identity (system:public-info-viewer).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: $K8S_MON_SA
+  namespace: $K8S_MON_NS
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: $K8S_MON_SA
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "pods"]
+    verbs: ["list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: $K8S_MON_SA
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: $K8S_MON_SA
+subjects:
+  - kind: ServiceAccount
+    name: $K8S_MON_SA
+    namespace: $K8S_MON_NS
+EOF
+}
+
+# k8s_mon_token - a live token for the monitor in $K8S_MON_RUN/token, renewed when old. Returns 1 if
+# none could be made (the API is down) - the check then reports itself broken, never "all fine".
+k8s_mon_token() {
+  local f="$K8S_MON_RUN/token" tok age
+  install -d -m 0700 -o root -g root "$K8S_MON_RUN"
+  if [ -s "$f" ]; then
+    age=$(( $(date +%s) - $(stat -c %Y "$f") ))
+    [ "$age" -ge $(( K8S_MON_RENEW_HOURS * 3600 )) ] || return 0
+  fi
+  tok="$(/snap/bin/k8s kubectl --request-timeout=10s -n "$K8S_MON_NS" create token "$K8S_MON_SA" --duration "${K8S_MON_TOKEN_HOURS}h" 2>/dev/null)" || return 1
+  [ -n "$tok" ] || return 1
+  ( umask 077; printf '%s' "$tok" > "$f.new" ) && mv -f "$f.new" "$f"
+  tok=""
+}
+
+K8S_FACTS_PY="$(cat <<'PYEOF'
+import json, os, re, ssl, subprocess, time, urllib.error, urllib.request
+E = os.environ
+OUT, ME, ME_ADDR, VIP = E["OUT"], E["ME"], E["ME_ADDR"], E["VIP"]
+CPS = [x.split("=", 1) for x in E["CPS"].split()]
+NODES = [x.split("\t") for x in E["NODES"].strip().split("\n") if x]
+series, helps = [], {}
+
+def m(name, value, labels=None, help=""):
+    if help: helps.setdefault(name, help)
+    lab = ",".join('%s="%s"' % (k, str(v).replace("\\", "\\\\").replace('"', '\\"').replace("\n", " "))
+                   for k, v in sorted((labels or {}).items()))
+    series.append((name, "%s{%s} %s" % (name, lab, value) if lab else "%s %s" % (name, value)))
+
+def run(cmd, timeout=20):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout
+    except Exception:
+        return 1, ""
+
+now = int(time.time())
+# ---- local: the VIP and keepalived
+rc, o = run(["ip", "-4", "-o", "addr", "show"])
+held = 1 if re.search(r"\sinet %s/" % re.escape(VIP), o) else 0
+m("enclave_k8s_vip_held", held, {"vip": VIP}, "1 while this control plane holds the API VIP (keepalived)")
+rc, o = run(["systemctl", "is-active", "keepalived"])
+m("enclave_k8s_keepalived_active", 1 if o.strip() == "active" else 0, None, "keepalived running here - without it this node can never take the VIP")
+
+# ---- local: Secrets at rest (3.64) - the args file, the running process, and that it WRITES encrypted
+cfg = None
+try:
+    mm = re.search(r"^--encryption-provider-config=(\S+)\s*$", open(E["ARGS"]).read(), re.M)
+    cfg = mm.group(1).strip('"') if mm else None
+except Exception:
+    pass
+running = 0
+for pid in os.listdir("/proc"):
+    if not pid.isdigit():
+        continue
+    try:
+        argv = open("/proc/%s/cmdline" % pid, "rb").read().split(b"\0")
+    except Exception:
+        continue
+    if argv and re.match(rb"^/snap/k8s/[^/]+/bin/kube-apiserver$", argv[0]):
+        running = 1 if any(a.startswith(b"--encryption-provider-config=") for a in argv) else 0
+        break
+writes = 0
+if cfg:
+    try:
+        st = re.search(r"^# enclave-state: .*\bwrite=(\S+)", open(cfg).read(), re.M)
+        writes = 1 if st and st.group(1) != "identity" else 0
+    except Exception:
+        pass
+H = "1 when this part of Secrets encryption at rest is in place (V-274882, backlog 3.64)"
+m("enclave_k8s_secrets_encryption", 1 if cfg else 0, {"check": "args_file"}, H)
+m("enclave_k8s_secrets_encryption", running, {"check": "running"})
+m("enclave_k8s_secrets_encryption", writes, {"check": "writes"})
+
+# ---- local: etcd membership and HA, from k8sd (no API call, no audit record)
+rc, o = run(["/snap/bin/k8s", "status"], 30)
+m("enclave_k8s_status_ok", 1 if rc == 0 else 0, None, "'k8s status' answered on this control plane")
+if rc == 0:
+    m("enclave_k8s_etcd_voters", o.count("(voter)"), None, "etcd voters in 'k8s status'")
+    m("enclave_k8s_ha", 1 if re.search(r"high availability:\s*yes", o) else 0, None, "'k8s status' says high availability: yes")
+m("enclave_k8s_etcd_voters_expected", len(CPS), None, "control planes in enclave-addresses.env")
+m("enclave_k8s_facts_timestamp_seconds", now, None, "when this control plane last ran its checks")
+
+# ---- the cluster: the VIP holder only, as the monitor identity
+if held:
+    api_ok = 1
+    ctx = ssl.create_default_context(cafile=E["CA"])
+    try:
+        tok = open(E["TOKEN"]).read().strip()
+    except Exception:
+        tok = ""
+    if not tok:
+        api_ok = 0
+
+    def get(addr, path, table=False):
+        h = {"Authorization": "Bearer " + tok}
+        if table:
+            h["Accept"] = "application/json;as=Table;v=v1;g=meta.k8s.io"
+        try:
+            with urllib.request.urlopen(urllib.request.Request("https://%s:6443%s" % (addr, path), headers=h),
+                                        context=ctx, timeout=5) as r:
+                return r.status, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, b""
+        except Exception:
+            return 0, b""
+
+    def table(body):
+        t = json.loads(body)
+        cols = [c["name"] for c in t["columnDefinitions"]]
+        return [dict(zip(cols, r["cells"])) for r in t.get("rows") or []]
+
+    if tok:
+        for name, addr in CPS:
+            code, _ = get(addr, "/readyz")
+            if code in (401, 403):
+                api_ok = 0          # the CHECK is broken - never report that as an API server down
+                continue
+            m("enclave_k8s_apiserver_ready", 1 if code == 200 else 0, {"node": name},
+              "1 when this API server answers /readyz with 200, asked from the VIP holder")
+        code, body = get(ME_ADDR, "/api/v1/nodes?includeObject=None", True)
+        if code == 200:
+            seen = {r["Name"]: r["Status"] for r in table(body)}
+            for name, role in NODES:
+                m("enclave_k8s_node_present", 1 if name in seen else 0, {"node": name, "role": role},
+                  "1 when this node from enclave-addresses.env is in the cluster")
+                m("enclave_k8s_node_ready", 1 if "Ready" in seen.get(name, "").split(",") else 0,
+                  {"node": name, "role": role}, "1 when the node is Ready")
+            m("enclave_k8s_nodes_unexpected", len(set(seen) - {n for n, _ in NODES}), None,
+              "nodes in the cluster that enclave-addresses.env does not name")
+        else:
+            api_ok = 0
+        code, body = get(ME_ADDR, "/api/v1/pods?includeObject=None", True)
+        if code == 200:
+            rows, bad, by = table(body), 0, {}
+            for r in rows:
+                st, rd = r.get("Status", "Unknown"), r.get("Ready", "0/0")
+                by[st] = by.get(st, 0) + 1
+                a, _, b = rd.partition("/")
+                if st not in ("Running", "Completed", "Succeeded") or (st == "Running" and a != b):
+                    bad += 1
+            m("enclave_k8s_pods", len(rows), None, "pods in the cluster")
+            m("enclave_k8s_pods_unhealthy", bad, None, "pods neither Running-and-ready nor Completed")
+            for st, n in sorted(by.items()):
+                m("enclave_k8s_pods_by_status", n, {"status": st}, "pods by the status column kubectl shows")
+        else:
+            api_ok = 0
+    m("enclave_k8s_monitor_api_ok", api_ok, None,
+      "1 when the VIP holder's cluster check could read the API as its own identity")
+    if api_ok:
+        m("enclave_k8s_cluster_facts_timestamp_seconds", now, None, "when the cluster was last checked")
+
+# ---- write atomically: node-exporter never sees half a file. Each metric's lines together, under
+# one HELP and TYPE - the text format wants a family contiguous, and nodes interleave two families.
+fam = {}
+for name, line in series:
+    fam.setdefault(name, []).append(line)
+body = []
+for name, lines in fam.items():
+    if name in helps:
+        body.append("# HELP %s %s" % (name, helps[name]))
+    body.append("# TYPE %s gauge" % name)
+    body.extend(lines)
+tmp = OUT + ".tmp"
+with open(tmp, "w") as f:
+    f.write("\n".join(body) + "\n")
+os.chmod(tmp, 0o644)
+os.replace(tmp, OUT)
+PYEOF
+)"
+
+# k8s-facts: once a minute on each control plane, from enclave-k8s-facts.timer.
+cmd_k8s_facts() {
+  need_root; guard_in_gap
+  local me addr; me="$(hostname -s)"; addr="$(k8s_me_cp)"
+  [ -n "$addr" ] || die "$me is not a Kubernetes control plane in enclave-addresses.env - k8s-facts runs on k8s-cp-0N only"
+  [ -d "$TEXTFILE_DIR" ] || die "no $TEXTFILE_DIR - run '$0 exporter' first"
+  [ -n "${K8S_API_VIP:-}" ] || die "no K8S_API_VIP in enclave-addresses.env"
+  k8s_mon_token || warn "no token for $K8S_MON_SA - the cluster part will report the check as broken"
+  OUT="$K8S_FACTS_FILE" ME="$me" ME_ADDR="$addr" VIP="$K8S_API_VIP" CPS="$(k8s_cp_pairs)" NODES="$(k8s_nodes)" \
+    ARGS="$K8S_APISERVER_ARGS" CA="$K8S_CA" TOKEN="$K8S_MON_RUN/token" python3 -c "$K8S_FACTS_PY" \
+    || die "the Kubernetes check failed - nothing published this minute"
+}
+
+# k8s-facts-timer: the identity (once, idempotent), the root-owned runtime copy, the unit - and the
+# first run's output, read back from the file node-exporter serves.
+cmd_k8s_facts_timer() {
+  need_root; guard_in_gap
+  [ -n "$(k8s_me_cp)" ] || die "$(hostname -s) is not a Kubernetes control plane - k8s-facts-timer runs on k8s-cp-0N only"
+  [ -d "$TEXTFILE_DIR" ] || die "no $TEXTFILE_DIR - run '$0 exporter' first"
+  k8s_rbac | /snap/bin/k8s kubectl apply -f - | sed 's/^/     /' || die "could not apply the monitor's identity ($K8S_MON_SA)"
+  ok "identity $K8S_MON_NS/$K8S_MON_SA: list nodes and pods, nothing else"
+  "$HERE/install-runtime.sh" || die "could not install the root-owned runtime copy"
+  local rt; rt="$("$HERE/install-runtime.sh" --print-dir)"
+  [ -x "$rt/monitoring.sh" ] || die "$rt/monitoring.sh missing after install-runtime.sh"
+  cat > /etc/systemd/system/enclave-k8s-facts.service <<UNIT
+[Unit]
+Description=Publish Kubernetes cluster checks for node-exporter (B-07 G10)
+After=network.target snap.k8s.k8sd.service
+
+[Service]
+Type=oneshot
+TimeoutStartSec=50
+ExecStart=$rt/monitoring.sh k8s-facts
+UNIT
+  # Calendar, every minute - the same reason as enclave-facts.timer (a monotonic chain lost its place
+  # across a reboot on host-4, 2026-09-16).
+  cat > /etc/systemd/system/enclave-k8s-facts.timer <<'UNIT'
+[Unit]
+Description=Kubernetes cluster checks, every minute
+
+[Timer]
+OnCalendar=*:*:00
+AccuracySec=5s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+  systemctl daemon-reload
+  systemctl enable --now enclave-k8s-facts.timer >/dev/null 2>&1 || die "could not enable enclave-k8s-facts.timer"
+  systemctl start enclave-k8s-facts.service || die "first run failed - sudo journalctl -u enclave-k8s-facts -n 30 --no-pager"
+  ok "enclave-k8s-facts.timer enabled; first run published:"
+  grep -v '^#' "$K8S_FACTS_FILE" | sed 's/^/     /'
+}
+
 # dashboards: on svc-obs-01. The WHY is the "DASHBOARDS ARE FILES IN THIS REPOSITORY" note above
 # harbor_facts. Validate every JSON, check the datasource uid matches, install to
 # /var/lib/grafana/dashboards, write the file provider, set the home dashboard (B-09a), restart
@@ -3087,7 +3619,9 @@ case "${1:-status}" in
   alert-test) shift; cmd_alert_test "$@" ;;
   facts)      shift; cmd_facts "$@" ;;
   facts-timer) shift; cmd_facts_timer "$@" ;;
+  k8s-facts)  shift; cmd_k8s_facts "$@" ;;
+  k8s-facts-timer) shift; cmd_k8s_facts_timer "$@" ;;
   dashboards) shift; cmd_dashboards "$@" ;;
   status)   shift; cmd_status "$@" ;;
-  *) printf 'usage: %s {exporter|libvirt|collector|scrape|grafana-admin|rules|alerting|alert-test on|off|facts|facts-timer|dashboards|status}\n' "$0" >&2; exit 2 ;;
+  *) printf 'usage: %s {exporter|libvirt|collector|scrape|grafana-admin|rules|alerting|alert-test on|off|facts|facts-timer|k8s-facts|k8s-facts-timer|dashboards|status}\n' "$0" >&2; exit 2 ;;
 esac

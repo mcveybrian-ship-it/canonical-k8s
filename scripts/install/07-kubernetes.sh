@@ -33,6 +33,9 @@
 #                                                nothing (needs the snap installed)
 #     sudo ./07-kubernetes.sh vip                each control plane: keepalived holds the API VIP
 #                                                (K8S_API_VIP) on whichever answers, VRRP unicast
+#     sudo ./07-kubernetes.sh etcd-drill         a control plane: snapshot the cluster's etcd, check
+#                                                it, restore it into a SCRATCH directory (never the
+#                                                live data), shred both - proves a restore would work
 #     sudo ./07-kubernetes.sh verify             on a control plane: the cluster, FIPS in the
 #                                                running processes, DNS, a dual-stack LoadBalancer
 #                                                Service, the K-A audit policy. Leaves the test
@@ -697,6 +700,69 @@ cmd_join() {
   ok "$ME joined as a $kind"
 }
 
+# ===================================================================== the etcd drill (C4)
+# etcdctl and etcdutl are NOT in the k8s snap (Canonical's etcd reference) and Ubuntu's etcd-client
+# is 3.4 with no etcdutl, so the restore tools are etcd's own release at the cluster's version,
+# staged on the mirror's /bin like regctl. They are ordinary Go builds, NOT FIPS: tools for a drill
+# or a recovery, never a running service (the same class as the database's etcd, POA&M ENG-68).
+# They live only in this run's private WORK directory - nothing is installed on the node.
+K8S_ETCD_TOOLS_VER="${K8S_ETCD_TOOLS_VER:-3.6.13}"
+K8S_BIN_URL="${K8S_BIN_URL:-https://svc-repo-01.${ENCLAVE_DOMAIN}/bin}"
+K8S_ETCD_CA="${K8S_ETCD_CA:-/etc/kubernetes/pki/etcd/ca.crt}"
+K8S_ETCD_CERT="${K8S_ETCD_CERT:-/etc/kubernetes/pki/apiserver-etcd-client.crt}"   # Canonical's restore-quorum how-to
+K8S_ETCD_KEY="${K8S_ETCD_KEY:-/etc/kubernetes/pki/apiserver-etcd-client.key}"
+
+cmd_etcd_drill() {
+  need_root
+  whoami_k8s
+  [ "$ME_ROLE" = cp ] || die "etcd runs on the control planes - this is $ME"
+  # THE TOOLS MUST MATCH THE CLUSTER - read the running snap's own bill of materials.
+  local have; have="$(python3 -c 'import json; print(json.load(open("/snap/k8s/current/bom.json"))["components"]["etcd"]["version"])' 2>&1)" \
+    || die "could not read the etcd version from /snap/k8s/current/bom.json: $have"
+  [ "${have#v}" = "$K8S_ETCD_TOOLS_VER" ] || die "the cluster runs etcd $have, the drill tools are $K8S_ETCD_TOOLS_VER - stage matching tools (K8S_ETCD_TOOLS_VER)"
+  ok "cluster etcd $have - tools $K8S_ETCD_TOOLS_VER match"
+  local f
+  for f in "$K8S_ETCD_CA" "$K8S_ETCD_CERT" "$K8S_ETCD_KEY"; do [ -r "$f" ] || die "missing $f"; done
+
+  # the tools, from the mirror, checked against its SHA256SUMS
+  install -d -m 0700 "$WORK/bin"
+  curl -fsS --cacert "$CA_ROOT" -o "$WORK/bin/SHA256SUMS" "$K8S_BIN_URL/SHA256SUMS" || die "could not fetch $K8S_BIN_URL/SHA256SUMS"
+  local t want got
+  for t in etcdctl etcdutl; do
+    curl -fsS --cacert "$CA_ROOT" -o "$WORK/bin/$t" "$K8S_BIN_URL/$t-v$K8S_ETCD_TOOLS_VER" || die "could not fetch $K8S_BIN_URL/$t-v$K8S_ETCD_TOOLS_VER - staged on the mirror?"
+    want="$(awk -v n="$t-v$K8S_ETCD_TOOLS_VER" '$2 == n {print $1}' "$WORK/bin/SHA256SUMS")"
+    got="$(sha256sum "$WORK/bin/$t" | cut -c1-64)"
+    if [ -z "$want" ] || [ "$want" != "$got" ]; then die "$t-v$K8S_ETCD_TOOLS_VER does not match the mirror's SHA256SUMS (want ${want:-none}, got $got)"; fi
+    chmod 0700 "$WORK/bin/$t"
+  done
+  ok "etcdctl and etcdutl $K8S_ETCD_TOOLS_VER fetched and checksum-verified (this run only)"
+
+  # 1. the snapshot
+  local snap="$WORK/snapshot.db" out
+  out="$("$WORK/bin/etcdctl" --endpoints=https://127.0.0.1:2379 --cacert "$K8S_ETCD_CA" --cert "$K8S_ETCD_CERT" --key "$K8S_ETCD_KEY" \
+         snapshot save "$snap" 2>&1)" || die "snapshot failed: $(printf '%s' "$out" | tail -3)"
+  chmod 0600 "$snap"
+  ok "snapshot taken: $(du -h "$snap" | cut -f1)"
+
+  # 2. what is in it
+  out="$("$WORK/bin/etcdutl" snapshot status "$snap" -w json 2>&1)" || die "snapshot status failed: $out"
+  printf '%s' "$out" | python3 -c 'import json,sys; d=json.loads(sys.stdin.read().strip().splitlines()[-1]); print("  [ok] snapshot status: hash %s, revision %s, %s keys, %.1f MB" % (d.get("hash"), d.get("revision"), d.get("totalKey"), d.get("totalSize", 0) / 1e6))' \
+    || die "could not read the snapshot status: $out"
+
+  # 3. restore it - into SCRATCH, with a throwaway member name; the live data dir is never named
+  out="$("$WORK/bin/etcdutl" snapshot restore "$snap" --data-dir "$WORK/restore" --name drill \
+         --initial-cluster drill=http://127.0.0.1:12380 --initial-advertise-peer-urls http://127.0.0.1:12380 2>&1)" \
+    || die "RESTORE FAILED - the snapshot is not usable: $(printf '%s' "$out" | tail -3)"
+  [ -s "$WORK/restore/member/snap/db" ] || die "the restore reported success but wrote no member/snap/db"
+  ok "restored into a scratch directory: member/snap/db $(du -h "$WORK/restore/member/snap/db" | cut -f1) - the snapshot is usable (its hash was checked by the restore)"
+
+  # 4. both copies hold every Secret in the cluster - shred, do not just delete
+  shred -u "$snap" "$WORK/restore/member/snap/db"
+  ok "the snapshot and the restored copy shredded"
+  echo
+  ok "etcd drill passed on $ME - a restore follows Canonical's quorum-loss procedure (docs/07-kubernetes.md)"
+}
+
 # ===================================================================== the API VIP
 # keepalived, VRRP UNICAST between the three control planes (runbook 3.0a: keepalived, not kube-vip;
 # the ufw rows for VRRP exist since A3). The VIP is for clients OUTSIDE the cluster - kubectl from
@@ -1005,6 +1071,7 @@ print(seen[-1] if seen else "")' "$log")"
 
 case "${1:-}" in
   vip)           shift; cmd_vip "$@" ;;
+  etcd-drill)    shift; cmd_etcd_drill "$@" ;;
   verify)        shift; cmd_verify "$@" ;;
   node-prep)     shift; cmd_node_prep "$@" ;;
   render)        shift; cmd_render "$@" ;;
@@ -1015,5 +1082,5 @@ case "${1:-}" in
   images-export) shift; cmd_images_export "$@" ;;
   images-load)   shift; cmd_images_load "$@" ;;
   images-check)  shift; cmd_images_check "$@" ;;
-  *) sed -n '2,41p' "$0"; exit 2 ;;
+  *) sed -n '2,44p' "$0"; exit 2 ;;
 esac

@@ -257,6 +257,36 @@ It does not notice an API server that runs but has lost etcd, a cluster-wide eve
 not fix. The VIP serves clients outside the cluster (svc-mgmt-01, svc-obs-01); inside, each worker's
 `k8s-apiserver-proxy` spreads over all three API servers already.
 
+### 3.11 The etcd drill — and the real restore
+
+```bash
+### MACHINE: k8s-cp-01 (any control plane) ###
+if [ "$(hostname -s)" != k8s-cp-01 ]; then echo "WRONG MACHINE: $(hostname -s)"; else
+  sudo ~/canonical-k8s/scripts/install/07-kubernetes.sh etcd-drill
+fi
+```
+
+`etcdctl` and `etcdutl` are **not in the k8s snap**, and Ubuntu's `etcd-client` is 3.4 with no `etcdutl`;
+the cluster runs **etcd v3.6.13** (the snap's `bom.json`). So the tools are etcd's own v3.6.13 release,
+verified against etcd's published `SHA256SUMS` on stage-01 and staged on the mirror as
+`/bin/etcdctl-v3.6.13` and `/bin/etcdutl-v3.6.13` (like `regctl`). They are standard Go builds, **not
+FIPS** — drill and recovery tools, never a running service. The drill refuses tools that do not match
+the running snap's etcd, keeps them only in its temp directory, and **shreds** the snapshot and the
+restored copy: both hold every Secret in the cluster.
+
+**A real restore** — a majority of control planes lost, at least one survivor — is Canonical's
+*Recover a cluster after quorum loss*
+(<https://documentation.ubuntu.com/canonical-kubernetes/latest/snap/howto/restore-quorum/>, read
+2026-10-15): `sudo snap stop k8s` on every survivor; `k8sd cluster-recover` on the one with the newest
+Raft log (`/var/snap/k8s/common/var/lib/k8sd/state/database`), lost nodes set to `spare`, its
+`recovery_db.tar.gz` copied to every survivor; an `etcdctl snapshot save` on one survivor (client
+certificate `/etc/kubernetes/pki/apiserver-etcd-client.{crt,key}`); `etcdutl snapshot restore` on every
+survivor into `/var/snap/k8s/common/var/lib/etcd/data` with each node's own `--name`,
+`--initial-advertise-peer-urls` and the combined `--initial-cluster`, read from
+`/var/snap/k8s/common/args/etcd`; `sudo snap start k8s`; `k8s status --wait-ready`. It recovers k8sd's
+store and etcd only — **not persistent volumes**. Not rehearsed here: the drill proves the snapshot and
+the tools; rehearsing the whole procedure needs a cluster it is safe to break.
+
 ## 4. What has been verified (2026-10-14)
 
 | | how |
@@ -289,6 +319,7 @@ from svc-mgmt-01's neighbour table. "Down" means no answer within 1 s.
 | ✅ **C2b — the node announcing the service address lost** (2026-10-14) | `virsh destroy k8s-wk-01` while it answered for `10.2.20.200` (read from stage-01's neighbour table) | **The test service never missed a probe:** the address moved to wk-04 — MetalLB's L2 failover took **under ~2 s** (the probe's resolution). The announcer also moves when a node *joins*: cp-01 took it on rejoining after C1, wk-01 after C2 — with no probe missed either time |
 | ✅ **C3 — a whole host lost** (2026-10-15) | `virsh destroy` of host-2's three guests at once, ~00:58:24: **cp-02 (the VIP holder), wk-02 (two of the four test pods), pg-02 (Postgres's synchronous standby)** | **API back in ~3 s** (VIP to cp-01, 00:58:25 → 00:58:28). **The test service never missed a probe** — with half its pods on a dead node. Kubernetes writable on 2 of 3 etcd. **Postgres:** pg-01 leader throughout; Patroni reported no synchronous standby for 12 s (00:58:39 → 00:58:51) then named pg-03; a write after committed in ms — **C3b settled it: PostgreSQL never committed unprotected** — the 12 s was Patroni's bookkeeping. **Rejoin:** pg-02 back as a replica at 01:03:35, lag 0, same timeline, no rewind; pg-03 kept the sync role; cp-02/wk-02 Ready, no pod stuck; VIP stayed on cp-01; two 1–2 s API blips during etcd resync, as in C1 |
 | ✅ **C3b — Postgres's synchronous standby lost, measured inside PostgreSQL** (2026-10-15) | `virsh destroy pg-03` (then the sync standby) with a loop on pg-01 sampling `synchronous_standby_names` and timing a write twice a second | **No unprotected window:** the setting went straight `"pg-03"` → `"pg-02"`, never empty. **A write stalled 36.4 s** (01:12:32 → 01:13:09), released the moment pg-02 became synchronous — Patroni's `ttl` 30 + `loop_wait` 10. Writes pause, nothing is lost (backlog 3.62) |
+| ✅ **C4 — etcd snapshot and restore drill** (2026-10-15) | `etcd-drill` on cp-01 | tools matched the cluster (etcd v3.6.13), checksum-verified; **snapshot 55 MB — revision 2,206,250, 755 keys**; checked (`etcdutl snapshot status`); **restored into a scratch directory** (its hash checked by the restore); both copies shredded. Proves a snapshot of this cluster restores with these tools; the full quorum-loss procedure (§3.11) is documented, not rehearsed |
 | ⚠️ unprompted API blips | — | Between the tests, 18:30–18:44 UTC: **four blips of 1–2 s** on the VIP with no failure injected and the VIP unmoved. "Down" is "no answer within 1 s", so most likely a slow API server on these 4-thread hosts, not an outage. Measured, not explained — worth chasing if it appears on production hardware |
 
 
@@ -319,8 +350,9 @@ from svc-mgmt-01's neighbour table. "Down" means no answer within 1 s.
    day — kubelet, containerd, k8sd and k8s-apiserver-proxy on core22's `fips.so` too.
 2. ~~**The API VIP**~~ ✅ live 2026-10-14 (§3.10).
 3. ~~**K-B** — sshd disabled on the workers~~ — **reversed 2026-10-14: ssh stays on** (§2, POA&M AO-21).
-4. **Survivability (C):** a control plane off, a worker off, a whole host off; an etcd snapshot
-   and restore; a full planned shutdown in the 3.57 order.
+4. **Survivability (C):** ✅ C1, C2, C2b, C3, C3b, C4 passed 2026-10-14/15 (§4.1). ⬜ **C5** — a full planned
+   shutdown and restart in the 3.57 order. ⬜ **Routine etcd backups** (G9) — the drill is one-off; nightly
+   snapshots need a home and encryption, since a snapshot holds every Secret.
 5. Then **B-08 Ceph** — blocked on backlog 3.48 (wk-04 has no OSD device).
 
 ## 7. Known gaps carried elsewhere

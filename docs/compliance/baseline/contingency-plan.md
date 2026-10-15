@@ -144,6 +144,17 @@ one operator on site is the worse outcome. ~~That alert rule is owed and does no
 when both replicas were stopped on purpose and cleared when they returned; `poam.md` ENG-06 closed),
 so the decision is now defensible.
 
+**Measured 2026-10-15 00:58 UTC — losing ONE host, with a healthy second standby** (B-07 survivability
+test C3: pg-02, the synchronous standby, powered off with the rest of host-2). pg-01 stayed leader
+throughout; Patroni reported **no synchronous standby for 12 s** (00:58:39 → 00:58:51, about 15 s after
+the loss) before naming pg-03; a write afterwards committed in milliseconds; pg-02 rejoined as a
+replica by itself on restart, same timeline, no rewind. **Not yet established:** whether PostgreSQL
+itself committed without a standby in that window — Patroni's record and PostgreSQL's
+`synchronous_standby_names` can differ for a moment — and how long a write issued *at* the moment of
+loss waits. The test that settles both: sample `synchronous_standby_names` and `pg_stat_replication`
+on the leader every second during the failure, with a write loop running. Until then, state the
+window as *Patroni-reported*, not as an acknowledged-transaction exposure.
+
 Applications find the primary with no load balancer at all, using `libpq`'s native multi-host
 support with `target_session_attrs=read-write` — which resolves to the Patroni leader by
 definition. It is client-side, so it works in an air gap, and it adds nothing to the boundary.

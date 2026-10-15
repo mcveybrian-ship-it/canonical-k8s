@@ -44,7 +44,8 @@ lost.**
 `enclave-facts`, `enclave-k8s-facts`) run a **root-owned runtime copy** in `/usr/local/lib/enclave`, not
 the repository (backlog 3.11). After pushing a change to anything a timer runs, re-run that timer's
 installer: `vm-backup.sh schedule --at <its time>`, `monitoring.sh facts-timer`, `monitoring.sh
-k8s-facts-timer`. Then check `cat /usr/local/lib/enclave/.source` shows the pushed commit. A dry run
+k8s-facts-timer`. Then check `cat /usr/local/lib/enclave/.source` shows the pushed commit. **Re-creating the backup
+timer starts a run at once** (it is `Persistent`; measured 2026-10-15 23:24), so do it outside working hours. A dry run
 from the repository proves nothing about what the timer runs. On 2026-10-15 a backup-target change
 was pushed and dry-run checked, and the nightly ran the old code anyway (backlog 3.67).
 

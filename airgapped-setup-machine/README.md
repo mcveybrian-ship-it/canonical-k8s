@@ -23,10 +23,11 @@ encrypted at rest (3.64, V-274882 closed) and it is monitored (G10, proven by fa
 1. ~~After the 07:00 UTC nightly, confirm host-4's copy landed on host-3, then retire host-1's.~~ **Checked
    2026-10-15 23:20 UTC: the 07:01 copy went to host-1 AGAIN** (rc=0). The timer runs host-4's root-owned
    runtime copy, installed 2026-10-14 00:33 from `537a65b` — before 3.61's override (`ef46955`). It was
-   never refreshed (backlog 3.67). **Do now:** push the repo to host-4, then on host-4
-   `sudo ./scripts/enclave/vm-backup.sh schedule --at 07:00` (refreshes the copy, keeps the time) and
-   `cat /usr/local/lib/enclave/.source`. **Then after the 10-16 07:00 UTC run**, confirm the copy is on
-   host-3, and only then retire host-1's (`/var/lib/libvirt/images/backup-copy`, and host-4's key line
+   never refreshed (backlog 3.67). ✅ **Refreshed 23:24 UTC** (`schedule --at 07:00`; runtime copy now
+   `f430a03`). Re-creating the timer **started a run at once** (Persistent), and its second copy was seen
+   sending to **host-3** (`root@10.2.20.157`) at 23:26. **Morning:** confirm that run finished — Prometheus
+   `enclave_backup_copy_last_rc{copy="second"}` 0 with target host-3, no `BackupCopyFailed` — and that the
+   07:00 run did the same; only then retire host-1's (`/var/lib/libvirt/images/backup-copy`, and host-4's key line
    in host-1's `/root/.ssh/authorized_keys`) — host-1's is host-4's ONLY second copy until then. That
    retirement clears the `FilesystemFillingWarning` on host-1 (firing since 2026-10-14 07:01).
 2. **Envelopes:** seal the lab Kubernetes Secrets passphrase (its fingerprint is in HANDOFF §3 — never in

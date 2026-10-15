@@ -310,7 +310,8 @@ the tools; rehearsing the whole procedure needs a cluster it is safe to break.
 
 Probes, one sample per second throughout: the whoami LoadBalancer address (`10.2.20.200`) from
 stage-01, and the API on the VIP from svc-mgmt-01 — with which control plane holds the VIP, read
-from svc-mgmt-01's neighbour table. "Down" means no answer within 1 s.
+from svc-mgmt-01's neighbour table. "Down" means no answer within 1 s. The probes are now
+`07-kubernetes.sh probe service|api|patroni`, each refusing to start until it has seen itself fail (§4.2).
 
 | test | what was done | measured |
 |---|---|---|
@@ -335,6 +336,103 @@ from svc-mgmt-01's neighbour table. "Down" means no answer within 1 s.
 
 **So a worker loss is not seamless for clients:** for ~50 s the share of requests aimed at that worker's pods fails. Backlog 3.63 holds the options.
 
+
+### 4.2 Repeating the failover tests
+
+Everything below is what was run on 2026-10-14/15, in the form to run it again. One failure at a
+time; bring the failed machine back before the next test. **Expected results are §4.1's.**
+
+**Before:** the test workload exists (`verify` creates it — four `whoami` pods, one per worker, on
+the address `10.2.20.200`), and svc-mgmt-01 and svc-obs-01 have the current repository
+(`push-repo-to-host.sh 10.2.20.161` and `.164` from stage-01).
+
+**1. Start the three probes**, each in its own session, for the length of the session. Each first
+proves it can see a failure (its self-test against a dead target) and refuses to start otherwise;
+each prints only changes, with how long the previous state lasted. The start lines name the node
+announcing the service address, the node holding the API VIP, and Patroni's leader and synchronous
+standby — which decide the targets below.
+
+```bash
+### MACHINE: svc-mgmt-01 (10.2.20.161) — two sessions: the service, and the API through the VIP ###
+~/canonical-k8s/scripts/install/07-kubernetes.sh probe service 90
+~/canonical-k8s/scripts/install/07-kubernetes.sh probe api 90
+```
+
+```bash
+### MACHINE: svc-obs-01 (10.2.20.164) — Patroni's view (8008 is open to this machine) ###
+~/canonical-k8s/scripts/install/07-kubernetes.sh probe patroni 90
+```
+
+**2. The tests.** `virsh destroy` is a pulled power cord; `virsh start` brings the guest back. Run each
+on the host the guest lives on (`vm-specs.env` placement: cp-0N and wk-0N on host-N, wk-04 on host-4).
+
+| test | do this, on the guest's host | read |
+|---|---|---|
+| **C1** a control plane | `sudo virsh destroy k8s-cp-0N` — the one the api probe names as VIP holder | api probe: the gap and the new holder. Then on another control plane, the write test below. Restore: `sudo virsh start k8s-cp-0N`; the VIP must **stay** where it went (`nopreempt`) |
+| **C2** a worker | `sudo virsh destroy k8s-wk-0N` — one with test pods (`kubectl -n enclave-verify get pods -o wide`) | service probe: partial failures for ~50 s (3.63); on a control plane, `kubectl get node k8s-wk-0N -o jsonpath='{.spec.taints}'` — `unreachable:NoExecute` and its time; the pod replaced 5 min later |
+| **C2b** the announcer | `sudo virsh destroy` the node the service probe names | service probe: should not fail; on its restart, the address moves back (~7 s, 3.63) |
+| **C3** a whole host | `for v in k8s-cp-0N k8s-wk-0N pg-0N; do sudo virsh destroy $v; done` | all three probes; the database write test below on the Patroni leader |
+| **C3b** Postgres's sync standby, from inside | the write loop below on the **leader**, then `sudo virsh destroy pg-0N` on the **sync standby's** host ~15 s later | the loop: a write stall (~36 s, 3.62) and `synchronous_standby_names` going straight to the other standby — **it must never print `[]`** |
+| **C4** etcd | `sudo …/07-kubernetes.sh etcd-drill` on a control plane (§3.11) | `etcd drill passed` |
+| **C5** cold start | the stop block, then the start block, below — then `verify` | `verify` 28/28 |
+
+The **cluster write test** (C1, C3), on a surviving control plane:
+
+```bash
+### MACHINE: a surviving control plane (k8s-cp-0N) ###
+case "$(hostname -s)" in k8s-cp-0[1-3])
+  sudo k8s kubectl get nodes | grep cp-0
+  sudo k8s kubectl get --raw='/readyz?verbose' | grep -E 'etcd|readyz check'
+  sudo k8s kubectl -n enclave-verify create configmap c-write-test --from-literal=at="$(date -u +%T)" \
+    && sudo k8s kubectl -n enclave-verify get configmap c-write-test -o jsonpath='{.data.at}{"\n"}' \
+    && sudo k8s kubectl -n enclave-verify delete configmap c-write-test ;;
+  *) echo "WRONG MACHINE: $(hostname -s)" ;; esac
+```
+
+The **database write loop** (C3, C3b), on the Patroni leader — a throwaway table in the `postgres`
+database, never the application's; prints only state changes and writes slower than 200 ms:
+
+```bash
+### MACHINE: the Patroni leader (pg-0N) ###
+case "$(hostname -s)" in pg-0[1-3])
+sudo -u postgres bash -s <<'EOS'
+psql -d postgres -X -q -c 'CREATE TABLE IF NOT EXISTS c3b_probe (at timestamptz)'
+for i in $(seq 1 150); do
+  s=$(psql -d postgres -X -At -c "SELECT to_char(clock_timestamp() AT TIME ZONE 'UTC','HH24:MI:SS'), '[' || current_setting('synchronous_standby_names') || ']', coalesce((SELECT string_agg(application_name || '=' || sync_state, ',' ORDER BY application_name) FROM pg_stat_replication), 'no-standbys')")
+  t0=$(date +%s%N); psql -d postgres -X -q -c 'INSERT INTO c3b_probe VALUES (now())'; t1=$(date +%s%N)
+  echo "$s| insert $(( (t1 - t0) / 1000000 )) ms"
+  sleep 0.5
+done | awk -F'|' '{ split($4, a, " "); key = $2 "|" $3; if (key != last || a[2] > 200) print; last = key }'
+psql -d postgres -X -q -c 'DROP TABLE c3b_probe'
+EOS
+;; *) echo "WRONG MACHINE: $(hostname -s)" ;; esac
+```
+
+**C5's stop and start** — the same block on host-1..4 at once, the stop first:
+
+```bash
+### MACHINE: host-1, host-2, host-3 or host-4 — STOP: worker, then control plane ###
+case "$(hostname -s)" in host-1) G="k8s-wk-01 k8s-cp-01" ;; host-2) G="k8s-wk-02 k8s-cp-02" ;; host-3) G="k8s-wk-03 k8s-cp-03" ;; host-4) G="k8s-wk-04" ;; *) G="" ;; esac
+if [ -z "$G" ]; then echo "WRONG MACHINE: $(hostname -s)"; else
+  for V in $G; do sudo virsh shutdown "$V"
+    for _ in $(seq 1 120); do [ "$(sudo virsh domstate "$V")" = "shut off" ] && break; sleep 1; done
+    echo "$V: $(sudo virsh domstate "$V") at $(date -u +%T)"; done
+fi
+```
+
+```bash
+### MACHINE: host-1, host-2, host-3 or host-4 — START: control planes together, workers 90 s later ###
+case "$(hostname -s)" in host-1) C=k8s-cp-01; W=k8s-wk-01 ;; host-2) C=k8s-cp-02; W=k8s-wk-02 ;; host-3) C=k8s-cp-03; W=k8s-wk-03 ;; host-4) C=""; W=k8s-wk-04 ;; *) W="" ;; esac
+if [ -z "$W" ]; then echo "WRONG MACHINE: $(hostname -s)"; else
+  if [ -n "$C" ]; then sudo virsh start "$C"; fi
+  sleep 90; sudo virsh start "$W"
+fi
+```
+
+**After the tests:** `verify` (28/28), then `verify --cleanup` only if the test workload is no longer
+wanted. Record each result in §4.1 with its times — measured, never "it seemed fine".
+
+## 5. Traps hit — each fixed in a script
 
 1. **New scripts went in as mode 644** (the file was created by a tool, not `cp`) — `sudo` said
    "command not found". Every step script is tracked 100755.

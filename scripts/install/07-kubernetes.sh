@@ -36,6 +36,12 @@
 #     sudo ./07-kubernetes.sh etcd-drill         a control plane: snapshot the cluster's etcd, check
 #                                                it, restore it into a SCRATCH directory (never the
 #                                                live data), shred both - proves a restore would work
+#          ./07-kubernetes.sh probe service|api|patroni [minutes]
+#                                                the failover-test probes, one sample a second,
+#                                                printing only changes: service and api ON
+#                                                svc-mgmt-01, patroni ON svc-obs-01 (what ufw allows).
+#                                                Each refuses to start until it has seen itself
+#                                                report DOWN against a target known to be dead
 #     sudo ./07-kubernetes.sh verify             on a control plane: the cluster, FIPS in the
 #                                                running processes, DNS, a dual-stack LoadBalancer
 #                                                Service, the K-A audit policy. Leaves the test
@@ -700,6 +706,88 @@ cmd_join() {
   ok "$ME joined as a $kind"
 }
 
+# ===================================================================== failover probes (C)
+# Used for the survivability tests (07-kubernetes.md 4.1, 4.2). THE LESSON OF 2026-10-15 IS BUILT IN:
+# the first service probe counted dig's timeout message as an answer and reported "never missed"
+# through four failure tests. So each probe first samples a target that CANNOT answer and refuses to
+# run unless that sample reads DOWN - a probe nobody has seen fail is not a probe.
+P_SERVICE_ADDR="${P_SERVICE_ADDR:-$K8S_LB_POOL_START}"   # the test Service's address (verify's whoami)
+P_SERVICE_PORT="${P_SERVICE_PORT:-53}"
+
+# node_of MAC - the k8s node with that MAC, from this machine's neighbour table (filled by pinging
+# each node once at start); the MAC itself if none matches.
+P_NODES=""
+p_learn_nodes() {
+  local k a n
+  for k in $(grep -oE '^K8S_(CP|WK)_[0-9]+=' "$ADDRS" | tr -d '=' | sort); do
+    a="${!k}"; n="$(printf '%s' "$k" | tr 'A-Z_' 'a-z-')"
+    ping -c1 -W1 "$a" >/dev/null 2>&1 || true
+    P_NODES="$P_NODES $(ip neigh show "$a" | awk '{print $5}')=$n"
+  done
+}
+node_of() { local m="${1:-}" x; for x in $P_NODES; do [ "${x%%=*}" = "$m" ] && { printf '%s' "${x#*=}"; return; }; done; printf '%s' "${m:-no-arp}"; }
+
+# one sample of each kind -> a state word
+p_service() {  # ADDR PORT
+  if dig -p "$2" +noall +additional +time=1 +tries=1 @"$1" whoami.verify 2>/dev/null | grep -qE '[[:space:]]IN[[:space:]]+(A|AAAA)[[:space:]]'
+  then printf 'SERVICE-UP@%s' "$(node_of "$(ip neigh show "$1" | awk '{print $5}')")"
+  else printf 'SERVICE-DOWN'; fi
+}
+p_api() {  # PORT
+  local c; c="$(curl -sk --max-time 1 -o /dev/null -w '%{http_code}' "https://$K8S_API_VIP:$1/livez" 2>/dev/null || true)"
+  case "$c" in 401|200) printf 'API-UP@%s' "$(node_of "$(ip neigh show "$K8S_API_VIP" | awk '{print $5}')")" ;;
+               *) printf 'API-DOWN(%s)' "${c:-000}" ;; esac
+}
+p_patroni() {  # PORT
+  local k j=""
+  for k in $(grep -oE '^PG_[0-9]+=' "$ADDRS" | tr -d '=' | sort); do
+    j="$(curl -sk --max-time 1 "https://${!k}:$1/cluster" 2>/dev/null || true)"; [ -n "$j" ] && break
+  done
+  printf '%s' "$j" | python3 -c '
+import json, sys
+try:
+    m = json.load(sys.stdin)["members"]; r = {x["role"]: x["name"] for x in m}
+    up = len([x for x in m if x["state"] in ("running", "streaming")])
+    print("PG:leader=%s sync=%s members=%d" % (r.get("leader", "NONE"), r.get("sync_standby", "NONE"), up), end="")
+except Exception:
+    print("PG:NO-ANSWER", end="")'
+}
+
+cmd_probe() {
+  local kind="${1:-}" mins="${2:-60}" st last="" since=0 now end
+  case "$mins" in ''|*[!0-9]*) die "minutes must be a number" ;; esac
+  case "$kind" in
+    service) command -v dig >/dev/null || die "no dig here" ;;
+    api|patroni) command -v curl >/dev/null || die "no curl here" ;;
+    *) die "usage: probe service|api|patroni [minutes] - service and api on svc-mgmt-01, patroni on svc-obs-01" ;;
+  esac
+  # THE SELF-TEST: the same check against a target that cannot answer must read DOWN.
+  case "$kind" in
+    service) st="$(p_service "$P_SERVICE_ADDR" 9)" ;;   # nothing serves DNS on port 9
+    api)     st="$(p_api 1)" ;;
+    patroni) st="$(p_patroni 1)" ;;
+  esac
+  case "$st" in *DOWN*|*NO-ANSWER*) ok "self-test: against a dead target the probe reads '$st' - it can see a failure" ;;
+    *) die "self-test FAILED: against a target that cannot answer the probe read '$st' - it would report a failure as success; not starting" ;; esac
+  [ "$kind" = patroni ] || p_learn_nodes
+  say "probing $kind for $mins min, one sample a second - only changes are printed (UTC)"
+  end=$(( $(date +%s) + mins * 60 ))
+  while [ "$(date +%s)" -lt "$end" ]; do
+    case "$kind" in
+      service) st="$(p_service "$P_SERVICE_ADDR" "$P_SERVICE_PORT")" ;;
+      api)     st="$(p_api 6443)" ;;
+      patroni) st="$(p_patroni 8008)" ;;
+    esac
+    now="$(date +%s)"
+    if [ "$st" != "$last" ]; then
+      if [ -n "$last" ]; then printf '  %s  %-40s (previous state lasted %ss)\n' "$(date -u -d "@$now" +%T)" "$st" "$((now - since))"
+      else printf '  %s  %-40s (start)\n' "$(date -u -d "@$now" +%T)" "$st"; fi
+      last="$st"; since="$now"
+    fi
+    sleep 1
+  done
+}
+
 # ===================================================================== the etcd drill (C4)
 # etcdctl and etcdutl are NOT in the k8s snap (Canonical's etcd reference) and Ubuntu's etcd-client
 # is 3.4 with no etcdutl, so the restore tools are etcd's own release at the cluster's version,
@@ -1071,6 +1159,7 @@ print(seen[-1] if seen else "")' "$log")"
 
 case "${1:-}" in
   vip)           shift; cmd_vip "$@" ;;
+  probe)         shift; cmd_probe "$@" ;;
   etcd-drill)    shift; cmd_etcd_drill "$@" ;;
   verify)        shift; cmd_verify "$@" ;;
   node-prep)     shift; cmd_node_prep "$@" ;;
@@ -1082,5 +1171,5 @@ case "${1:-}" in
   images-export) shift; cmd_images_export "$@" ;;
   images-load)   shift; cmd_images_load "$@" ;;
   images-check)  shift; cmd_images_check "$@" ;;
-  *) sed -n '2,44p' "$0"; exit 2 ;;
+  *) sed -n '2,50p' "$0"; exit 2 ;;
 esac

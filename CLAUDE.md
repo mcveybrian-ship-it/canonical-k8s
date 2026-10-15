@@ -13,10 +13,15 @@ rebuilt from memory at the start of every session.
 
 ## What this project is
 
-A platform-selection analysis for a small, fully air-gapped DoD IL5 Kubernetes enclave —
-3 physical hosts, 3 control-plane VMs, 3 worker VMs, no VMware. The deliverable is a
-comparison document, published as an artifact, evaluating **Canonical Kubernetes** against
-**Spectro Cloud Palette VerteX**.
+A **reproducible, auditable build procedure** for a small, fully air-gapped DoD IL5 Kubernetes
+enclave on **Canonical Kubernetes** — four physical hosts; three control-plane VMs, four workers,
+a three-node PostgreSQL cluster and four service VMs; no VMware — **and the compliance baseline
+that goes with it. That build is the deliverable** (decided 2026-10-15, `docs/backlog.md` §9, X-1).
+
+It began as a platform-selection analysis. The comparison of Canonical Kubernetes against
+**Spectro Cloud Palette VerteX**, published as an artifact, chose Canonical on 2026-08-27. That
+artifact is now a **historical decision record, as of 2026-08-31, not maintained**: its vendor
+figures are not kept current, and none may be quoted without re-verifying it first.
 
 ## Working rules
 
@@ -192,6 +197,9 @@ Validate before committing: `bash -n` for shell, the PowerShell parser for `.ps1
 `yaml.safe_load` for autoinstall configs.
 
 ## Editing the document
+
+**The comparison artifact is historical since 2026-10-15 (X-1).** Edit it only to correct the record — never to
+refresh a vendor claim without re-verifying it from a source fetched that session. What follows still governs how.
 
 `artifact/artifact-source.html` is the source of truth. It is written **without**
 `<!doctype>`, `<html>`, `<head>` or `<body>` tags because the Artifact tool wraps it at

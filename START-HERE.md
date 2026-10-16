@@ -43,9 +43,12 @@ lost.**
 **A pushed change does not reach a timer by itself.** The nightly and periodic jobs (`enclave-vm-backup`,
 `enclave-facts`, `enclave-k8s-facts`) run a **root-owned runtime copy** in `/usr/local/lib/enclave`, not
 the repository (backlog 3.11). After pushing a change to anything a timer runs, re-run that timer's
-installer: `vm-backup.sh schedule --at <its time>`, `monitoring.sh facts-timer`, `monitoring.sh
-k8s-facts-timer`. Then check `cat /usr/local/lib/enclave/.source` shows the pushed commit. **Re-creating the backup
-timer starts a run at once** (it is `Persistent`; measured 2026-10-15 23:24), so do it outside working hours. A dry run
+installer: `vm-backup.sh schedule --at <its time>` — **in Central time, `BACKUP_TZ`, today `02:00`**, not UTC —
+`monitoring.sh facts-timer`, `monitoring.sh k8s-facts-timer`; or, to refresh the code without touching any timer,
+`install-runtime.sh` alone. Then check `cat /usr/local/lib/enclave/.source` shows the pushed commit. **A
+`Persistent` timer re-created with a calendar whose last occurrence is newer than its last run fires at
+once:** on 2026-10-15 `--at 07:00` was read as 07:00 Central (12:00 UTC), later than that day's 07:00 UTC
+run, so a full backup started immediately and the nightly moved into working hours. A dry run
 from the repository proves nothing about what the timer runs. On 2026-10-15 a backup-target change
 was pushed and dry-run checked, and the nightly ran the old code anyway (backlog 3.67).
 

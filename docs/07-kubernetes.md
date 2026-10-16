@@ -583,8 +583,8 @@ node's key for a write-only rsync into its own folder. It **refuses if the store
 mounted**, so a missing drive never fills a root filesystem. Then on the VIP holder
 `etcd-backup --force` (the first backup, now) and on every control plane `etcd-backup --timer`.
 On host-4 refresh the runtime copy so its third copy carries the folder: `sudo
-./scripts/enclave/install-runtime.sh` — **not** `vm-backup.sh schedule`, which re-creates the timer
-and starts a full backup run at once (3.67).
+./scripts/enclave/install-runtime.sh` — it refreshes the code and leaves the backup timer alone (re-creating it
+with a different time can start a full run at once, 3.67).
 
 **Watch** (`monitoring.sh rules`): **KubernetesEtcdBackupMissed** (no snapshot that restored in 26 h,
 critical — it is the only backup), **KubernetesEtcdBackupStoreStale** (one store not refreshed in
@@ -600,6 +600,10 @@ promtool against simulated failures, 14 scenarios. The *Enclave Kubernetes* dash
 
 Not rehearsed on this cluster: the nightly restore into scratch proves the file, and rehearsing the
 whole procedure needs a cluster it is safe to break.
+
+**Deployed 2026-10-16.** The six blocks `--setup` prints were not run the first time, and both store folders were missing. So each
+control plane's *public* key went to the operator's home, and **one block per store** authorised all three (`3 etcd-backup keys
+authorised` on each). The first backup, `--force` on k8s-cp-01 at 00:02:27 UTC, is in §6 item 7.
 
 ## 4. What has been verified (2026-10-14)
 
@@ -801,8 +805,9 @@ wanted. Record each result in §4.1 with its times — measured, never "it seeme
    Left: `encrypt check` in the nightly check; the lab passphrase's envelope; a re-key procedure (POA&M ENG-76).
 6. ✅ **Cluster monitoring (G10)** — **deployed and proven by failure 2026-10-15 (§3.13, option A).** What option B would add: backlog 3.66. Before: Prometheus scraped none of the seven nodes: no alert for a `NotReady` node, etcd, the VIP
    moving or a certificate expiring.
-7. 🔄 **Nightly etcd backups (G9)** — **built and tested offline 2026-10-16 (§3.14)**: two stores, restore-tested every night,
-   with the Secrets scan; the only backup of the cluster's state (3.68). Deploy next.
+7. ✅ **Nightly etcd backups (G9)** — **deployed 2026-10-16 (§3.14).** First backup 00:02:27 UTC on k8s-cp-01: 60.5 MB,
+   revision 2,581,830, restore-tested, on host-4's store at 00:02:33 and host-3's at 00:02:36; Secrets scan 23 in etcd, 0
+   plain. Timers on all three control planes, first nightly 06:00 UTC; four alerts live. The only backup of the cluster's state (3.68).
 8. ⬜ **Kubernetes in the whole-enclave power-down order** (3.57, contingency plan §5.3) — the blocks exist (§4.2, C5).
 9. ⬜ **The application front door** — the gateway is enabled but unexercised, `*.apps` points at a placeholder, and Q-CORE (i)
    (is the gateway's TLS FIPS?) is open. With the vendor's application.

@@ -23,8 +23,9 @@ encrypted at rest (3.64, V-274882 closed) and it is monitored (G10, proven by fa
 1. ~~After the 07:00 UTC nightly, confirm host-4's copy landed on host-3, then retire host-1's.~~ **Checked
    2026-10-15 23:20 UTC: the 07:01 copy went to host-1 AGAIN** (rc=0). The timer runs host-4's root-owned
    runtime copy, installed 2026-10-14 00:33 from `537a65b` — before 3.61's override (`ef46955`). It was
-   never refreshed (backlog 3.67). ✅ **Refreshed 23:24 UTC** (`schedule --at 07:00`; runtime copy now
-   `f430a03`). Re-creating the timer **started a run at once** (Persistent), and its second copy was seen
+   never refreshed (backlog 3.67). ✅ **Refreshed 23:24 UTC** (runtime copy now `f430a03`) — but with `schedule --at 07:00`, which is
+   **Central** time: the nightly moved to 12:00 UTC and, being later than that day's run, fired at once (Persistent);
+   **corrected 2026-10-16 to `--at 02:00`**, and its second copy was seen
    sending to **host-3** (`root@10.2.20.157`) at 23:26. **Morning:** confirm that run finished — Prometheus
    `enclave_backup_copy_last_rc{copy="second"}` 0 with target host-3, no `BackupCopyFailed` — and that the
    07:00 run did the same; only then retire host-1's (`/var/lib/libvirt/images/backup-copy`, and host-4's key line
@@ -32,7 +33,8 @@ encrypted at rest (3.64, V-274882 closed) and it is monitored (G10, proven by fa
    retirement clears the `FilesystemFillingWarning` on host-1 (firing since 2026-10-14 07:01).
 2. **Envelopes:** seal the lab Kubernetes Secrets passphrase (its fingerprint is in HANDOFF §3 — never in
    git) and confirm the pgBackRest one (3.50).
-3. **G9 — nightly etcd backups: BUILT 2026-10-16, tested offline** (07-kubernetes.md §3.14; D1 two stores, D2 no
+3. ✅ **G9 — nightly etcd backups: DEPLOYED 2026-10-16 00:02 UTC** (first backup on cp-01, on both stores). Morning: confirm the 06:00
+   UTC timed run and that host-4's 07:00 UTC third copy carried `etcd/`. Was: **BUILT 2026-10-16, tested offline** (07-kubernetes.md §3.14; D1 two stores, D2 no
    extra encryption, D3 etcdctl accepted). Deploy: push; `etcd-backup --setup` on each control plane and its
    printed blocks on host-4 and host-3; `--force` on the VIP holder; `--timer` on all three; host-4
    `install-runtime.sh`; svc-obs-01 `rules` + `dashboards`. Then 3.68 (no VM backups on hosts 1–3) to decide.

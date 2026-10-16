@@ -474,7 +474,7 @@ backup within about 60 days** (`ssp-inputs.md` §2.8, acting AO, 2026-09-24).
 
 | | runs | bounds retention by |
 |---|---|---|
-| VM backups | host-4, nightly 02:00 Central | the nightly incremental becomes a **full** for any VM whose newest full is `BACKUP_FULL_MAX_DAYS` (30) old. When a third chain starts, `prune` destroys the oldest, so 2 chains kept means ~60 days |
+| VM backups | host-4 to its USB volume; **host-1..3 to their own iSCSI LUN on the NAS** (3.68, lab); nightly 02:00 Central. Database disks are left out (`BACKUP_EXCLUDE_DIRS`): pgBackRest backs them up | the nightly incremental becomes a **full** for any VM whose newest full is `BACKUP_FULL_MAX_DAYS` (30) old. When a third chain starts, `prune` destroys the oldest, so 2 chains kept means ~60 days |
 | off-host copies | host-3 (second, since 2026-10-15 23:24 UTC — host-1 before, 3.61); lab-vault and the lab NAS (third, lab only — a site's own NAS or SAN where it has one) | they mirror the source with `--delete` the same night, so a set pruned on host-4 is deleted there too |
 | Kubernetes cluster state (etcd) | the control plane holding the API VIP, nightly 06:00 UTC (G9): a snapshot, restore-tested, pushed to host-4 and host-3; carried to network storage by host-4's third copy where the site has any | the newest 14 kept on the node, mirrored with `--delete` to each store: 14 nights. Holds Secrets as AES-GCM ciphertext only (3.64); no application records |
 | database backups | pgBackRest: host-4 (repo1) and host-3 (repo2), full on Sunday, differential daily | 2 fulls kept. Each backup ends with pgBackRest's own expiry, which deletes the oldest full, its differentials and older WAL: ~14 days |

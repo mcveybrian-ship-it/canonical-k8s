@@ -327,6 +327,7 @@ cmd_plan() {
       # an override must name another host the map knows
       for o in ${BACKUP_SECOND_OVERRIDE:-}; do
         known="$(plan_hosts | grep -cx "${o#*=}" || true)"
+        [ "${o#*=}" != none ] || continue   # none: no second copy - the host's volume is off the machine (3.68)
         if [ "${o%%=*}" = "${o#*=}" ] || [ "$known" -eq 0 ]; then warn "BACKUP_SECOND_OVERRIDE '$o' names the host itself or a host the map does not know"; fail=1; fi
       done
     fi

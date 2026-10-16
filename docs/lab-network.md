@@ -567,6 +567,35 @@ from the sealed envelope (`airgap-media.md` §9.6) - without the envelope the co
 shows its last run and last clean run. **A difference found by `--verify-all` is reported, not
 repaired.**
 
+**Hosts 1–3 back up to iSCSI LUNs on the NAS (backlog 3.68, decided by Brian 2026-10-16) — LAB ONLY.**
+Their nine guests had no VM backups at all. There is no local volume to give them: the VM pools are full and the
+NVMe remainder is Ceph's (3.48). So each host gets **its own zvol on the `archive` pool, shared over iSCSI**,
+and it appears as a local disk. The host encrypts it with LUKS (`vm-backup.sh volume-init`), so the NAS holds
+only ciphertext; the keyfile stays on the host. **No CHAP** — it is MD5, not FIPS-approved. Each target admits
+one host's initiator name, on the storage network only (POA&M ENG-78). The database disks are left out, because
+pgBackRest backs them up. These hosts make no second, third or pgBackRest copy, because their volume is
+already off the machine. A production site uses its own LUN with the same settings, or a local drive per host
+(`BACKUP_LUKS_UUID_HOST_N`); START-HERE's lab-vs-production table.
+
+On the NAS, once, in the TrueNAS UI (25.10) — for each of host-1, host-2, host-3:
+
+1. **Its initiator name**, read on the host: `sudo sed -n 's/^InitiatorName=//p' /etc/iscsi/initiatorname.iscsi`.
+2. **A zvol:** *Datasets → `archive` → Add Zvol*, name `vmbackup-host-1`, size **1 TiB**, **Sparse** ticked (the
+   pool is 16.4 TB, so thin is safe; three hosts' OS-disk chains are a few hundred GB). Leave other defaults.
+3. **iSCSI, the first time only:** *Shares → iSCSI → Portals → Add*, listen on **`10.2.30.171`** (the storage
+   address, not `0.0.0.0`), port 3260, **no discovery authentication**. Then *System → Services → iSCSI*:
+   **start and enable at boot**.
+4. **An initiator group:** *Shares → iSCSI → Initiators → Add*, the host's initiator name from step 1 only.
+5. **A target:** *Targets → Add*, name **`vmbackup-host-1`**: TrueNAS makes it
+   `iqn.2005-10.org.freenas.ctl:vmbackup-host-1`, which is `BACKUP_ISCSI_TARGET_HOST_1` in `vm-specs.env`'s lab
+   profile. Portal group from step 3, initiator group from step 4, **authentication None**.
+6. **An extent:** *Extents → Add*, Device, the zvol from step 2.
+7. **Associate:** *Associated Targets → Add*, the target from step 5, **LUN ID 0**, the extent from step 6.
+
+Then on each host, with its repository pushed: `sudo ./scripts/enclave/vm-backup.sh volume-init`, which
+logs in, refuses any LUN that already holds data, formats, and asks for the recovery passphrase for the
+envelope. Then `sudo ./scripts/enclave/vm-backup.sh schedule --at 02:00`, **in Central time**.
+
 **A. The password hash, then the build.** `openssl` asks twice and refuses a mismatch (`mkpasswd`
 asks once — that cost a rebuild). Copy the `$6$` line; the Dell block asks for it, so it never sits
 on a command line. The block re-attaches the data disk if it already exists (a rebuild).

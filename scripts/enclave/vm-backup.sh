@@ -27,7 +27,11 @@
 #     sudo ./vm-backup.sh schedule [--at HH:MM]  install a nightly systemd timer (default 02:00)
 #     sudo ./vm-backup.sh unschedule             remove it
 #     sudo ./vm-backup.sh keyfile                add a keyfile so unlocking needs no human
-#     sudo ./vm-backup.sh reattach               after a reboot: unlock, mount, re-block USB
+#     sudo ./vm-backup.sh reattach               after a reboot: iSCSI login (if this host has a target),
+#                                                unlock, mount, re-block USB (if it was a USB drive)
+#     sudo ./vm-backup.sh volume-init [device]   ONCE, a NEW backup volume: LUKS2 (FIPS pbkdf2) and ext4 on
+#                                                an EMPTY device - this host's iSCSI LUN when none is named.
+#                                                Refuses anything that already holds data (3.68)
 #
 #     --dest <path>            override BACKUP_DEST for this run
 #     --accept-unencrypted     proceed when the destination is not on an encrypted device
@@ -86,7 +90,27 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 DEST="${VM_BACKUP_DEST:-${BACKUP_DEST:-}}"
 # KEEP counts CHAINS (a full plus its incrementals), not sets and not days - see cmd_prune.
 KEEP="${BACKUP_KEEP_CHAINS:-2}"
-LUKS_UUID="${BACKUP_LUKS_UUID:-}"
+# PER-HOST SETTINGS (backlog 3.68, 2026-10-16). A setting NAME_<HOST> - host-1 is HOST_1 - wins over
+# NAME for that host when it is SET, EVEN EMPTY: an empty per-host value means "none on this host".
+# So one file serves hosts with a USB drive, an iSCSI LUN or a site mount, and hosts whose backup
+# volume is already off the machine can turn the copies off without turning them off for host-4.
+HOSTKEY="$(hostname -s | tr 'a-z-' 'A-Z_')"
+per_host() {
+  local v="${1}_${HOSTKEY}"
+  if [ -n "${!v+x}" ]; then printf '%s' "${!v}"; else v="$1"; printf '%s' "${!v:-}"; fi
+}
+LUKS_UUID="$(per_host BACKUP_LUKS_UUID)"
+# THE BACKUP VOLUME OVER iSCSI (3.68) - a LUN from network storage that looks like a local disk; the
+# host encrypts it with LUKS, so the storage only ever holds ciphertext. Addressed by its iSCSI path
+# (portal + target + LUN 0), which is fixed for as long as the target exists - the LUKS UUID is for
+# a USB drive, which can move between /dev/sdX names. No CHAP: CHAP is MD5 (not FIPS-approved); the
+# target admits only this host's initiator name, on the storage network (decided 2026-10-16).
+ISCSI_PORTAL="${BACKUP_ISCSI_PORTAL:-}"
+ISCSI_TARGET="$(per_host BACKUP_ISCSI_TARGET)"
+# DISKS UNDER THESE DIRECTORIES ARE NOT BACKED UP HERE (3.68, decided 2026-10-16): the data pool's
+# disks belong to an application with its own backup - the database's to pgBackRest - and a restored
+# pg node re-clones its data from the leader. 500 GB each, nightly, for a copy that is worse.
+EXCLUDE_DIRS="${BACKUP_EXCLUDE_DIRS-}"
 LUKS_NAME="${BACKUP_LUKS_NAME:-vmbackup}"
 KEYFILE="${BACKUP_KEYFILE:-/etc/enclave/vmbackup.key}"
 # NOT images-data (backlog 3.42, decided 2026-09-27): that volume holds the database disks, and
@@ -104,7 +128,7 @@ SECOND_STATE="${BACKUP_SECOND_STATE:-/var/lib/enclave-backup-second.state}"
 SECOND_SKIP="${BACKUP_SECOND_SKIP:-svc-repo-01}"
 # THE THIRD COPY - lab only in this repo; see cmd_third_copy. Empty = off. A LIST since 2026-10-13
 # (the Dell vault and the lab NAS): each item [user@]address[:directory] - see third_targets.
-THIRD_ADDR="${BACKUP_THIRD_ADDR:-}"
+THIRD_ADDR="$(per_host BACKUP_THIRD_ADDR)"
 THIRD_DIR="${BACKUP_THIRD_DIR:-/srv/cold/backup-copy}"
 THIRD_KEY="${BACKUP_THIRD_KEY:-/etc/enclave/backup-third.key}"
 THIRD_STATE="${BACKUP_THIRD_STATE:-/var/lib/enclave-backup-third.state}"
@@ -112,7 +136,7 @@ THIRD_SKIP="${BACKUP_THIRD_SKIP:-$SECOND_SKIP}"
 # THE pgBackRest STORE COPY - LAB ONLY (2026-10-13). This host's pgBackRest repository - encrypted by
 # pgBackRest itself (3.50) - pushed nightly to ONE target, [user@]address:directory. Empty = off, and
 # off everywhere but the lab. See cmd_pgbackrest_copy.
-PGBR_COPY="${BACKUP_PGBR_COPY:-}"
+PGBR_COPY="$(per_host BACKUP_PGBR_COPY)"
 PGBR_COPY_KEY="${BACKUP_PGBR_COPY_KEY:-/etc/enclave/backup-pgbackrest.key}"
 PGBR_COPY_STATE="${BACKUP_PGBR_COPY_STATE:-/var/lib/enclave-backup-pgbackrest.state}"
 # RECORDS DESTRUCTION (backlog 3.27) - see vm-specs.env and cmd_hold below.
@@ -188,8 +212,9 @@ domains() {  # every defined domain, one per line
 # Parsed from the XML rather than domblklist, because the format lives in <driver type=> and
 # domblklist does not print it.
 domain_disks() {  # <domain> -> "target<TAB>source", backup-capable disks only
-  virsh dumpxml "$1" 2>/dev/null | python3 -c '
-import sys, xml.etree.ElementTree as ET
+  virsh dumpxml "$1" 2>/dev/null | EXCLUDE="$EXCLUDE_DIRS" python3 -c '
+import os, sys, xml.etree.ElementTree as ET
+EX = [d.rstrip("/") + "/" for d in os.environ.get("EXCLUDE", "").split() if d]
 try:
     root = ET.fromstring(sys.stdin.read())
 except Exception:
@@ -204,6 +229,8 @@ for d in root.findall("./devices/disk"):
     fmt = drv.get("type") if drv is not None else None
     if not path or fmt != "qcow2":
         continue
+    if any(path.startswith(e) for e in EX):
+        continue
     print("%s\t%s" % (tgt.get("dev"), path))
 '
 }
@@ -211,8 +238,9 @@ for d in root.findall("./devices/disk"):
 # What was left out, and why. SAY IT - a disk silently dropped from a backup is the kind of
 # thing discovered during a restore.
 domain_skipped_disks() {  # <domain> -> "target<TAB>format<TAB>source"
-  virsh dumpxml "$1" 2>/dev/null | python3 -c '
-import sys, xml.etree.ElementTree as ET
+  virsh dumpxml "$1" 2>/dev/null | EXCLUDE="$EXCLUDE_DIRS" python3 -c '
+import os, sys, xml.etree.ElementTree as ET
+EX = [d.rstrip("/") + "/" for d in os.environ.get("EXCLUDE", "").split() if d]
 try:
     root = ET.fromstring(sys.stdin.read())
 except Exception:
@@ -224,6 +252,9 @@ for d in root.findall("./devices/disk"):
     path = src.get("file") or src.get("dev") or src.get("name")
     fmt = drv.get("type") if drv is not None else "?"
     if not path:
+        continue
+    if any(path.startswith(e) for e in EX):
+        print("%s\t%s, on BACKUP_EXCLUDE_DIRS - its application backs it up\t%s" % (tgt.get("dev"), fmt, path))
         continue
     if d.get("device") == "disk" and fmt == "qcow2":
         continue
@@ -303,7 +334,7 @@ check_dest() {
 
   if [ ! -d "$DEST" ]; then
     warn "$DEST does not exist."
-    if [ -e /etc/modprobe.d/99-stig-usb-storage.conf ] && ! lsmod | grep -q '^usb_storage'; then
+    if [ -z "$ISCSI_TARGET" ] && [ -e /etc/modprobe.d/99-stig-usb-storage.conf ] && ! lsmod | grep -q '^usb_storage'; then
       warn "  USB STORAGE IS BLOCKED ON THIS MACHINE by the STIG, deliberately:"
       say  "    /etc/modprobe.d/99-stig-usb-storage.conf  (runbook 6.3g)"
       say  "  A USB drive plugged in now will not appear. To use one:"
@@ -509,7 +540,22 @@ backup_one() {  # <domain> <full|incr>
     done < <(domain_disks "$dom")
     printf '  </disks>\n</domainbackup>\n'
   } > "$bxml"
-  printf '<domaincheckpoint><name>chk-%s</name></domaincheckpoint>\n' "$STAMP" > "$cxml"
+  # THE CHECKPOINT NAMES ITS DISKS when any disk is excluded (3.68): every backed-up disk gets a bitmap,
+  # an excluded one gets none. Left to the default, libvirt would put a change-tracking bitmap on the
+  # database disk every night - work on a disk this script no longer copies, and a broken checkpoint
+  # the day that disk is recreated empty for Patroni to refill. With nothing excluded the document is
+  # exactly what it was, so a host without a data pool sees no change at all.
+  local ex; ex="$(domain_skipped_disks "$dom" | awk -F'\t' '$2 ~ /BACKUP_EXCLUDE_DIRS/ {print $1}')"
+  {
+    printf '<domaincheckpoint><name>chk-%s</name>' "$STAMP"
+    if [ -n "$ex" ]; then
+      printf '<disks>'
+      while IFS=$'\t' read -r t s; do [ -z "${t:-}" ] || printf '<disk name="%s" checkpoint="bitmap"/>' "$t"; done < <(domain_disks "$dom")
+      for t in $ex; do printf '<disk name="%s" checkpoint="no"/>' "$t"; done
+      printf '</disks>'
+    fi
+    printf '</domaincheckpoint>\n'
+  } > "$cxml"
 
   say "$dom: $mode backup -> $out"
   [ -n "$prev" ] && say "   building on checkpoint $prev"
@@ -1125,14 +1171,42 @@ cmd_hold() {
 # `reattach` does all three and then RE-BLOCKS USB immediately, so the deviation window is
 # open for seconds rather than until somebody remembers.
 
-luks_dev() { printf '/dev/disk/by-uuid/%s\n' "$LUKS_UUID"; }
+luks_dev() {
+  if [ -n "$ISCSI_TARGET" ]; then printf '/dev/disk/by-path/ip-%s-iscsi-%s-lun-0\n' "$ISCSI_PORTAL" "$ISCSI_TARGET"
+  else printf '/dev/disk/by-uuid/%s\n' "$LUKS_UUID"; fi
+}
+volume_named() {   # does this host name a backup volume at all?
+  [ -n "$LUKS_UUID" ] || [ -n "$ISCSI_TARGET" ] \
+    || die "no backup volume is named for $(hostname -s): set BACKUP_LUKS_UUID_$HOSTKEY (a local or USB drive) or BACKUP_ISCSI_TARGET_$HOSTKEY with BACKUP_ISCSI_PORTAL (a LUN) in vm-specs.env"
+  [ -z "$ISCSI_TARGET" ] || [ -n "$ISCSI_PORTAL" ] || die "BACKUP_ISCSI_TARGET_$HOSTKEY is set but BACKUP_ISCSI_PORTAL is not"
+}
+
+# iscsi_attach - log this host in to its backup LUN, if it has one. Idempotent; the node record is set
+# to log in by itself at boot as well, so reattach after a reboot usually finds it there already.
+iscsi_attach() {
+  [ -n "$ISCSI_TARGET" ] || return 0
+  command -v iscsiadm >/dev/null 2>&1 || die "iscsiadm not found - install open-iscsi"
+  if iscsiadm -m session 2>/dev/null | grep -qF " $ISCSI_TARGET"; then
+    ok "iSCSI: logged in to $ISCSI_TARGET"; return 0
+  fi
+  local out
+  out="$(iscsiadm -m discovery -t sendtargets -p "$ISCSI_PORTAL" 2>&1)" \
+    || die "iSCSI discovery at $ISCSI_PORTAL failed: $(printf '%s' "$out" | tail -1) - is the storage up, and is this host's initiator name allowed?"
+  printf '%s\n' "$out" | grep -qF " $ISCSI_TARGET" \
+    || die "the portal $ISCSI_PORTAL does not offer $ISCSI_TARGET to this host - check the target's initiator list for $(sed -n 's/^InitiatorName=//p' /etc/iscsi/initiatorname.iscsi 2>/dev/null)"
+  iscsiadm -m node -T "$ISCSI_TARGET" -p "$ISCSI_PORTAL" -o update -n node.startup -v automatic >/dev/null \
+    || warn "could not set $ISCSI_TARGET to log in at boot - reattach will still log in"
+  out="$(iscsiadm -m node -T "$ISCSI_TARGET" -p "$ISCSI_PORTAL" --login 2>&1)" \
+    || die "iSCSI login to $ISCSI_TARGET failed: $(printf '%s' "$out" | tail -1)"
+  ok "iSCSI: logged in to $ISCSI_TARGET at $ISCSI_PORTAL"
+}
 
 # keyfile: one-time. A random key file under /etc/enclave (on this host's own encrypted root)
 # added as an extra LUKS keyslot on the backup volume, so reattach and the timer can unlock it
 # with no human. The existing passphrase keeps working.
 cmd_keyfile() {
   need_root
-  [ -n "$LUKS_UUID" ] || die "BACKUP_LUKS_UUID is not set in vm-specs.env"
+  volume_named; iscsi_attach
   local dev; dev="$(luks_dev)"
   [ -b "$dev" ] || die "no LUKS device at $dev - is the drive attached and unlocked?"
   if [ -s "$KEYFILE" ]; then
@@ -1155,13 +1229,75 @@ cmd_keyfile() {
   fi
 }
 
+# volume-init [device] - ONCE: make a NEW backup volume (3.68). LUKS2 with pbkdf2 named explicitly (the
+# LUKS2 default, argon2id, is not FIPS-approved - host-4's header was made the same way), opened with
+# this host's keyfile, ext4 with no root reserve, mounted at DEST. THE GUARDS COME FIRST AND DO NOT
+# DEPEND ON WHO IS RUNNING IT: a device that is mounted, partitioned, or carries ANY signature (a
+# filesystem, LUKS, a partition table, LVM) is refused - there is no --force. A fresh LUN has none.
+cmd_volume_init() {
+  need_root; assert_hypervisor
+  local dev="${1:-}" real sig parts mnt size
+  [ -n "$DEST" ] || die "no destination set (BACKUP_DEST)"
+  if [ -z "$dev" ]; then
+    [ -n "$ISCSI_TARGET" ] || die "name the device, or set BACKUP_ISCSI_TARGET_$HOSTKEY for this host"
+    volume_named; iscsi_attach; dev="$(luks_dev)"
+    local i=0; while [ ! -b "$dev" ] && [ "$i" -lt 20 ]; do sleep 1; udevadm settle --timeout=2 2>/dev/null; i=$((i+1)); done
+  fi
+  [ -b "$dev" ] || die "$dev is not a block device"
+  real="$(readlink -f "$dev")"
+  [ "$(lsblk -dno TYPE "$real" 2>/dev/null)" = disk ] || die "$real is not a whole disk"
+  mnt="$(lsblk -no MOUNTPOINTS "$real" 2>/dev/null | tr -d ' \n')"
+  [ -z "$mnt" ] || die "$real (or a partition of it) is mounted at $mnt - refusing"
+  parts="$(lsblk -no NAME "$real" | tail -n +2 | wc -l)"
+  [ "$parts" -eq 0 ] || die "$real has $parts partition(s) or holders - refusing"
+  sig="$(wipefs -n "$real" 2>/dev/null | tail -n +2)"
+  [ -z "$sig" ] || die "$real already carries a signature - it holds something. Refusing; volume-init only formats an EMPTY device:
+$sig"
+  mountpoint -q "$DEST" && die "$DEST is already a mountpoint - another volume is in use"
+  [ ! -e "/dev/mapper/$LUKS_NAME" ] || die "/dev/mapper/$LUKS_NAME is already open"
+  size="$(lsblk -dnbo SIZE "$real")"
+  say "about to make $real ($(numfmt --to=iec "$size")B) this host's backup volume - it is empty"
+  # the keyfile: made here if this host has none - nothing ever types it
+  if [ ! -s "$KEYFILE" ]; then
+    install -d -m 0700 "$(dirname "$KEYFILE")"
+    ( umask 077; head -c 4096 /dev/urandom > "$KEYFILE" ); chmod 0400 "$KEYFILE"
+    ok "created $KEYFILE (0400 root, on this machine's encrypted root)"
+  fi
+  cryptsetup luksFormat --batch-mode --type luks2 --pbkdf pbkdf2 --cipher aes-xts-plain64 --key-size 512 --hash sha256 \
+    --label "vmbackup-$(hostname -s)" "$real" "$KEYFILE" || die "luksFormat failed - nothing else was done"
+  ok "LUKS2 (aes-xts-plain64, 512-bit, pbkdf2) - UUID $(cryptsetup luksUUID "$real")"
+  # A PASSPHRASE TOO, for the envelope: the keyfile lives on this host, and a restore from another
+  # machine needs a way in. Asked here, twice, never shown; skipped (and said) without a terminal.
+  if { : </dev/tty; } 2>/dev/null; then
+    say "add a RECOVERY PASSPHRASE for the envelope (asked twice; Enter on an empty line skips):"
+    local p1 p2; read -rsp "  passphrase: " p1 </dev/tty; echo >&2
+    if [ -n "$p1" ]; then
+      read -rsp "  again: " p2 </dev/tty; echo >&2
+      if [ "$p1" = "$p2" ]; then
+        printf '%s' "$p1" | cryptsetup luksAddKey --key-file "$KEYFILE" "$real" - && ok "recovery passphrase added - seal it with this host's name and the UUID"
+      else warn "the two entries differ - no passphrase added; run 'cryptsetup luksAddKey --key-file $KEYFILE $real' later"; fi
+    else warn "no recovery passphrase - only $KEYFILE opens this volume"; fi
+    p1=""; p2=""
+  else warn "no terminal - no recovery passphrase added; only $KEYFILE opens this volume"; fi
+  cryptsetup luksOpen --key-file "$KEYFILE" "$real" "$LUKS_NAME" || die "luksOpen failed"
+  mkfs.ext4 -q -m 0 -L "vmbackup-$(hostname -s)" "/dev/mapper/$LUKS_NAME" || die "mkfs.ext4 failed"
+  install -d "$DEST"
+  mount "/dev/mapper/$LUKS_NAME" "$DEST" || die "mount at $DEST failed"
+  mountpoint -q "$DEST" || die "$DEST is not a mountpoint after mounting"
+  ok "this host's backup volume is ready at $DEST:"
+  df -h "$DEST" | tail -1 | sed 's/^/       /'
+  [ -n "$ISCSI_TARGET" ] || say "  a local drive: set BACKUP_LUKS_UUID_$HOSTKEY='$(cryptsetup luksUUID "$real")' in vm-specs.env"
+  say "next: sudo $0 schedule --at 02:00   (Central time) - the timers, and the attach unit for boot"
+}
+
 # reattach: after a reboot. Open the USB window if needed, unlock (keyfile if present, else
 # passphrase), mount at $DEST, and re-block USB on exit whatever happened.
 cmd_reattach() {
   need_root; assert_hypervisor
   [ -n "$DEST" ] || die "no destination set"
   if mountpoint -q "$DEST"; then ok "$DEST is already mounted - nothing to do"; return 0; fi
-  [ -n "$LUKS_UUID" ] || die "BACKUP_LUKS_UUID is not set in vm-specs.env"
+  volume_named
+  iscsi_attach
 
   # NOT `local`, AND THAT IS THE POINT. `reblock` below runs from an EXIT trap, which fires
   # after this function has already returned - so a `local` is out of scope by the time the
@@ -1183,7 +1319,9 @@ cmd_reattach() {
   local dev; dev="$(luks_dev)"
 
   if [ ! -b "$dev" ]; then
-    if ! lsmod | grep -q "^usb_storage"; then
+    # THE USB WINDOW ONLY FOR A USB DRIVE: an iSCSI LUN needs no deviation from the STIG's block,
+    # which is why the runbook wanted a network target in the first place (10b).
+    if [ -z "$ISCSI_TARGET" ] && ! lsmod | grep -q "^usb_storage"; then
       [ -x "$tailor" ] || die "need $tailor to open the USB window"
       say "USB storage is blocked - opening the window briefly"
       "$tailor" usb enable >/dev/null 2>&1 || warn "usb enable reported a problem - continuing"
@@ -1209,7 +1347,7 @@ cmd_reattach() {
   }
   trap reblock EXIT
 
-  [ -b "$dev" ] || die "LUKS device $dev never appeared - is the drive plugged in and powered?"
+  [ -b "$dev" ] || die "LUKS device $dev never appeared - $( [ -n "$ISCSI_TARGET" ] && echo "is the iSCSI session up ('iscsiadm -m session')?" || echo "is the drive plugged in and powered?")"
   ok "found the encrypted volume: $(readlink -f "$dev")"
 
   # TRIM. OFF BY DEFAULT AND THAT IS DELIBERATE - it is a posture decision, not a tuning knob.
@@ -1455,7 +1593,7 @@ EOF
   cat > "/etc/systemd/system/${ATTACH_SVC}.service" <<EOF
 [Unit]
 Description=Attach the encrypted VM backup volume at ${DEST} after boot (keyfile, hands-off)
-After=local-fs.target
+After=local-fs.target$( [ -n "$ISCSI_TARGET" ] && printf ' network-online.target iscsid.service\nWants=network-online.target' )
 StartLimitIntervalSec=900
 StartLimitBurst=6
 
@@ -1554,6 +1692,8 @@ cmd_restore_plan() {
   5. START, and verify the SERVICE, not just the boot.
          virsh start $dom
 
+$( x="$(domain_skipped_disks "$dom" | awk -F'\t' '$2 ~ /BACKUP_EXCLUDE_DIRS/ {print "         " $1 "  " $3}')"
+   [ -z "$x" ] || printf '  NOT IN THIS BACKUP - disks on BACKUP_EXCLUDE_DIRS, backed up by their application (3.68):\n%s\n  If one is intact, keep it. If lost: recreate it empty (03-compose-vm.sh) and let the\n  application refill it - a pg node: Patroni re-clones from the leader (patronictl reinit),\n  or pgBackRest restores it (docs/06a-postgres-ha.md).\n\n' "$x")
   NOTE ON CHECKPOINTS: restoring an old image while libvirt still holds newer checkpoints
   leaves the two disagreeing about what has changed. Clear them after a restore:
          virsh checkpoint-list $dom --name | xargs -r -n1 virsh checkpoint-delete $dom --metadata
@@ -1646,6 +1786,10 @@ cmd_second_copy() {
   need_root
   local target addr
   target="$(second_host)"
+  if [ "$target" = none ]; then
+    say "second copy: none for $(hostname -s) (BACKUP_SECOND_OVERRIDE) - its backup volume is already off this machine"
+    return 0
+  fi
   [ -n "$target" ] || die "no second-copy target. Set PLACE_BACKUP_SECOND in vm-specs.env (or BACKUP_SECOND_HOST) -
        empty means every backup lives only on this machine, which IS red flag 1.2."
   # The target's address from enclave-addresses.env: host-1 -> $HOST_1.
@@ -1892,7 +2036,7 @@ push_sets() {
 # the facts can still say so - a missing series reads as silence (dashboards-and-metrics.md).
 copy_rows() {
   local h u a d k st
-  h="$(second_host)"
+  h="$(second_host)"; [ "$h" != none ] || h=""
   printf 'second %s %s\n' "${h:-none}" "$( [ -n "$h" ] && echo "$SECOND_STATE" || echo - )"
   if [ -z "$THIRD_ADDR" ]; then
     printf 'third none -\n'
@@ -2600,6 +2744,7 @@ case "${1:-status}" in
   prune)        shift || true; cmd_prune "$@" ;;
   keyfile)      cmd_keyfile ;;
   reattach)     cmd_reattach ;;
+  volume-init)  shift; cmd_volume_init "$@" ;;
   schedule)     shift || true; cmd_schedule "${1:-02:00}" ;;
   unschedule)   cmd_unschedule ;;
   restore-plan) shift || true; cmd_restore_plan "${1:-}" ;;
@@ -2608,5 +2753,5 @@ case "${1:-status}" in
   third-copy)   shift || true; cmd_third_copy "$@" ;;
   pgbackrest-copy) shift || true; cmd_pgbackrest_copy "$@" ;;
   hold)         shift || true; cmd_hold "$@" ;;
-  *) printf 'usage: %s {status|facts|full [vm]|incr [vm]|progress|verify [--all]|prune [--dry-run]|keyfile|reattach|schedule [HH:MM]|unschedule|restore-plan <vm>|restore-test <vm> [--set S] [--keep] [-n]|second-copy [--setup] [-n] [--all] [--verify-all]|third-copy [--setup] [-n] [--all] [--verify-all]|pgbackrest-copy [--setup] [-n]|hold {status|set "<reason>" --review YYYY-MM-DD|release}}\n' "$0" >&2; exit 2 ;;
+  *) printf 'usage: %s {status|facts|full [vm]|incr [vm]|progress|verify [--all]|prune [--dry-run]|keyfile|reattach|volume-init [device]|schedule [HH:MM]|unschedule|restore-plan <vm>|restore-test <vm> [--set S] [--keep] [-n]|second-copy [--setup] [-n] [--all] [--verify-all]|third-copy [--setup] [-n] [--all] [--verify-all]|pgbackrest-copy [--setup] [-n]|hold {status|set "<reason>" --review YYYY-MM-DD|release}}\n' "$0" >&2; exit 2 ;;
 esac

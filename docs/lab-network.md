@@ -567,7 +567,7 @@ from the sealed envelope (`airgap-media.md` §9.6) - without the envelope the co
 shows its last run and last clean run. **A difference found by `--verify-all` is reported, not
 repaired.**
 
-**Hosts 1–3 back up to iSCSI LUNs on the NAS (backlog 3.68, decided by Brian 2026-10-16) — LAB ONLY.**
+**Every host backs up to its own iSCSI LUN on the NAS (backlog 3.68, decided by Brian 2026-10-16; host-4 too the same night, its USB SSD shelved) — LAB ONLY.**
 Their nine guests had no VM backups at all. There is no local volume to give them: the VM pools are full and the
 NVMe remainder is Ceph's (3.48). So each host gets **its own zvol on the `archive` pool, shared over iSCSI**,
 and it appears as a local disk. The host encrypts it with LUKS (`vm-backup.sh volume-init`), so the NAS holds
@@ -577,7 +577,7 @@ pgBackRest backs them up. These hosts make no second, third or pgBackRest copy, 
 already off the machine. A production site uses its own LUN with the same settings, or a local drive per host
 (`BACKUP_LUKS_UUID_HOST_N`); START-HERE's lab-vs-production table.
 
-On the NAS, once, in the TrueNAS UI (25.10) — for each of host-1, host-2, host-3:
+On the NAS, once, in the TrueNAS UI (25.10) — for each host (host-4's zvol **2 TiB**: its backups were 883 GB on the USB SSD). **The Wizard is the quick route** (*Shares → Block (iSCSI) → Wizard*: target name, extent *Device* on the zvol or *Create New* on `archive`, sharing platform **Modern OS** (4k), the existing portal, the host's initiator) and does steps 3–7 in one pass; it is what built them on 2026-10-16:
 
 1. **Its initiator name**, read on the host: `sudo sed -n 's/^InitiatorName=//p' /etc/iscsi/initiatorname.iscsi`.
 2. **A zvol:** *Datasets → `archive` → Add Zvol*, name `vmbackup-host-1`, size **1 TiB**, **Sparse** ticked (the

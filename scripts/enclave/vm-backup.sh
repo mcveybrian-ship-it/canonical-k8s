@@ -301,6 +301,15 @@ newest_full_stamp() {
   printf '%s' "$newest"
 }
 
+# find under a domain's backup directory - and NOTHING, successfully, when that directory does not
+# exist yet: a new domain, or a new volume before its first backup. A plain find fails there, and
+# under pipefail and set -e that ended the facts run for every domain on the host (3.69). A real
+# error on a directory that DOES exist - a dead volume answering EIO - still fails, as it should.
+sets_find() {  # <domain> <find arguments...>
+  [ -d "$DEST/$1" ] || return 0
+  find "$DEST/$1" "${@:2}"
+}
+
 # <domain> -> whole days since its newest complete full, or nothing if it has none.
 newest_full_age_days() {
   local s e; s="$(newest_full_stamp "$1")"
@@ -476,6 +485,26 @@ cmd_status() {
 }
 
 # ---------------------------------------------------------------- backup
+# A RUN THAT PRODUCED NO BACKUP MUST NOT LEAVE ITS CHECKPOINT BEHIND (backlog 3.69, 2026-10-16). The
+# next incremental builds on the NEWEST checkpoint; if that is this run's, it copies only what changed
+# since a backup that does not exist, and the chain silently loses a day. A plain checkpoint-delete
+# merges the checkpoint's bitmap into the one before it, so the next run picks up everything since the
+# last GOOD backup. If libvirt refuses, every checkpoint's metadata goes - the self-heal's remedy below -
+# so the next run finds nothing to build on and does a FULL, which is always correct.
+unwind_checkpoint() {  # <domain>
+  local dom="$1" c="chk-$STAMP" x
+  virsh checkpoint-info "$dom" "$c" >/dev/null 2>&1 || return 0
+  if virsh checkpoint-delete "$dom" "$c" >/dev/null 2>&1; then
+    say "   removed this run's checkpoint $c - the next run builds on the last good backup"
+    return 0
+  fi
+  warn "   could not merge away checkpoint $c - dropping $dom's checkpoint metadata so the next run is a FULL"
+  for x in $(virsh checkpoint-list "$dom" --name 2>/dev/null | sed '/^$/d'); do
+    virsh checkpoint-delete "$dom" "$x" --metadata >/dev/null 2>&1 \
+      && say "     dropped $x" || warn "     could NOT drop $x - run '$0 full $dom' before the next nightly"
+  done
+}
+
 # One domain, one SET: a push-mode libvirt backup of every qcow2 disk into
 # $DEST/<domain>/<stamp>/, plus a new checkpoint chk-<stamp> for the next incremental to build
 # on. After the copy: DOMAIN.xml, MANIFEST.sha256 (the completion marker) and INFO.
@@ -623,6 +652,18 @@ backup_one() {  # <domain> <full|incr>
   done
   local res; res="$(virsh domjobinfo "$dom" --completed 2>/dev/null | awk -F': *' '/Job type/{print $2}')"
   say "   finished after ${waited}s (job: ${res:-unknown})"
+  # A JOB THAT DID NOT COMPLETE IS NOT A BACKUP (backlog 3.69). Until 2026-10-16 the result above was
+  # printed and then ignored: the manifest and INFO were written whatever it said, so a failed full
+  # counted as a full. Found when host-4's storage NIC dropped off the USB bus mid-way through
+  # svc-repo-01's first full onto the iSCSI LUN. Anything but Completed - Failed, Cancelled, or no
+  # answer because libvirtd restarted - leaves the set without a manifest, which is what an
+  # interrupted run looks like (BackupInterrupted alerts on it), and removes this run's checkpoint.
+  case "$res" in
+    Completed*) ;;
+    *) warn "$dom: the job ended '${res:-with no result}', not Completed - $out is NOT a backup"
+       unwind_checkpoint "$dom"
+       return 1 ;;
+  esac
 
   # Manifest of what ARRIVED. Sizes and hashes of the files on the destination, not of the
   # sources - a copy that silently truncated looks identical from the source side.
@@ -632,7 +673,19 @@ backup_one() {  # <domain> <full|incr>
   # --inactive so it is the DEFINITION, not the running state with its runtime additions.
   virsh dumpxml --inactive "$dom" > "$out/DOMAIN.xml" 2>/dev/null \
     || warn "$dom: could not save the domain definition - a restore will need it written by hand"
-  ( cd "$out" && sha256sum ./*.qcow2 ./DOMAIN.xml > MANIFEST.sha256 2>/dev/null ) || true
+  # THE MANIFEST IS WRITTEN WHOLE OR NOT AT ALL (3.69): hashed into a .part file, renamed only when
+  # every file read back. Before, a read error mid-hash - the volume dying under it - left a short
+  # manifest behind `|| true`, and a short manifest still marks the set complete. DOMAIN.xml is hashed
+  # when it exists; a missing one was warned about above and does not make the disks unrestorable.
+  # sha256sum's own errors are NOT hidden: they say why the set failed (an I/O error, a vanished file).
+  if ! ( cd "$out" || exit 1
+         set -- ./*.qcow2; [ -f DOMAIN.xml ] && set -- "$@" ./DOMAIN.xml
+         sha256sum "$@" > MANIFEST.sha256.part && mv -f MANIFEST.sha256.part MANIFEST.sha256 ); then
+    rm -f "$out/MANIFEST.sha256.part"
+    warn "$dom: could not read back what arrived - $out is NOT a backup (no manifest written)"
+    unwind_checkpoint "$dom"
+    return 1
+  fi
   printf 'domain=%s\nmode=%s\nbased_on=%s\nstamp=%s\nhost=%s\n' \
     "$dom" "$mode" "${prev:-none}" "$STAMP" "$(hostname -s)" > "$out/INFO"
   ok "$dom: $(find "$out" -name '*.qcow2' | wc -l) file(s), $(du -sh "$out" | cut -f1)"
@@ -1183,11 +1236,47 @@ volume_named() {   # does this host name a backup volume at all?
 
 # iscsi_attach - log this host in to its backup LUN, if it has one. Idempotent; the node record is set
 # to log in by itself at boot as well, so reattach after a reboot usually finds it there already.
+# This host's session to its backup target: LOGGED_IN when it works, FAILED or FREE when not, nothing
+# when there is none. Read from sysfs - `iscsiadm -m session` lists a dead session exactly like a live one.
+iscsi_state() {
+  local s
+  for s in /sys/class/iscsi_session/session*; do
+    [ "$(cat "$s/targetname" 2>/dev/null)" = "$ISCSI_TARGET" ] || continue
+    cat "$s/state" 2>/dev/null; return 0
+  done
+}
+
+# What is wrong with the MOUNTED backup volume - one line - or nothing (backlog 3.69). A volume stays
+# mounted after its device has gone: host-4's did on 2026-10-16, on an iSCSI path whose NIC had dropped
+# off the USB bus, and `mountpoint` went on saying yes. Two things say no: ext4's own error count, which
+# stays until e2fsck clears it, and the iSCSI session's state. Measured healthy on host-1 the same
+# night: LOGGED_IN, connection up, errors_count 0. Not ext4 (a site's NFS): only the session counts.
+dest_problem() {
+  local dm n st
+  dm="$(basename "$(readlink -f "$(findmnt -n -o SOURCE "$DEST" 2>/dev/null)" 2>/dev/null)")"
+  n="$(cat "/sys/fs/ext4/$dm/errors_count" 2>/dev/null || true)"
+  if [ -n "$n" ] && [ "$n" != 0 ]; then
+    printf 'its filesystem has recorded %s error(s) and needs e2fsck before it is trusted' "$n"; return 0
+  fi
+  [ -n "$ISCSI_TARGET" ] || return 0
+  st="$(iscsi_state)"
+  [ "$st" = LOGGED_IN ] || printf 'its iSCSI session to %s is %s, not LOGGED_IN' "$ISCSI_TARGET" "${st:-gone}"
+}
+
 iscsi_attach() {
   [ -n "$ISCSI_TARGET" ] || return 0
   command -v iscsiadm >/dev/null 2>&1 || die "iscsiadm not found - install open-iscsi"
   if iscsiadm -m session 2>/dev/null | grep -qF " $ISCSI_TARGET"; then
-    ok "iSCSI: logged in to $ISCSI_TARGET"; return 0
+    local st; st="$(iscsi_state)"
+    if [ "$st" = LOGGED_IN ]; then ok "iSCSI: logged in to $ISCSI_TARGET"; return 0; fi
+    # LISTED IS NOT LOGGED IN (3.69). This said "logged in" for any session iscsiadm listed - including
+    # host-4's on 2026-10-16, FREE with its connection failed. Log the dead one out and start afresh -
+    # but never from under an open LUKS mapping: that would pull the disk out from beneath it.
+    [ ! -e "/dev/mapper/$LUKS_NAME" ] \
+      || die "the iSCSI session to $ISCSI_TARGET is ${st:-in no known state}, and $LUKS_NAME is still open on it - 'sudo cryptsetup close $LUKS_NAME' first, then reattach"
+    warn "iSCSI: the session to $ISCSI_TARGET is ${st:-in no known state}, not LOGGED_IN - logging it out to start afresh"
+    iscsiadm -m node -T "$ISCSI_TARGET" -p "$ISCSI_PORTAL" --logout >/dev/null 2>&1 \
+      || warn "  the logout reported a problem - trying the login anyway"
   fi
   local out
   out="$(iscsiadm -m discovery -t sendtargets -p "$ISCSI_PORTAL" 2>&1)" \
@@ -1295,7 +1384,17 @@ $sig"
 cmd_reattach() {
   need_root; assert_hypervisor
   [ -n "$DEST" ] || die "no destination set"
-  if mountpoint -q "$DEST"; then ok "$DEST is already mounted - nothing to do"; return 0; fi
+  if mountpoint -q "$DEST"; then
+    # MOUNTED IS NOT HEALTHY (3.69): a volume whose device died under it is still mounted.
+    local why; why="$(dest_problem)"
+    if [ -n "$why" ]; then
+      warn "$DEST is mounted, but $why."
+      say  "  Take it down, then run reattach again - it logs in afresh and checks the filesystem:"
+      say  "     sudo umount $DEST && sudo cryptsetup close $LUKS_NAME"
+      return 1
+    fi
+    ok "$DEST is already mounted - nothing to do"; return 0
+  fi
   volume_named
   iscsi_attach
 
@@ -1382,6 +1481,23 @@ cmd_reattach() {
       cryptsetup luksOpen $disc "$dev" "$LUKS_NAME" || die "luksOpen failed"
     fi
   fi
+
+  # CHECK BEFORE MOUNTING (3.69) - what boot does for every filesystem in fstab, and what nothing did
+  # here. -p repairs only what is safe unattended and stops on anything else, so the boot-time attach
+  # unit can run it too. A clean filesystem costs one superblock read; one that recorded errors - its
+  # device lost under it, as host-4's was on 2026-10-16 - gets a full check first.
+  local fstype frc=0
+  fstype="$(blkid -o value -s TYPE "/dev/mapper/$LUKS_NAME" 2>/dev/null || true)"
+  case "$fstype" in
+    ext2|ext3|ext4)
+      e2fsck -p "/dev/mapper/$LUKS_NAME" || frc=$?
+      case "$frc" in
+        0) ok "filesystem checked: clean" ;;
+        1|2|3) warn "e2fsck REPAIRED the filesystem (exit $frc) - what it changed is printed above" ;;
+        *) die "e2fsck stopped (exit $frc) and needs a human: 'sudo e2fsck -f /dev/mapper/$LUKS_NAME', then reattach again. Nothing was mounted." ;;
+      esac ;;
+    *) warn "filesystem type '${fstype:-unknown}' is not ext - not checked before mounting" ;;
+  esac
 
   install -d "$DEST"
   # discard in the mount options too - the dm-crypt layer allowing TRIM is necessary but not
@@ -2563,8 +2679,15 @@ cmd_facts() {
   local out="$TEXTFILE_DIR/enclave-backup.prom" tmp
   [ -d "$TEXTFILE_DIR" ] || { warn "no $TEXTFILE_DIR - run: monitoring.sh exporter"; return 1; }
   tmp="$(mktemp "$TEXTFILE_DIR/.backup.XXXXXX")" || { warn "cannot write in $TEXTFILE_DIR"; return 1; }
+  # A run that dies part-way must not leave its half-file behind: one every 15 minutes, for as long
+  # as the cause lasts. Global, not local - the trap fires after a set -e exit has left this function.
+  FACTS_TMP="$tmp"; trap 'rm -f "${FACTS_TMP:-}"' EXIT
 
-  {
+  # THE BODY IS A FUNCTION, NOT A { } GROUP (backlog 3.69, 2026-10-16). It was a group redirected into
+  # $tmp, and the detached branch's `return 0` returned from cmd_facts itself - past the rename below.
+  # So a detached volume NEVER published dest_mounted 0: the last file, saying 1, stayed in place, and
+  # BackupDestinationDetached could not fire. Now the return leaves the body and the file is published.
+  facts_body() {
     printf '# HELP enclave_backup_source_ok 1 if the backup destination could be read\n'
     printf '# TYPE enclave_backup_source_ok gauge\n'
     printf '# HELP enclave_backup_dest_mounted 1 if the backup destination is a mounted filesystem\n'
@@ -2593,6 +2716,11 @@ cmd_facts() {
       return 0
     fi
     printf 'enclave_backup_source_ok 1\n'
+    # MOUNTED IS NOT HEALTHY (3.69) - see dest_problem. dest_mounted said 1 all night on 2026-10-16 while
+    # host-4's volume sat on a dead iSCSI path.
+    printf '# HELP enclave_backup_dest_healthy 0 if the mounted backup volume has recorded filesystem errors or lost its iSCSI session\n'
+    printf '# TYPE enclave_backup_dest_healthy gauge\n'
+    printf 'enclave_backup_dest_healthy %s\n' "$([ -z "$(dest_problem)" ] && echo 1 || echo 0)"
 
     printf '# HELP enclave_backup_dest_avail_bytes free space at the backup destination\n'
     printf '# TYPE enclave_backup_dest_avail_bytes gauge\n'
@@ -2626,12 +2754,12 @@ cmd_facts() {
 
       # newest COMPLETE: the manifest's own mtime is when the set finished, which is the
       # number that matters - a set that began yesterday and finished today is today's.
-      newest_ok="$(find "$DEST/$d" -mindepth 2 -maxdepth 2 -name MANIFEST.sha256 \
+      newest_ok="$(sets_find "$d" -mindepth 2 -maxdepth 2 -name MANIFEST.sha256 \
                     -printf '%T@\n' 2>/dev/null | sort -n | tail -1 | cut -d. -f1)"
-      newest_any="$(find "$DEST/$d" -mindepth 1 -maxdepth 1 -type d \
+      newest_any="$(sets_find "$d" -mindepth 1 -maxdepth 1 -type d \
                     -printf '%T@\n' 2>/dev/null | sort -n | tail -1 | cut -d. -f1)"
-      nc="$(find "$DEST/$d" -mindepth 2 -maxdepth 2 -name MANIFEST.sha256 2>/dev/null | wc -l)"
-      ni="$(( $(find "$DEST/$d" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l) - nc ))"
+      nc="$(sets_find "$d" -mindepth 2 -maxdepth 2 -name MANIFEST.sha256 2>/dev/null | wc -l)"
+      ni="$(( $(sets_find "$d" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l) - nc ))"
       [ "$ni" -lt 0 ] && ni=0
 
       [ -n "$newest_ok" ] && { printf 'enclave_backup_last_success_seconds{domain="%s"} %s\n' "$d" "$newest_ok"; protected=$((protected + 1)); }
@@ -2643,14 +2771,17 @@ cmd_facts() {
       # ~60-day bound is about - BackupRetentionExceeded fires past AL_BACKUP_RETENTION_MAX. The
       # set's directory name is its UTC start stamp, so this reads names, not files.
       local oldest_set oldest_e
-      oldest_set="$(find "$DEST/$d" -mindepth 2 -maxdepth 2 -name MANIFEST.sha256 -printf '%h\n' 2>/dev/null | sort | head -1)"
-      oldest_e="$( [ -n "$oldest_set" ] && stamp_epoch "${oldest_set##*/}")"
+      oldest_set="$(sets_find "$d" -mindepth 2 -maxdepth 2 -name MANIFEST.sha256 -printf '%h\n' 2>/dev/null | sort | head -1)"
+      # NOT `x="$( [ -n "$y" ] && ... )"`: with no complete set the test fails, the assignment returns
+      # 1, and set -e ended the whole facts run - so a domain with no finished backup stopped every
+      # backup metric on the host, the state BackupNeverCompleted exists to report (3.69, 2026-10-16).
+      oldest_e=""; [ -z "$oldest_set" ] || oldest_e="$(stamp_epoch "${oldest_set##*/}")"
       [ -n "$oldest_e" ] && printf 'enclave_backup_oldest_set_seconds{domain="%s"} %s\n' "$d" "$oldest_e"
 
       # SUM FILE SIZES, DO NOT `du` THE TREE. du walks and stats every block on a USB disk,
       # every 15 minutes, on a volume holding hundreds of GB. A set holds a handful of qcow2
       # files, so one stat each is the same answer for none of the cost.
-      dir="$(find "$DEST/$d" -mindepth 2 -maxdepth 2 -name MANIFEST.sha256 \
+      dir="$(sets_find "$d" -mindepth 2 -maxdepth 2 -name MANIFEST.sha256 \
               -printf '%T@ %h\n' 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2-)"
       if [ -n "$dir" ]; then
         sz="$(find "$dir" -maxdepth 1 -type f -printf '%s\n' 2>/dev/null | awk '{t+=$1} END{print t+0}')"
@@ -2713,7 +2844,8 @@ cmd_facts() {
     printf '# HELP enclave_backup_facts_generated_seconds unix time these facts were written\n'
     printf '# TYPE enclave_backup_facts_generated_seconds gauge\n'
     printf 'enclave_backup_facts_generated_seconds %s\n' "$(date +%s)"
-  } > "$tmp"
+  }
+  facts_body > "$tmp"
 
   if [ ! -s "$tmp" ]; then rm -f "$tmp"; warn "backup facts produced NO output - $out left alone"; return 1; fi
   # Written beside the target and renamed into place, so node-exporter never reads half a file.

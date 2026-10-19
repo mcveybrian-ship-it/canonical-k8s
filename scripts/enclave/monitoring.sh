@@ -1511,6 +1511,23 @@ groups:
             reboot it is detached for three separate reasons - usb-storage is STIG-blocked,
             LUKS is locked, and nothing types the passphrase.
 
+      # MOUNTED IS NOT HEALTHY (backlog 3.69, 2026-10-16). host-4's volume stayed mounted all night on
+      # an iSCSI path whose NIC had dropped off the USB bus: dest_mounted said 1, ext4 had aborted its
+      # journal, and the full backup writing to it failed. vm-backup.sh's dest_problem is the test.
+      - alert: BackupVolumeFailed
+        expr: enclave_backup_dest_healthy == 0
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "the backup volume on {{ \$labels.machine }} is mounted but has failed"
+          description: "Its filesystem has recorded errors, or its iSCSI session is down. Nothing written to it now is a backup."
+          action: >-
+            'sudo ./scripts/enclave/vm-backup.sh reattach' on {{ \$labels.machine }} names the problem
+            and the two commands that take the volume down; run reattach again after them - it logs
+            in afresh and checks the filesystem. On iSCSI, first 'ip -br link': is the storage NIC
+            still there?
+
       - alert: BackupTimerDisabled
         expr: enclave_backup_timer_enabled == 0
         for: 1h
@@ -1538,6 +1555,26 @@ groups:
             'sudo ./scripts/enclave/monitoring.sh facts' on the hypervisor and read what it
             says about vm-backup.sh. If the textfile directory is missing, run
             'monitoring.sh exporter' first.
+
+      # FROZEN, NOT ABSENT (backlog 3.69, 2026-10-16). When vm-backup.sh facts fails, the textfile it
+      # last wrote STAYS - so the metrics never go absent, the rule above never fires, and every rule
+      # in this group goes on evaluating the last good night. On 2026-10-16 host-4's backup facts froze
+      # at 02:00 UTC with the old volume's numbers (33 sets each, last success the night before) while
+      # its new volume held an interrupted full and then died; nothing alerted for three and a half hours
+      # and would not have until someone looked. Same threshold as ComplianceFactsStale: one timer
+      # writes both.
+      - alert: BackupFactsStale
+        expr: (time() - enclave_backup_facts_generated_seconds) > ${AL_FACTS_STALE}
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "backup metrics on {{ \$labels.machine }} are frozen"
+          description: "vm-backup.sh facts last wrote {{ \$value | printf \"%.0f\" }} seconds ago. Every backup alert for this machine is judging the last good run, not this one."
+          action: >-
+            'sudo ./scripts/enclave/monitoring.sh facts' on {{ \$labels.machine }} prints why
+            vm-backup.sh facts fails. A volume that answers I/O errors is the likely cause:
+            'sudo ./scripts/enclave/vm-backup.sh status', then 'reattach'.
 
       - alert: BackupVolumeFilling
         expr: enclave_backup_dest_avail_bytes < ${AL_BACKUP_FREE_BYTES}

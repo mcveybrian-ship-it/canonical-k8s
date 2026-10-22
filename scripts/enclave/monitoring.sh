@@ -57,7 +57,10 @@ TEXTFILE_DIR="${TEXTFILE_DIR:-/var/lib/node_exporter/textfile}"
 # THE SYSTEMD COLLECTOR IS DELIBERATELY NARROWED. Unrestricted it emits several series for
 # every unit on the box - hundreds of them, most of which nobody will ever look at, on a
 # Prometheus with a 90d retention. Named units only: the ones a machine exists to run.
-SYSTEMD_UNITS="${SYSTEMD_UNITS:-(auditd|chrony|sshd|ssh|ufw|nginx|docker|containerd|grafana-server|prometheus|prometheus-alertmanager|prometheus-node-exporter|prometheus-libvirt-exporter|prometheus-postgres-exporter|etcd|patroni|libvirtd|virtqemud|postgresql.*|maas-.*|named|bind9|dailyaidecheck|vm-backup|enclave-facts|enclave-k8s-facts|keepalived|snap\\.k8s\\..*)\\.(service|timer)}"
+# THE PATTERN IS ANCHORED - a name must match WHOLE. `vm-backup` stood here until 2026-10-22 and matched
+# nothing: the units are enclave-vm-backup, enclave-vm-verify and enclave-vm-backup-attach, so no
+# backup unit was ever reported (measured on hosts 1-4) and a failed nightly was invisible (3.71).
+SYSTEMD_UNITS="${SYSTEMD_UNITS:-(auditd|chrony|sshd|ssh|ufw|nginx|docker|containerd|grafana-server|prometheus|prometheus-alertmanager|prometheus-node-exporter|prometheus-libvirt-exporter|prometheus-postgres-exporter|etcd|patroni|libvirtd|virtqemud|postgresql.*|maas-.*|named|bind9|dailyaidecheck|enclave-vm-backup|enclave-vm-backup-attach|enclave-vm-verify|enclave-facts|enclave-k8s-facts|keepalived|snap\\.k8s\\..*)\\.(service|timer)}"
 LV_PORT="${LIBVIRT_EXPORTER_PORT:-9177}"
 
 # THE DATASOURCE UID IS A CONTRACT between the provisioning file and every dashboard JSON.
@@ -1485,18 +1488,38 @@ groups:
             'sudo ./scripts/enclave/vm-backup.sh status' to see which, then
             'vm-backup.sh full <domain>'.
 
+      # NOT WHILE A RUN IS STILL WORKING (3.71, 2026-10-22). A set has no manifest from the moment its
+      # copy starts until the read-back hash ends: on 2026-10-20 svc-repo-01's full was "incomplete" for
+      # 115 minutes and every one of them was a run doing its job. The run lock (enclave_backup_run_active)
+      # tells that from an abandoned set. A host whose facts predate the metric keeps the old behaviour.
       - alert: BackupInterrupted
-        expr: enclave_backup_sets_incomplete > 0
+        expr: enclave_backup_sets_incomplete > 0 unless on (instance) (enclave_backup_run_active == 1)
         for: 30m
         labels:
           severity: warning
         annotations:
           summary: "{{ \$labels.domain }} has an interrupted backup set"
-          description: "A set directory with no MANIFEST.sha256 - a run that started and never finished."
+          description: "A set directory with no MANIFEST.sha256, and no vm-backup.sh run holding the lock - a run that started and never finished."
           action: >-
             An interrupted full also leaves a checkpoint pointing at a base that never
             finished. 'vm-backup.sh status' shows checkpoints; clear the partial set and the
             stale checkpoint before the next run.
+
+      # A FAILED RUN, SEEN WHERE IT HAPPENS (3.71, 2026-10-22). Until the unit list above was fixed no backup
+      # unit was collected, so a failed nightly surfaced only as BackupMissed a day later, and a failed weekly
+      # deep verify - the one check that reads every byte - never surfaced at all.
+      - alert: BackupRunFailed
+        expr: node_systemd_unit_state{name=~"enclave-vm-(backup|verify|backup-attach).service", state="failed"} == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ \$labels.name }} failed on {{ \$labels.machine }}"
+          description: "The nightly backup, the weekly deep verify or the boot-time volume attach ended in failure."
+          action: >-
+            'journalctl -u {{ \$labels.name }} -n 80' on {{ \$labels.machine }} says which step. The nightly's
+            copies are allowed to fail without failing the unit, so a failed nightly is incr, verify or prune.
+            Once fixed: 'sudo systemctl reset-failed {{ \$labels.name }}', or wait for the next run.
 
       - alert: BackupDestinationDetached
         expr: enclave_backup_dest_mounted == 0

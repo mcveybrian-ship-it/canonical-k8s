@@ -90,6 +90,10 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 DEST="${VM_BACKUP_DEST:-${BACKUP_DEST:-}}"
 # KEEP counts CHAINS (a full plus its incrementals), not sets and not days - see cmd_prune.
 KEEP="${BACKUP_KEEP_CHAINS:-2}"
+# ONE RUN AT A TIME (backlog 3.71) - see take_lock. The wait stays inside the timer units' 6 h
+# TimeoutStartSec, so a run that waits and then works is not killed for the waiting.
+LOCK_FILE="${BACKUP_LOCK_FILE:-/run/lock/enclave-vm-backup.lock}"
+LOCK_WAIT="${BACKUP_LOCK_WAIT:-14400}"
 # PER-HOST SETTINGS (backlog 3.68, 2026-10-16). A setting NAME_<HOST> - host-1 is HOST_1 - wins over
 # NAME for that host when it is SET, EVEN EMPTY: an empty per-host value means "none on this host".
 # So one file serves hosts with a USB drive, an iSCSI LUN or a site mount, and hosts whose backup
@@ -2702,6 +2706,12 @@ cmd_facts() {
     printf '# TYPE enclave_backup_timer_enabled gauge\n'
     printf 'enclave_backup_timer_enabled %s\n' \
       "$(systemctl is-active "$SVC_NAME.timer" >/dev/null 2>&1 && echo 1 || echo 0)"
+    # A RUN IN PROGRESS (3.71) - the run lock is held. What BackupInterrupted needs to tell a set still
+    # being written, or hashed, from one a run abandoned: on 2026-10-20 svc-repo-01's full took 85 min
+    # to copy and 30 more to hash, all of it "incomplete".
+    printf '# HELP enclave_backup_run_active 1 while a vm-backup.sh run holds the run lock\n'
+    printf '# TYPE enclave_backup_run_active gauge\n'
+    printf 'enclave_backup_run_active %s\n' "$(run_active)"
 
     # AN UNMOUNTED DESTINATION MUST NOT REPORT ZERO BACKUPS.
     # $DEST still exists as an empty directory when the USB volume is not attached, so
@@ -2853,11 +2863,44 @@ cmd_facts() {
   ok "wrote $out ($(grep -vc '^#' "$out") samples)"
 }
 
+# ---------------------------------------------------------------- the run lock
+# ONE RUN AT A TIME (backlog 3.71). Found 2026-10-22: re-enabling host-4's timers fired the nightly
+# backup and the weekly deep verify within a second of each other - both Persistent, both overdue -
+# and they ran side by side: double load on one volume, `verify --all` meeting a set still being
+# written, and both units ending in third-copy, two rsyncs mirroring into the same folders with
+# --delete. Every command that reads or writes the backup volume takes this lock; a second one WAITS
+# for it (BACKUP_LOCK_WAIT) and then refuses with a line naming the holder. status, progress and facts
+# never take it - they must answer DURING a run - and facts reports it as enclave_backup_run_active.
+# Exported, so a command this script starts for itself does not wait on its own parent. Not taken
+# by a non-root caller: every locked command refuses one anyway, with the clearer message.
+take_lock() {  # <command>
+  [ "${VMB_LOCKED:-0}" = 1 ] && return 0
+  [ "$(id -u)" -eq 0 ] || return 0
+  command -v flock >/dev/null 2>&1 || die "flock not found (util-linux) - cannot keep runs apart"
+  exec 9>>"$LOCK_FILE" || die "cannot open the run lock $LOCK_FILE"
+  if ! flock -n 9; then
+    say "another vm-backup.sh run holds $LOCK_FILE: $(head -1 "$LOCK_FILE" 2>/dev/null || echo 'holder unknown')"
+    say "   '$1' waits up to $((LOCK_WAIT / 60)) min for it to finish"
+    flock -w "$LOCK_WAIT" 9 \
+      || die "the run lock is still held after $((LOCK_WAIT / 60)) min, by: $(head -1 "$LOCK_FILE" 2>/dev/null) - '$1' NOT started"
+    ok "the run lock is free - starting '$1'"
+  fi
+  printf '%s pid %s since %s\n' "$1" "$$" "$(date -u +%FT%TZ)" > "$LOCK_FILE"
+  export VMB_LOCKED=1
+}
+
+# 1 while a run holds the lock, else 0 - for the facts. A fresh read-only descriptor and flock -n:
+# it never waits, and holds the lock for no longer than the test itself.
+run_active() {
+  [ -e "$LOCK_FILE" ] || { echo 0; return 0; }
+  if ( flock -n 9 ) 9<"$LOCK_FILE" 2>/dev/null; then echo 0; else echo 1; fi
+}
+
 case "${1:-status}" in
   status)       cmd_status ;;
   facts)        cmd_facts ;;
-  full)         shift || true; cmd_backup full "${1:-all}" ;;
-  incr)         shift || true; cmd_backup incr "${1:-all}" ;;
+  full)         shift || true; take_lock full; cmd_backup full "${1:-all}" ;;
+  incr)         shift || true; take_lock incr; cmd_backup incr "${1:-all}" ;;
   progress)     cmd_progress ;;
   # `shift || true; ... "$@"` IS LOAD-BEARING, NOT STYLE. Both of these read `verify)
   # cmd_verify ;;` until 2026-09-17, so the flags never reached the functions that parse
@@ -2872,18 +2915,18 @@ case "${1:-status}" in
   #                  function that has already deleted every full backup in this enclave once.
   #
   # If a subcommand takes arguments, forward them. If it takes none, do not add a shift.
-  verify)       shift || true; cmd_verify "$@" ;;
-  prune)        shift || true; cmd_prune "$@" ;;
+  verify)       shift || true; take_lock verify; cmd_verify "$@" ;;
+  prune)        shift || true; take_lock prune; cmd_prune "$@" ;;
   keyfile)      cmd_keyfile ;;
   reattach)     cmd_reattach ;;
   volume-init)  shift; cmd_volume_init "$@" ;;
   schedule)     shift || true; cmd_schedule "${1:-02:00}" ;;
   unschedule)   cmd_unschedule ;;
   restore-plan) shift || true; cmd_restore_plan "${1:-}" ;;
-  restore-test) shift || true; cmd_restore_test "$@" ;;
-  second-copy)  shift || true; cmd_second_copy "$@" ;;
-  third-copy)   shift || true; cmd_third_copy "$@" ;;
-  pgbackrest-copy) shift || true; cmd_pgbackrest_copy "$@" ;;
+  restore-test) shift || true; take_lock restore-test; cmd_restore_test "$@" ;;
+  second-copy)  shift || true; take_lock second-copy; cmd_second_copy "$@" ;;
+  third-copy)   shift || true; take_lock third-copy; cmd_third_copy "$@" ;;
+  pgbackrest-copy) shift || true; take_lock pgbackrest-copy; cmd_pgbackrest_copy "$@" ;;
   hold)         shift || true; cmd_hold "$@" ;;
   *) printf 'usage: %s {status|facts|full [vm]|incr [vm]|progress|verify [--all]|prune [--dry-run]|keyfile|reattach|volume-init [device]|schedule [HH:MM]|unschedule|restore-plan <vm>|restore-test <vm> [--set S] [--keep] [-n]|second-copy [--setup] [-n] [--all] [--verify-all]|third-copy [--setup] [-n] [--all] [--verify-all]|pgbackrest-copy [--setup] [-n]|hold {status|set "<reason>" --review YYYY-MM-DD|release}}\n' "$0" >&2; exit 2 ;;
 esac

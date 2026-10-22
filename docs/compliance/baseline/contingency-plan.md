@@ -226,8 +226,11 @@ limitation. It is still host 4** (runbook §9a.2).
 ✅ **The database half is resolved — 2026-09-28 (B-06a slice 5).** The WAL archive went to host-4
 **and** host-3 as two live pgBackRest stores, each taking its own backups, and a **point-in-time
 restore was proven from each store on its own** — so losing host 4 no longer loses the database's
-roll-forward (`poam.md` ENG-04 closed, ENG-02 reduced). The whole-guest backups still land on host
-4 with a second copy on host-3 (host-1 until 2026-10-15, backlog 3.61), and **every copy is still in one room** (§3.2).
+roll-forward (`poam.md` ENG-04 closed, ENG-02 reduced). The whole-guest backups now land on each host's own encrypted
+volume on the NAS (backlog 3.68, 2026-10-16), so none sits on the machine it protects; host-4's are
+copied on to the lab vault and the NAS. Its copy to another host (host-1, then host-3 from 2026-10-15,
+3.61) stopped 2026-10-20 to keep host-3's shared volume free; its backups are off host-4 already (3.70). **Every copy is still in one
+room** (§3.2).
 
 ### 3.2 The design survives a single host failure. It does not survive a site event.
 

@@ -526,14 +526,23 @@ def page_backup():
     p.legend()
     vms = p.box(40, 110, 330, 90, "<b>host-4's guests</b><br>svc-mgmt-01 · svc-repo-01 · svc-harbor-01 · svc-obs-01", "svc", 11)
     vb = p.box(470, 110, 380, 90, "<b>vm-backup.sh</b> nightly 02:00 Central<br>incr · verify (new sets) · prune · weekly verify --all", "svc", 11)
-    drv = p.box(950, 110, 330, 90, "<b>/mnt/vmbackup</b> on host-4<br>USB SSD, LUKS · 2 chains kept", "svc", 11)
+    # The volume and the second copy are READ from the lab profile, not written here: both labels went stale
+    # once already (the drive said "USB SSD" for a week after 3.68 moved host-4 to a NAS LUN).
+    vol = ("iSCSI LUN on the NAS (lab; a site LUN in production)" if LAB.get("BACKUP_ISCSI_TARGET_HOST_4")
+           else "USB SSD")
+    drv = p.box(950, 110, 330, 90, "<b>/mnt/vmbackup</b> on host-4<br>%s, LUKS · 2 chains kept" % vol, "svc", 11)
     ov = dict(x.split("=", 1) for x in LAB.get("BACKUP_SECOND_OVERRIDE", "").split() if "=" in x)
-    c2 = p.box(950, 240, 330, 80, "<b>second copy → %s</b>%s<br>write-only rrsync · svc-repo-01 skipped"
-               % (ov.get("host-4", "host-1"), " (lab: 3.61; production: the ring)" if "host-4" in ov else ""), "svc", 11)
+    h4 = ov.get("host-4", "host-1")
+    if h4 == "none":
+        c2 = p.box(950, 240, 330, 80, "<b>second copy → none in the lab</b> (3.70: the volume is already on the NAS)"
+                   "<br>production: the ring's next host · write-only rrsync · svc-repo-01 skipped", "svc", 11)
+    else:
+        c2 = p.box(950, 240, 330, 80, "<b>second copy → %s</b>%s<br>write-only rrsync · svc-repo-01 skipped"
+                   % (h4, " (lab: 3.61; production: the ring)" if "host-4" in ov else ""), "svc", 11)
     c3 = p.box(1320, 240, 330, 80, "<b>third copy → lab-vault + NAS</b><br>10.2.30.170 · 10.2.30.171 (encrypted dataset), storage network", "lab", 11)
     p.edge(vms, vb, "", FLOW)
     p.edge(vb, drv, "", FLOW)
-    p.edge(drv, c2, "nightly · new files verified", FLOW)
+    p.edge(drv, c2, "nightly · new files verified" + (" · production only" if h4 == "none" else ""), FLOW)
     p.edge(drv, c3, "nightly · lab only", FLOW_LAB)
     p.box(40, 240, 860, 80, "Copies verify only files not verified before (a ledger on host-4); the weekly verify re-reads both "
           "copies in full (--verify-all). Measured 2026-10-01: 182.4 GB first third copy in 38.6 min.", "note")

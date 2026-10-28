@@ -1551,6 +1551,62 @@ groups:
             in afresh and checks the filesystem. On iSCSI, first 'ip -br link': is the storage NIC
             still there?
 
+      # THE BACKUP STORAGE ITSELF - one probe per host every minute (backlog 3.72, 2026-10-28). Two failures
+      # that look the same from one host and are not: on 2026-10-27 the NAS was powered off (its button) and
+      # EVERY host lost it; on 2026-10-16 host-4's USB storage NIC dropped and only host-4 did. So the "all"
+      # case and the "one" case are separate rules, and the "one" rule stays quiet while the "all" one fires.
+      - alert: BackupStorageDown
+        expr: count by (portal) (enclave_storage_portal_up == 0) == count by (portal) (enclave_storage_portal_up)
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "the backup storage {{ \$labels.portal }} is unreachable from every host"
+          description: "No host can open its iSCSI portal. Nightly backups will fail on all of them until it is back."
+          action: >-
+            The storage itself: is it powered on and on its network? (2026-10-27: the NAS's power button.)
+            When it is back the hosts log in again by themselves, and the next nightly's reattach heals each
+            volume - or run 'sudo ./scripts/enclave/vm-backup.sh reattach' on each host to do it now.
+
+      - alert: BackupStoragePathDown
+        expr: >-
+          (enclave_storage_portal_up == 0)
+          unless on (portal) (count by (portal) (enclave_storage_portal_up == 0) == count by (portal) (enclave_storage_portal_up))
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ \$labels.machine }} cannot reach the backup storage {{ \$labels.portal }} - the other hosts can"
+          description: "The storage is up; this host's path to it is not. Its nightly backup will fail."
+          action: >-
+            This host's storage NIC, cable or switch port: 'ip -br link' on {{ \$labels.machine }}.
+            (2026-10-16: host-4's USB 2.5 Gb adapter dropped off the USB bus - reseat it or move it to
+            another port.) Then 'sudo ./scripts/enclave/vm-backup.sh reattach' there.
+
+      - alert: BackupStorageSessionDown
+        expr: (enclave_storage_session_up == 0) and on (instance, portal) (enclave_storage_portal_up == 1)
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ \$labels.machine }} reaches the backup storage but is not logged in to it"
+          description: "The portal answers and the iSCSI session is not LOGGED_IN - it is not reconnecting by itself."
+          action: >-
+            'sudo ./scripts/enclave/vm-backup.sh reattach' on {{ \$labels.machine }} logs a dead session
+            out and in again. If the login is refused, check the target's initiator list on the storage.
+
+      - alert: BackupStorageProbeStale
+        expr: (time() - enclave_storage_probe_timestamp_seconds) > 300
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "the backup storage probe on {{ \$labels.machine }} has stopped"
+          description: "No probe for {{ \$value | printf \"%.0f\" }} seconds - the three rules above are judging an old reading."
+          action: >-
+            'systemctl status enclave-storage-probe.timer' on {{ \$labels.machine }}; reinstall it with
+            'sudo ./scripts/enclave/vm-backup.sh storage-probe --timer'.
+
       - alert: BackupTimerDisabled
         expr: enclave_backup_timer_enabled == 0
         for: 1h

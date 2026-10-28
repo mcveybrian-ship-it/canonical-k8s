@@ -1690,6 +1690,305 @@
           }
         }
       ]
+    },
+    {
+      "type": "row",
+      "title": "Backup storage - can every host reach the NAS (or the site's SAN), every minute",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 108
+      },
+      "panels": []
+    },
+    {
+      "type": "stat",
+      "title": "Backup storage reachable",
+      "description": "Each host opens a TCP connection to its iSCSI portal every minute (vm-backup.sh storage-probe). All red at once: the storage is down (2026-10-27, the NAS's power button). One red: that host's path (2026-10-16, host-4's USB storage NIC).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "enclave-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 9,
+        "x": 0,
+        "y": 109
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "transparent",
+                "value": null
+              }
+            ]
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "1": {
+                  "text": "Reachable",
+                  "color": "green",
+                  "index": 0
+                },
+                "0": {
+                  "text": "UNREACHABLE",
+                  "color": "red",
+                  "index": 1
+                }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value_and_name",
+        "colorMode": "background",
+        "graphMode": "none",
+        "orientation": "vertical"
+      },
+      "targets": [
+        {
+          "expr": "enclave_storage_portal_up",
+          "refId": "A",
+          "instant": true,
+          "legendFormat": "{{machine}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "enclave-prometheus"
+          }
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "iSCSI session",
+      "description": "This host's session to its backup target. NOT LOGGED IN while the storage is reachable means it is not reconnecting by itself: run vm-backup.sh reattach on that host.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "enclave-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 9,
+        "x": 9,
+        "y": 109
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "transparent",
+                "value": null
+              }
+            ]
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "1": {
+                  "text": "Logged in",
+                  "color": "green",
+                  "index": 0
+                },
+                "0": {
+                  "text": "NOT LOGGED IN",
+                  "color": "red",
+                  "index": 1
+                }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value_and_name",
+        "colorMode": "background",
+        "graphMode": "none",
+        "orientation": "vertical"
+      },
+      "targets": [
+        {
+          "expr": "enclave_storage_session_up",
+          "refId": "A",
+          "instant": true,
+          "legendFormat": "{{machine}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "enclave-prometheus"
+          }
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Probe age",
+      "description": "Seconds since each host's last storage probe. Over 5 minutes: the probe has stopped, and the two panels to the left show an old reading.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "enclave-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 109
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 180
+              },
+              {
+                "color": "red",
+                "value": 300
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value_and_name",
+        "colorMode": "background",
+        "graphMode": "none",
+        "orientation": "vertical"
+      },
+      "targets": [
+        {
+          "expr": "time() - enclave_storage_probe_timestamp_seconds",
+          "refId": "A",
+          "instant": true,
+          "legendFormat": "{{machine}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "enclave-prometheus"
+          }
+        }
+      ]
+    },
+    {
+      "type": "state-timeline",
+      "title": "Backup storage reachable, per host - when it went, and when it came back",
+      "description": "Green: the iSCSI portal answered that minute's probe. Red: it did not. Gaps: no probe.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "enclave-prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 24,
+        "x": 0,
+        "y": 113
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "transparent",
+                "value": null
+              }
+            ]
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "1": {
+                  "text": "Reachable",
+                  "color": "green",
+                  "index": 0
+                },
+                "0": {
+                  "text": "UNREACHABLE",
+                  "color": "red",
+                  "index": 1
+                }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "showValue": "never",
+        "mergeValues": true,
+        "rowHeight": 0.8,
+        "alignValue": "left",
+        "legend": {
+          "showLegend": false,
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      },
+      "targets": [
+        {
+          "expr": "enclave_storage_portal_up",
+          "refId": "A",
+          "legendFormat": "{{machine}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "enclave-prometheus"
+          }
+        }
+      ]
     }
   ]
 }

@@ -29,6 +29,8 @@
 #     sudo ./vm-backup.sh keyfile                add a keyfile so unlocking needs no human
 #     sudo ./vm-backup.sh reattach               after a reboot: iSCSI login (if this host has a target),
 #                                                unlock, mount, re-block USB (if it was a USB drive)
+#     sudo ./vm-backup.sh storage-probe [--timer]  is the iSCSI backup storage there - portal and session -
+#                                                for node-exporter; --timer installs the every-minute probe
 #     sudo ./vm-backup.sh volume-init [device]   ONCE, a NEW backup volume: LUKS2 (FIPS pbkdf2) and ext4 on
 #                                                an EMPTY device - this host's iSCSI LUN when none is named.
 #                                                Refuses anything that already holds data (3.68)
@@ -1585,6 +1587,8 @@ VERIFY_SVC="enclave-vm-verify"
 # same second, and nothing noticed until BackupMissed fired - backups had depended on a human
 # remembering `reattach`. Hands-off is the requirement: an unattended reboot must not stop them.
 ATTACH_SVC="enclave-vm-backup-attach"
+# Probes the backup storage every minute (backlog 3.72) - see cmd_storage_probe.
+PROBE_SVC="enclave-storage-probe"
 # WHEN THE DEEP VERIFY RUNS. Weekly, and deliberately not adjacent to the nightly backup:
 # both read the same USB volume and overlapping them halves the throughput of each. Sunday
 # 04:00 leaves the nightly run at 02:00 finished long before. A parameter, not a constant.
@@ -1773,6 +1777,7 @@ EOF
   else
     warn "${ATTACH_SVC}.service did not start - see: systemctl status ${ATTACH_SVC}.service"
   fi
+  storage_probe_timer "$self"
   ok "scheduled: ${SVC_NAME}.timer at ${at} ${BACKUP_TZ} daily -> ${DEST}"
   ok "scheduled: ${VERIFY_SVC}.timer '${weekly_cal}' - deep verify, reads every byte"
   say ""
@@ -1813,8 +1818,10 @@ cmd_unschedule() {
   # and unmounting a volume a restore may be reading is not unschedule's business.
   systemctl disable "${ATTACH_SVC}.service" >/dev/null 2>&1 || true
   rm -f "/etc/systemd/system/${ATTACH_SVC}.service"
+  systemctl disable --now "${PROBE_SVC}.timer" >/dev/null 2>&1 || true
+  rm -f "/etc/systemd/system/${PROBE_SVC}.timer" "/etc/systemd/system/${PROBE_SVC}.service" "$TEXTFILE_DIR/$STORAGE_PROM"
   systemctl daemon-reload
-  ok "removed ${SVC_NAME}, ${VERIFY_SVC} and ${ATTACH_SVC}"
+  ok "removed ${SVC_NAME}, ${VERIFY_SVC}, ${ATTACH_SVC} and ${PROBE_SVC}"
 }
 
 # ---------------------------------------------------------------- restore
@@ -2903,6 +2910,84 @@ cmd_facts() {
   ok "wrote $out ($(grep -vc '^#' "$out") samples)"
 }
 
+# ---------------------------------------------------------------- the storage probe
+# IS THE BACKUP STORAGE THERE - EVERY MINUTE, FROM EVERY HOST (backlog 3.72, 2026-10-28). The NAS was
+# off for 26 hours (its power button) and the alerts that fired were about backups: the facts run every
+# 15 minutes and BackupVolumeFailed waits 15 more, and nothing said "the storage is gone". On 2026-10-16
+# the same symptom had a different cause - host-4's USB storage NIC alone. One probe per host tells the
+# two apart: every host losing the portal is the storage; one host losing it is that host's path.
+# What it measures: a TCP connection to the iSCSI portal within BACKUP_PROBE_TIMEOUT seconds, and this
+# host's session state (LOGGED_IN or not). A host with no iSCSI backup volume publishes nothing - a
+# site's NFS mount is not probed here. Written for node-exporter's textfile collector, like the facts.
+STORAGE_PROM="enclave-storage.prom"
+cmd_storage_probe() {
+  need_root; assert_hypervisor
+  if [ "${1:-}" = --timer ]; then
+    "$HERE/install-runtime.sh" >/dev/null || die "could not install the root-owned runtime copy"
+    storage_probe_timer "$("$HERE/install-runtime.sh" --print-dir)/vm-backup.sh"
+    return
+  fi
+  local out="$TEXTFILE_DIR/$STORAGE_PROM" tmp up=0 sess=0 st host port to="${BACKUP_PROBE_TIMEOUT:-3}"
+  if [ -z "$ISCSI_TARGET" ]; then
+    rm -f "$out"; say "no iSCSI backup volume on $(hostname -s) - nothing to probe"; return 0
+  fi
+  [ -d "$TEXTFILE_DIR" ] || die "no $TEXTFILE_DIR - run: monitoring.sh exporter"
+  host="${ISCSI_PORTAL%:*}"; port="${ISCSI_PORTAL##*:}"
+  timeout "$to" bash -c "</dev/tcp/$host/$port" 2>/dev/null && up=1
+  st="$(iscsi_state)"; [ "$st" = LOGGED_IN ] && sess=1
+  tmp="$(mktemp "$TEXTFILE_DIR/.storage.XXXXXX")" || die "cannot write in $TEXTFILE_DIR"
+  {
+    printf '# HELP enclave_storage_portal_up 1 if the backup storage iSCSI portal accepted a TCP connection within %ss\n' "$to"
+    printf '# TYPE enclave_storage_portal_up gauge\n'
+    printf 'enclave_storage_portal_up{portal="%s"} %s\n' "$ISCSI_PORTAL" "$up"
+    printf '# HELP enclave_storage_session_up 1 if this host'"'"'s iSCSI session to its backup target is LOGGED_IN\n'
+    printf '# TYPE enclave_storage_session_up gauge\n'
+    printf 'enclave_storage_session_up{portal="%s",target="%s"} %s\n' "$ISCSI_PORTAL" "$ISCSI_TARGET" "$sess"
+    printf '# HELP enclave_storage_probe_timestamp_seconds unix time of this probe\n'
+    printf '# TYPE enclave_storage_probe_timestamp_seconds gauge\n'
+    printf 'enclave_storage_probe_timestamp_seconds %s\n' "$(date +%s)"
+  } > "$tmp"
+  chmod 0644 "$tmp"; mv -f "$tmp" "$out"
+  say "portal $ISCSI_PORTAL $([ "$up" = 1 ] && echo reachable || echo UNREACHABLE) - session ${st:-none}"
+}
+
+# The probe's every-minute timer. Run by `schedule`, and by `storage-probe --timer` alone so it can be
+# added or refreshed without touching the backup timers. Removes itself where there is nothing to probe.
+storage_probe_timer() {  # <the runtime copy's vm-backup.sh>
+  local self="$1"
+  if [ -z "$ISCSI_TARGET" ]; then
+    systemctl disable --now "${PROBE_SVC}.timer" >/dev/null 2>&1 || true
+    rm -f "/etc/systemd/system/${PROBE_SVC}.timer" "/etc/systemd/system/${PROBE_SVC}.service" "$TEXTFILE_DIR/$STORAGE_PROM"
+    systemctl daemon-reload
+    say "no iSCSI backup volume here - no storage probe"
+    return 0
+  fi
+  cat > "/etc/systemd/system/${PROBE_SVC}.service" <<EOF
+[Unit]
+Description=Probe the backup storage (iSCSI portal and session) for node-exporter
+
+[Service]
+Type=oneshot
+ExecStart=${self} storage-probe
+EOF
+  cat > "/etc/systemd/system/${PROBE_SVC}.timer" <<EOF
+[Unit]
+Description=Probe the backup storage every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now "${PROBE_SVC}.timer" >/dev/null 2>&1 || die "could not enable ${PROBE_SVC}.timer"
+  systemctl start "${PROBE_SVC}.service" || warn "the first probe failed - see: journalctl -u ${PROBE_SVC}.service -n 20"
+  ok "installed ${PROBE_SVC}.timer - every minute: $(grep -v '^#' "$TEXTFILE_DIR/$STORAGE_PROM" 2>/dev/null | tr '\n' ' ')"
+}
+
 # ---------------------------------------------------------------- the run lock
 # ONE RUN AT A TIME (backlog 3.71). Found 2026-10-22: re-enabling host-4's timers fired the nightly
 # backup and the weekly deep verify within a second of each other - both Persistent, both overdue -
@@ -2968,5 +3053,6 @@ case "${1:-status}" in
   third-copy)   shift || true; take_lock third-copy; cmd_third_copy "$@" ;;
   pgbackrest-copy) shift || true; take_lock pgbackrest-copy; cmd_pgbackrest_copy "$@" ;;
   hold)         shift || true; cmd_hold "$@" ;;
-  *) printf 'usage: %s {status|facts|full [vm]|incr [vm]|progress|verify [--all]|prune [--dry-run]|keyfile|reattach|volume-init [device]|schedule [HH:MM]|unschedule|restore-plan <vm>|restore-test <vm> [--set S] [--keep] [-n]|second-copy [--setup] [-n] [--all] [--verify-all]|third-copy [--setup] [-n] [--all] [--verify-all]|pgbackrest-copy [--setup] [-n]|hold {status|set "<reason>" --review YYYY-MM-DD|release}}\n' "$0" >&2; exit 2 ;;
+  storage-probe) shift || true; cmd_storage_probe "$@" ;;
+  *) printf 'usage: %s {status|facts|full [vm]|incr [vm]|progress|verify [--all]|prune [--dry-run]|keyfile|reattach|volume-init [device]|schedule [HH:MM]|unschedule|restore-plan <vm>|restore-test <vm> [--set S] [--keep] [-n]|second-copy [--setup] [-n] [--all] [--verify-all]|third-copy [--setup] [-n] [--all] [--verify-all]|pgbackrest-copy [--setup] [-n]|hold {status|set "<reason>" --review YYYY-MM-DD|release}|storage-probe [--timer]}\n' "$0" >&2; exit 2 ;;
 esac

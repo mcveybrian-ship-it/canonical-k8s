@@ -1267,6 +1267,50 @@ dest_problem() {
   [ "$st" = LOGGED_IN ] || printf 'its iSCSI session to %s is %s, not LOGGED_IN' "$ISCSI_TARGET" "${st:-gone}"
 }
 
+# The state of the block device under this host's open LUKS mapping - running, transport-offline, or
+# nothing when the mapping or its device is gone. Its own function so the heal can be tested offline.
+mapper_device_state() {
+  local dm sl
+  dm="$(basename "$(readlink -f "/dev/mapper/$LUKS_NAME" 2>/dev/null)")"
+  sl="$(ls "/sys/block/$dm/slaves" 2>/dev/null | head -1)"
+  [ -n "$sl" ] && cat "/sys/block/$sl/device/state" 2>/dev/null
+  return 0
+}
+
+# HEAL A MOUNTED VOLUME WHOSE STORAGE CAME BACK (2026-10-28). The NAS was powered off for 26 hours
+# (its power button, 10-27 09:42 Central); when it returned every host's iSCSI session logged back in
+# by itself, but each ext4 had recorded errors while its disk was gone, and reattach refused and
+# printed commands for a person to type (3.69). The nightly runs reattach first, so healing here means
+# the next nightly recovers on its own. Three refusals, each one line in the journal: the storage is
+# not back (a dead session cannot be checked against), a run holds the volume (the lock), or the
+# unmount fails. After this, reattach carries on as a fresh attach - log in, open, e2fsck -p, mount -
+# and e2fsck -p fixes only what is safe unattended: anything else stops it there and the alerts fire.
+heal_volume() {
+  local st
+  if [ -n "$ISCSI_TARGET" ] && [ "$(iscsi_state)" != LOGGED_IN ]; then
+    warn "  the storage is not back (iSCSI session: $(iscsi_state || true)) - nothing to heal onto yet"
+    return 1
+  fi
+  if [ "$(run_active)" != 0 ]; then
+    warn "  a backup run holds the volume ($(head -1 "$LOCK_FILE" 2>/dev/null)) - not touching it"
+    return 1
+  fi
+  take_lock reattach-heal
+  say "  healing: unmount, check, remount"
+  if ! umount "$DEST"; then
+    warn "  could not unmount $DEST - in use by: $(fuser -vm "$DEST" 2>&1 | tail -n +2 | tr -s ' ' | head -5)"
+    return 1
+  fi
+  # The mapping must sit on a LIVE device. A session that recovered in place keeps its device (seen on
+  # all four hosts 2026-10-28); a full re-login makes a new one and leaves the mapping on the dead one.
+  st="$(mapper_device_state)"
+  if [ "$st" != running ]; then
+    say "  the encrypted volume sits on a device in state '${st:-gone}' - closing it, to reopen on the live one"
+    cryptsetup close "$LUKS_NAME" || { warn "  could not close $LUKS_NAME"; return 1; }
+  fi
+  ok "  unmounted - carrying on as a fresh attach"
+}
+
 iscsi_attach() {
   [ -n "$ISCSI_TARGET" ] || return 0
   command -v iscsiadm >/dev/null 2>&1 || die "iscsiadm not found - install open-iscsi"
@@ -1391,13 +1435,9 @@ cmd_reattach() {
   if mountpoint -q "$DEST"; then
     # MOUNTED IS NOT HEALTHY (3.69): a volume whose device died under it is still mounted.
     local why; why="$(dest_problem)"
-    if [ -n "$why" ]; then
-      warn "$DEST is mounted, but $why."
-      say  "  Take it down, then run reattach again - it logs in afresh and checks the filesystem:"
-      say  "     sudo umount $DEST && sudo cryptsetup close $LUKS_NAME"
-      return 1
-    fi
-    ok "$DEST is already mounted - nothing to do"; return 0
+    [ -n "$why" ] || { ok "$DEST is already mounted - nothing to do"; return 0; }
+    warn "$DEST is mounted, but $why."
+    heal_volume || return 1
   fi
   volume_named
   iscsi_attach

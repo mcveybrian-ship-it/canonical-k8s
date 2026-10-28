@@ -500,6 +500,13 @@ Also measured: scrubs weekly on every pool (Sunday 00:00); **HDD standby is `ALW
 disk** — step 6's 60 minutes is not applied; TrueNAS 25.10 has no `smart.test.query` API method, so
 whether periodic SMART tests are scheduled is a UI check (Data Protection).
 
+**Operating it (2026-10-28):** web UI **https://10.0.20.10/ui/** (office network; TrueNAS's self-signed certificate);
+account **`truenas_admin`**, created at install (TrueNAS's installer default; root is kept only as a fallback). Its journal
+needs `sudo` — run `sudo -v` alone first, so a pasted block cannot be swallowed by the password prompt. **A short press
+of the power button shuts it down cleanly** — that is what took it off for 26 hours on 2026-10-27 (09:42:21 Central,
+`Power key pressed short`); guard or move it. **On a UPS since 2026-10-28 ~17:47 Central**; the UPS's USB signal to the
+NAS (System → Services → UPS) is not set up yet, so a long outage still ends with the battery, not a clean shutdown.
+
 **The TrueNAS Shell is zsh**, which does not treat `#` as a comment at an interactive prompt — a
 pasted `### MACHINE:` line fails with `missing end of string`. Type **`bash`** first; every block in
 this repository then behaves as it does elsewhere.

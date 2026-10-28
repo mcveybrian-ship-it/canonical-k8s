@@ -97,6 +97,7 @@ refusal. **A difference that is not in this table is a defect: add it here the d
 | Cluster images into Harbor | `images-load` from stage-01 over the gap cable | on svc-harbor-01 from svc-repo-01's `/oci/` — **the in-gap fetch is not built yet** (directory listing is off) | `docs/07-kubernetes.md` §3.1, §7 |
 | stage-01's enclave address | `10.2.20.160`, temporary, for the build | removed at cutover — nothing inside depends on stage-01 | `enclave-addresses.env` |
 | Dead-worker fencing (H2) | a documented manual step — no BMCs | automatic, through each host's BMC | backlog B-07 (H2), 2.8 |
+| **Alert email** (3.72) | `scripts/lab/alert-mail.sh` on **stage-01**, outside the gap: reads Alertmanager on svc-obs-01 over SSH once a minute and mails new and cleared alerts (critical, plus `Backup…`) through Google's SMTP with an app password — the enclave sends nothing out; settings and the password in `/etc/enclave-lab/alert-mail.env` (encadmin, 0600), never in git | **none** — the notification is the dashboard (acting AO, Q26, 2026-09-18); if a path out is ever authorised, an `email_configs` block on Alertmanager's one receiver, sent from inside, not this relay | `scripts/lab/alert-mail.sh`; `monitoring.sh` (the receiver) |
 
 ## Before you start, gather
 

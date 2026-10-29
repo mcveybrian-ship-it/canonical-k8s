@@ -61,9 +61,11 @@ load_conf() {
 
 # The relay itself. Python's own smtplib, so the password never appears in a process list.
 RELAY_PY="$(cat <<'PYEOF'
-import email.utils, json, os, re, smtplib, sys, time
+import email.utils, json, os, re, smtplib, ssl, sys, time
 from email.message import EmailMessage
 
+# ONE LINE ON FAILURE: the journal and the operator get the reason, not two tracebacks.
+sys.excepthook = lambda t, v, tb: print(f"  [x] {t.__name__}: {v}", file=sys.stderr)
 E = os.environ
 mode = sys.argv[1]
 state_path = E["ALERT_MAIL_STATE"]
@@ -76,14 +78,27 @@ def send(subject, body):
     m["Message-ID"] = email.utils.make_msgid(domain="stage-01.lab")
     m.set_content(body)
     port = int(E["ALERT_MAIL_SMTP_PORT"])
+    # VERIFY THE SERVER. smtplib's own default context does not check the certificate at all.
+    ctx = ssl.create_default_context()
     if port == 465:
-        s = smtplib.SMTP_SSL(E["ALERT_MAIL_SMTP_HOST"], port, timeout=30)
+        s = smtplib.SMTP_SSL(E["ALERT_MAIL_SMTP_HOST"], port, timeout=30, context=ctx)
     else:
-        s = smtplib.SMTP(E["ALERT_MAIL_SMTP_HOST"], port, timeout=30); s.starttls()
+        s = smtplib.SMTP(E["ALERT_MAIL_SMTP_HOST"], port, timeout=30); s.starttls(context=ctx)
     try:
-        s.login(E["ALERT_MAIL_SMTP_USER"], E["ALERT_MAIL_SMTP_PASS"]); s.send_message(m)
+        s.ehlo()
+        s.user, s.password = E["ALERT_MAIL_SMTP_USER"], E["ALERT_MAIL_SMTP_PASS"]
+        # AUTH LOGIN IN TWO STEPS (2026-10-29). Gmail closes the connection on smtplib's default - AUTH PLAIN
+        # with the credentials on the same line - for ANY account, and answers every other form properly.
+        # Measured from stage-01 with a made-up account: the default 'Connection unexpectedly closed';
+        # PLAIN in two steps, LOGIN in two steps and LOGIN in one line each a clean 535 (wrong password).
+        s.auth("LOGIN", s.auth_login, initial_response_ok=False)
+        s.send_message(m)
+    except smtplib.SMTPAuthenticationError as e:
+        raise RuntimeError(f"Google refused the sign-in ({e.smtp_code}): check the address and that the app "
+                           f"password is current - {e.smtp_error.decode(errors='replace')[:120]}") from None
     finally:
-        s.quit()
+        try: s.quit()
+        except Exception: pass
 
 if mode == "test":
     send("[enclave lab] test - the alert relay can send",

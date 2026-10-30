@@ -1,39 +1,54 @@
-# Facility A — a main facility with external sites that must run through a lockdown
+# Facility A — a main facility that can disconnect from its external sites at will
 
-**Status: designed on paper 2026-10-30 — all fifteen questions answered by Brian (A1–A15, plus
-A10c). Still open: the review role, vendor questions 2–6, DoD CRL lifetime, a survey of each site.
-Nothing built.**
-Backlog 3.74. Diagram: [`01-facility-a.drawio`](01-facility-a.drawio) — three pages: normal
-operation, lockdown, reconnect and reconcile.
+Backlog 3.74. **The answers live in [`01-facility-a.env`](01-facility-a.env)**, one line each with
+who set it and when. **Everything below the BEGIN marker, and the whole of
+[`01-facility-a.drawio`](01-facility-a.drawio), is generated from them** by
+[`facility-design.py`](facility-design.py) — change an answer and rebuild; never edit the
+generated parts. A what-if prints the variant's design and checks and writes nothing:
 
-## The scenario as given (Brian, 2026-10-30)
+```bash
+### MACHINE: stage-01 (10.0.20.160) - prints only, writes nothing ###
+python3 docs/facility-setups/facility-design.py show 01-facility-a SITE_HA=S1 DISCONNECT_DAYS=120
+```
+
+Changing an answer writes the `.env`, the block below and the `.drawio`:
+
+```bash
+### MACHINE: stage-01 (10.0.20.160) ###
+if [ "$(hostname -s)" != stage-01 ]; then echo "WRONG MACHINE: $(hostname -s)"; else
+  cd ~/canonical-k8s && python3 docs/facility-setups/facility-design.py set 01-facility-a SITE_HA=M1 --note "why"
+fi
+```
+
+`ask 01-facility-a --open` walks only the unanswered questions, one at a time; `keys` lists every
+key and the values it takes.
+
+## The scenario (Brian, 2026-10-30)
 
 - The main facility runs the internal system.
 - External sites sit outside the facility and are connected to it.
-- When the facility goes on lockdown, the internal system is cut off from the external sites.
-- During the lockdown **both sides keep running**: the internal system, and each external site on
+- **The main facility can disconnect from the external sites at will** — whenever it chooses, for
+  any reason. The design does not depend on why.
+- While disconnected **both sides keep running**: the internal system, and each external site on
   its own.
 - When the connection comes back, the external sites' data is **reconciled back into the
   internal system**.
+- Every site is a closed system, connected or not: *"these are closed systems but get more closed
+  on lock down"*.
 
-## What it changes in the current design
-
-| The design today | Facility A | Source |
-|---|---|---|
-| Network: **fully disconnected, no egress — locked** | **Still holds.** Every site is a closed system (A2). What changes is that the closed network spans sites, joined by a link in normal operation; a lockdown cuts that link and leaves each site closed on its own | `HANDOFF.md` §1 |
-| One site, one room | Several sites, and a link between them that is part of the boundary | `HANDOFF.md` §1, §4 |
-| One site, no standby — accepted as a risk | Two or more sites, each able to run alone | `HANDOFF.md` §4, `poam.md` AO-19 |
-| One database, one writer: Patroni, synchronous replication | A writer at every site for the length of the lockdown | backlog B-06a, `06a-postgres-ha.md` |
-| The mission application is COTS | The merge happens inside data the vendor's product owns | backlog 6a.21 |
-| One clock for the enclave | Each site keeps its own time during the split, and a merge orders events by it | `scripts/enclave/time-sync.sh` |
+*Restated 2026-10-30.* The scenario was first given as a lockdown: when the facility goes on
+lockdown, the internal system is cut off from the external sites. Brian widened it the same day to
+a main site that can be disconnected at will from the external sites. Every answer below carries over
+unchanged, and the questions now say *disconnect*. The widening raised one new question: who may
+order a disconnect (A6c).
 
 ## Where the hard part is
 
 **Copying data back is easy. Deciding what wins is not.** Three cases, in order of difficulty:
 
-1. **External sites only create new records during the lockdown.** The reconcile is an append.
+1. **External sites only create new records during the disconnect.** The reconcile is an append.
    The one trap: if both sides number records from their own counter, both issue the same next
-   number. Per-site number ranges or prefixes have to be decided **before** the first lockdown —
+   number. Per-site number ranges or prefixes have to be decided **before** the first disconnect —
    afterwards there are already two record 1042s.
 2. **External sites also change records that existed before the split, and the main side does
    not touch them.** Still mergeable: the external change applies on top.
@@ -56,73 +71,29 @@ interfaces, which somebody has to build and own, with a review queue for case 3.
 **Proposal: an external site always works on its local copy.** If a site normally uses the main
 system and switches to a local copy only when the link is cut, the switch-over happens during an
 incident — the least-tested moment there is. If it always works locally and the link only carries
-sync, a lockdown pauses sync and changes nothing about how the site runs. Depends on A4.
+sync, a disconnect pauses sync and changes nothing about how the site runs. Depends on A4.
+With disconnects at will this matters more: one can come at any time, and it must never be an
+incident for the site.
 
-**A lockdown is a security event.** For its duration the external site ran outside the main
-facility's control. What comes back should land in a staging area and be checked before it is
-merged, not replicate straight in — and a named person authorises the reconnect.
+**Treat every reconnect as a security event, whatever the reason for the disconnect.** For its
+duration the external site ran outside the main facility's control. What comes back should land
+in a staging area and be checked before it is merged, not replicate straight in — and a named
+person authorises the reconnect.
 
-## What an external site needs to run alone
+## How the harder answers were reached (2026-10-30)
 
-An external site is a smaller copy of this enclave, and most of it already exists here:
+Two answers came after Brian asked to see the options. The comparisons are kept as he saw them —
+**a record of the decision, not the current state**: the current answers are in the generated
+block, and a later change there does not rewrite this history. The one edit since: he saw them
+as *lockdown*, now *disconnect* (restated above). The substance is unchanged.
 
-- compute and a database of its own — how big depends on A1;
-- its own backups (`vm-backup.sh`) — the lockdown length (A5) sets how much;
-- its own time source, if a lockdown can outlast the clock's drift tolerance;
-- identity that works disconnected — CAC needs revocation lists cached at the site (6a.23, D3);
-- its own monitoring, because `svc-obs-01` is on the other side of the cut;
-- patches and images carried from the main site while connected (mirror, Harbor).
-
-**One host per site means a host failure during a lockdown stops that site.** Whether that is
-acceptable is part of A1.
-
-## Questions
-
-**Answer them in this order.** A4 and A3 first: together they decide whether the merge is
-**bought** (the vendor's feature) or **built** (an export, staging and review queue that somebody
-owns). A2 and A1 next: they decide the accreditation shape and the hardware at each site. The rest
-refine a design that those four have already shaped.
-
-| # | Question | Who answers | Why it decides the design | Answer |
-|---|---|---|---|---|
-| **A1** | How many external sites, and what runs at each — the full application or part of it, for how many users? | facility | Sizes each site: one host or three | 🔄 **4–10 external sites** (Brian, 2026-10-30). So a site is a **repeatable, parameterised build** — one procedure, a parameter file per site, never hand-built 4–10 times — and a reconnect after a lockdown is up to ten separate merges. ✅ **The whole application at every site** (Brian, 2026-10-30) — so the merge covers every record type the product has. ✅ **Under 10 concurrent users per site** (Brian, 2026-10-30) — small hardware. **One host or more is decided by A9**, not by load |
-| **A2** | What carries the link in normal operation — dedicated fibre, a leased circuit, an encrypted tunnel — and are the external sites inside the same accreditation boundary? | facility (link) · AO (boundary) | One system across sites, or separate systems with an interconnection agreement. A link through space the facility does not control needs FIPS-validated encryption on it | ✅ **Answered 2026-10-30 (Brian):** *"these are closed systems but get more closed on lock down"* — no egress in either state; the lockdown cuts the inter-site link. ✅ **The link is the facility's own fibre, on ground it controls** (Brian, 2026-10-30) — so no bulk link encryption is required for crossing uncontrolled space; the services' own TLS still protects the traffic. Reading, to confirm with A15: the external sites are outside the **lockdown** perimeter but on ground the facility controls. ✅ **One system, one authorization** (Brian as acting AO, 2026-10-30): one SSP covers every site, each external site a segment of the same enclave — so **every site meets the full control set**, physical protection included (A15) |
-| **A3** | During a lockdown, does an external site only create new records, or also change records that existed before? Does the main side change those same records meanwhile? And when both sides changed one record, who decides which stands — a rule, or a named role? | mission owner | Cases 1–3 above | 🔄 **All three — answered 2026-10-30 (Brian):** *"case 1, 2, 3 must all be accounted for"*. The built merge handles new records, changes to records the main side did not touch, **and real conflicts**. ✅ **Conflicts: merge by field, a person for real clashes** (Brian, 2026-10-30): where the two sides changed **different** fields of a record, both changes apply automatically; only where they changed the **same** field does a named role decide, from a review queue. Nothing is discarded silently — both versions stay in the record's history. ⚠️ **What that requires:** a field can only be called "changed" against the record **as it stood at the cut**, so every site keeps that starting state, and its change journal records each field's before and after. Still open: which role reviews the queue |
-| **A4** | Does the COTS application support a disconnected remote site that syncs back? Detail below | vendor | Vendor-supported sync, or a built export/import | ✅ **No — answered 2026-10-30 (Brian).** The product runs only as one central system. **The merge is BUILT**: export, staging, checks and a review queue, through the product's own interfaces, owned by whoever builds it. The vendor questions below narrow to what that build needs |
-| **A5** | How long can a lockdown last — hours, days, weeks? | facility | Storage, backups, time source and CRL freshness at each site | ✅ **Design for 30–45 days untended — the design figure is 45** (Brian, 2026-10-30). So: a receive-only GPS time source at every site; CAC revocation lists valid 45+ days after the cut, or an AO decision on what happens when they expire; application passwords that outlive 45 days, or CAC; an alert on any site certificate within 45 days + margin of expiry. Comparison in the A5 section below |
-| **A6** | Who declares a lockdown, how is the link cut (physically or by policy), and who authorises the reconnect? | facility | The reconcile procedure and its checks | 🔄 **The cut is both** (Brian, 2026-10-30): configuration first for speed, then a physical disconnect to make it certain. **Design rule that follows:** a site behaves the same however the link is lost, and **the reconnect is the controlled step** — sync resumes only when authorised, never because the link came back; plugging the fibre back in starts nothing. ✅ **Reconnect in two steps, by two roles** (Brian, 2026-10-30): security lifts the lockdown and restores the link; then the system owner (or ISSO) **releases each site's merge** after its staging checks pass — *is it safe* and *is the data good* are separate decisions with separate names. Reading: security also declares the lockdown |
-| **A7** | Does data also flow out — do external sites receive the main side's records, and does reference data (people, locations) need to stay current while connected? | mission owner | One-way or two-way, and what goes stale during the split | ✅ **Two-way, and every site holds a full copy of everything** (Brian, 2026-10-30; answers A13 too). Any lookup works during a lockdown. **What it costs:** 4–10 complete copies of records retrieved by personal identifier, outside the lockdown perimeter — each encrypted at rest, each sized for the whole database, and each in the records-destruction scope (3.27). **Destruction is a change the merge must carry too:** a record destroyed on one side during a lockdown and edited on the other is a conflict of its own |
-| **A8** | Who can fix an external site during a lockdown? Nobody at the main facility can reach it while the link is cut | facility | A trained person and local admin accounts at each site, or a stated acceptance that a broken site stays broken until the reconnect | ✅ **Nobody — a broken site waits for the reconnect** (Brian, 2026-10-30); a stated, accepted risk, with no admin access held at the sites. **What follows:** (1) a site must run the whole lockdown **untended** — disks, logs and backups sized for the longest lockdown (A5) with margin, nothing scheduled that needs a person; (2) staff at a broken site fall back to **paper**, and those records are entered at the reconnect — a fourth input to the merge |
-| **A9** | If an external site's hardware fails during a lockdown, how much of its data may be lost, and how soon must it be working again? | mission owner · AO accepts | One host or three per site (A1), and how often the site backs itself up | ✅ **M2 — two hosts + a witness per site** (Brian, 2026-10-30): keeps running through a host loss with nobody's help. Options and trade-offs in the A9 section below |
-| **A10** | Are the external sites linked to each other, or only to the main facility? In a lockdown, are they cut from each other too? | facility | Hub or mesh: whether sites see each other's data, and how many merges a reconnect has | ✅ **Mesh — and the external sites keep syncing each other during a lockdown** (Brian, 2026-10-30). **The most expensive answer so far, stated plainly:** (1) during a lockdown the external sites are **4–10 writers merging continuously**, not islands waiting for one merge each — the merge stops being a batch job at the reconnect and becomes a **continuously running sync engine** between independent instances of a product whose vendor does not support it (A4), which somebody builds, tests and owns; (2) a same-field clash between two sites **cannot be reviewed during the lockdown** if nobody at the sites holds the review role — the record has to carry both values, visibly flagged, until the main's reviewer decides; (3) **the staging checks are bypassed between sites**: a bad change at one site reaches the others before anything checks it, and the main's checks see it only at the reconnect; (4) the mesh can **split unevenly** — A reaches B but not C — so the engine must handle any partition, not just "main cut off"; (5) the order of changes comes from per-record version tracking, not clocks (GPS helps people read times, it cannot order edits). See A10c for how the sites sync |
-| **A10c** | During a lockdown, how do the external sites sync with each other — through a lead site, or peer to peer? | Brian | How much is built: one merge component, or a general multi-writer engine | ✅ **Through a lead site** (Brian, 2026-10-30). One external site is pre-named the **lockdown lead**, with a pre-named backup; during a lockdown the others sync with it exactly as they sync with the main normally. **The same hub merge component runs at the main and at the lead** — built and tested once. A site that cannot reach the lead runs alone. At the reconnect, the lead's merged state and any lone site merge into the main, each change still carrying the site that made it |
-| **A11** | Is an unplanned link failure — a cut fibre, a dead switch — handled exactly like a lockdown? Can one site be cut while the others stay connected? | mission owner | **Recommended: yes to both** — one mechanism, reconciled per site. Otherwise the everyday failure takes a path the drill never tests | ✅ **Yes — one mechanism for every loss of contact** (Brian, 2026-10-30): lockdown, cut fibre or dead switch, one site or all. A site first tries to reach the main **through the mesh**; failing that, it works with the lead or alone. Every link failure therefore exercises the lockdown path. Proposed detail: after an unplanned loss, with no lockdown declared, only the second reconnect step applies — the system owner's release |
-| **A12** | If a person's access is withdrawn at the main facility during a lockdown, how soon must the external sites honour it? They cannot hear about it until the reconnect | AO | A local revocation procedure at each site, or a stated, accepted risk | ✅ **By phone and a site supervisor** (Brian as acting AO, 2026-10-30): security tells the sites out of band — phone or radio — and a **supervisor role in the application** at each site (not an OS admin, so A8 stands) disables the user; the change syncs through the lead to every reachable site. Depends on the product allowing that role — vendor question 6 |
-| **A13** | After the reconcile, does an external site keep every record, or only what it needs to work? | mission owner · privacy office | Every copy of records retrieved by personal identifier is in the retention and destruction scope (backlog 3.27), and each copy sits outside the facility perimeter | ✅ **Every record, at every site** — answered with A7 (Brian, 2026-10-30). ⚠️ The privacy office should see this: it multiplies the copies the records notice has to cover |
-| **A14** | Will lockdowns be drilled, how often, and does the drill include the reconcile? | facility | A reconcile that has never run fails the first time it is real. Sets how the procedure is tested | ✅ **Quarterly, merge included** (Brian, 2026-10-30): the cut, the lead taking over, the two-role reconnect and the merge with its review queue, four times a year, on the real system. ⚠️ A drill cannot run for 45 days: the **untended** claim (A5) is proven by sizing and measurement, not by the drill |
-| **A15** | What does an external site have: a locked room or a rack, power and UPS runtime, cooling, physical access control? | facility | The hardware's form factor, and the physical-protection (PE) controls at each site | 🔄 **Space varies by site** (Brian, 2026-10-30): some have rooms, some only a locking cabinet in a shared room. So **one site build that fits the smallest** — compact hardware that fits a locking cabinet — and the physical controls written **per site** (who holds the key, the access log). A site survey per site also places the **GPS antenna**, which needs a view of the sky. ✅ **Power also varies by site** (Brian, 2026-10-30) — so design for the weakest, **UPS only**: a site must survive a total power loss mid-lockdown and **restart unattended** — firmware set to power on after AC loss, disks unlocked by TPM (clevis, already working on all four main hosts — never a passphrase prompt), the UPS signalling a clean shutdown on low battery, and the database and cluster **cold-starting in the right order by themselves**, which the main build does not do yet (backlog 3.57) |
-
-**A4 in detail — the questions for the vendor:**
-
-1. ~~Does the product have a supported mode for a site that runs disconnected and syncs back?~~
-   **No** (Brian, 2026-10-30). So the questions are now about building the merge around it:
-2. Can an **independent instance** run at each external site, and what does each cost in licences?
-3. How does it number records, and can numbering be split by site (a range or a prefix per site)?
-4. What interfaces does it offer to **read and write records** — an API, an import, an export — and
-   does writing through them keep the product's own rules: validation, its audit trail? Writing to
-   its database directly is the path the vendor will not support.
-5. Is an instance supported on this platform: Canonical Kubernetes, PostgreSQL 16?
-6. Can a **supervisor role** — not an administrator — disable a user in one instance, and are
-   user accounts data that can be read and written through the interfaces in 4, so a disable
-   at one site can sync to the others (A12)?
-
-## A9 — the options for a site whose host fails during a lockdown
+### A9 — the options for a site whose host fails during a disconnect
 
 Asked 2026-10-30; Brian asked to see the options for *must keep running* and *short outage*.
-The constraint that shapes all four: **during a lockdown nobody from the main facility can help**,
+The constraint that shapes all four: **during a disconnect nobody from the main facility can help**,
 so whatever recovery an option needs happens with what is already at the site.
 
-| | Option | Machines per site | A host fails during a lockdown | Needs a person on site (A8) |
+| | Option | Machines per site | A host fails during a disconnect | Needs a person on site (A8) |
 |---|---|---|---|---|
 | **M1** | **Three small hosts** — the main enclave in miniature: Kubernetes and a Patroni member on each | 3 | **Keeps running, automatically.** Patroni failover was proven by a power cut on 2026-09-28; a lost Kubernetes worker costs ~50 s of partial failures (3.63). Then runs with no spare — degraded until the host is replaced, after the reconnect | No |
 | **M2** | **Two hosts + a witness** — a small box holding only quorum votes, no data. The witness design already exists as option 2.8 | 2 + witness | **Keeps running, automatically** — either host can be lost | No |
@@ -132,128 +103,374 @@ so whatever recovery an option needs happens with what is already at the site.
 **Across 4–10 sites the counts multiply** — M1 is 12–30 machines, M2 8–20 plus a witness each.
 Subscriptions are counted per machine, and the COTS licence per instance is vendor question 2.
 
-**The coupling to A8:** S1 and S2 work only if a trained person is at the site during a lockdown.
+**The coupling to A8:** S1 and S2 work only if a trained person is at the site during a disconnect.
 If A8's answer is *nobody*, only M1 and M2 remain.
 
-✅ **Chosen: M2** (Brian, 2026-10-30). Two consequences to design for:
+**Brian chose M2 on 2026-10-30.** Two consequences it carries:
 
-- **The witness sits at the site, not at the main facility.** In a lockdown the site is alone; a
+- **The witness sits at the site, not at the main facility.** In a disconnect the site is alone; a
   witness on the far side of the cut is a vote it cannot reach.
 - **Storage on two hosts needs its own answer.** The application's records are in PostgreSQL,
   which Patroni replicates; anything the main build keeps on Ceph (the map store, per the data
   protection diagram) cannot use the three-host Ceph layout at a two-host site.
 
-## A5 — designing for a week, or for weeks
+### A5 — designing for a week, or for weeks
 
 Asked 2026-10-30; Brian asked to see the *week* and *weeks or more* options. A site runs the whole
-lockdown untended (A8), so everything below has to last it with nobody touching it. Measured or
+disconnect untended (A8), so everything below has to last it with nobody touching it. Measured or
 configured values are this repo's; nothing here is estimated except where it says so.
 
 | | Up to a week | Weeks or more (say 30–45 days) | Source |
 |---|---|---|---|
 | **Clock** | ~4 s of drift at the measured rate — acceptable. At the reconnect the site's clock **steps** back by that much, and its audit trail shows the step | ~17 s a month and growing. **A receive-only GPS time source at every site** — the main facility's own AO-13 design, 4–10 times over | `HANDOFF.md` AO-13: +0.583 s/day measured on lab hardware; STIG `makestep 1 -1` makes any correction over 1 s a step |
 | **CAC revocation lists (DoD CRLs)** | Must still be valid a week after the cut | Must still be valid 30+ days after the cut. **If they are not, then when they expire either CAC logins fail at the site, or revocation checking is relaxed** — an AO decision either way | 6a.23 D3. ⚠️ **How long DoD CRLs stay valid is not measured here** — read `nextUpdate` from the real files when CAC is built |
-| **Enclave certificates** | No effect: CRL 90 days, leaf certificates 365 days | No effect at these lifetimes — but lockdowns are unannounced, so a site certificate must never sit within *(longest lockdown + margin)* of its expiry: an alert, not a habit | `ca.sh` defaults `CA_CRL_DAYS` 90, `CA_LEAF_DAYS` 365 |
-| **OS accounts** | No effect — nobody logs into a site's OS during a lockdown (A8) | Same. The hard ceiling is ~95 days (password max 60 + inactive 35), well past either | `stig-tailor.sh` |
-| **Application users' passwords** | The product's own policy | **A password that expires mid-lockdown locks that user out until the reconnect** — nobody can reset it (A8). Expiry longer than the longest lockdown, or CAC | vendor — the product's settings |
+| **Enclave certificates** | No effect: CRL 90 days, leaf certificates 365 days | No effect at these lifetimes — but a disconnect comes when the main chooses, not when a site is ready, so a site certificate must never sit within *(longest disconnect + margin)* of its expiry: an alert, not a habit | `ca.sh` defaults `CA_CRL_DAYS` 90, `CA_LEAF_DAYS` 365 |
+| **OS accounts** | No effect — nobody logs into a site's OS during a disconnect (A8) | Same. The hard ceiling is ~95 days (password max 60 + inactive 35), well past either | `stig-tailor.sh` |
+| **Application users' passwords** | The product's own policy | **A password that expires mid-disconnect locks that user out until the reconnect** — nobody can reset it (A8). Expiry longer than the longest disconnect, or CAC | vendor — the product's settings |
 | **Disk for logs** | ~175 MB per machine | ~750 MB per machine per month — still small | audit rate measured 25 MB/day/machine (`open-questions.md`, audit offload) |
 | **The merge** | A week of changes from under 10 users per site | A month of changes, a bigger review queue, and more paper records from any broken site (A8) | — |
 | **Withdrawn access (A12)** | Stays valid at the sites for up to a week | Stays valid for weeks | — |
 
-✅ **Chosen: weeks, 30–45 days; the design figure is 45** (Brian, 2026-10-30).
+**Brian chose weeks on 2026-10-30, with 45 days as the design figure.**
 
 **Verdict:** weeks costs **a GPS receiver per site** and an answer on **CAC revocation lists**.
-Everything else holds at either length. Lockdowns are not scheduled, and a design for a week
-fails *during* a long one — the clock wanders and the revocation lists expire with nobody there
+Everything else holds at either length. A disconnect lasts as long as the main chooses, and a
+design for a week fails *during* a long one — the clock wanders and the revocation lists expire with nobody there
 to fix either.
 
-## The design, as decided 2026-10-30
+<!-- BEGIN facility-design.py: generated from the .env - change answers with set or ask, never edit inside this block -->
+**Status:** 21 of 30 questions answered · **0 conflicts** · 9 open. Answers: [`01-facility-a.env`](01-facility-a.env) · diagram: [`01-facility-a.drawio`](01-facility-a.drawio) · generated by [`facility-design.py`](facility-design.py).
 
-Put together from the answers above; each point names the question it comes from. Designed on
-paper, nothing built.
+## Checks
 
-**Shape.** The main facility is today's enclave, unchanged in shape, plus a **sync hub**. Around it
-are **4–10 identical external sites** (A1), each built from one procedure and a parameter file per
-site: two hosts and a witness (A9, M2), a receive-only GPS time source (A5), and a UPS, sized to
-fit a locking cabinet (A15). The links are facility-owned fibre on controlled ground (A2), and the
-sites are also linked to each other (A10). **It is one system with one authorization (A2).**
+🔴 conflict - two answers cannot both hold · 🟠 cost - a consequence to accept knowingly · 🔵 depends on work not done yet · ⬜ open
 
-**Data.** Every site holds a **full copy of every record**, encrypted at rest and in the
-destruction scope (A7, A13). Each site numbers new records from **its own range** (A3, vendor
-question 3). **A site always works on its local copy**, and the link carries sync, so a cut pauses
-sync instead of switching anything over.
+- 🟠 **A4 no + A10b lead: the merge is a sync engine running through the disconnect**, not a batch job at the reconnect - a software product of its own around a COTS product that does not support it.
+- 🟠 **Checks are bypassed between sites** (A10b): a bad change at one site reaches the others before anything checks it; the main's staging sees it only at the reconnect.
+- 🟠 A7: **up to 10 complete copies of records retrieved by personal identifier** outside the main facility - tell the privacy office; the records notice has to cover them.
+- 🔵 A15b: a site must restart unattended after a total power loss - an **ordered cold start of the database and the cluster**, which the main build does not do yet (backlog 3.57).
+- 🔵 A9 M2: the witness design (backlog 2.8) becomes required, and anything the main keeps on Ceph needs a two-host answer at a site.
+- 🔵 A4 no: the built merge depends on **V4** - which interfaces the product offers to read and write records.
+- 🔵 A12 depends on **V6** - a supervisor role that can disable a user in one instance.
 
-**The sync and merge component — built, not bought (A4).**
+## What it changes in the current design
 
-- It reads and writes **through the product's own interfaces** (vendor question 4), never its
-  database directly.
-- Every change carries **site, record, field, before, after, and version**. "Changed" is judged
-  against the record **as it stood at the cut**.
-- **Merge by field (A3).** Changes to different fields both apply. A clash on the same field
-  leaves the record carrying **both values, flagged**, until the review queue at the main decides.
-  A record destroyed on one side and edited on the other is a clash too.
-- It is **one component in two places**: the main normally, and the **pre-named lead site** during
-  a lockdown, with a pre-named backup lead (A10c).
+| The design today | This facility | Source |
+|---|---|---|
+| Network: **fully disconnected, no egress** - locked | **Still holds.** Every site is a closed system; a disconnect makes it more closed | `HANDOFF.md` §1 |
+| One site, one room | 4-10 external sites plus the main, linked to each other | `HANDOFF.md` §1, §4 |
+| One database, one writer | A writer at every site through a disconnect; the lead also merges the others | B-06a |
+| The mission application is COTS | The merge is built around it, through its interfaces | 6a.21 |
+| One clock, the main's time master | A GPS time source at every site | AO-13 |
+| One authorization | Still one - every site inside it | A2b |
 
-**Lockdown.**
+## Answers
 
-- **Cutting the link:** by configuration first, then physically (A6).
-- **Running untended:** sites run up to **45 days** with nobody to fix them (A5, A8). They keep
-  syncing each other through the lead; a site that cannot reach the lead runs alone. Any loss of
-  contact uses this same mechanism, and a site tries the main through the mesh first (A11).
-- **Withdrawing access:** security phones or radios the sites, and an application supervisor
-  disables the user there (A12).
-- **A site that breaks:** its staff use paper, entered at the reconnect (A8).
+| # | Question | Who answers | Answer | Set by |
+|---|---|---|---|---|
+| **A4** | Does the mission application (COTS) support an external site that runs disconnected and syncs its data back? | vendor | **No, it does not** - the merge is BUILT - through the product's own interfaces, owned by whoever builds it | Brian 2026-10-30 |
+| **A3** | During a disconnect, what does an external site do to records? | mission owner | **Both sides may edit the same record** - cases 1-3: real conflicts, decided by a rule or a person (A3b) | Brian 2026-10-30: "case1 ,2,3 must all be account for" |
+| **A3b** | When both sides changed one record, how is it decided? | mission owner | **Field merge + a person for clashes** - different fields: both apply; same field: the record carries both values, flagged, until a named role decides - nothing is lost silently | Brian 2026-10-30 |
+| **A3c** | Which role works the review queue? | mission owner | ⬜ open |  |
+| **A2a** | What physically carries the link between the main and the external sites? | facility | **The facility's own fibre, on its ground** - no bulk link encryption needed for crossing uncontrolled space; the services' own TLS still protects the traffic | Brian 2026-10-30: "these are closed systems but get more closed on lock down" |
+| **A2b** | One system in one accreditation boundary, or separate systems with interconnection agreements? | AO | **One system, one authorization** - one SSP covers every site - so every site meets the full control set, physical protection included | Brian as acting AO 2026-10-30 |
+| **A1a** | How many external sites? | facility | **4-10 sites** - enough that a site must be one repeatable build with a parameter file per site | Brian 2026-10-30 |
+| **A1b** | What runs at each site during a disconnect? | mission owner | **The whole application** - every function at every site; the merge covers every record type | Brian 2026-10-30 |
+| **A1c** | How many people use one site at the same time? | facility | **Under 10** - small hardware - a site is sized by its recovery model (A9), not by load | Brian 2026-10-30 |
+| **A9** | A site's host fails during a disconnect, and nobody from the main can help. What is acceptable? | mission owner, AO accepts | **Two hosts + a witness - keeps running** - keeps running automatically through either host's loss; the witness is a small box holding only quorum votes, at the site (the 2.8 witness design) | Brian 2026-10-30, after seeing M1/M2/S1/S2 |
+| **A8** | During a disconnect, who can fix a site when something other than a host failure breaks it? | facility | **Nobody - wait for the reconnect** - a site runs the whole disconnect untended; staff at a broken site use paper, entered at the reconnect | Brian 2026-10-30 |
+| **A5** | What is the longest disconnect a site must survive untended, in days? | facility | **45** days | Brian 2026-10-30: weeks, 30-45 days, after seeing a week against weeks (asked as LOCKDOWN_DAYS) |
+| **A6c** | The main can disconnect at will - who may order a disconnect? | facility | ⬜ open | A6c, added 2026-10-30 when the cut became "the main can disconnect at will" |
+| **A6a** | How is the link cut when the main disconnects? | facility | **Both** - configuration first for speed, then a physical disconnect to make it certain | Brian 2026-10-30 |
+| **A6b** | Who authorises the reconnect? | facility | **Two steps, two roles** - security ends the disconnect and restores the link; the system owner or ISSO then releases each site's merge after its checks | Brian 2026-10-30 |
+| **A7** | What does each external site hold? | mission owner, privacy office | **A full copy of everything** - any lookup works during a disconnect; one complete copy of the records per site, each encrypted at rest and in the destruction scope | Brian 2026-10-30 (answers A13 too) |
+| **A10** | Are the external sites linked to each other, or only to the main? | facility | **Also to each other** - site-to-site links too - what they do in a disconnect is A10b | Brian 2026-10-30 |
+| **A10b** | During a disconnect, do the external sites sync each other, and how? | facility | **Yes, through a lead site** - a pre-named lead (and backup) runs the same hub as the main; the others sync with it | Brian 2026-10-30: the sites keep syncing each other, through a lead site |
+| **A11** | Is an unplanned link failure (cut fibre, dead switch) handled exactly like an ordered disconnect? | mission owner | **Yes - one mechanism** - every loss of contact takes the disconnect path, so every link failure exercises it | Brian 2026-10-30 |
+| **A12** | Someone's access is withdrawn at the main during a disconnect. How do the sites stop that person? | AO | **Phone + a site supervisor** - security phones the sites; a supervisor role in the application disables the user - vendor question V6 | Brian as acting AO 2026-10-30 |
+| **A14** | How often is a full disconnect drilled, merge included? | facility | **Quarterly** - four full drills a year; the review queue becomes routine | Brian 2026-10-30 |
+| **A15a** | What space does a site have for its equipment? | facility | **Varies by site** - one site build that fits the smallest; physical controls written per site | Brian 2026-10-30 |
+| **A15b** | What power does a site have? | facility | **Varies by site** - design for the weakest: UPS only | Brian 2026-10-30 |
+| **V2** | Can an independent instance run at each site, and what does each cost in licences? | vendor | ⬜ open |  |
+| **V3** | How does the product number records - can numbering be split by site? | vendor | ⬜ open |  |
+| **V4** | What interfaces read and write records (API, import, export), and does writing through them keep the product's validation and audit trail? | vendor | ⬜ open |  |
+| **V5** | Is an instance supported on Canonical Kubernetes and PostgreSQL 16? | vendor | ⬜ open |  |
+| **V6** | Can a supervisor role - not an administrator - disable a user in one instance, and are user accounts data the sync can carry? | vendor | ⬜ open |  |
+| **CRL** | How many days are DoD revocation lists valid from issue (their nextUpdate)? | measured when CAC is built (6a.23) | ⬜ open | read nextUpdate from the real DoD CRLs when CAC is built (6a.23) |
+| **SURVEY** | Has each site been surveyed - space, power, GPS antenna, key holders? | facility | ⬜ open |  |
 
-**Reconnect: two steps, two roles (A6).**
+## The design
 
-1. **Security** lifts the lockdown and restores the link. Nothing syncs.
-2. **The system owner or ISSO** releases the merge, site by site. The lead's merged state (every
-   change tagged with its site), any lone site's changes and any paper records go to **staging**
-   for checks, then the merge, with clashes sent to the review queue. Then the main's state flows
-   back out to every site.
+**Shape.**
 
-After an unplanned loss with no lockdown declared, step 2 alone (proposed, A11).
+- The main facility is today's enclave, unchanged in shape, plus a **sync hub**.
+- **4-10 external sites** (A1a), identical - one build procedure and a parameter file per site: two hosts + a witness (A9 M2); a receive-only GPS time source (A5); a UPS, and nothing more assumed (A15b); sized to fit a locking cabinet (A15a).
+- Links: no bulk link encryption needed for crossing uncontrolled space; the services' own TLS still protects the traffic (A2a). Sites linked to each other as well as to the main (A10).
+- **One SSP covers every site - so every site meets the full control set, physical protection included** (A2b).
+
+**Data.**
+
+- Each site holds a full copy of everything: any lookup works during a disconnect; one complete copy of the records per site, each encrypted at rest and in the destruction scope (A7).
+- Each site numbers new records from **its own range** (A3, V3) - decided before the first disconnect.
+- **A site always works on its local copy**; the links carry sync, so a cut pauses sync instead of switching anything over.
+- The scope is every function at every site; the merge covers every record type (A1b).
+
+**Sync and merge.**
+
+- **Built, not bought (A4):** reads and writes **through the product's own interfaces** (V4), never its database.
+- Every change carries **site, record, field, before, after and version**; *changed* is judged against the record **as it stood at the cut**.
+- **Cases 1-3** (A3). Different fields: both apply; same field: the record carries both values, flagged, until a named role decides - nothing is lost silently (A3b).
+- A record **destroyed on one side and edited on the other** is a clash too.
+- **Who works the review queue is open** (A3c).
+- **One component in two places:** the main normally, and the **pre-named lead site** during a disconnect, with a pre-named backup lead (A10b).
+
+**Disconnected.**
+
+- **The main disconnects from the external sites at will** - for any reason, whenever it chooses.
+- **Who may order a disconnect is open** (A6c).
+- **Cut:** configuration first for speed, then a physical disconnect to make it certain (A6a).
+- **Untended for up to 45 days** (A5): a site runs the whole disconnect untended; staff at a broken site use paper, entered at the reconnect (A8).
+- The sites keep syncing each other **through the lead**; a site that cannot reach the lead runs alone.
+- **Any loss of contact uses this same mechanism** (A11); a site tries the main **through the mesh** first.
+- **Withdrawn access:** security phones the sites; a supervisor role in the application disables the user - vendor question V6 (A12).
+
+**Reconnect.**
+
+- Plugging the link back in **starts nothing** (A6b).
+- **Step 1 - security** ends the disconnect and restores the link. Nothing syncs.
+- **Step 2 - the system owner or ISSO** releases the merge, site by site, after its checks.
+- In: the lead's merged state (every change tagged with its site), any lone site's changes, paper records from a site that broke -> **staging** at the main -> checks -> the merge -> clashes to the review queue -> the system of record -> back out to every site.
+- After an unplanned loss, with no disconnect ordered: step 2 alone (proposed, A11).
 
 **Running untended for 45 days.**
 
-- Disks, logs (~750 MB per machine per month) and backups are sized for it, and nothing scheduled
-  needs a person.
-- **A total power loss restarts by itself:** power-on after AC loss, TPM disk unlock, a clean
-  shutdown signalled by the UPS, and an **ordered cold start of the database and the cluster**
-  (backlog 3.57, not yet solved on the main build).
-- CAC revocation lists stay valid 45+ days, or the AO decides what happens when they expire.
-  Application passwords outlive 45 days, or logins use CAC. An alert fires on any site certificate
-  within 45 days plus a margin of its expiry.
+- Disks, logs and backups sized for it - nothing scheduled needs a person.
+- **Clock:** 26.2 s of drift without GPS, over the 5 s tolerance - **a receive-only GPS at every site**.
+- **Revocation lists** must outlast 59 days: the enclave CRL is 90 days; DoD lists are not measured yet (CRL).
+- **Application passwords** must outlive 45 days, or logins use CAC.
+- **An alert** on any site certificate within 59 days of expiry.
+- **A total power loss restarts by itself:** power-on after AC loss, TPM disk unlock, a clean shutdown on the UPS signal, and an ordered cold start of the database and the cluster (3.57).
 
-**Tested quarterly**, merge included (A14). The 45-day claim is proven by sizing and measurement.
+**Testing.**
 
-### What it adds to this repo, when built
+- Quarterly (A14) - merge included; the untended length is proven by sizing and measurement, not by the drill.
+
+## Numbers
+
+| | Value | From |
+|---|---|---|
+| External sites (A1a) | **4-10** | the answer |
+| Hosts at the sites (A9 M2) | **8-20** | 2 per site |
+| Witness boxes | **4-10** | one per site, at the site |
+| Clock drift over 45 days, no GPS | **26.2 s** | 0.583 s/day, measured on lab hardware 2026-09-27/28 (poam.md AO-13); tolerance 5 s, ASSUMED - how far a site clock may drift before it needs its own GPS |
+| Audit logs per machine over 45 days | **1.1 GB** | 25 MB/day, measured audit-log rate per machine (stig-tailor.sh; backlog N-2) |
+| Everything that expires must outlast | **59 days** | the longest disconnect + 14 days margin (ASSUMED - margin before any certificate or list expires) |
+| Enclave CRL lifetime | **90 days** | scripts/enclave/ca.sh default |
+| Enclave certificate lifetime | **365 days** | scripts/enclave/ca.sh default |
+
+## What it adds to this repo, when built
 
 | | Item | Builds on |
 |---|---|---|
-| **New** | **The sync and merge component**, with staging, checks and the review queue. **The largest item, and with no vendor support** | — |
-| **New** | **A site build**: the unattended build parameterised for two hosts and a witness, with one parameter file per site | backlog 2.6, the witness design in 2.8 |
-| **Required** | **An unattended cold start** of Postgres and Kubernetes after total power loss | backlog 3.57 |
-| **Changed** | **Time**: GPS at every site, not just the main | AO-13 |
-| **Changed** | **The SSP**: several sites, mesh links, physical controls per site, and PPSM rows for the sync traffic | baseline documents |
-| **Changed** | **Records destruction** at every site, and the privacy office told about the copies | backlog 3.27 |
+| **New** | **The sync and merge component**, with staging, checks and the review queue - the largest item, with no vendor support | - |
+| **New** | **A site build**: the unattended build parameterised for 2 hosts + witness, a parameter file per site | 2.6, the 2.8 witness design |
+| **Required** | **An unattended cold start** of Postgres and Kubernetes after a total power loss | 3.57 |
+| **Changed** | **Time**: a GPS at every site, not just the main | AO-13 |
+| **Changed** | **The SSP**: several sites, the links, physical controls per site, PPSM rows for the sync traffic | baseline documents |
+| **Changed** | **Records destruction at every site**, and the privacy office told about the copies | 3.27 |
 
-### The honest cost
+## The honest cost
 
-The sites are buildable from what this repository already does. **The sync engine is a software
-product of its own**: a continuously running, multi-site, field-level merge around a COTS product
-whose vendor does not support it. It needs an owner, a test suite and a lifecycle. Two things
-follow that are easy to miss:
+The sites are buildable from what this repository already does. **The merge is a software product of its own**: a continuously running, multi-site, field-level sync, around a COTS product whose vendor does not support it. It needs an owner, a test suite and a lifecycle.
 
-- **Every product upgrade has to be re-tested against the sync engine before it reaches any site.**
-  The interfaces it relies on can change.
-- **The main and all 4–10 sites must run the same product version.** An upgrade becomes one
-  coordinated event across every site, and it cannot happen during a lockdown.
+- **Every product upgrade is re-tested against it** before it reaches any site - the interfaces it relies on can change.
+- **The main and every site run the same product version**, so an upgrade is one coordinated event - never during a disconnect.
 
-### Still open
+## Still open
 
-- **Which role works the review queue** (A3).
-- **Vendor questions 2–6.**
-- **How long DoD revocation lists stay valid**, measured when CAC is built (6a.23).
-- **A survey of each site**: space, power, GPS antenna placement, key holders.
+- ⬜ **A3c** Which role works the review queue? - *mission owner*
+- ⬜ **A6c** The main can disconnect at will - who may order a disconnect? - *facility*
+- ⬜ **V2** Can an independent instance run at each site, and what does each cost in licences? - *vendor*
+- ⬜ **V3** How does the product number records - can numbering be split by site? - *vendor*
+- ⬜ **V4** What interfaces read and write records (API, import, export), and does writing through them keep the product's validation and audit trail? - *vendor*
+- ⬜ **V5** Is an instance supported on Canonical Kubernetes and PostgreSQL 16? - *vendor*
+- ⬜ **V6** Can a supervisor role - not an administrator - disable a user in one instance, and are user accounts data the sync can carry? - *vendor*
+- ⬜ **CRL** How many days are DoD revocation lists valid from issue (their nextUpdate)? - *measured when CAC is built (6a.23)*
+- ⬜ **SURVEY** Has each site been surveyed - space, power, GPS antenna, key holders? - *facility*
+
+## Every question's options
+
+So a change is a choice between known alternatives. ✅ marks the answer.
+
+**A4** Does the mission application (COTS) support an external site that runs disconnected and syncs its data back?
+
+| | Option | What it means |
+|---|---|---|
+|  | `yes` Yes, it has that mode | the merge is BOUGHT - the vendor's feature; the platform gives each site what it needs |
+| ✅ | `no` No, it does not | the merge is BUILT - through the product's own interfaces, owned by whoever builds it |
+
+**A3** During a disconnect, what does an external site do to records?
+
+| | Option | What it means |
+|---|---|---|
+|  | `create` Only creates new records | case 1: the merge is an append - safe only with a number range per site |
+|  | `update` Also changes old records | cases 1-2: sites also change records that existed before the cut; the main never touches those same records meanwhile |
+| ✅ | `both-edit` Both sides may edit the same record | cases 1-3: real conflicts, decided by a rule or a person (A3b) |
+
+**A3b** When both sides changed one record, how is it decided?
+
+| | Option | What it means |
+|---|---|---|
+| ✅ | `field-merge` Field merge + a person for clashes | different fields: both apply; same field: the record carries both values, flagged, until a named role decides - nothing is lost silently |
+|  | `person-all` A person decides every one | any record changed on both sides waits for review - the simplest rule, and the most manual work after a long disconnect |
+|  | `main-wins` The main facility always wins | the main's version stands; the site's change is kept for review but not applied |
+|  | `newest-wins` Newest change wins | the later timestamp stands - silently drops the other side's change, and needs trusted clocks at every site |
+
+**A2a** What physically carries the link between the main and the external sites?
+
+| | Option | What it means |
+|---|---|---|
+| ✅ | `own-fibre` The facility's own fibre, on its ground | no bulk link encryption needed for crossing uncontrolled space; the services' own TLS still protects the traffic |
+|  | `leased` A leased circuit through uncontrolled space | the link needs FIPS-validated encryption and is part of the security boundary |
+|  | `tunnel` An encrypted tunnel over another network | FIPS-validated tunnel endpoints at the main and every site; the carrying network stays outside the boundary |
+
+**A2b** One system in one accreditation boundary, or separate systems with interconnection agreements?
+
+| | Option | What it means |
+|---|---|---|
+| ✅ | `one` One system, one authorization | one SSP covers every site - so every site meets the full control set, physical protection included |
+|  | `separate` Separate systems + agreements | each site authorized on its own, an interconnection agreement for every linked pair, and the merge moves records between systems |
+
+**A1a** How many external sites?
+
+| | Option | What it means |
+|---|---|---|
+|  | `1` 1 site | a single external site |
+|  | `2-3` 2-3 sites | a handful of sites |
+| ✅ | `4-10` 4-10 sites | enough that a site must be one repeatable build with a parameter file per site |
+
+**A1b** What runs at each site during a disconnect?
+
+| | Option | What it means |
+|---|---|---|
+| ✅ | `whole` The whole application | every function at every site; the merge covers every record type |
+|  | `part` Only part of it | a subset of functions and fewer record types to merge - name the part in the scenario |
+
+**A1c** How many people use one site at the same time?
+
+| | Option | What it means |
+|---|---|---|
+| ✅ | `under-10` Under 10 | small hardware - a site is sized by its recovery model (A9), not by load |
+|  | `10-50` 10-50 | a working office |
+|  | `50-plus` 50+ | close to the main facility's own size |
+
+**A9** A site's host fails during a disconnect, and nobody from the main can help. What is acceptable?
+
+| | Option | What it means |
+|---|---|---|
+|  | `M1` Three hosts - keeps running | the main enclave in miniature: keeps running automatically through one host loss, then degraded until the host is replaced |
+| ✅ | `M2` Two hosts + a witness - keeps running | keeps running automatically through either host's loss; the witness is a small box holding only quorum votes, at the site (the 2.8 witness design) |
+|  | `S1` One host + a warm standby | no data lost; down for minutes while a PERSON promotes the standby |
+|  | `S2` One host + backup device + spare | loses up to archive_timeout of changes; down for hours while a PERSON restores onto the spare |
+
+**A8** During a disconnect, who can fix a site when something other than a host failure breaks it?
+
+| | Option | What it means |
+|---|---|---|
+|  | `local-admin` A trained admin at each site | local admin accounts and break-glass envelopes at every site, each in the audit scope |
+| ✅ | `nobody` Nobody - wait for the reconnect | a site runs the whole disconnect untended; staff at a broken site use paper, entered at the reconnect |
+|  | `travel` Main staff travel to it | the disconnect cuts the network, not people: an admin goes to the site's console |
+
+**A6c** The main can disconnect at will - who may order a disconnect?
+
+| | Option | What it means |
+|---|---|---|
+|  | `security` The security officer | the same role that restores the link at the reconnect (A6b) |
+|  | `owner` The system owner or ISSO | a disconnect is an operational decision as well as a security one |
+|  | `either` Either of them | both roles hold the procedure; whoever is on duty orders it |
+
+**A6a** How is the link cut when the main disconnects?
+
+| | Option | What it means |
+|---|---|---|
+|  | `physical` Physically | a person disconnects or powers off the link at the main |
+|  | `config` By configuration | the network shuts the inter-site ports - fast, and only as good as the configuration |
+| ✅ | `both` Both | configuration first for speed, then a physical disconnect to make it certain |
+
+**A6b** Who authorises the reconnect?
+
+| | Option | What it means |
+|---|---|---|
+| ✅ | `two-step` Two steps, two roles | security ends the disconnect and restores the link; the system owner or ISSO then releases each site's merge after its checks |
+|  | `security` The security officer alone | ending the disconnect releases every site's merge |
+|  | `owner` The system owner or ISSO alone | one person decides both the reconnect and the merge |
+
+**A7** What does each external site hold?
+
+| | Option | What it means |
+|---|---|---|
+| ✅ | `full` A full copy of everything | any lookup works during a disconnect; one complete copy of the records per site, each encrypted at rest and in the destruction scope |
+|  | `subset` Only what the site needs | its own area, open records and recent history; a lookup for anything else fails during a disconnect |
+
+**A10** Are the external sites linked to each other, or only to the main?
+
+| | Option | What it means |
+|---|---|---|
+|  | `hub` Only to the main | every site talks only to the main; a disconnect cuts every site from every other |
+| ✅ | `mesh` Also to each other | site-to-site links too - what they do in a disconnect is A10b |
+
+**A10b** During a disconnect, do the external sites sync each other, and how?
+
+| | Option | What it means |
+|---|---|---|
+|  | `none` No - each site alone | site-to-site links carry no data in a disconnect; one merge per site at the reconnect |
+| ✅ | `lead` Yes, through a lead site | a pre-named lead (and backup) runs the same hub as the main; the others sync with it |
+|  | `p2p` Yes, peer to peer | every site merges with every site it reaches - a general multi-writer engine, the hardest thing to build and prove |
+
+**A11** Is an unplanned link failure (cut fibre, dead switch) handled exactly like an ordered disconnect?
+
+| | Option | What it means |
+|---|---|---|
+| ✅ | `same` Yes - one mechanism | every loss of contact takes the disconnect path, so every link failure exercises it |
+|  | `different` No - an ordered disconnect is special | two paths to build; the everyday one is not the one an ordered disconnect uses |
+
+**A12** Someone's access is withdrawn at the main during a disconnect. How do the sites stop that person?
+
+| | Option | What it means |
+|---|---|---|
+| ✅ | `phone-supervisor` Phone + a site supervisor | security phones the sites; a supervisor role in the application disables the user - vendor question V6 |
+|  | `accept` Accepted risk until the reconnect | the person stays valid at the sites for the whole disconnect |
+
+**A14** How often is a full disconnect drilled, merge included?
+
+| | Option | What it means |
+|---|---|---|
+| ✅ | `quarterly` Quarterly | four full drills a year; the review queue becomes routine |
+|  | `twice` Twice a year | two full drills a year |
+|  | `yearly` Yearly | one full drill a year - the contingency-plan test cadence |
+|  | `none` Not drilled | the reconcile first runs when it is real |
+
+**A15a** What space does a site have for its equipment?
+
+| | Option | What it means |
+|---|---|---|
+|  | `room` A locked room | a dedicated, access-controlled room with its own rack |
+|  | `cabinet` A locking cabinet in a shared room | the cabinet key and an access log become the controls |
+| ✅ | `varies` Varies by site | one site build that fits the smallest; physical controls written per site |
+
+**A15b** What power does a site have?
+
+| | Option | What it means |
+|---|---|---|
+|  | `generator` Generator + UPS | outages rare and short - the unattended restart is still needed, rarely |
+|  | `ups` UPS only | a long cut takes the site down; it must restart unattended |
+| ✅ | `varies` Varies by site | design for the weakest: UPS only |
+
+**SURVEY** Has each site been surveyed - space, power, GPS antenna, key holders?
+
+| | Option | What it means |
+|---|---|---|
+| ✅ | `not-started` Not started | no site surveyed |
+|  | `in-progress` In progress | some sites surveyed |
+|  | `done` Done | every site surveyed |
+<!-- END facility-design.py -->

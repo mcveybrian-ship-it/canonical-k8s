@@ -48,6 +48,25 @@ check_diagrams() {   # <sha>
     return 1
 }
 
+# ---- FACILITY DESIGNS MUST MATCH THEIR ANSWERS (added 2026-10-30) ----------------------------
+# docs/facility-setups/NN-*.md (the generated block) and NN-*.drawio are generated from NN-*.env by
+# facility-design.py, which also reads make-diagrams.py, ca.sh and 06a-postgres-ha.sh - so all of
+# them come from the commit being pushed. FACILITY_DIR is cleared so a test override cannot leak
+# in. Same override as the diagrams: ALLOW_STALE_DIAGRAMS=i-have-checked
+check_facilities() {   # <sha>
+    git cat-file -e "$1:docs/facility-setups/facility-design.py" 2>/dev/null || return 0
+    command -v python3 >/dev/null 2>&1 || { echo "pre-push: python3 not found - facility designs NOT checked" >&2; return 0; }
+    d=$(mktemp -d) || return 0
+    git archive "$1" docs/facility-setups docs/diagrams scripts/enclave/enclave-addresses.env scripts/enclave/vm-specs.env \
+        scripts/enclave/ca.sh scripts/install/06a-postgres-ha.sh | tar -x -C "$d"
+    out=$(FACILITY_DIR='' python3 "$d/docs/facility-setups/facility-design.py" --check 2>&1); rc=$?
+    rm -rf "$d"
+    [ "$rc" -eq 0 ] && return 0
+    echo "pre-push: REFUSING - commit $(git log -1 --format='%h' "$1") has stale facility designs:" >&2
+    echo "$out" | sed 's/^/  /' >&2
+    return 1
+}
+
 while read -r local_ref local_sha remote_ref remote_sha; do
 
     # Deleting a remote ref sends a zero local sha - nothing to inspect.
@@ -83,6 +102,7 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     done
 
     check_diagrams "$local_sha" || dfail=1
+    check_facilities "$local_sha" || dfail=1
 done
 
 if [ "$dfail" -ne 0 ]; then
@@ -91,6 +111,7 @@ if [ "$dfail" -ne 0 ]; then
     else
         echo >&2
         echo "  Nothing was pushed. Regenerate and commit:  python3 docs/diagrams/make-diagrams.py" >&2
+        echo "    or, for a facility:  python3 docs/facility-setups/facility-design.py build <scenario>" >&2
         echo "  A deliberate exception:  ALLOW_STALE_DIAGRAMS=i-have-checked git push ..." >&2
         exit 1
     fi
